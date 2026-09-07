@@ -1,0 +1,16 @@
+[package]
+name = "tool-process"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+capability-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tool-core.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

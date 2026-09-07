@@ -1,0 +1,35 @@
+# Fast local-dev settings: keep parallel jobs within RAM limits and link with
+# lld (much faster + far less memory than the default GNU ld on big GUI bins).
+# Applies to the new workspace crates AND src-tauri builds (Cargo reads config
+# hierarchically). Release profiles are untouched.
+
+[build]
+# 12 cores / 15 GB RAM: cap parallelism so concurrent rustc + linking can't
+# OOM the machine. Lower to 6 if the system still struggles.
+jobs = 8
+
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[profile.dev]
+# Fast iteration: no optimization, no debuginfo (fastest link by far),
+# max codegen parallelism, incremental on.
+opt-level = 0
+debug = 0
+codegen-units = 256
+incremental = true
+
+# When you actually need to debug (gdb/lsp backtraces):
+#   cargo +stable run --profile dev-dbg -p app-host
+[profile.dev-dbg]
+inherits = "dev"
+debug = true
+
+[alias]
+# Fast gates: check one crate while iterating, whole workspace before commit.
+ck = "check -p"
+ckall = "check --workspace"
+t = "test -p"
+tall = "test --workspace"
+b = "build -p"

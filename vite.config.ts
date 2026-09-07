@@ -9,10 +9,11 @@ export default defineConfig({
 	plugins: [sveltekit(), tailwindcss()],
 	define: {
 		'import.meta.env.VITE_APP_VERSION': JSON.stringify(pkg.version),
-		// True only when the frontend is built by the Tauri CLI (which sets
-		// TAURI_ENV_PLATFORM). Baked in at build time so routing decisions never
-		// depend on the Tauri globals being injected at runtime.
-		__IS_DESKTOP__: JSON.stringify(!!process.env.TAURI_ENV_PLATFORM)
+		// True only for desktop builds: the Tauri CLI (which sets
+		// TAURI_ENV_PLATFORM) or the native Rust host (UTSUWA_NATIVE=1).
+		// Baked in at build time so routing decisions never depend on
+		// runtime-injected globals.
+		__IS_DESKTOP__: JSON.stringify(!!process.env.TAURI_ENV_PLATFORM || !!process.env.UTSUWA_NATIVE)
 	},
 	ssr: {
 		noExternal: ['bits-ui']

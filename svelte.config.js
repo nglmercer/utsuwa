@@ -5,7 +5,10 @@ import { mdsvex } from 'mdsvex';
 import rehypeSlug from 'rehype-slug';
 import { createHighlighter } from 'shiki/bundle/web';
 
+// Native Rust host (winit+wry) production builds set UTSUWA_NATIVE=1 to get
+// the same static output + locked-down CSP the Tauri desktop build uses.
 const isTauri = !!process.env.TAURI_ENV_PLATFORM;
+const isDesktop = isTauri || !!process.env.UTSUWA_NATIVE;
 
 const highlighter = await createHighlighter({
 	themes: ['github-light', 'github-dark'],
@@ -34,7 +37,7 @@ const config = {
 	],
 
 	kit: {
-		adapter: isTauri
+		adapter: isDesktop
 			? adapterStatic({ fallback: 'index.html' })
 			: adapterAuto(),
 		// Lock down the desktop webview: with a broad fs read capability, a script
@@ -44,7 +47,7 @@ const config = {
 		// CSP is managed separately. connect/img stay permissive because users
 		// point the app at arbitrary provider endpoints and it pulls the on-device
 		// embedding model from a CDN; the protection is locking script-src.
-		csp: isTauri
+		csp: isDesktop
 			? {
 					mode: 'hash',
 					directives: {
