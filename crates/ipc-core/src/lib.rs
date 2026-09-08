@@ -28,6 +28,8 @@ pub enum IpcMethod {
     SettingsGet,
     #[serde(rename = "settings.set")]
     SettingsSet,
+    #[serde(rename = "activity.list")]
+    ActivityList,
 }
 
 /// Request envelope: frontend → host.

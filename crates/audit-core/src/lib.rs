@@ -40,6 +40,9 @@ pub struct AuditRecord {
     pub outcome: AuditOutcome,
     /// Short human reason. Redacted — see [`redact_detail`].
     pub detail: String,
+    /// Execution wall-clock for completed tool calls, when measured.
+    /// Absent for policy-only records (requests, decisions without run).
+    pub duration_ms: Option<u64>,
 }
 
 impl AuditRecord {
@@ -57,7 +60,13 @@ impl AuditRecord {
             resource,
             outcome,
             detail: redact_detail(&detail.into()),
+            duration_ms: None,
         }
+    }
+
+    pub fn with_duration(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
+        self
     }
 }
 
@@ -135,9 +144,22 @@ pub trait AuditSink: Send + Sync {
 }
 
 /// Test/development sink: appends to a mutex-guarded vec.
-#[derive(Debug, Default)]
+/// Bounded ring: the oldest records drop past capacity, so a long session
+/// cannot grow memory without limit. (Durable audit storage is Phase 32
+/// follow-up work.)
+#[derive(Debug)]
 pub struct InMemorySink {
     records: std::sync::Mutex<Vec<AuditRecord>>,
+    capacity: usize,
+}
+
+/// Default ring capacity for the shared host sink.
+pub const DEFAULT_SINK_CAPACITY: usize = 1000;
+
+impl Default for InMemorySink {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_SINK_CAPACITY)
+    }
 }
 
 impl InMemorySink {
@@ -145,8 +167,19 @@ impl InMemorySink {
         Self::default()
     }
 
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            records: std::sync::Mutex::new(Vec::new()),
+            capacity: capacity.max(1),
+        }
+    }
+
     pub fn records(&self) -> Vec<AuditRecord> {
         self.records.lock().expect("audit lock").clone()
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.lock().expect("audit lock").len()
     }
 
     pub fn outcomes(&self) -> Vec<AuditOutcome> {
@@ -156,7 +189,12 @@ impl InMemorySink {
 
 impl AuditSink for InMemorySink {
     fn record(&self, record: AuditRecord) {
-        self.records.lock().expect("audit lock").push(record);
+        let mut records = self.records.lock().expect("audit lock");
+        if records.len() >= self.capacity {
+            let drop_count = records.len() - self.capacity + 1;
+            records.drain(..drop_count);
+        }
+        records.push(record);
     }
 }
 
@@ -190,6 +228,33 @@ mod tests {
         assert_eq!(records[0].outcome, AuditOutcome::Approved);
         assert_eq!(records[1].outcome, AuditOutcome::ApprovalDenied);
         assert!(records[0].timestamp_ms > 0);
+    }
+
+    #[test]
+    fn ring_drops_oldest_past_capacity() {
+        let sink = InMemorySink::with_capacity(3);
+        for i in 0..5 {
+            sink.record(AuditRecord::now(
+                principal(),
+                None,
+                None,
+                AuditOutcome::Executed,
+                format!("step-{i}"),
+            ));
+        }
+        assert_eq!(sink.len(), 3);
+        let records = sink.records();
+        let details: Vec<&str> = records.iter().map(|r| r.detail.as_str()).collect();
+        assert_eq!(details, vec!["step-2", "step-3", "step-4"]);
+    }
+
+    #[test]
+    fn durations_attach_to_records() {
+        let record = AuditRecord::now(principal(), None, None, AuditOutcome::Executed, "ok")
+            .with_duration(42);
+        assert_eq!(record.duration_ms, Some(42));
+        let plain = AuditRecord::now(principal(), None, None, AuditOutcome::Denied, "no");
+        assert_eq!(plain.duration_ms, None);
     }
 
     #[test]

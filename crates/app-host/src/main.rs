@@ -241,6 +241,10 @@ fn main() {
             None
         }
     };
+    // Shared audit sink (plan Phase 35): the permission queue and the
+    // agent runtime both record here; the Activity panel reads it back
+    // over `activity.list`. Bounded in memory; durable storage is later.
+    let audit = Arc::new(audit_core::InMemorySink::new());
     // The live permission kernel state: agent turns submit here, the
     // dialog resolves here, resumed turns read grants from here.
     let approvals = Arc::new(Mutex::new(match &storage {
@@ -255,8 +259,11 @@ fn main() {
             ApprovalQueue::new()
                 .with_grants(seed)
                 .on_persistent_grant(storage_core::persistent_grant_hook(Arc::clone(store)))
+                .with_sink(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>)
         }
-        None => ApprovalQueue::new(),
+        None => {
+            ApprovalQueue::new().with_sink(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>)
+        }
     }));
     // Agent runtime → frontend event path: scripts queue on the reply
     // channel and the proxy wakes the window thread to evaluate them,
@@ -270,11 +277,17 @@ fn main() {
             tracing::warn!("dropping agent event: event loop closed");
         }
     });
-    let mut dispatcher = Dispatcher::new(version).with_approvals(Arc::clone(&approvals));
+    let mut dispatcher =
+        Dispatcher::new(version).with_approvals(Arc::clone(&approvals)).with_audit(Arc::clone(&audit));
     if let Some(store) = &storage {
         dispatcher = dispatcher.with_storage(Arc::clone(store));
     }
-    match app_host::agent_runtime::AgentRuntime::start(approvals, storage, None, emit) {
+    match app_host::agent_runtime::AgentRuntime::start(
+        approvals,
+        storage,
+        Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
+        emit,
+    ) {
         Ok(runtime) => dispatcher = dispatcher.with_agent(runtime),
         Err(err) => tracing::error!(%err, "agent runtime unavailable; agent.* methods will fail"),
     }

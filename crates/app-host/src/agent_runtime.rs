@@ -18,6 +18,7 @@ use agent_core::{Agent, AgentLimits};
 use audit_core::AuditSink;
 use capability_core::AgentId;
 use ipc_core::HostEvent;
+use mcp_runtime::{McpManager, McpServerConfig};
 use model_core::{ModelMessage, ModelProvider};
 use model_openai_compatible::OpenAICompatibleClient;
 use policy_core::ApprovalQueue;
@@ -25,11 +26,14 @@ use std::sync::{Arc, Mutex};
 use storage_core::Storage;
 use tool_core::ToolRegistry;
 use tool_process::{ProcessLimits, ProcessManager};
+use tracing::Instrument as _;
 
 /// Setting keys the provider factory reads. Values are JSON strings.
 pub const SETTING_BASE_URL: &str = "model.base_url";
 pub const SETTING_API_KEY: &str = "model.api_key";
 pub const SETTING_MODEL_NAME: &str = "model.name";
+/// Settings key holding the MCP server set (JSON array of server configs).
+pub const SETTING_MCP_SERVERS: &str = "mcp.servers";
 
 /// Transcript cap: oldest messages are dropped past this bound so a long
 /// session cannot grow memory (or model context) without limit.
@@ -73,6 +77,8 @@ pub struct AgentRuntime {
     provider_factory:
         Arc<dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync>,
     processes: Arc<ProcessManager>,
+    mcp: Arc<McpManager>,
+    storage: Option<Arc<Mutex<Storage>>>,
     state: Mutex<State>,
     executor: tokio::runtime::Runtime,
 }
@@ -85,12 +91,19 @@ impl AgentRuntime {
         audit: Option<Arc<dyn AuditSink>>,
         emit: EmitFn,
     ) -> Result<Arc<Self>, RuntimeError> {
-        Self::start_with_factory(approvals, audit, emit, settings_provider_factory(storage))
+        Self::start_with_factory(
+            approvals,
+            storage.clone(),
+            audit,
+            emit,
+            settings_provider_factory(storage),
+        )
     }
 
     /// Start with an explicit provider factory (tests inject stubs).
     pub fn start_with_factory(
         approvals: Arc<Mutex<ApprovalQueue>>,
+        storage: Option<Arc<Mutex<Storage>>>,
         audit: Option<Arc<dyn AuditSink>>,
         emit: EmitFn,
         provider_factory: Arc<
@@ -110,6 +123,8 @@ impl AgentRuntime {
             emit,
             provider_factory,
             processes: ProcessManager::new(ProcessLimits::default()),
+            mcp: Arc::new(McpManager::new()),
+            storage,
             state: Mutex::new(State {
                 generation: 0,
                 transcript: Vec::new(),
@@ -138,6 +153,46 @@ impl AgentRuntime {
                 event: event.to_string(),
                 data,
             });
+        }
+    }
+
+    /// The MCP server manager: configure servers here (or via the
+    /// `mcp.servers` settings key, which syncs every turn) and their
+    /// tools join the next turn's registry through host policy.
+    pub fn mcp_manager(&self) -> &Arc<McpManager> {
+        &self.mcp
+    }
+
+    /// Synchronous MCP status snapshot (blocks on the worker executor).
+    pub fn mcp_status_blocking(&self) -> Vec<mcp_runtime::McpServerStatus> {
+        self.executor.block_on(self.mcp.status())
+    }
+
+    /// Sync the MCP server set from settings and register every enabled
+    /// server's tools into the turn registry. Best-effort per server: a
+    /// down server logs and skips, never fails the turn.
+    async fn attach_mcp_tools(&self, registry: &mut ToolRegistry) {
+        if let Some(storage) = &self.storage {
+            let configs: Option<Vec<McpServerConfig>> = storage
+                .lock()
+                .ok()
+                .and_then(|store| store.get_setting(SETTING_MCP_SERVERS).ok())
+                .flatten()
+                .and_then(|value| {
+                    serde_json::from_value(value).map_err(|e| {
+                        tracing::warn!(%e, "mcp.servers setting is not a server array; ignoring");
+                    }).ok()
+                });
+            if let Some(configs) = configs {
+                if let Err(e) = self.mcp.sync_configs(configs).await {
+                    tracing::warn!(%e, "mcp settings sync failed");
+                }
+            }
+        }
+        for id in self.mcp.server_ids().await {
+            if let Err(e) = self.mcp.register_into(&id, registry).await {
+                tracing::warn!(server = %id, error = %e, "mcp server unavailable this turn");
+            }
         }
     }
 
@@ -250,6 +305,18 @@ impl AgentRuntime {
 
     async fn run_turn(
         &self,
+        transcript: Vec<ModelMessage>,
+        generation: u64,
+        resume_note: Option<String>,
+    ) {
+        let span = tracing::info_span!("host.turn", generation, resumed = resume_note.is_some());
+        self.run_turn_inner(transcript, generation, resume_note)
+            .instrument(span)
+            .await
+    }
+
+    async fn run_turn_inner(
+        &self,
         mut transcript: Vec<ModelMessage>,
         generation: u64,
         resume_note: Option<String>,
@@ -268,7 +335,7 @@ impl AgentRuntime {
                 return;
             }
         };
-        let registry = match default_registry(&self.processes) {
+        let mut registry = match default_registry(&self.processes) {
             Ok(registry) => registry,
             Err(err) => {
                 self.emit_if_current(
@@ -279,6 +346,7 @@ impl AgentRuntime {
                 return;
             }
         };
+        self.attach_mcp_tools(&mut registry).await;
         let policy = match self.approvals.lock() {
             Ok(queue) => queue.context(),
             Err(_) => {
@@ -411,11 +479,17 @@ fn default_registry(processes: &Arc<ProcessManager>) -> Result<ToolRegistry, Run
 }
 
 /// Provider factory reading `model.*` settings from storage. The API key
-/// lives in settings for now (OS keychain arrives with plan Phase 33);
-/// it is never logged and never forwarded except to the configured
-/// provider base URL.
+/// lives in the OS keychain (plan Phase 33); it is never logged and never
+/// forwarded except to the configured provider base URL.
 fn settings_provider_factory(
     storage: Option<Arc<Mutex<Storage>>>,
+) -> Arc<dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync> {
+    provider_factory_with_secrets(storage, secret_core::system("utsuwa"))
+}
+
+fn provider_factory_with_secrets(
+    storage: Option<Arc<Mutex<Storage>>>,
+    secrets: Arc<dyn secret_core::SecretStore>,
 ) -> Arc<dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync> {
     Arc::new(move || {
         let storage = storage.as_ref().ok_or(RuntimeError::ModelNotConfigured)?;
@@ -434,10 +508,48 @@ fn settings_provider_factory(
         let name = get(SETTING_MODEL_NAME)?
             .filter(|s| !s.is_empty())
             .ok_or(RuntimeError::ModelNotConfigured)?;
-        let api_key = get(SETTING_API_KEY)?.filter(|s| !s.is_empty());
+        let api_key = resolve_api_key(&storage, secrets.as_ref())?;
         Ok(Arc::new(OpenAICompatibleClient::new(base_url, api_key, name))
             as Arc<dyn ModelProvider>)
     })
+}
+
+/// API key resolution order: OS keychain first; then a one-time migration
+/// of the legacy plaintext `model.api_key` settings value into the
+/// keychain (the settings row is deleted afterwards). The key is never
+/// logged, never exposed to the model context, and never forwarded except
+/// to the configured provider.
+fn resolve_api_key(
+    storage: &Storage,
+    secrets: &dyn secret_core::SecretStore,
+) -> Result<Option<String>, RuntimeError> {
+    match secrets.get(secret_core::ACCOUNT_MODEL_API_KEY) {
+        Ok(Some(key)) if !key.is_empty() => return Ok(Some(key)),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(%e, "secret store unreadable; checking legacy settings"),
+    }
+    let legacy = storage
+        .get_setting(SETTING_API_KEY)
+        .map_err(|e| RuntimeError::Settings(e.to_string()))?
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.is_empty());
+    if let Some(key) = legacy {
+        match secrets.set(secret_core::ACCOUNT_MODEL_API_KEY, &key) {
+            Ok(()) => {
+                // Best-effort plaintext removal; a failure here only logs.
+                if let Err(e) = storage.delete_setting(SETTING_API_KEY) {
+                    tracing::warn!(%e, "migrated api key but could not delete the settings row");
+                } else {
+                    tracing::info!("migrated model.api_key from settings to the OS keychain");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%e, "cannot store api key in keychain; using settings value");
+            }
+        }
+        return Ok(Some(key));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -519,6 +631,7 @@ mod tests {
         });
         let runtime = AgentRuntime::start_with_factory(
             Arc::clone(&approvals),
+            None,
             None,
             emit,
             Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
@@ -704,6 +817,7 @@ mod tests {
         let runtime = AgentRuntime::start_with_factory(
             Arc::clone(&approvals),
             None,
+            None,
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
@@ -756,6 +870,223 @@ mod tests {
     }
 
     #[test]
+    fn settings_mcp_servers_join_the_turn() {
+        use mcp_runtime::{McpServerConfig, McpTransport, TrustLevel};
+        use std::collections::HashMap;
+
+        // The shared fake MCP server (same script the mcp-runtime
+        // integration tests use).
+        let script_source =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../mcp-runtime/tests/fake_server.py"));
+        let dir = std::env::temp_dir().join(format!(
+            "utsuwa-runtime-mcp-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake_server.py");
+        std::fs::write(&script, script_source).unwrap();
+
+        let db = dir.join("state.db");
+        let storage = Arc::new(Mutex::new(storage_core::Storage::open(&db).unwrap()));
+        let config = McpServerConfig {
+            id: capability_core::ServerId::new("fake"),
+            transport: McpTransport::Stdio {
+                command: "python3".to_string(),
+                args: vec![script.to_string_lossy().to_string()],
+                env_allowlist: vec!["PATH".to_string()],
+                extra_env: HashMap::new(),
+            },
+            enabled: true,
+            trust: TrustLevel::Untrusted,
+        };
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(
+                crate::agent_runtime::SETTING_MCP_SERVERS,
+                &serde_json::to_value(vec![config]).unwrap(),
+            )
+            .unwrap();
+
+        let harness = {
+            let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = events.clone();
+            let provider = QueueProvider::new(vec![text_turn("mcp turn done")]);
+            let runtime = AgentRuntime::start_with_factory(
+                Arc::clone(&approvals),
+                Some(Arc::clone(&storage)),
+                None,
+                Arc::new(move |event| {
+                    sink.lock().unwrap().push(event);
+                }),
+                Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+            )
+            .unwrap();
+            Harness {
+                runtime,
+                approvals,
+                events,
+            }
+        };
+
+        harness.runtime.send_message("hi".to_string()).unwrap();
+        let done = wait_for(&harness, "agent.turn_done");
+        assert_eq!(done.data["text"], "mcp turn done");
+
+        // The settings-driven server connected and registered its tools.
+        let status = harness.runtime.mcp_status_blocking();
+        assert_eq!(status.len(), 1);
+        assert!(status[0].connected);
+        assert_eq!(status[0].tools, 3);
+    }
+
+    #[test]
+    fn mcp_tool_call_needs_approval_without_grant() {
+        use mcp_runtime::{McpServerConfig, McpTransport, TrustLevel};
+        use std::collections::HashMap;
+
+        let script_source =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../mcp-runtime/tests/fake_server.py"));
+        let dir = std::env::temp_dir().join(format!(
+            "utsuwa-runtime-mcp-approval-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake_server.py");
+        std::fs::write(&script, script_source).unwrap();
+
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let provider = QueueProvider::new(vec![vec![
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: "m1".to_string(),
+                name: "mcp.fake.echo".to_string(),
+                arguments: serde_json::json!({"message": "via-mcp"}).to_string(),
+            }),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ]]);
+        let runtime = AgentRuntime::start_with_factory(
+            Arc::clone(&approvals),
+            None,
+            None,
+            Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }),
+            Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+        )
+        .unwrap();
+        let harness = Harness {
+            runtime,
+            approvals,
+            events,
+        };
+
+        // Configure the server directly (no settings involved here).
+        let config = McpServerConfig {
+            id: capability_core::ServerId::new("fake"),
+            transport: McpTransport::Stdio {
+                command: "python3".to_string(),
+                args: vec![script.to_string_lossy().to_string()],
+                env_allowlist: vec!["PATH".to_string()],
+                extra_env: HashMap::new(),
+            },
+            enabled: true,
+            trust: TrustLevel::Untrusted,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(harness.runtime.mcp_manager().configure(config))
+            .unwrap();
+
+        harness.runtime.send_message("use the mcp tool".to_string()).unwrap();
+        let requested = wait_for(&harness, "permission.requested");
+        assert_eq!(requested.data["capability"], "McpInvoke");
+        assert_eq!(
+            requested.data["resource"],
+            serde_json::json!({"McpTool": {"server": "fake", "tool": "echo"}})
+        );
+        // Nothing executed: the turn suspended for the human.
+        assert_eq!(harness.approvals.lock().unwrap().list().len(), 1);
+        assert!(harness
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| e.event != "agent.turn_done"));
+    }
+
+    #[test]
+    fn legacy_api_key_migrates_to_the_secret_store() {
+        use secret_core::{SecretStore, ACCOUNT_MODEL_API_KEY};
+
+        let dir = std::env::temp_dir().join(format!(
+            "utsuwa-runtime-secrets-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Arc::new(Mutex::new(
+            storage_core::Storage::open(&dir.join("state.db")).unwrap(),
+        ));
+        {
+            let store = storage.lock().unwrap();
+            store
+                .set_setting(SETTING_BASE_URL, &serde_json::json!("http://localhost:11434/v1"))
+                .unwrap();
+            store.set_setting(SETTING_MODEL_NAME, &serde_json::json!("m")).unwrap();
+            store.set_setting(SETTING_API_KEY, &serde_json::json!("sk-legacy")).unwrap();
+        }
+        let secrets: Arc<dyn SecretStore> = Arc::new(secret_core::MemoryStore::default());
+        let factory = provider_factory_with_secrets(Some(Arc::clone(&storage)), Arc::clone(&secrets));
+
+        // First build migrates the plaintext row into the secret store.
+        factory().unwrap();
+        assert_eq!(
+            secrets.get(ACCOUNT_MODEL_API_KEY).unwrap(),
+            Some("sk-legacy".to_string())
+        );
+        assert_eq!(storage.lock().unwrap().get_setting(SETTING_API_KEY).unwrap(), None);
+
+        // Second build reads from the secret store, not settings.
+        factory().unwrap();
+        assert_eq!(
+            secrets.get(ACCOUNT_MODEL_API_KEY).unwrap(),
+            Some("sk-legacy".to_string())
+        );
+    }
+
+    #[test]
+    fn provider_builds_without_any_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "utsuwa-runtime-nokey-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Arc::new(Mutex::new(
+            storage_core::Storage::open(&dir.join("state.db")).unwrap(),
+        ));
+        {
+            let store = storage.lock().unwrap();
+            store
+                .set_setting(SETTING_BASE_URL, &serde_json::json!("http://localhost:11434/v1"))
+                .unwrap();
+            store.set_setting(SETTING_MODEL_NAME, &serde_json::json!("m")).unwrap();
+        }
+        let secrets: Arc<dyn secret_core::SecretStore> =
+            Arc::new(secret_core::MemoryStore::default());
+        let factory = provider_factory_with_secrets(Some(storage), secrets);
+        // Ollama-style keyless providers still construct.
+        factory().unwrap();
+    }
+
+    #[test]
     fn cancel_suppresses_late_worker_events() {
         struct HangingProvider;
         #[async_trait::async_trait]
@@ -772,6 +1103,7 @@ mod tests {
         let sink = events.clone();
         let runtime = AgentRuntime::start_with_factory(
             approvals,
+            None,
             None,
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);

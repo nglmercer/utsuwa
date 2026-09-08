@@ -13,6 +13,8 @@ members = [
     "crates/storage-core",
     "crates/tool-core",
     "crates/tool-process",
+    "crates/mcp-runtime",
+    "crates/secret-core",
 ]
 exclude = ["src-tauri"]
 
@@ -29,16 +31,20 @@ capability-core = { path = "crates/capability-core" }
 futures-core = "0.3"
 futures-util = "0.3"
 ipc-core = { path = "crates/ipc-core" }
+keyring = { version = "4" }
+secret-core = { path = "crates/secret-core" }
 model-core = { path = "crates/model-core" }
 model-openai-compatible = { path = "crates/model-openai-compatible" }
 policy-core = { path = "crates/policy-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rmcp = { version = "3.2", default-features = false, features = ["client", "transport-child-process"] }
 rusqlite = { version = "0.32", default-features = false }
 serde = { version = "1", features = ["derive"] }
 storage-core = { path = "crates/storage-core" }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+mcp-runtime = { path = "crates/mcp-runtime" }
 tool-core = { path = "crates/tool-core" }
 tool-filesystem = { path = "crates/tool-filesystem" }
 tool-process = { path = "crates/tool-process" }

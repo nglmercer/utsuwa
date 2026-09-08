@@ -107,6 +107,9 @@ pub enum Capability {
     ClipboardRead,
     ClipboardWrite,
     ApplicationLaunch,
+    /// Invoke a tool served by an external MCP server. Never implied by
+    /// other capabilities: every MCP tool call authorizes on its own.
+    McpInvoke,
 }
 
 /// Concrete resource a capability acts on.
@@ -117,6 +120,9 @@ pub enum Resource {
     Executable(PathBuf),
     Application(String),
     Window(String),
+    /// A tool served by an MCP server. Matched exactly (server + tool):
+    /// a grant for one MCP tool never covers another.
+    McpTool { server: String, tool: String },
 }
 
 /// A granted scope: the set of resources a capability may touch.
@@ -173,6 +179,10 @@ fn scope_covers(scope: &Resource, resource: &Resource) -> bool {
         }
         (Resource::Application(s), Resource::Application(r)) => s == r,
         (Resource::Window(s), Resource::Window(r)) => s == r,
+        (
+            Resource::McpTool { server: ss, tool: st },
+            Resource::McpTool { server: rs, tool: rt },
+        ) => ss == rs && st == rt,
         _ => false,
     }
 }

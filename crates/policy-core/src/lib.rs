@@ -49,6 +49,8 @@ pub struct GrantedScope {
 
 /// Capability risk class: reads/observation can be pre-approved, mutations
 /// and control always need the user unless a standing grant exists.
+/// External MCP tools count as control: third-party code the host did
+/// not ship must never run on a read-only pre-approval.
 fn is_mutation_or_control(cap: &Capability) -> bool {
     use Capability::*;
     matches!(
@@ -62,6 +64,7 @@ fn is_mutation_or_control(cap: &Capability) -> bool {
             | DesktopControl
             | ClipboardWrite
             | ApplicationLaunch
+            | McpInvoke
     )
 }
 
@@ -75,12 +78,19 @@ fn default_ttl(decision_allows_mutation: bool) -> Duration {
 }
 
 /// Evaluate one request. Pure function of (principal, request, context) —
-/// no I/O, no ambient authority, no panics.
+/// no I/O, no ambient authority, no panics. The span names the principal
+/// kind and capability only: concrete resources may contain user paths.
 pub fn authorize(
     principal: &Principal,
     request: &CapabilityRequest,
     context: &AuthorizationContext,
 ) -> AuthorizationDecision {
+    let _span = tracing::debug_span!(
+        "policy.authorize",
+        kind = ?principal.kind(),
+        capability = ?request.capability
+    )
+    .entered();
     // The WebView never holds direct OS authority: a Frontend principal
     // asking for a privileged capability is denied outright rather than
     // prompted (prompting would train users to bless the wrong layer).
@@ -280,6 +290,7 @@ impl ApprovalQueue {
         id: &str,
         lifetime: Option<GrantLifetime>,
     ) -> Result<bool, QueueError> {
+        let _span = tracing::info_span!("permission.decide", request = %id).entered();
         // Phase 1: peek at the request without removing it, so a storage
         // failure below cannot lose a pending approval.
         let grant = {

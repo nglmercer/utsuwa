@@ -20,6 +20,7 @@ pub struct Dispatcher {
     approvals: Option<Arc<Mutex<ApprovalQueue>>>,
     agent: Option<Arc<AgentRuntime>>,
     storage: Option<Arc<Mutex<storage_core::Storage>>>,
+    audit: Option<Arc<audit_core::InMemorySink>>,
 }
 
 impl Clone for Dispatcher {
@@ -29,6 +30,7 @@ impl Clone for Dispatcher {
             approvals: self.approvals.clone(),
             agent: self.agent.clone(),
             storage: self.storage.clone(),
+            audit: self.audit.clone(),
         }
     }
 }
@@ -40,6 +42,7 @@ impl Dispatcher {
             approvals: None,
             agent: None,
             storage: None,
+            audit: None,
         }
     }
 
@@ -59,6 +62,12 @@ impl Dispatcher {
     /// Attach SQLite storage (`settings.get` / `settings.set`).
     pub fn with_storage(mut self, storage: Arc<Mutex<storage_core::Storage>>) -> Self {
         self.storage = Some(storage);
+        self
+    }
+
+    /// Attach the shared audit sink (`activity.list`).
+    pub fn with_audit(mut self, audit: Arc<audit_core::InMemorySink>) -> Self {
+        self.audit = Some(audit);
         self
     }
 
@@ -117,6 +126,7 @@ impl Dispatcher {
             IpcMethod::AgentCancel => self.agent_cancel(),
             IpcMethod::SettingsGet => self.settings_get(request),
             IpcMethod::SettingsSet => self.settings_set(request),
+            IpcMethod::ActivityList => self.activity_list(request),
         }
     }
 
@@ -288,6 +298,30 @@ impl Dispatcher {
             message: err.to_string(),
         })?;
         Ok(serde_json::json!({ "ok": true }))
+    }
+
+    /// Recent audit records, newest first, for the Activity panel
+    /// (plan Phase 35: time, tool, status, resource, principal, duration).
+    /// `params.limit` clamps to 1..=200 (default 50). Details are already
+    /// redacted at record time.
+    fn activity_list(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
+        let audit = self.audit.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "audit sink is not attached".to_string(),
+        })?;
+        let limit = request
+            .params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50)
+            .clamp(1, 200) as usize;
+        let mut records = audit.records();
+        records.reverse();
+        records.truncate(limit);
+        serde_json::to_value(&records).map_err(|err| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: err.to_string(),
+        })
     }
 }
 
@@ -481,6 +515,7 @@ mod tests {
         AgentRuntime::start_with_factory(
             Arc::new(Mutex::new(ApprovalQueue::new())),
             None,
+            None,
             emit,
             Arc::new(|| {
                 Err(crate::agent_runtime::RuntimeError::ModelNotConfigured)
@@ -547,6 +582,38 @@ mod tests {
             .handle_message(r#"{"id":"43","method":"agent.cancel","params":{}}"#)
             .unwrap();
         assert!(script.contains("__resolve(\"43\", true"), "{script}");
+    }
+
+    #[test]
+    fn activity_lists_newest_first_with_limit() {
+        use audit_core::{AuditOutcome, AuditRecord, AuditSink};
+        let sink = Arc::new(audit_core::InMemorySink::new());
+        for i in 0..5 {
+            sink.record(AuditRecord::now(
+                capability_core::Principal::User,
+                None,
+                None,
+                AuditOutcome::Executed,
+                format!("step-{i}"),
+            ));
+        }
+        let audited = dispatcher().with_audit(sink);
+
+        let script = audited
+            .handle_message(r#"{"id":"50","method":"activity.list","params":{"limit":2}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"50\", true"), "{script}");
+        // Newest first: step-4 before step-3, and step-0 is cut off.
+        let step4 = script.find("step-4").unwrap();
+        let step3 = script.find("step-3").unwrap();
+        assert!(step4 < step3);
+        assert!(!script.contains("step-0"));
+
+        // Missing sink is a typed error, not a panic.
+        let script = dispatcher()
+            .handle_message(r#"{"id":"51","method":"activity.list","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("audit sink is not attached"), "{script}");
     }
 
     #[test]

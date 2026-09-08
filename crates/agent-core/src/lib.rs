@@ -14,6 +14,7 @@ use model_core::{
 use policy_core::{AuthorizationContext, AuthorizationDecision};
 use std::sync::Arc;
 use tool_core::{ToolContext, ToolOutput, ToolRegistry};
+use tracing::Instrument as _;
 
 /// Hard limits enforced on every turn (plan Phase 36). More limits
 /// (iterations, tool calls, wall-clock) join with the agent loop.
@@ -150,6 +151,18 @@ impl Agent {
     /// frontend approval UI (Task 14) resumes it later.
     pub async fn turn_with_tools(
         &self,
+        messages: Vec<ModelMessage>,
+        registry: &ToolRegistry,
+        policy: &AuthorizationContext,
+    ) -> Result<AgentOutcome, AgentError> {
+        let turn_span = tracing::info_span!("agent.turn", agent = %self.agent_id);
+        self.turn_with_tools_inner(messages, registry, policy)
+            .instrument(turn_span)
+            .await
+    }
+
+    async fn turn_with_tools_inner(
+        &self,
         mut messages: Vec<ModelMessage>,
         registry: &ToolRegistry,
         policy: &AuthorizationContext,
@@ -280,14 +293,29 @@ impl Agent {
         outcome: AuditOutcome,
         detail: String,
     ) {
+        self.audit_timed(capability, resource, outcome, detail, None);
+    }
+
+    fn audit_timed(
+        &self,
+        capability: Option<capability_core::Capability>,
+        resource: Option<capability_core::Resource>,
+        outcome: AuditOutcome,
+        detail: String,
+        duration_ms: Option<u64>,
+    ) {
         if let Some(sink) = &self.audit {
-            sink.record(AuditRecord::now(
+            let mut record = AuditRecord::now(
                 self.principal(),
                 capability,
                 resource,
                 outcome,
                 detail,
-            ));
+            );
+            if let Some(ms) = duration_ms {
+                record = record.with_duration(ms);
+            }
+            sink.record(record);
         }
     }
 
@@ -376,22 +404,30 @@ impl Agent {
             ),
             None => (None, None),
         };
-        match tool.invoke(ctx, args).await {
+        // Span carries the tool name only: arguments may embed secrets
+        // and are never log fields.
+        let span = tracing::info_span!("tool.invoke", tool = %call.name);
+        let started = std::time::Instant::now();
+        let outcome = tool.invoke(ctx, args).instrument(span).await;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match outcome {
             Ok(output) => {
-                self.audit(
+                self.audit_timed(
                     capability,
                     resource,
                     AuditOutcome::Executed,
                     format!("{} ok", call.name),
+                    Some(elapsed_ms),
                 );
                 Ok(output)
             }
             Err(err) => {
-                self.audit(
+                self.audit_timed(
                     capability,
                     resource,
                     AuditOutcome::Failed,
                     err.to_string(),
+                    Some(elapsed_ms),
                 );
                 Err(PendingOrFailed::Failed(err.to_string()))
             }

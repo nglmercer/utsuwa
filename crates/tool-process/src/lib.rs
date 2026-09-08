@@ -173,6 +173,14 @@ impl ProcessManager {
 
     /// Spawn a validated child. Returns its handle and OS pid.
     pub fn spawn(self: &Arc<Self>, spec: &SpawnSpec) -> Result<(String, u32), ToolError> {
+        // The span names the executable and argument count only: argument
+        // values may carry secrets and are never log fields.
+        let _span = tracing::info_span!(
+            "process.spawn",
+            executable = %spec.executable.display(),
+            args = spec.args.len()
+        )
+        .entered();
         let mut inner = self.lock()?;
         if inner.procs.len() >= self.limits.max_processes {
             if !Self::evict_finished(&mut inner) {
