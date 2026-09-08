@@ -6,11 +6,14 @@
 //! clicking. Every tool declares its capability so the agent + policy
 //! engine approve each call; tickets are re-validated inside `invoke`.
 //!
-//! Platform backends (Windows UI Automation, macOS AX, Linux portals)
-//! are Phases 28–30. This crate ships the trait, the tools, and a stub
+//! Platform backends (Windows UI Automation, macOS AX, Linux X11)
+//! are Phases 28–30. This crate ships the trait, the [`plugin`]
+//! model (manifest + capability registry), the tools, and a stub
 //! backend that reports unavailability — tool/policy/audit wiring is
 //! testable on any machine, and no tool ever pretends to act when no
 //! backend exists.
+
+pub mod plugin;
 
 use std::sync::Arc;
 
@@ -639,6 +642,38 @@ pub mod tools {
             Ok(ToolOutput::new(serde_json::json!({ "ok": true })))
         }
     }
+
+    /// Build the agent tools one plugin unlocks: exactly one tool per
+    /// declared capability. Anything the manifest omits never reaches
+    /// the model — e.g. Linux X11 (no `set_value`) exposes the other
+    /// six tools, and the stub exposes none.
+    pub fn for_plugin(plugin: &super::plugin::DesktopPlugin) -> Vec<Arc<dyn Tool>> {
+        use super::plugin::DesktopCapability;
+        let backend = plugin.backend.clone();
+        let mut out: Vec<Arc<dyn Tool>> = Vec::new();
+        if plugin.supports(DesktopCapability::ListWindows) {
+            out.push(Arc::new(ListWindowsTool { backend: backend.clone() }));
+        }
+        if plugin.supports(DesktopCapability::AccessibilityTree) {
+            out.push(Arc::new(AccessibilityTreeTool { backend: backend.clone() }));
+        }
+        if plugin.supports(DesktopCapability::InvokeElement) {
+            out.push(Arc::new(InvokeElementTool { backend: backend.clone() }));
+        }
+        if plugin.supports(DesktopCapability::SetValue) {
+            out.push(Arc::new(SetValueTool { backend: backend.clone() }));
+        }
+        if plugin.supports(DesktopCapability::Screenshot) {
+            out.push(Arc::new(ScreenshotTool { backend: backend.clone() }));
+        }
+        if plugin.supports(DesktopCapability::Click) {
+            out.push(Arc::new(ClickTool { backend: backend.clone() }));
+        }
+        if plugin.supports(DesktopCapability::TypeText) {
+            out.push(Arc::new(TypeTextTool { backend }));
+        }
+        out
+    }
 }
 
 /// Placeholder backend: honest failure instead of fake control.
@@ -697,7 +732,7 @@ pub struct FakeBackend {
 
 #[cfg(test)]
 impl FakeBackend {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             windows: vec![WindowInfo {
                 id: "w1".to_string(),
@@ -921,6 +956,46 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, tool_core::ToolError::InvalidArgs { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn for_plugin_exposes_only_declared_capabilities() {
+        use super::plugin::{DesktopCapability, DesktopPlugin, DesktopPluginManifest, FULL_CAPABILITIES};
+        let manifest = |capabilities: Vec<DesktopCapability>| DesktopPluginManifest {
+            id: "desktop.test".to_string(),
+            name: "test".to_string(),
+            version: "0.1.0".to_string(),
+            platforms: vec![std::env::consts::OS.to_string()],
+            capabilities,
+            description: "test".to_string(),
+        };
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
+
+        // Full manifest: all seven tools.
+        let full = DesktopPlugin::new(manifest(FULL_CAPABILITIES.to_vec()), backend.clone());
+        let ids: Vec<String> = super::tools::for_plugin(&full)
+            .iter()
+            .map(|t| t.metadata().id.0.clone())
+            .collect();
+        assert_eq!(ids.len(), 7);
+        assert!(ids.contains(&"desktop.set_value".to_string()));
+
+        // X11-shaped manifest (no set_value): six tools, no set_value.
+        let partial_caps: Vec<DesktopCapability> = FULL_CAPABILITIES
+            .iter()
+            .copied()
+            .filter(|c| *c != DesktopCapability::SetValue)
+            .collect();
+        let partial = DesktopPlugin::new(manifest(partial_caps), backend);
+        let ids: Vec<String> = super::tools::for_plugin(&partial)
+            .iter()
+            .map(|t| t.metadata().id.0.clone())
+            .collect();
+        assert_eq!(ids.len(), 6);
+        assert!(!ids.contains(&"desktop.set_value".to_string()));
+
+        // Stub plugin: no tools at all.
+        assert!(super::tools::for_plugin(&DesktopPlugin::stub()).is_empty());
     }
 
     #[tokio::test]

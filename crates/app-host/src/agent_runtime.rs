@@ -85,7 +85,7 @@ pub struct AgentRuntime {
     mcp: Arc<McpManager>,
     plugins: Arc<plugin_wasm::PluginRuntime>,
     memory: Mutex<Arc<memory::MemoryStore>>,
-    desktop: Mutex<Arc<dyn tool_desktop::DesktopBackend>>,
+    desktop: Mutex<tool_desktop::plugin::DesktopPlugin>,
     storage: Option<Arc<Mutex<Storage>>>,
     state: Mutex<State>,
     executor: tokio::runtime::Runtime,
@@ -139,7 +139,7 @@ impl AgentRuntime {
                 memory::MemoryStore::open_in_memory()
                     .map_err(|e| RuntimeError::Tools(e.to_string()))?,
             )),
-            desktop: Mutex::new(Self::desktop_backend()),
+            desktop: Mutex::new(Self::desktop_plugin()),
             storage,
             state: Mutex::new(State {
                 generation: 0,
@@ -151,16 +151,31 @@ impl AgentRuntime {
         }))
     }
 
-    /// Platform desktop backend: Linux connects to the session X
-    /// server (Xwayland included) and falls back to the stub when no
-    /// display answers; other platforms stay stubbed until their
-    /// Phase 28–29 backends land.
-    fn desktop_backend() -> std::sync::Arc<dyn tool_desktop::DesktopBackend> {
+    /// Desktop plugins installed on this host. The Linux X11 plugin
+    /// joins when a display answers; Windows UI Automation and macOS
+    /// AX are declared so their future crates drop in behind the same
+    /// ids (Phases 28–29). Activation picks the first available plugin
+    /// for this OS, else the capability-free stub.
+    fn desktop_plugin() -> tool_desktop::plugin::DesktopPlugin {
+        use tool_desktop::plugin::{DesktopPlugin, DesktopPluginRegistry};
+        let mut registry = DesktopPluginRegistry::new();
         #[cfg(target_os = "linux")]
-        if let Ok(linux) = desktop_linux::LinuxBackend::connect() {
-            return std::sync::Arc::new(linux);
+        if let Some(linux) = desktop_linux::plugin() {
+            registry.register(linux);
         }
-        tool_desktop::stub()
+        registry.register(DesktopPlugin::unimplemented(
+            "desktop.windows-uia",
+            "Windows UI Automation backend",
+            "windows",
+            "Planned Phase 28 backend: UI Automation element actions, Win32 capture, SendInput.",
+        ));
+        registry.register(DesktopPlugin::unimplemented(
+            "desktop.macos-ax",
+            "macOS Accessibility backend",
+            "macos",
+            "Planned Phase 29 backend: AX element actions, ScreenCaptureKit, CGEvent input.",
+        ));
+        registry.select().unwrap_or_else(DesktopPlugin::stub)
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, RuntimeError> {
@@ -223,13 +238,13 @@ impl AgentRuntime {
         })
     }
 
-    /// Install the desktop backend (boot only, or tests with a fake).
-    /// The turn registers `desktop.*` tools only while the backend
-    /// reports availability — with the stub backend the model never
-    /// sees actions that cannot run.
-    pub fn set_desktop_backend(&self, backend: Arc<dyn tool_desktop::DesktopBackend>) {
+    /// Install the desktop plugin (boot only, or tests with a fake).
+    /// The turn registers `desktop.*` tools only for the active
+    /// plugin's declared capabilities — with the stub plugin the model
+    /// never sees actions that cannot run.
+    pub fn set_desktop_plugin(&self, plugin: tool_desktop::plugin::DesktopPlugin) {
         if let Ok(mut slot) = self.desktop.lock() {
-            *slot = backend;
+            *slot = plugin;
         }
     }
 
@@ -318,30 +333,22 @@ impl AgentRuntime {
         }
     }
 
-    /// Register `desktop.*` tools while a real backend is present. With
-    /// the stub backend nothing registers: every desktop call stays
-    /// behind policy + tickets, and unavailable actions stay invisible.
+    /// Register `desktop.*` tools for the active plugin's declared
+    /// capabilities. With the stub plugin nothing registers: every
+    /// desktop call stays behind policy + tickets, and actions the
+    /// platform lacks (e.g. `set_value` on X11) stay invisible.
     fn attach_desktop_tools(&self, registry: &mut ToolRegistry) {
-        let backend = match self.desktop.lock() {
-            Ok(backend) => Arc::clone(&backend),
+        let plugin = match self.desktop.lock() {
+            Ok(plugin) => plugin.clone(),
             Err(_) => {
-                tracing::warn!("desktop backend lock failed; skipping desktop tools this turn");
+                tracing::warn!("desktop plugin lock failed; skipping desktop tools this turn");
                 return;
             }
         };
-        if !backend.is_available() {
+        if !plugin.is_available() {
             return;
         }
-        use tool_desktop::tools::*;
-        for tool in [
-            Arc::new(ListWindowsTool { backend: backend.clone() }) as Arc<dyn tool_core::Tool>,
-            Arc::new(AccessibilityTreeTool { backend: backend.clone() }),
-            Arc::new(InvokeElementTool { backend: backend.clone() }),
-            Arc::new(SetValueTool { backend: backend.clone() }),
-            Arc::new(ScreenshotTool { backend: backend.clone() }),
-            Arc::new(ClickTool { backend: backend.clone() }),
-            Arc::new(TypeTextTool { backend }),
-        ] {
+        for tool in tool_desktop::tools::for_plugin(&plugin) {
             if let Err(e) = registry.register(tool) {
                 tracing::warn!(error = %e, "desktop tool registration failed");
             }
@@ -1112,7 +1119,17 @@ mod tests {
 
         // With the stub backend the model never sees desktop tools; with a
         // backend installed they join the turn like any other tool source.
-        harness.runtime.set_desktop_backend(Arc::new(FakeDesktop));
+        harness.runtime.set_desktop_plugin(tool_desktop::plugin::DesktopPlugin::new(
+            tool_desktop::plugin::DesktopPluginManifest {
+                id: "desktop.test-fake".to_string(),
+                name: "test fake".to_string(),
+                version: "0.1.0".to_string(),
+                platforms: vec![std::env::consts::OS.to_string()],
+                capabilities: tool_desktop::plugin::FULL_CAPABILITIES.to_vec(),
+                description: "test".to_string(),
+            },
+            Arc::new(FakeDesktop),
+        ));
         harness.runtime.send_message("press save".to_string()).unwrap();
         let done = wait_for(&harness, "agent.turn_done");
         let executed = done.data["executed"].as_array().unwrap();

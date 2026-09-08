@@ -10,8 +10,9 @@
 
 mod x11;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tool_desktop::{
+    plugin::{DesktopCapability, DesktopPlugin, DesktopPluginManifest, FULL_CAPABILITIES},
     DesktopBackend, DesktopError, ElementNode, Point, Screenshot, WindowInfo,
 };
 use x11::{XConn, XError};
@@ -47,6 +48,30 @@ pub struct LinuxBackend {
     atom_utf8: u32,
     atom_pid: u32,
     atom_cardinal: u32,
+}
+
+/// This backend as an installed desktop plugin. `None` when no
+/// display answers, so the host registry falls through to other
+/// plugins (or nothing). X11 has no `set_value` primitive, so the
+/// manifest honestly omits it and the host never offers that tool.
+pub fn plugin() -> Option<DesktopPlugin> {
+    let backend = LinuxBackend::connect().ok()?;
+    let capabilities: Vec<DesktopCapability> = FULL_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|c| *c != DesktopCapability::SetValue)
+        .collect();
+    Some(DesktopPlugin::new(
+        DesktopPluginManifest {
+            id: "desktop.linux-x11".to_string(),
+            name: "Linux X11 backend".to_string(),
+            version: "0.1.0".to_string(),
+            platforms: vec!["linux".to_string()],
+            capabilities,
+            description: "Raw X11 over the session socket (Xwayland included): windows, hierarchy-as-tree, screenshots, XTEST input. No display means no plugin.".to_string(),
+        },
+        Arc::new(backend),
+    ))
 }
 
 impl LinuxBackend {
@@ -314,6 +339,23 @@ mod tests {
         let (_, x2, y2) = conn.query_pointer(root).unwrap();
         assert_eq!((x1, y1), (x0.saturating_add(7), y0.saturating_add(7)));
         assert_eq!((x2, y2), (x0, y0));
+    }
+
+    #[test]
+    fn plugin_manifest_is_honest() {
+        use tool_desktop::plugin::DesktopCapability;
+        let Some(plugin) = super::plugin() else {
+            eprintln!("SKIP live X11 tests: no display");
+            return;
+        };
+        assert_eq!(plugin.manifest.id, "desktop.linux-x11");
+        assert_eq!(plugin.manifest.platforms, vec!["linux".to_string()]);
+        assert!(plugin.is_available());
+        assert!(plugin.serves_current_platform());
+        // Six of seven: X11 has no set_value primitive.
+        assert_eq!(plugin.manifest.capabilities.len(), 6);
+        assert!(!plugin.supports(DesktopCapability::SetValue));
+        assert!(plugin.supports(DesktopCapability::Click));
     }
 
     #[test]
