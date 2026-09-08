@@ -1,4 +1,5 @@
-//! Native desktop host: winit event loop + wry WebView + host→frontend events.
+//! Native desktop host: GTK-embedded wry WebView on Linux (X11 and
+//! Wayland), winit event loop + wry WebView elsewhere, host→frontend events.
 //!
 //! Task 2 scope: workspace wiring only — the `WindowHost` trait, an
 //! in-process channel implementation, and the winit event-loop constructor.
