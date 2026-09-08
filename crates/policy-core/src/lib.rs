@@ -108,6 +108,19 @@ pub fn authorize(
         };
     }
 
+    // Secret paths are never silently allowed: no standing grant covers
+    // them, however broad. The user can still approve each access in the
+    // dialog — explicit, audited, and never inherited from a home-folder
+    // style grant.
+    if is_secret_path(&request.resource) {
+        return AuthorizationDecision::RequireUserApproval {
+            reason: format!(
+                "{:?} on a secret path needs fresh approval every time: {:?}",
+                request.capability, request.resource
+            ),
+        };
+    }
+
     // Standing grant covering this exact capability + resource?
     let kind = principal.kind();
     for grant in &context.grants {
@@ -339,6 +352,61 @@ impl ApprovalQueue {
             ));
         }
         Ok(approved)
+    }
+
+    /// Record a grant directly, without a pending request. This is the
+    /// explicit user path (settings UI): the caller already holds user
+    /// intent, so no dialog is involved — but persistence is still
+    /// fail-closed like [`ApprovalQueue::decide`], and the decision is
+    /// audit-logged either way.
+    pub fn grant_direct(
+        &self,
+        principal_kind: PrincipalKind,
+        capability: Capability,
+        scope: capability_core::ResourceScope,
+        lifetime: GrantLifetime,
+        reason: String,
+    ) -> Result<GrantedScope, QueueError> {
+        let grant = GrantedScope {
+            principal_kind,
+            capability: capability.clone(),
+            scope: scope.clone(),
+            lifetime,
+        };
+        if lifetime == GrantLifetime::Persistent {
+            if let Some(persist) = &self.persist {
+                persist(&grant).map_err(QueueError::Persist)?;
+            }
+        }
+        {
+            let mut inner = self.inner.lock().expect("approval queue lock");
+            inner.grants.push(grant.clone());
+        }
+        if let Some(sink) = &self.sink {
+            sink.record(audit_core::AuditRecord::now(
+                Principal::Agent(capability_core::AgentId::new("user-grant")),
+                Some(capability),
+                scope.resources.first().cloned(),
+                audit_core::AuditOutcome::Approved,
+                reason,
+            ));
+        }
+        Ok(grant)
+    }
+
+    /// Drop every in-memory grant matching a capability + scope. Returns
+    /// how many were removed. Storage rows are the caller's job (they
+    /// need row ids from `load_grants`); call this alongside so a
+    /// revoked grant stops authorizing immediately, even before restart.
+    pub fn revoke_where(
+        &self,
+        capability: &Capability,
+        scope: &capability_core::ResourceScope,
+    ) -> usize {
+        let mut inner = self.inner.lock().expect("approval queue lock");
+        let before = inner.grants.len();
+        inner.grants.retain(|g| !(g.capability == *capability && g.scope == *scope));
+        before - inner.grants.len()
     }
 
     /// Snapshot of standing grants (seed + approvals) for agent turns.
@@ -599,5 +667,89 @@ mod tests {
         assert!(!is_secret_path(&Resource::Path(PathBuf::from(
             "/work/main.rs"
         ))));
+    }
+
+    fn grant_home() -> GrantedScope {
+        GrantedScope {
+            principal_kind: PrincipalKind::Agent,
+            capability: Capability::FilesystemRead,
+            scope: ResourceScope::new(vec![Resource::Path(PathBuf::from("/home/u"))]),
+            lifetime: GrantLifetime::Persistent,
+        }
+    }
+
+    #[test]
+    fn broad_grant_covers_ordinary_files_but_never_secrets() {
+        let ctx = AuthorizationContext {
+            grants: vec![grant_home()],
+        };
+        let ordinary = CapabilityRequest {
+            principal: Principal::Agent(AgentId::new("a")),
+            capability: Capability::FilesystemRead,
+            resource: Resource::Path(PathBuf::from("/home/u/docs/note.txt")),
+        };
+        assert!(matches!(
+            authorize(&ordinary.principal, &ordinary, &ctx),
+            AuthorizationDecision::Allow { .. }
+        ));
+        let secret = CapabilityRequest {
+            resource: Resource::Path(PathBuf::from("/home/u/.ssh/id_ed25519")),
+            ..ordinary
+        };
+        assert!(matches!(
+            authorize(&secret.principal, &secret, &ctx),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn grant_direct_persists_and_revoke_drops() {
+        use std::sync::{Arc, Mutex};
+        let stored: Arc<Mutex<Vec<GrantedScope>>> = Arc::new(Mutex::new(Vec::new()));
+        let hook_store = Arc::clone(&stored);
+        let queue = ApprovalQueue::new()
+            .on_persistent_grant(Arc::new(move |grant: &GrantedScope| {
+                hook_store.lock().expect("hook lock").push(grant.clone());
+                Ok(())
+            }));
+        let grant = queue
+            .grant_direct(
+                PrincipalKind::Agent,
+                Capability::FilesystemRead,
+                ResourceScope::new(vec![Resource::Path(PathBuf::from("/home/u"))]),
+                GrantLifetime::Persistent,
+                "user broad-read grant".to_string(),
+            )
+            .unwrap();
+        assert_eq!(stored.lock().expect("hook lock").len(), 1);
+        assert_eq!(queue.grants_snapshot(), vec![grant.clone()]);
+        // Session grants skip storage but still take effect in memory.
+        queue
+            .grant_direct(
+                PrincipalKind::Agent,
+                Capability::FilesystemRead,
+                ResourceScope::new(vec![Resource::Path(PathBuf::from("/tmp"))]),
+                GrantLifetime::Session,
+                "session grant".to_string(),
+            )
+            .unwrap();
+        assert_eq!(stored.lock().expect("hook lock").len(), 1);
+        assert_eq!(queue.grants_snapshot().len(), 2);
+        // Revoke drops exactly the matching scope.
+        assert_eq!(
+            queue.revoke_where(
+                &Capability::FilesystemRead,
+                &ResourceScope::new(vec![Resource::Path(PathBuf::from("/home/u"))]),
+            ),
+            1
+        );
+        assert_eq!(queue.grants_snapshot().len(), 1);
+        assert_eq!(
+            queue.revoke_where(
+                &Capability::FilesystemRead,
+                &ResourceScope::new(vec![Resource::Path(PathBuf::from("/nowhere"))]),
+            ),
+            0
+        );
     }
 }

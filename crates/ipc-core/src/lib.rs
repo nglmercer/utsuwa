@@ -24,6 +24,18 @@ pub enum IpcMethod {
     PermissionDeny,
     #[serde(rename = "permission.list")]
     PermissionList,
+    /// Mint a standing read grant directly (explicit user action in
+    /// settings). Restricted to read-only capabilities — mutations always
+    /// need the per-request dialog.
+    #[serde(rename = "permission.grant")]
+    PermissionGrant,
+    /// Drop standing grants matching a capability + scope, in memory and
+    /// in storage.
+    #[serde(rename = "permission.revoke")]
+    PermissionRevoke,
+    /// Standing grants plus the resolved home directory (for settings UI).
+    #[serde(rename = "permission.grants")]
+    PermissionGrants,
     #[serde(rename = "settings.get")]
     SettingsGet,
     #[serde(rename = "settings.set")]

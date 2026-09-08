@@ -109,3 +109,88 @@ export function replyParams(
 	}
 	return { method: 'permission.approve', params: { id, lifetime: choice } };
 }
+
+/** One standing grant, as serialized by the host's `permission.grants`. */
+export interface StandingGrant {
+	capability: string;
+	paths: string[];
+	lifetime: string;
+}
+
+/** Standing grants plus the host-resolved home directory. */
+export interface GrantsSnapshot {
+	grants: StandingGrant[];
+	home: string | null;
+}
+
+function parseGrant(item: unknown): StandingGrant | null {
+	if (typeof item !== 'object' || item === null) return null;
+	const g = item as Record<string, unknown>;
+	if (typeof g.capability !== 'string') return null;
+	const paths: string[] = [];
+	const scope = g.scope as Record<string, unknown> | undefined;
+	const resources = scope !== undefined && Array.isArray(scope.resources) ? scope.resources : [];
+	for (const r of resources) {
+		if (typeof r === 'object' && r !== null && typeof (r as Record<string, unknown>).Path === 'string') {
+			paths.push((r as Record<string, unknown>).Path as string);
+		}
+	}
+	return {
+		capability: g.capability,
+		paths,
+		lifetime: typeof g.lifetime === 'string' ? g.lifetime : ''
+	};
+}
+
+/** Fetch standing grants for the access settings UI. Throws the bridge
+ * rejection when the host is unreachable so the panel can show it. */
+export async function listGrants(
+	invoke: (method: string, params?: Record<string, unknown>) => Promise<unknown>
+): Promise<GrantsSnapshot> {
+	const result = (await invoke('permission.grants', {})) as Record<string, unknown>;
+	const raw = Array.isArray(result.grants) ? result.grants : [];
+	return {
+		grants: raw.flatMap((item) => {
+			const parsed = parseGrant(item);
+			return parsed ? [parsed] : [];
+		}),
+		home: typeof result.home === 'string' ? result.home : null
+	};
+}
+
+/** True when a FilesystemRead grant covers the home directory — the
+ * "model can read any file" toggle state. */
+export function homeReadGranted(snapshot: GrantsSnapshot): boolean {
+	if (snapshot.home === null) return false;
+	return snapshot.grants.some(
+		(g) => g.capability === 'FilesystemRead' && g.paths.some((p) => p === snapshot.home)
+	);
+}
+
+/** Grant the model persistent read access to the home folder (explicit
+ * user action). Returns the granted path. Throws on bridge errors. */
+export async function grantHomeReadAccess(
+	invoke: (method: string, params?: Record<string, unknown>) => Promise<unknown>
+): Promise<string> {
+	const result = (await invoke('permission.grant', {
+		capability: 'FilesystemRead',
+		lifetime: 'persistent'
+	})) as Record<string, unknown>;
+	if (result.ok !== true || typeof result.path !== 'string') {
+		throw new Error('permission.grant returned an unexpected payload');
+	}
+	return result.path;
+}
+
+/** Revoke the home-folder read grant. Returns the removed row count. */
+export async function revokeHomeReadAccess(
+	invoke: (method: string, params?: Record<string, unknown>) => Promise<unknown>
+): Promise<number> {
+	const result = (await invoke('permission.revoke', {
+		capability: 'FilesystemRead'
+	})) as Record<string, unknown>;
+	if (result.ok !== true || typeof result.removed !== 'number') {
+		throw new Error('permission.revoke returned an unexpected payload');
+	}
+	return result.removed;
+}

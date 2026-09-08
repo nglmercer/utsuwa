@@ -14,6 +14,7 @@
 		{ href: localPath('app', '/settings/data'), label: 'Data', icon: 'database' },
 		{ href: localPath('app', '/settings/activity'), label: 'Activity', icon: 'file-text' },
 		{ href: localPath('app', '/settings/plugins'), label: 'Plugins', icon: 'circle-dot' },
+		{ href: localPath('app', '/settings/access'), label: 'Access', icon: 'lock' },
 		{ href: localPath('app', '/settings/developer'), label: 'Developer', icon: 'code' }
 	]);
 

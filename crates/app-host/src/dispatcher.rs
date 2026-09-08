@@ -7,6 +7,7 @@
 //! [`IpcMethod`], so they cannot even parse).
 
 use crate::agent_runtime::AgentRuntime;
+use capability_core::{Capability, PrincipalKind, Resource, ResourceScope};
 use ipc_core::{ErrorCode, HostEvent, IpcErrorBody, IpcErrorResponse, IpcMethod, IpcRequest, IpcResponse};
 use policy_core::{ApprovalQueue, GrantLifetime, QueueError};
 use serde_json::Value;
@@ -131,6 +132,9 @@ impl Dispatcher {
             IpcMethod::PermissionApprove => self.decide(request, true),
             IpcMethod::PermissionDeny => self.decide(request, false),
             IpcMethod::PermissionList => self.list_pending(),
+            IpcMethod::PermissionGrant => self.permission_grant(request),
+            IpcMethod::PermissionRevoke => self.permission_revoke(request),
+            IpcMethod::PermissionGrants => self.permission_grants(),
             IpcMethod::AgentSendMessage => self.agent_send(request),
             IpcMethod::AgentCancel => self.agent_cancel(),
             IpcMethod::SettingsGet => self.settings_get(request),
@@ -212,6 +216,170 @@ impl Dispatcher {
             code: ErrorCode::Internal,
             message: err.to_string(),
         })
+    }
+
+    /// The user's home directory, resolved from the environment. Used as
+    /// the default broad-read scope when settings omit a path.
+    fn home_dir() -> Result<std::path::PathBuf, IpcErrorBody> {
+        std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .map(std::path::PathBuf::from)
+            .map_err(|_| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: "cannot determine the home directory; pass an explicit path".to_string(),
+            })
+    }
+
+    /// Resolve the grant/revoke target: an explicit absolute path, or the
+    /// home directory. The target must exist (canonicalized, so `..` and
+    /// symlinks resolve before any check) and must not itself be a secret
+    /// path — key directories keep per-file approval even from their owner.
+    fn grant_root(params: &Value) -> Result<std::path::PathBuf, IpcErrorBody> {
+        let raw = params.get("path").and_then(|v| v.as_str());
+        let base = match raw {
+            Some(p) => std::path::PathBuf::from(p),
+            None => Self::home_dir()?,
+        };
+        if !base.is_absolute() {
+            return Err(IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "grant path must be absolute".to_string(),
+            });
+        }
+        let canonical = base.canonicalize().map_err(|_| IpcErrorBody {
+            code: ErrorCode::InvalidParams,
+            message: format!("grant path does not exist: {}", base.display()),
+        })?;
+        if policy_core::is_secret_path(&Resource::Path(canonical.clone())) {
+            return Err(IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "secret paths keep per-file approval and cannot be granted in bulk".to_string(),
+            });
+        }
+        Ok(canonical)
+    }
+
+    /// Mint a standing grant from explicit user action (settings UI).
+    /// Restricted to `FilesystemRead`: reads can be pre-approved, but
+    /// mutations and control always go through the per-request dialog —
+    /// there is deliberately no bulk path for them.
+    fn permission_grant(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
+        if request.params.get("capability").and_then(|v| v.as_str()) != Some("FilesystemRead") {
+            return Err(IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "permission.grant only issues FilesystemRead grants".to_string(),
+            });
+        }
+        // Standing grants outlive the request by definition: only
+        // session and persistent lifetimes make sense here. Omitted
+        // lifetimes default to session (vanishes on restart); the
+        // settings toggle passes persistent explicitly.
+        let lifetime = match request.params.get("lifetime").and_then(|v| v.as_str()) {
+            None => GrantLifetime::Session,
+            Some(_) => {
+                let parsed =
+                    parse_lifetime(request.params.get("lifetime").and_then(|v| v.as_str()))?;
+                if !matches!(parsed, GrantLifetime::Session | GrantLifetime::Persistent) {
+                    return Err(IpcErrorBody {
+                        code: ErrorCode::InvalidParams,
+                        message: "grant lifetime must be 'session' or 'persistent'".to_string(),
+                    });
+                }
+                parsed
+            }
+        };
+        let root = Self::grant_root(&request.params)?;
+        let scope = ResourceScope::new(vec![Resource::Path(root.clone())]);
+        let queue = self.approvals.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "approval queue is not attached".to_string(),
+        })?;
+        let queue = queue.lock().map_err(|_| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "approval queue lock failed".to_string(),
+        })?;
+        queue
+            .grant_direct(
+                PrincipalKind::Agent,
+                Capability::FilesystemRead,
+                scope,
+                lifetime,
+                format!("user broad-read grant for {}", root.display()),
+            )
+            .map_err(|e| match e {
+                QueueError::Persist(detail) => IpcErrorBody {
+                    code: ErrorCode::Internal,
+                    message: format!("grant could not be stored: {detail}"),
+                },
+                other => IpcErrorBody {
+                    code: ErrorCode::Internal,
+                    message: other.to_string(),
+                },
+            })?;
+        Ok(serde_json::json!({ "ok": true, "path": root.to_string_lossy() }))
+    }
+
+    /// Drop standing grants for a capability + scope, in memory and in
+    /// storage, so revocation takes effect immediately and survives restart.
+    fn permission_revoke(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
+        if request.params.get("capability").and_then(|v| v.as_str()) != Some("FilesystemRead") {
+            return Err(IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "permission.revoke only revokes FilesystemRead grants".to_string(),
+            });
+        }
+        let root = Self::grant_root(&request.params)?;
+        let scope = ResourceScope::new(vec![Resource::Path(root.clone())]);
+        let queue = self.approvals.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "approval queue is not attached".to_string(),
+        })?;
+        let queue = queue.lock().map_err(|_| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "approval queue lock failed".to_string(),
+        })?;
+        let mut removed = queue.revoke_where(&Capability::FilesystemRead, &scope);
+        drop(queue);
+        if let Some(storage) = self.storage.as_ref() {
+            let storage = storage.lock().map_err(|_| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: "storage lock failed".to_string(),
+            })?;
+            let rows = storage.load_grants().map_err(|e| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: format!("could not load grants: {e}"),
+            })?;
+            for row in rows {
+                if row.grant.capability == Capability::FilesystemRead && row.grant.scope == scope {
+                    storage.delete_grant(row.id).map_err(|e| IpcErrorBody {
+                        code: ErrorCode::Internal,
+                        message: format!("could not delete grant: {e}"),
+                    })?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(serde_json::json!({ "ok": true, "removed": removed }))
+    }
+
+    /// Standing grants plus the resolved home directory, so settings UI
+    /// can render the broad-read toggle without guessing paths.
+    fn permission_grants(&self) -> Result<Value, IpcErrorBody> {
+        let queue = self.approvals.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "approval queue is not attached".to_string(),
+        })?;
+        let queue = queue.lock().map_err(|_| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "approval queue lock failed".to_string(),
+        })?;
+        let grants = serde_json::to_value(queue.grants_snapshot()).map_err(|err| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: err.to_string(),
+        })?;
+        drop(queue);
+        let home = Self::home_dir().ok().map(|p| p.to_string_lossy().into_owned());
+        Ok(serde_json::json!({ "grants": grants, "home": home }))
     }
 
     /// Start (or supersede) an agent turn. Returns immediately; the text,
@@ -564,6 +732,110 @@ mod tests {
         assert!(script.contains("__resolve(\"20\", true"), "{script}");
         assert!(script.contains("perm-1"), "{script}");
         assert!(script.contains("FilesystemRead"), "{script}");
+    }
+
+    #[test]
+    fn broad_read_grant_revoke_roundtrip() {
+        use capability_core::{Capability, Principal, Resource};
+        let dir = std::env::temp_dir().join(format!(
+            "utsuwa-grant-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = temp_storage("grants");
+        let queue = Arc::new(Mutex::new(
+            ApprovalQueue::new()
+                .on_persistent_grant(storage_core::persistent_grant_hook(storage.clone())),
+        ));
+        let dispatcher = dispatcher()
+            .with_approvals(queue.clone())
+            .with_storage(storage.clone());
+
+        // Grant persistent read on the temp dir.
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"30","method":"permission.grant","params":{{"capability":"FilesystemRead","path":"{}","lifetime":"persistent"}}}}"#,
+                dir.to_string_lossy()
+            ))
+            .unwrap();
+        assert!(script.contains("__resolve(\"30\", true"), "{script}");
+        assert_eq!(queue.lock().unwrap().context().grants.len(), 1);
+        assert_eq!(
+            storage
+                .lock()
+                .unwrap()
+                .load_grants()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // The grant authorizes agent reads underneath (and reports home).
+        let script = dispatcher
+            .handle_message(r#"{"id":"31","method":"permission.grants","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"31\", true"), "{script}");
+        assert!(script.contains(&dir.to_string_lossy().to_string()), "{script}");
+        let ctx = queue.lock().unwrap().context();
+        let req = capability_core::CapabilityRequest {
+            principal: Principal::Agent(capability_core::AgentId::new("a")),
+            capability: Capability::FilesystemRead,
+            resource: Resource::Path(dir.join("note.txt")),
+        };
+        assert!(matches!(
+            policy_core::authorize(&req.principal, &req, &ctx),
+            policy_core::AuthorizationDecision::Allow { .. }
+        ));
+
+        // Revoke drops it from memory and storage alike.
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"32","method":"permission.revoke","params":{{"capability":"FilesystemRead","path":"{}"}}}}"#,
+                dir.to_string_lossy()
+            ))
+            .unwrap();
+        assert!(script.contains("__resolve(\"32\", true"), "{script}");
+        assert!(script.contains("\"removed\":2"), "{script}");
+        assert!(queue.lock().unwrap().context().grants.is_empty());
+        assert!(storage
+            .lock()
+            .unwrap()
+            .load_grants()
+            .unwrap()
+            .is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn broad_read_grant_rejects_anything_but_reads() {
+        let queue = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let dispatcher = dispatcher().with_approvals(queue);
+        for (id, params) in [
+            ("40", r#"{"capability":"FilesystemWrite","lifetime":"persistent"}"#),
+            ("41", r#"{"capability":"FilesystemRead","path":"/no/such/dir/utsuwa","lifetime":"persistent"}"#),
+            ("42", r#"{"capability":"FilesystemRead","path":"relative/path","lifetime":"persistent"}"#),
+            ("43", r#"{"capability":"FilesystemRead","lifetime":"once"}"#),
+        ] {
+            let script = dispatcher
+                .handle_message(&format!(
+                    r#"{{"id":"{id}","method":"permission.grant","params":{params}}}"#
+                ))
+                .unwrap();
+            assert!(script.contains(&format!("__resolve(\"{id}\", false")), "{script}");
+        }
+        // Secret roots are refused even from their owner.
+        let ssh = std::env::temp_dir().join(format!("utsuwa-grant-ssh-{}", std::process::id()));
+        std::fs::create_dir_all(ssh.join(".ssh")).unwrap();
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"44","method":"permission.grant","params":{{"capability":"FilesystemRead","path":"{}","lifetime":"persistent"}}}}"#,
+                ssh.join(".ssh").to_string_lossy()
+            ))
+            .unwrap();
+        assert!(script.contains("__resolve(\"44\", false"), "{script}");
+        std::fs::remove_dir_all(&ssh).ok();
     }
 
     fn temp_storage(name: &str) -> Arc<Mutex<storage_core::Storage>> {

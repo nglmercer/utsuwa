@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 
 import {
 	formatCapability,
+	grantHomeReadAccess,
 	headlineFor,
+	homeReadGranted,
+	listGrants,
 	parsePermissionRequest,
 	replyParams,
+	revokeHomeReadAccess,
 	riskLevel
 } from './permissions.ts';
 
@@ -57,4 +61,52 @@ test('reply params route deny and searchable lifetimes', () => {
 		method: 'permission.approve',
 		params: { id: 'perm-1', lifetime: 'task' }
 	});
+});
+
+test('grants snapshot detects the home read toggle', async () => {
+	const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+	const invoke = async (method: string, params?: Record<string, unknown>) => {
+		calls.push([method, params]);
+		if (method === 'permission.grants') {
+			return {
+				grants: [
+					{
+						principal_kind: 'Agent',
+						capability: 'FilesystemRead',
+						scope: { resources: [{ Path: '/home/u' }] },
+						lifetime: 'Persistent'
+					},
+					{ capability: 'FilesystemRead', scope: { resources: [] }, lifetime: 'x' },
+					{ bogus: true }
+				],
+				home: '/home/u'
+			};
+		}
+		if (method === 'permission.grant') return { ok: true, path: '/home/u' };
+		if (method === 'permission.revoke') return { ok: true, removed: 2 };
+		throw new Error(`unexpected ${method}`);
+	};
+	const snapshot = await listGrants(invoke);
+	assert.equal(snapshot.home, '/home/u');
+	assert.equal(snapshot.grants.length, 2);
+	assert.equal(homeReadGranted(snapshot), true);
+	assert.equal(await grantHomeReadAccess(invoke), '/home/u');
+	assert.equal(await revokeHomeReadAccess(invoke), 2);
+	assert.deepEqual(calls[1], [
+		'permission.grant',
+		{ capability: 'FilesystemRead', lifetime: 'persistent' }
+	]);
+	assert.deepEqual(calls[2], ['permission.revoke', { capability: 'FilesystemRead' }]);
+});
+
+test('home toggle stays off without a matching grant', () => {
+	assert.equal(homeReadGranted({ grants: [], home: '/home/u' }), false);
+	assert.equal(homeReadGranted({ grants: [], home: null }), false);
+	assert.equal(
+		homeReadGranted({
+			grants: [{ capability: 'FilesystemWrite', paths: ['/home/u'], lifetime: 'Persistent' }],
+			home: '/home/u'
+		}),
+		false
+	);
 });
