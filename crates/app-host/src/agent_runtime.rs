@@ -605,33 +605,31 @@ impl AgentRuntime {
     }
 }
 
-/// Tools the agent may call, all behind policy + tickets: the plan's
-/// first tool set (read/search/patch) plus structured process execution
-/// (spawn/status/kill, no shell).
+/// Tools the agent may call, all behind policy + tickets: the
+/// filesystem plugin's declared capabilities (read/search/patch/write)
+/// plus structured process execution (spawn/status/kill, no shell).
 fn default_registry(processes: &Arc<ProcessManager>) -> Result<ToolRegistry, RuntimeError> {
-    use tool_filesystem::{FilesystemLimits, SearchLimits};
     let mut registry = ToolRegistry::new();
-    let fs = FilesystemLimits::default();
-    let search = SearchLimits::default();
-    let tools: Vec<Arc<dyn tool_core::Tool>> = vec![
-        Arc::new(tool_filesystem::ListTool { limits: fs.clone() }),
-        Arc::new(tool_filesystem::StatTool),
-        Arc::new(tool_filesystem::ReadTool { limits: fs.clone() }),
-        Arc::new(tool_filesystem::ReadRangeTool { limits: fs.clone() }),
-        Arc::new(tool_filesystem::SearchTextTool { limits: search.clone() }),
-        Arc::new(tool_filesystem::GlobTool { limits: search }),
-        Arc::new(tool_filesystem::PatchTool { limits: fs }),
+    let mut fs_plugins = tool_filesystem::plugin::FsPluginRegistry::new();
+    fs_plugins.register(tool_filesystem::plugin::FsPlugin::local());
+    let mut tools: Vec<Arc<dyn tool_core::Tool>> = fs_plugins
+        .select()
+        .map(|plugin| tool_filesystem::plugin::tools_for_plugin(&plugin))
+        .unwrap_or_default();
+    for tool in [
         Arc::new(tool_process::SpawnTool {
             manager: Arc::clone(processes),
             limits: ProcessLimits::default(),
-        }),
+        }) as Arc<dyn tool_core::Tool>,
         Arc::new(tool_process::StatusTool {
             manager: Arc::clone(processes),
         }),
         Arc::new(tool_process::KillTool {
             manager: Arc::clone(processes),
         }),
-    ];
+    ] {
+        tools.push(tool);
+    }
     for tool in tools {
         registry
             .register(tool)

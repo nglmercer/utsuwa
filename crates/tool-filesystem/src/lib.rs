@@ -1,10 +1,15 @@
-//! Read-only filesystem broker (plan Phase 16, Task 13).
+//! Filesystem broker (plan Phase 16, Task 13) with a native plugin
+//! registry ([`plugin`]).
 //!
 //! Tools: `filesystem.list`, `filesystem.stat`, `filesystem.read`,
-//! `filesystem.read_range`. Every call requires a capability ticket minted
-//! from a policy `Allow`; the broker re-validates the ticket and enforces
-//! scope on **canonical** paths, so `..` and symlinks cannot escape the
-//! granted tree. Never `allowed_root.join(user_input)` without this check.
+//! `filesystem.read_range`, `filesystem.search_text`, `filesystem.glob`,
+//! `filesystem.patch`, `filesystem.write`. Every call requires a
+//! capability ticket minted from a policy `Allow`; the broker
+//! re-validates the ticket and enforces scope on **canonical** paths, so
+//! `..` and symlinks cannot escape the granted tree. Never
+//! `allowed_root.join(user_input)` without this check.
+
+pub mod plugin;
 
 use capability_core::{Capability, CapabilityRequest, CapabilityTicket, Resource, TicketError};
 use std::path::{Path, PathBuf};
@@ -15,6 +20,8 @@ use tool_core::{CapabilityRequirement, ToolContext, ToolError, ToolOutput};
 pub struct FilesystemLimits {
     pub max_read_bytes: usize,
     pub max_list_entries: usize,
+    /// Largest single `filesystem.write` payload.
+    pub max_write_bytes: usize,
 }
 
 impl Default for FilesystemLimits {
@@ -22,6 +29,7 @@ impl Default for FilesystemLimits {
         Self {
             max_read_bytes: 256 * 1024,
             max_list_entries: 500,
+            max_write_bytes: 256 * 1024,
         }
     }
 }
@@ -91,6 +99,131 @@ fn authorized_path(
             "'{}' is outside the granted scope",
             path.display()
         )))
+    }
+}
+
+/// Validate the ticket and resolve a *write* target inside the granted
+/// scope, returning the resolved path plus whether it must be created.
+/// Symlinks are refused outright (a link inside the scope, dangling or
+/// not, could redirect creation or truncation outside it). Existing
+/// files canonicalize exactly like reads; missing files resolve through
+/// their nearest existing ancestor, so grants for not-yet-existing files
+/// and directories work while `..` can never escape: everything is
+/// lexically normalized first, symlinks resolve at the existing prefix,
+/// and the remainder is literal single components.
+fn authorized_write_path(
+    ctx: &ToolContext,
+    capability: Capability,
+    path: &Path,
+) -> Result<(PathBuf, bool), ToolError> {
+    let ticket = ctx.ticket.as_ref().ok_or_else(|| {
+        denied("no capability ticket: route filesystem access through the agent + policy engine")
+    })?;
+    check_ticket(ticket, ctx, &capability, path)?;
+    if std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(denied(format!(
+            "'{}' is a symlink: writes through links are refused",
+            path.display()
+        )));
+    }
+    // arg_path guarantees absolute paths; normalize away `.`/`..`/dupes
+    // before any resolution so later prefix checks see no surprises.
+    let normalized = lexical_normalize(path).ok_or_else(|| ToolError::InvalidArgs {
+        tool: "filesystem".to_string(),
+        message: "path must be absolute".to_string(),
+    })?;
+    let mut roots = Vec::new();
+    for resource in &ticket.scope.resources {
+        if let Resource::Path(root) = resource {
+            if let Some(resolved) = resolve_target(root) {
+                roots.push(resolved);
+            }
+        }
+    }
+    let in_scope = |target: &Path| roots.iter().any(|root| target.starts_with(root));
+    if normalized.exists() {
+        let target = normalized.canonicalize().map_err(|_| {
+            failed(format!("cannot access '{}': unreadable", path.display()))
+        })?;
+        if !in_scope(&target) {
+            return Err(denied(format!(
+                "'{}' is outside the granted scope",
+                path.display()
+            )));
+        }
+        if target.is_dir() {
+            return Err(failed(format!("'{}' is a directory", path.display())));
+        }
+        return Ok((target, false));
+    }
+    if normalized.file_name().is_none() {
+        return Err(ToolError::InvalidArgs {
+            tool: "filesystem".to_string(),
+            message: "path must name a file".to_string(),
+        });
+    }
+    let target = resolve_target(&normalized).ok_or_else(|| {
+        failed(format!(
+            "cannot access '{}': no reachable parent directory",
+            path.display()
+        ))
+    })?;
+    if !in_scope(&target) {
+        return Err(denied(format!(
+            "'{}' is outside the granted scope",
+            path.display()
+        )));
+    }
+    Ok((target, true))
+}
+
+/// Lexical absolute-path normalization: resolves `.`, `..`, and
+/// duplicate separators without touching the filesystem. `None` for
+/// relative paths (grants and write targets are absolute-only).
+fn lexical_normalize(raw: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if !raw.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for component in raw.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
+/// Resolve a normalized absolute path against the filesystem: existing
+/// paths canonicalize (symlinks resolved); missing paths resolve through
+/// their nearest existing ancestor plus the literal remaining
+/// components. `None` when nothing up to the root exists.
+fn resolve_target(normalized: &Path) -> Option<PathBuf> {
+    if let Ok(canonical) = normalized.canonicalize() {
+        return Some(canonical);
+    }
+    let mut below: Vec<std::ffi::OsString> = Vec::new();
+    let mut cursor = normalized;
+    loop {
+        if let Ok(canonical) = cursor.canonicalize() {
+            let mut full = canonical;
+            for component in below.iter().rev() {
+                full.push(component);
+            }
+            return Some(full);
+        }
+        // Normalized paths only run out of names at the root, and the
+        // root always canonicalizes — so `None` here ends the walk.
+        let name = cursor.file_name()?;
+        below.push(name.to_os_string());
+        cursor = cursor.parent()?;
     }
 }
 
@@ -779,6 +912,74 @@ impl tool_core::Tool for PatchTool {
     }
 }
 
+pub struct WriteTool {
+    pub limits: FilesystemLimits,
+}
+
+#[async_trait::async_trait]
+impl tool_core::Tool for WriteTool {
+    fn metadata(&self) -> tool_core::ToolMetadata {
+        tool_core::ToolMetadata {
+            id: capability_core::ToolId::new("filesystem.write"),
+            description: "Create a new file or overwrite an existing one inside the granted scope (capped). Missing parents are created; symlinks are never followed.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                },
+                "required": ["path", "content"],
+            }),
+            effects: vec![tool_core::ToolEffect::FilesystemWrite],
+        }
+    }
+
+    fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
+        arg_path(args).ok().map(|path| requirement(Capability::FilesystemWrite, &path))
+    }
+
+    async fn invoke(
+        &self,
+        ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidArgs {
+                tool: "filesystem".to_string(),
+                message: "missing string 'content' argument".to_string(),
+            })?;
+        if content.len() > self.limits.max_write_bytes {
+            return Err(ToolError::InvalidArgs {
+                tool: "filesystem".to_string(),
+                message: format!("content exceeds the {} byte limit", self.limits.max_write_bytes),
+            });
+        }
+        let (path, created) =
+            authorized_write_path(&ctx, Capability::FilesystemWrite, &arg_path(&args)?)?;
+        let before_hash = std::fs::read(&path).ok().map(|bytes| sha256_hex(&bytes));
+        if created {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| failed(e.to_string()))?;
+            }
+        }
+        std::fs::write(&path, content.as_bytes()).map_err(|e| failed(e.to_string()))?;
+        let after_hash = sha256_hex(content.as_bytes());
+        Ok(ToolOutput::new(serde_json::json!({
+            "path": path.to_string_lossy(),
+            "created": created,
+            "bytes": content.len(),
+            "hash": after_hash,
+        }))
+        .with_mutation(tool_core::MutationEvidence {
+            path: path.to_string_lossy().into_owned(),
+            before_sha256: before_hash,
+            after_sha256: Some(after_hash),
+        }))
+    }
+}
+
 /// Strict `root` argument parsing shared by search/glob: absolute paths
 /// only, so calls never resolve against an ambient working directory.
 fn search_root(args: &serde_json::Value) -> Result<PathBuf, ToolError> {
@@ -1204,6 +1405,138 @@ mod tests {
             .unwrap_err();
         assert!(format!("{err:?}").contains("exactly once"), "{err:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "aaa bbb aaa");
+    }
+
+    fn write_ctx(path: &Path) -> ToolContext {
+        agent_ctx_for(path, Capability::FilesystemWrite)
+    }
+
+    #[tokio::test]
+    async fn write_creates_new_files_with_parents() {
+        let dir = TestDir::create();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+        };
+        let target = dir.0.join("new").join("note.txt");
+        let out = write
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": target.to_string_lossy(), "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["created"], true);
+        assert_eq!(out.content["bytes"], 5);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+        let evidence = out.mutation.as_ref().expect("write attaches evidence");
+        assert!(evidence.before_sha256.is_none());
+        assert_eq!(
+            evidence.after_sha256.as_deref(),
+            Some(sha256_hex(b"hello").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn write_covers_file_scoped_grants_for_missing_files() {
+        // The agent declares the exact file it wants; policy grants that
+        // path before it exists. The grant cannot canonicalize, so the
+        // write must match it lexically.
+        let dir = TestDir::create();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+        };
+        let target = dir.0.join("planned.txt");
+        let out = write
+            .invoke(
+                write_ctx(&target),
+                serde_json::json!({"path": target.to_string_lossy(), "content": "x"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["created"], true);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn write_overwrites_existing_files() {
+        let dir = TestDir::create();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+        };
+        let file = dir.0.join("hello.txt");
+        let out = write
+            .invoke(
+                write_ctx(&file),
+                serde_json::json!({"path": file.to_string_lossy(), "content": "replaced"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["created"], false);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "replaced");
+        let evidence = out.mutation.as_ref().expect("write attaches evidence");
+        assert_eq!(
+            evidence.before_sha256.as_deref(),
+            Some(sha256_hex(b"hello world").as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn write_refuses_escapes_dirs_symlinks_and_oversize() {
+        let dir = TestDir::create();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+        };
+        // `..` escapes the granted tree.
+        let err = write
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": dir.0.join("..").join("evil").to_string_lossy(), "content": "x"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }), "{err:?}");
+        // Existing directories are not files.
+        let err = write
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": dir.0.join("sub").to_string_lossy(), "content": "x"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("directory"), "{err:?}");
+        // Symlinks are never followed, dangling or not.
+        #[cfg(unix)]
+        {
+            let link = dir.0.join("link");
+            std::os::unix::fs::symlink(dir.0.join("nowhere"), &link).unwrap();
+            let err = write
+                .invoke(
+                    write_ctx(&dir.0),
+                    serde_json::json!({"path": link.to_string_lossy(), "content": "x"}),
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{err:?}").contains("symlink"), "{err:?}");
+        }
+        // Oversized payloads never reach the backend.
+        let err = write
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": dir.0.join("big").to_string_lossy(), "content": "x".repeat(300_000)}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs { .. }), "{err:?}");
+        // No ticket, no write.
+        let err = write
+            .invoke(
+                ToolContext::new(Principal::Agent(AgentId::new("a"))),
+                serde_json::json!({"path": dir.0.join("nope").to_string_lossy(), "content": "x"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }), "{err:?}");
+        assert!(!dir.0.join("nope").exists());
     }
 
     #[tokio::test]
