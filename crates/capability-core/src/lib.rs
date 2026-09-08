@@ -110,6 +110,9 @@ pub enum Capability {
     /// Invoke a tool served by an external MCP server. Never implied by
     /// other capabilities: every MCP tool call authorizes on its own.
     McpInvoke,
+    /// Invoke a tool served by a WASM plugin. Same rule as [`Capability::McpInvoke`]:
+    /// third-party guest code authorizes per call, never by implication.
+    PluginInvoke,
 }
 
 /// Concrete resource a capability acts on.
@@ -123,6 +126,8 @@ pub enum Resource {
     /// A tool served by an MCP server. Matched exactly (server + tool):
     /// a grant for one MCP tool never covers another.
     McpTool { server: String, tool: String },
+    /// A tool served by a WASM plugin. Matched exactly like [`Resource::McpTool`].
+    PluginTool { plugin: String, tool: String },
 }
 
 /// A granted scope: the set of resources a capability may touch.
@@ -183,6 +188,10 @@ fn scope_covers(scope: &Resource, resource: &Resource) -> bool {
             Resource::McpTool { server: ss, tool: st },
             Resource::McpTool { server: rs, tool: rt },
         ) => ss == rs && st == rt,
+        (
+            Resource::PluginTool { plugin: sp, tool: st },
+            Resource::PluginTool { plugin: rp, tool: rt },
+        ) => sp == rp && st == rt,
         _ => false,
     }
 }

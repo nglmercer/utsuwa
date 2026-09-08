@@ -14,6 +14,7 @@ model-openai-compatible.workspace = true
 policy-core.workspace = true
 secret-core.workspace = true
 mcp-runtime.workspace = true
+plugin-wasm.workspace = true
 tool-core.workspace = true
 tool-filesystem.workspace = true
 tool-process.workspace = true
@@ -34,3 +35,4 @@ gtk = "0.18"
 
 [dev-dependencies]
 futures-util = "0.3"
+wat.workspace = true

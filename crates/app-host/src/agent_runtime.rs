@@ -34,6 +34,11 @@ pub const SETTING_API_KEY: &str = "model.api_key";
 pub const SETTING_MODEL_NAME: &str = "model.name";
 /// Settings key holding the MCP server set (JSON array of server configs).
 pub const SETTING_MCP_SERVERS: &str = "mcp.servers";
+/// Settings key holding the WASM plugin directory (JSON string path).
+/// Discovered every turn so installs take effect without a restart;
+/// only `Enabled` plugins register tools, and every call stays behind
+/// policy + tickets.
+pub const SETTING_PLUGIN_DIR: &str = "plugin.dir";
 
 /// Transcript cap: oldest messages are dropped past this bound so a long
 /// session cannot grow memory (or model context) without limit.
@@ -78,6 +83,7 @@ pub struct AgentRuntime {
         Arc<dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync>,
     processes: Arc<ProcessManager>,
     mcp: Arc<McpManager>,
+    plugins: Arc<plugin_wasm::PluginRuntime>,
     storage: Option<Arc<Mutex<Storage>>>,
     state: Mutex<State>,
     executor: tokio::runtime::Runtime,
@@ -124,6 +130,9 @@ impl AgentRuntime {
             provider_factory,
             processes: ProcessManager::new(ProcessLimits::default()),
             mcp: Arc::new(McpManager::new()),
+            plugins: Arc::new(
+                plugin_wasm::PluginRuntime::new().map_err(|e| RuntimeError::Tools(e.to_string()))?,
+            ),
             storage,
             state: Mutex::new(State {
                 generation: 0,
@@ -168,6 +177,13 @@ impl AgentRuntime {
         self.executor.block_on(self.mcp.status())
     }
 
+    /// The WASM plugin manager: lifecycle calls here (`plugin.enable` /
+    /// `plugin.disable` / …) take effect on the next turn's registry,
+    /// which is rebuilt per turn through [`PluginRuntime::register_enabled`].
+    pub fn plugin_manager(&self) -> &Arc<plugin_wasm::PluginRuntime> {
+        &self.plugins
+    }
+
     /// Sync the MCP server set from settings and register every enabled
     /// server's tools into the turn registry. Best-effort per server: a
     /// down server logs and skips, never fails the turn.
@@ -193,6 +209,41 @@ impl AgentRuntime {
             if let Err(e) = self.mcp.register_into(&id, registry).await {
                 tracing::warn!(server = %id, error = %e, "mcp server unavailable this turn");
             }
+        }
+    }
+
+    /// Discover the configured plugin directory and register every
+    /// enabled plugin's tools into the turn registry. Best-effort like
+    /// MCP: a broken plugin logs and skips, never fails the turn.
+    /// Enabling (user action via `plugin.enable`) only loads code —
+    /// calls still need a policy ticket per invocation.
+    fn attach_plugin_tools(&self, registry: &mut ToolRegistry) {
+        if let Some(storage) = &self.storage {
+            let dir: Option<String> = storage
+                .lock()
+                .ok()
+                .and_then(|store| store.get_setting(SETTING_PLUGIN_DIR).ok())
+                .flatten()
+                .and_then(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|e| {
+                            tracing::warn!(%e, "plugin.dir setting is not a path string; ignoring");
+                        })
+                        .ok()
+                });
+            if let Some(dir) = dir {
+                if let Err(e) = self.plugins.discover_dir(std::path::Path::new(&dir)) {
+                    tracing::warn!(dir = %dir, error = %e, "plugin discovery failed");
+                }
+            }
+        }
+        match self.plugins.register_enabled(registry) {
+            Ok(added) => {
+                if !added.is_empty() {
+                    tracing::debug!(tools = ?added, "plugin tools registered for turn");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "plugin registration failed"),
         }
     }
 
@@ -347,6 +398,7 @@ impl AgentRuntime {
             }
         };
         self.attach_mcp_tools(&mut registry).await;
+        self.attach_plugin_tools(&mut registry);
         let policy = match self.approvals.lock() {
             Ok(queue) => queue.context(),
             Err(_) => {

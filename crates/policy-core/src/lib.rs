@@ -65,6 +65,7 @@ fn is_mutation_or_control(cap: &Capability) -> bool {
             | ClipboardWrite
             | ApplicationLaunch
             | McpInvoke
+            | PluginInvoke
     )
 }
 

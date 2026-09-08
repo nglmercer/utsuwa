@@ -1,0 +1,21 @@
+[package]
+name = "plugin-wasm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+capability-core.workspace = true
+plugin-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tool-core.workspace = true
+tracing.workspace = true
+wasmtime.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wat.workspace = true

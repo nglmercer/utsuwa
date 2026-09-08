@@ -30,6 +30,16 @@ pub enum IpcMethod {
     SettingsSet,
     #[serde(rename = "activity.list")]
     ActivityList,
+    #[serde(rename = "plugin.list")]
+    PluginList,
+    #[serde(rename = "plugin.enable")]
+    PluginEnable,
+    #[serde(rename = "plugin.disable")]
+    PluginDisable,
+    #[serde(rename = "plugin.update")]
+    PluginUpdate,
+    #[serde(rename = "plugin.remove")]
+    PluginRemove,
 }
 
 /// Request envelope: frontend → host.

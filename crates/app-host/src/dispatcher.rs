@@ -12,6 +12,15 @@ use policy_core::{ApprovalQueue, GrantLifetime, QueueError};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
+/// A plugin lifecycle operation behind `plugin.*` IPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PluginOp {
+    Enable,
+    Disable,
+    Update,
+    Remove,
+}
+
 /// Host state the dispatcher may report. The agent runtime and storage
 /// attachments are optional so headless/unit configurations keep working;
 /// methods needing a missing attachment fail with a typed error.
@@ -127,6 +136,11 @@ impl Dispatcher {
             IpcMethod::SettingsGet => self.settings_get(request),
             IpcMethod::SettingsSet => self.settings_set(request),
             IpcMethod::ActivityList => self.activity_list(request),
+            IpcMethod::PluginList => self.plugin_list(),
+            IpcMethod::PluginEnable => self.plugin_manage(request, PluginOp::Enable),
+            IpcMethod::PluginDisable => self.plugin_manage(request, PluginOp::Disable),
+            IpcMethod::PluginUpdate => self.plugin_manage(request, PluginOp::Update),
+            IpcMethod::PluginRemove => self.plugin_manage(request, PluginOp::Remove),
         }
     }
 
@@ -240,6 +254,59 @@ impl Dispatcher {
             message: "agent runtime is not attached".to_string(),
         })?;
         agent.cancel();
+        Ok(serde_json::json!({ "ok": true }))
+    }
+
+    /// Every known WASM plugin with trust + lifecycle state, for the
+    /// Plugins panel (plan Phase 24/25). Needs the agent runtime for its
+    /// plugin manager; without one the panel reports unavailability.
+    fn plugin_list(&self) -> Result<Value, IpcErrorBody> {
+        let agent = self.agent.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "agent runtime is not attached".to_string(),
+        })?;
+        serde_json::to_value(agent.plugin_manager().infos()).map_err(|err| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: err.to_string(),
+        })
+    }
+
+    /// One lifecycle transition by plugin id: enable / disable / update /
+    /// remove (plan Phase 24). Activation never grants authority — it only
+    /// loads code and registers tools behind policy + tickets.
+    fn plugin_manage(&self, request: &IpcRequest, op: PluginOp) -> Result<Value, IpcErrorBody> {
+        let agent = self.agent.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "agent runtime is not attached".to_string(),
+        })?;
+        let id = request.params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
+            IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "plugin lifecycle methods need a string 'id'".to_string(),
+            }
+        })?;
+        if id.is_empty() || id.len() > 128 {
+            return Err(IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "plugin 'id' must be 1-128 chars".to_string(),
+            });
+        }
+        let manager = agent.plugin_manager();
+        let outcome = match op {
+            PluginOp::Enable => manager.enable(id),
+            PluginOp::Disable => manager.disable(id),
+            PluginOp::Update => manager.update(id),
+            PluginOp::Remove => manager.remove(id),
+        };
+        outcome.map_err(|err| IpcErrorBody {
+            // Unknown ids are a caller error; engine/lifecycle failures
+            // are host-side.
+            code: match err {
+                plugin_wasm::WasmError::Unknown(_) => ErrorCode::InvalidParams,
+                _ => ErrorCode::Internal,
+            },
+            message: err.to_string(),
+        })?;
         Ok(serde_json::json!({ "ok": true }))
     }
 
@@ -558,6 +625,101 @@ mod tests {
             .handle_message(r#"{"id":"34","method":"settings.get","params":{}}"#)
             .unwrap();
         assert!(script.contains("needs a string 'key'"), "{script}");
+    }
+
+    /// Minimal echo guest: returns its arguments unchanged.
+    const ECHO_WAT: &str = r#"(module
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (global.get $heap) (local.set $ptr)
+    (global.get $heap) (local.get $len) (i32.add) (global.set $heap)
+    (local.get $ptr))
+  (func (export "invoke") (param $ptr i32) (param $len i32) (result i64)
+    (local $out i32)
+    (local.get $len) (call 0) (local.set $out)
+    (memory.copy (local.get $out) (local.get $ptr) (local.get $len))
+    (i64.or
+      (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+      (i64.extend_i32_u (local.get $len)))))"#;
+
+    fn plugin_root(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "utsuwa-dispatcher-plugin-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("echo");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.toml"),
+            "[plugin]\nid = \"echo\"\nname = \"Echo\"\nversion = \"0.1.0\"\napi = 1\n\n\
+             [runtime]\ntype = \"wasm\"\n\n\
+             [[tools]]\nname = \"run\"\ndescription = \"echo\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("plugin.wasm"), wat::parse_str(ECHO_WAT).unwrap()).unwrap();
+        root
+    }
+
+    #[test]
+    fn plugin_lifecycle_through_ipc() {
+        let root = plugin_root("lifecycle");
+        let agent = stub_runtime();
+        agent
+            .plugin_manager()
+            .discover_dir(&root)
+            .unwrap();
+        agent.plugin_manager().load("echo").unwrap();
+        let dispatcher = dispatcher().with_agent(agent);
+
+        // Loaded, not yet serving.
+        let script = dispatcher
+            .handle_message(r#"{"id":"50","method":"plugin.list","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"50\", true"), "{script}");
+        assert!(script.contains("\"state\":\"loaded\""), "{script}");
+
+        // Enable serves it; list shows the state change.
+        let script = dispatcher
+            .handle_message(r#"{"id":"51","method":"plugin.enable","params":{"id":"echo"}}"#)
+            .unwrap();
+        assert!(script.contains("\"ok\":true"), "{script}");
+        let script = dispatcher
+            .handle_message(r#"{"id":"52","method":"plugin.list","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("\"state\":\"enabled\""), "{script}");
+
+        // Disable unserves; unknown ids and missing ids are caller errors.
+        let script = dispatcher
+            .handle_message(r#"{"id":"53","method":"plugin.disable","params":{"id":"echo"}}"#)
+            .unwrap();
+        assert!(script.contains("\"ok\":true"), "{script}");
+        let script = dispatcher
+            .handle_message(r#"{"id":"54","method":"plugin.enable","params":{"id":"nope"}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"54\", false"), "{script}");
+        assert!(script.contains("unknown plugin"), "{script}");
+        let script = dispatcher
+            .handle_message(r#"{"id":"55","method":"plugin.update","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"55\", false"), "{script}");
+        assert!(script.contains("need a string 'id'"), "{script}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn plugin_methods_without_runtime_reject() {
+        let script = dispatcher()
+            .handle_message(r#"{"id":"56","method":"plugin.list","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("agent runtime is not attached"), "{script}");
+        let script = dispatcher()
+            .handle_message(r#"{"id":"57","method":"plugin.remove","params":{"id":"echo"}}"#)
+            .unwrap();
+        assert!(script.contains("agent runtime is not attached"), "{script}");
     }
 
     #[test]
