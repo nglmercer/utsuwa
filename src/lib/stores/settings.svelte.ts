@@ -23,8 +23,10 @@ function createSettingsStore() {
 	// Desktop hotkey configuration
 	let hotkeys = $state<HotkeyConfig>({ ...DEFAULT_HOTKEYS });
 
-	// Load from localStorage on init
-	if (browser) {
+	// Load from localStorage on init. Keep the reactive reads inside a closure:
+	// Svelte 5 otherwise treats a top-level initialization block as capturing
+	// only the initial value of rune state.
+	function loadPersistedSettings() {
 		const saved = localStorage.getItem('utsuwa-settings');
 		if (saved) {
 			try {
@@ -63,6 +65,8 @@ function createSettingsStore() {
 		}
 		if (isDesktopBuild()) void hydrateNativeModelSettings();
 	}
+
+	if (browser) loadPersistedSettings();
 
 	function save() {
 		if (browser) {

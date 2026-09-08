@@ -3,7 +3,7 @@
 	// grid + axes helpers, free orbit controls. No post-processing.
 	import { T, useThrelte, useTask } from '@threlte/core';
 	import { useXR } from '@threlte/xr';
-	import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+	import type { OrbitControls as OrbitControlsInstance } from 'three/addons/controls/OrbitControls.js';
 	import {
 		ShaderMaterial,
 		Color,
@@ -70,7 +70,7 @@
 
 	const { camera, renderer, scene } = useThrelte();
 	const { isPresenting } = useXR();
-	let controls: OrbitControls | null = null;
+	let controls: OrbitControlsInstance | null = null;
 	let modelRoot = $state<Group | undefined>();
 
 	// Dark mode detection
@@ -382,12 +382,18 @@
 		if (locked) return;
 
 		if (camera.current && renderer) {
-			controls = new OrbitControls(camera.current, renderer.domElement);
-			controls.screenSpacePanning = true;
-			applyCamera();
+			let disposed = false;
+			void import('three/addons/controls/OrbitControls.js').then(({ OrbitControls }) => {
+				if (disposed || !camera.current || !renderer) return;
+				controls = new OrbitControls(camera.current, renderer.domElement);
+				controls.screenSpacePanning = true;
+				applyCamera();
+			});
 
 			return () => {
+				disposed = true;
 				controls?.dispose();
+				controls = null;
 			};
 		}
 	});
