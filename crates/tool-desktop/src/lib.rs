@@ -81,10 +81,12 @@ pub trait DesktopBackend: Send + Sync {
     async fn type_text(&self, window_id: Option<&str>, text: &str) -> Result<(), DesktopError>;
 }
 
-/// Builds the backend for this host. Today every platform reports
-/// unavailability until its Phase 28–30 backend lands; the selection
-/// point stays in one place so that work plugs in here.
-pub fn backend() -> Arc<dyn DesktopBackend> {
+/// The always-available placeholder backend: honest failure instead
+/// of fake control. Hosts inject the real platform backend (Linux X11,
+/// future Windows/macOS) at startup; `tool-desktop` itself depends on
+/// no platform crate so backends can implement this trait without a
+/// dependency cycle.
+pub fn stub() -> Arc<dyn DesktopBackend> {
     Arc::new(StubBackend)
 }
 
@@ -800,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn stub_backend_is_honest() {
         let tool = ListWindowsTool {
-            backend: super::backend(),
+            backend: super::stub(),
         };
         let ctx = ctx_for(
             Capability::DesktopObserve,

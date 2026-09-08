@@ -139,7 +139,7 @@ impl AgentRuntime {
                 memory::MemoryStore::open_in_memory()
                     .map_err(|e| RuntimeError::Tools(e.to_string()))?,
             )),
-            desktop: Mutex::new(tool_desktop::backend()),
+            desktop: Mutex::new(Self::desktop_backend()),
             storage,
             state: Mutex::new(State {
                 generation: 0,
@@ -149,6 +149,18 @@ impl AgentRuntime {
             }),
             executor,
         }))
+    }
+
+    /// Platform desktop backend: Linux connects to the session X
+    /// server (Xwayland included) and falls back to the stub when no
+    /// display answers; other platforms stay stubbed until their
+    /// Phase 28–29 backends land.
+    fn desktop_backend() -> std::sync::Arc<dyn tool_desktop::DesktopBackend> {
+        #[cfg(target_os = "linux")]
+        if let Ok(linux) = desktop_linux::LinuxBackend::connect() {
+            return std::sync::Arc::new(linux);
+        }
+        tool_desktop::stub()
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, RuntimeError> {

@@ -136,6 +136,7 @@ dependencies = [
  "async-trait",
  "audit-core",
  "capability-core",
+ "desktop-linux",
  "futures-util",
  "gtk",
  "ipc-core",
@@ -974,6 +975,16 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "desktop-linux"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "thiserror 2.0.20",
+ "tokio",
+ "tool-desktop",
 ]
 
 [[package]]

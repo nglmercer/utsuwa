@@ -19,6 +19,7 @@ members = [
     "crates/plugin-wasm",
     "crates/memory",
     "crates/tool-desktop",
+    "crates/desktop-linux",
 ]
 exclude = ["src-tauri"]
 
@@ -30,6 +31,7 @@ license = "AGPL-3.0-or-later"
 agent-core = { path = "crates/agent-core" }
 async-trait = "0.1"
 audit-core = { path = "crates/audit-core" }
+desktop-linux = { path = "crates/desktop-linux" }
 bytes = "1"
 capability-core = { path = "crates/capability-core" }
 futures-core = "0.3"
