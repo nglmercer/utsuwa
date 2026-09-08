@@ -65,6 +65,22 @@ pub struct ToolOutput {
     pub content: serde_json::Value,
     /// True when the broker truncated an oversized result (limits, Phase 36).
     pub truncated: bool,
+    /// Mutation evidence for the audit log (plan Phase 10): mutating tools
+    /// attach what changed so the agent layer can record before/after
+    /// hashes without re-reading the world. Never shown to the model as a
+    /// separate channel — it travels beside `content`.
+    pub mutation: Option<MutationEvidence>,
+}
+
+/// Before/after hashes for one mutated file (plan Phase 10). Hashes are
+/// hex sha256 over raw bytes; `None` means "absent on that side"
+/// (created or deleted file, or an unreadable side that must not fail
+/// the audit write).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MutationEvidence {
+    pub path: String,
+    pub before_sha256: Option<String>,
+    pub after_sha256: Option<String>,
 }
 
 impl ToolOutput {
@@ -72,7 +88,13 @@ impl ToolOutput {
         Self {
             content,
             truncated: false,
+            mutation: None,
         }
+    }
+
+    pub fn with_mutation(mut self, evidence: MutationEvidence) -> Self {
+        self.mutation = Some(evidence);
+        self
     }
 }
 

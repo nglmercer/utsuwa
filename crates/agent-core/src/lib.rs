@@ -293,7 +293,7 @@ impl Agent {
         outcome: AuditOutcome,
         detail: String,
     ) {
-        self.audit_timed(capability, resource, outcome, detail, None);
+        self.audit_timed(capability, resource, outcome, detail, None, None);
     }
 
     fn audit_timed(
@@ -303,6 +303,7 @@ impl Agent {
         outcome: AuditOutcome,
         detail: String,
         duration_ms: Option<u64>,
+        mutation: Option<tool_core::MutationEvidence>,
     ) {
         if let Some(sink) = &self.audit {
             let mut record = AuditRecord::now(
@@ -314,6 +315,9 @@ impl Agent {
             );
             if let Some(ms) = duration_ms {
                 record = record.with_duration(ms);
+            }
+            if let Some(evidence) = mutation {
+                record = record.with_mutation(evidence);
             }
             sink.record(record);
         }
@@ -412,12 +416,16 @@ impl Agent {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match outcome {
             Ok(output) => {
+                // Mutation evidence (if the tool attached any) joins the
+                // audit record: path + before/after hashes, never contents.
+                let mutation = output.mutation.clone();
                 self.audit_timed(
                     capability,
                     resource,
                     AuditOutcome::Executed,
                     format!("{} ok", call.name),
                     Some(elapsed_ms),
+                    mutation,
                 );
                 Ok(output)
             }
@@ -428,6 +436,7 @@ impl Agent {
                     AuditOutcome::Failed,
                     err.to_string(),
                     Some(elapsed_ms),
+                    None,
                 );
                 Err(PendingOrFailed::Failed(err.to_string()))
             }
@@ -1068,6 +1077,21 @@ mod tests {
                 AuditOutcome::Executed,          // run 3 patched
             ]
         );
+        // 5. The Executed record witnesses the mutation: path plus
+        // before/after hashes, never file contents.
+        {
+            use sha2::{Digest, Sha256};
+            let hash = |s: &[u8]| format!("{:x}", Sha256::digest(s));
+            let executed = sink
+                .records()
+                .into_iter()
+                .find(|r| r.outcome == AuditOutcome::Executed)
+                .expect("executed record");
+            let evidence = executed.mutation.as_ref().expect("mutation evidence");
+            assert_eq!(evidence.path, target_str);
+            assert_eq!(evidence.before_sha256.as_deref(), Some(hash(b"version one").as_str()));
+            assert_eq!(evidence.after_sha256.as_deref(), Some(hash(b"version two").as_str()));
+        }
         std::fs::remove_dir_all(&root).unwrap();
     }
 

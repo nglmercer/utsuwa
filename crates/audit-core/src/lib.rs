@@ -43,6 +43,10 @@ pub struct AuditRecord {
     /// Execution wall-clock for completed tool calls, when measured.
     /// Absent for policy-only records (requests, decisions without run).
     pub duration_ms: Option<u64>,
+    /// Mutation evidence for file writes (plan Phase 10): path plus
+    /// before/after sha256. Hashes, never contents — the log stays a
+    /// witness, not a backup.
+    pub mutation: Option<tool_core::MutationEvidence>,
 }
 
 impl AuditRecord {
@@ -61,11 +65,17 @@ impl AuditRecord {
             outcome,
             detail: redact_detail(&detail.into()),
             duration_ms: None,
+            mutation: None,
         }
     }
 
     pub fn with_duration(mut self, duration_ms: u64) -> Self {
         self.duration_ms = Some(duration_ms);
+        self
+    }
+
+    pub fn with_mutation(mut self, evidence: tool_core::MutationEvidence) -> Self {
+        self.mutation = Some(evidence);
         self
     }
 }

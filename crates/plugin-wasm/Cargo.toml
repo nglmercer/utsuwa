@@ -9,6 +9,7 @@ capability-core.workspace = true
 plugin-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tool-core.workspace = true
@@ -17,5 +18,6 @@ wasmtime.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 tokio.workspace = true
 wat.workspace = true

@@ -5,7 +5,8 @@ import {
 	formatDuration,
 	headlineFor,
 	parseActivityList,
-	parseActivityRecord
+	parseActivityRecord,
+	shortHash
 } from './activity.ts';
 
 test('parses a full Rust audit record', () => {
@@ -38,6 +39,49 @@ test('MCP resources summarize as server / tool', () => {
 	assert.equal(record?.principal, 'MCP gh');
 	assert.equal(record?.resource, 'MCP gh / search');
 	assert.equal(record?.duration_ms, null);
+});
+
+test('mutation witness parses, garbage witnesses yield null', () => {
+	const record = parseActivityRecord({
+		timestamp_ms: 1,
+		principal: 'User',
+		capability: 'FilesystemWrite',
+		resource: { Path: '/work/notes.txt' },
+		outcome: 'Executed',
+		detail: 'filesystem.patch ok',
+		duration_ms: 7,
+		mutation: {
+			path: '/work/notes.txt',
+			before_sha256: 'aaaabbbbccccdddd',
+			after_sha256: null
+		}
+	});
+	assert.deepEqual(record?.mutation, {
+		path: '/work/notes.txt',
+		before_sha256: 'aaaabbbbccccdddd',
+		after_sha256: null
+	});
+
+	const plain = parseActivityRecord({
+		timestamp_ms: 1,
+		principal: 'User',
+		outcome: 'Executed',
+		detail: ''
+	});
+	assert.equal(plain?.mutation, null);
+
+	const broken = parseActivityRecord({
+		timestamp_ms: 1,
+		principal: 'User',
+		outcome: 'Executed',
+		detail: '',
+		mutation: { before_sha256: 'abc' }
+	});
+	assert.equal(broken?.mutation, null);
+
+	assert.equal(shortHash(null), null);
+	assert.equal(shortHash('abc'), 'abc');
+	assert.equal(shortHash('aaaabbbbccccdddd'), 'aaaa…dddd');
 });
 
 test('garbage records are dropped', () => {

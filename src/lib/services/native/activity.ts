@@ -4,6 +4,12 @@
 // method (Rust `audit_core::AuditRecord`: time, tool, status, resource,
 // principal, duration); details are redacted at record time.
 
+export interface MutationWitness {
+	path: string;
+	before_sha256: string | null;
+	after_sha256: string | null;
+}
+
 export interface ActivityRecord {
 	timestamp_ms: number;
 	principal: string;
@@ -12,6 +18,9 @@ export interface ActivityRecord {
 	outcome: string;
 	detail: string;
 	duration_ms: number | null;
+	/** File-mutation witness for writes (plan Phase 10): short hashes,
+	 * never contents. Null for reads and policy-only records. */
+	mutation: MutationWitness | null;
 }
 
 /** Parse one Rust audit record into presentation shape. Returns null for
@@ -27,8 +36,25 @@ export function parseActivityRecord(data: unknown): ActivityRecord | null {
 		resource: summarizeResource(d.resource),
 		outcome: d.outcome,
 		detail: typeof d.detail === 'string' ? d.detail : '',
-		duration_ms: typeof d.duration_ms === 'number' ? d.duration_ms : null
+		duration_ms: typeof d.duration_ms === 'number' ? d.duration_ms : null,
+		mutation: parseMutationWitness(d.mutation)
 	};
+}
+
+/** Parse the audit mutation witness. Anything malformed yields null —
+ * a broken witness must not drop the whole record. */
+function parseMutationWitness(data: unknown): MutationWitness | null {
+	if (typeof data !== 'object' || data === null) return null;
+	const m = data as Record<string, unknown>;
+	if (typeof m.path !== 'string') return null;
+	const hash = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+	return { path: m.path, before_sha256: hash(m.before_sha256), after_sha256: hash(m.after_sha256) };
+}
+
+/** Short hash for display, e.g. "a3f9…c21e". Null stays null. */
+export function shortHash(hash: string | null): string | null {
+	if (hash === null || hash.length < 16) return hash;
+	return `${hash.slice(0, 4)}…${hash.slice(-4)}`;
 }
 
 function summarizePrincipal(principal: unknown): string {

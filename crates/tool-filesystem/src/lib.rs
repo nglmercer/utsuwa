@@ -261,6 +261,7 @@ impl tool_core::Tool for ReadTool {
         Ok(ToolOutput {
             content: serde_json::json!({ "path": path.to_string_lossy(), "content": text }),
             truncated: bytes.truncated,
+            mutation: None,
         })
     }
 }
@@ -319,6 +320,7 @@ impl tool_core::Tool for ReadRangeTool {
                 "content": String::from_utf8_lossy(&bytes.content),
             }),
             truncated: bytes.truncated,
+            mutation: None,
         })
     }
 }
@@ -432,6 +434,7 @@ impl tool_core::Tool for SearchTextTool {
                 "matches": matches,
             }),
             truncated,
+            mutation: None,
         })
     }
 }
@@ -533,6 +536,7 @@ impl tool_core::Tool for GlobTool {
                 "paths": paths,
             }),
             truncated,
+            mutation: None,
         })
     }
 }
@@ -733,6 +737,7 @@ impl tool_core::Tool for PatchTool {
                 )));
             }
         }
+        let before_hash = sha256_hex(&current);
         let mut text = String::from_utf8(current)
             .map_err(|_| failed(format!("'{}' is not valid UTF-8", path.display())))?;
         for replacement in &replacements {
@@ -760,11 +765,17 @@ impl tool_core::Tool for PatchTool {
             let _ = std::fs::remove_file(&temp);
             return Err(failed(err.to_string()));
         }
+        let after_hash = sha256_hex(text.as_bytes());
         Ok(ToolOutput::new(serde_json::json!({
             "path": path.to_string_lossy(),
             "replacements": replacements.len(),
-            "hash": sha256_hex(text.as_bytes()),
-        })))
+            "hash": after_hash,
+        }))
+        .with_mutation(tool_core::MutationEvidence {
+            path: path.to_string_lossy().into_owned(),
+            before_sha256: Some(before_hash),
+            after_sha256: Some(after_hash),
+        }))
     }
 }
 
@@ -1136,6 +1147,14 @@ mod tests {
         assert_eq!(
             out.content["hash"].as_str().unwrap(),
             &sha256_hex(b"hello rust")
+        );
+        // Mutation evidence witnesses the change for the audit log.
+        let evidence = out.mutation.as_ref().expect("patch attaches evidence");
+        assert_eq!(evidence.path, file.to_string_lossy());
+        assert_eq!(evidence.before_sha256.as_deref(), Some(hash.as_str()));
+        assert_eq!(
+            evidence.after_sha256.as_deref(),
+            Some(sha256_hex(b"hello rust").as_str())
         );
     }
 

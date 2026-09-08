@@ -51,6 +51,7 @@ dependencies = [
  "policy-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
  "tool-core",
@@ -372,6 +373,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tool-core",
 ]
 
 [[package]]
@@ -3088,6 +3090,7 @@ dependencies = [
  "plugin-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
  "tool-core",

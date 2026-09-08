@@ -165,6 +165,21 @@ async fn cross_plugin_ticket_rejected() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+fn fs_writer_wat(path: &str, data: &str) -> String {
+    format!(
+        r#"(module
+  (import "utsuwa" "host.fs.write" (func $write (param i32 i32 i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{path}")
+  (data (i32.const 512) "{data}")
+  {ALLOC_FN}
+  (func (export "invoke") (param i32 i32) (result i64)
+    (call $write (i32.const 0) (i32.const {plen}) (i32.const 512) (i32.const {dlen}))))"#,
+        plen = path.len(),
+        dlen = data.len()
+    )
+}
+
 fn fs_reader_wat(path: &str) -> String {
     format!(
         r#"(module
@@ -242,6 +257,47 @@ fn logger_wat(lines: usize) -> String {
 {calls}
     (i64.or (i64.shl (i64.extend_i32_u (i32.const 64)) (i64.const 32)) (i64.const 2))))"#
     )
+}
+
+#[tokio::test]
+async fn guest_file_write_leaves_mutation_evidence() {
+    use sha2::{Digest, Sha256};
+    let hash = |s: &[u8]| format!("{:x}", Sha256::digest(s));
+
+    let root = test_dir("fswrite");
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("out.txt");
+    std::fs::write(&file, "before-guest").unwrap();
+    let scope = root.to_string_lossy().to_string();
+
+    let rt = setup(
+        &root,
+        "fswrite",
+        &format!("read = []\nwrite = [\"{scope}\"]"),
+        &fs_writer_wat(&file.to_string_lossy(), "after-guest"),
+    );
+    let tool_id = bridge_tool_id("fswrite", "run");
+    let reg = registered(&rt, &tool_id);
+
+    let out = reg
+        .invoke(&tool_id, invoke_ctx("fswrite", "run"), serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(out.content["ok"], true, "envelope: {}", out.content);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "after-guest");
+    // The audit witness: path + before/after hashes, never contents.
+    let evidence = out.mutation.as_ref().expect("write attaches evidence");
+    assert_eq!(evidence.path, file.to_string_lossy());
+    assert_eq!(
+        evidence.before_sha256.as_deref(),
+        Some(hash(b"before-guest").as_str())
+    );
+    assert_eq!(
+        evidence.after_sha256.as_deref(),
+        Some(hash(b"after-guest").as_str())
+    );
+
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test]

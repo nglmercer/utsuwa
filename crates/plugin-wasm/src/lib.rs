@@ -85,6 +85,8 @@ struct ActiveCall {
     write_ticket: Option<capability_core::CapabilityTicket>,
     invocation: InvocationId,
     logs: Vec<String>,
+    /// One entry per successful guest file write, in order.
+    mutations: Vec<tool_core::MutationEvidence>,
 }
 
 struct StoreData {
@@ -363,12 +365,12 @@ impl PluginRuntime {
 
     /// Call a loaded tool: ticket-checked by the caller (bridge), executed
     /// here under fuel with per-call state. Returns raw guest bytes plus
-    /// captured logs.
+    /// captured logs and file-mutation evidence, in order.
     fn call_tool(
         &self,
         id: &str,
         args_json: &[u8],
-    ) -> Result<(Vec<u8>, Vec<String>), WasmError> {
+    ) -> Result<(Vec<u8>, Vec<String>, Vec<tool_core::MutationEvidence>), WasmError> {
         let instances = self
             .instances
             .lock()
@@ -419,8 +421,11 @@ impl PluginRuntime {
         memory
             .read(&mut *store, ret_ptr, &mut out)
             .map_err(|e| WasmError::Abi(format!("cannot read guest result: {e}")))?;
-        let logs = store.data_mut().call.take().map(|c| c.logs).unwrap_or_default();
-        Ok((out, logs))
+        let call = store.data_mut().call.take();
+        let (logs, mutations) = call
+            .map(|c| (c.logs, c.mutations))
+            .unwrap_or_default();
+        Ok((out, logs, mutations))
     }
 
     /// Install per-invocation guest authority before a bridge call.
@@ -476,6 +481,7 @@ impl PluginRuntime {
             write_ticket: mint(Capability::FilesystemWrite, scope_of(&manifest.filesystem.write)),
             invocation,
             logs: Vec::new(),
+            mutations: Vec::new(),
         };
         let instances = self
             .instances
@@ -519,6 +525,28 @@ fn read_guest_str(
         .read(caller, ptr as usize, &mut buf)
         .map_err(|_| wasmtime::Error::msg("string outside guest memory"))?;
     Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Cap on witnessed pre-write bytes: larger files witness as `before:
+/// None` rather than paying unbounded I/O inside the sandbox call.
+const MAX_WITNESS_BYTES: u64 = 1 << 20;
+
+/// Hash the current file bytes before a guest overwrite. A missing file
+/// hashes as `None` (created file); an oversized one too.
+fn witness_before(path: &str) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(MAX_WITNESS_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > MAX_WITNESS_BYTES {
+        return None;
+    }
+    Some(sha256_hex(&buf))
 }
 
 fn guest_alloc(caller: &mut Caller<'_, StoreData>, len: usize) -> Result<usize, wasmtime::Error> {
@@ -651,16 +679,31 @@ fn host_fs_write(
     memory
         .read(&mut caller, data_ptr as usize, &mut data)
         .map_err(|_| wasmtime::Error::msg("data outside guest memory"))?;
-    let envelope = match ticket_check(
+    let authorized = ticket_check(
         &caller,
         Capability::FilesystemWrite,
         Resource::Path(path.clone().into()),
-    ) {
+    );
+    let envelope = match authorized {
         Err(reason) => serde_json::json!({"ok": false, "error": reason}),
-        Ok(()) => match std::fs::write(&path, &data) {
-            Err(e) => serde_json::json!({"ok": false, "error": format!("write failed: {e}")}),
-            Ok(()) => serde_json::json!({"ok": true, "bytes": data.len()}),
-        },
+        Ok(()) => {
+            // Witness the pre-write bytes first: the audit log records
+            // before/after hashes, never contents.
+            let before = witness_before(&path);
+            match std::fs::write(&path, &data) {
+                Err(e) => serde_json::json!({"ok": false, "error": format!("write failed: {e}")}),
+                Ok(()) => {
+                    if let Some(call) = caller.data_mut().call.as_mut() {
+                        call.mutations.push(tool_core::MutationEvidence {
+                            path: path.clone(),
+                            before_sha256: before,
+                            after_sha256: Some(sha256_hex(&data)),
+                        });
+                    }
+                    serde_json::json!({"ok": true, "bytes": data.len()})
+                }
+            }
+        }
     };
     return_guest_bytes(&mut caller, envelope.to_string().as_bytes())
 }
@@ -765,7 +808,7 @@ impl Tool for PluginToolBridge {
                 ctx.invocation_id.clone(),
             )
             .map_err(|e| failed(e.to_string()))?;
-        let (bytes, logs) = self
+        let (bytes, logs, mutations) = self
             .runtime
             .call_tool(&self.id, &args_json)
             .map_err(|e| failed(e.to_string()))?;
@@ -776,7 +819,12 @@ impl Tool for PluginToolBridge {
         if !logs.is_empty() {
             content["guest_log"] = serde_json::json!(logs);
         }
-        Ok(ToolOutput::new(content))
+        let mut output = ToolOutput::new(content);
+        // One audit slot per tool call: keep the last write's evidence.
+        if let Some(evidence) = mutations.into_iter().last() {
+            output = output.with_mutation(evidence);
+        }
+        Ok(output)
     }
 }
 
