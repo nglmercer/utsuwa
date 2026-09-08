@@ -85,6 +85,7 @@ pub struct AgentRuntime {
     mcp: Arc<McpManager>,
     plugins: Arc<plugin_wasm::PluginRuntime>,
     memory: Mutex<Arc<memory::MemoryStore>>,
+    desktop: Mutex<Arc<dyn tool_desktop::DesktopBackend>>,
     storage: Option<Arc<Mutex<Storage>>>,
     state: Mutex<State>,
     executor: tokio::runtime::Runtime,
@@ -138,6 +139,7 @@ impl AgentRuntime {
                 memory::MemoryStore::open_in_memory()
                     .map_err(|e| RuntimeError::Tools(e.to_string()))?,
             )),
+            desktop: Mutex::new(tool_desktop::backend()),
             storage,
             state: Mutex::new(State {
                 generation: 0,
@@ -207,6 +209,16 @@ impl AgentRuntime {
                     .expect("in-memory memory store always opens"),
             )
         })
+    }
+
+    /// Install the desktop backend (boot only, or tests with a fake).
+    /// The turn registers `desktop.*` tools only while the backend
+    /// reports availability — with the stub backend the model never
+    /// sees actions that cannot run.
+    pub fn set_desktop_backend(&self, backend: Arc<dyn tool_desktop::DesktopBackend>) {
+        if let Ok(mut slot) = self.desktop.lock() {
+            *slot = backend;
+        }
     }
 
     /// Sync the MCP server set from settings and register every enabled
@@ -290,6 +302,36 @@ impl AgentRuntime {
         ] {
             if let Err(e) = registry.register(tool) {
                 tracing::warn!(error = %e, "memory tool registration failed");
+            }
+        }
+    }
+
+    /// Register `desktop.*` tools while a real backend is present. With
+    /// the stub backend nothing registers: every desktop call stays
+    /// behind policy + tickets, and unavailable actions stay invisible.
+    fn attach_desktop_tools(&self, registry: &mut ToolRegistry) {
+        let backend = match self.desktop.lock() {
+            Ok(backend) => Arc::clone(&backend),
+            Err(_) => {
+                tracing::warn!("desktop backend lock failed; skipping desktop tools this turn");
+                return;
+            }
+        };
+        if !backend.is_available() {
+            return;
+        }
+        use tool_desktop::tools::*;
+        for tool in [
+            Arc::new(ListWindowsTool { backend: backend.clone() }) as Arc<dyn tool_core::Tool>,
+            Arc::new(AccessibilityTreeTool { backend: backend.clone() }),
+            Arc::new(InvokeElementTool { backend: backend.clone() }),
+            Arc::new(SetValueTool { backend: backend.clone() }),
+            Arc::new(ScreenshotTool { backend: backend.clone() }),
+            Arc::new(ClickTool { backend: backend.clone() }),
+            Arc::new(TypeTextTool { backend }),
+        ] {
+            if let Err(e) = registry.register(tool) {
+                tracing::warn!(error = %e, "desktop tool registration failed");
             }
         }
     }
@@ -447,6 +489,7 @@ impl AgentRuntime {
         self.attach_mcp_tools(&mut registry).await;
         self.attach_plugin_tools(&mut registry);
         self.attach_memory_tools(&mut registry);
+        self.attach_desktop_tools(&mut registry);
         let policy = match self.approvals.lock() {
             Ok(queue) => queue.context(),
             Err(_) => {
@@ -980,6 +1023,90 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "concise answers preferred");
         assert_eq!(entries[0].importance, 6);
+    }
+
+    struct FakeDesktop;
+
+    #[async_trait::async_trait]
+    impl tool_desktop::DesktopBackend for FakeDesktop {
+        async fn list_windows(&self) -> Result<Vec<tool_desktop::WindowInfo>, tool_desktop::DesktopError> {
+            Ok(vec![tool_desktop::WindowInfo {
+                id: "w1".to_string(),
+                title: "Notes".to_string(),
+                app: "notes".to_string(),
+            }])
+        }
+        async fn accessibility_tree(
+            &self,
+            _window_id: &str,
+        ) -> Result<Vec<tool_desktop::ElementNode>, tool_desktop::DesktopError> {
+            Ok(vec![])
+        }
+        async fn invoke_element(&self, _window_id: &str, _element_id: &str) -> Result<(), tool_desktop::DesktopError> {
+            Ok(())
+        }
+        async fn set_value(
+            &self,
+            _window_id: &str,
+            _element_id: &str,
+            _value: &str,
+        ) -> Result<(), tool_desktop::DesktopError> {
+            Ok(())
+        }
+        async fn screenshot(
+            &self,
+            _window_id: Option<&str>,
+        ) -> Result<tool_desktop::Screenshot, tool_desktop::DesktopError> {
+            Err(tool_desktop::DesktopError::ActionFailed("no display".to_string()))
+        }
+        async fn click(
+            &self,
+            _window_id: Option<&str>,
+            _at: tool_desktop::Point,
+        ) -> Result<(), tool_desktop::DesktopError> {
+            Ok(())
+        }
+        async fn type_text(&self, _window_id: Option<&str>, _text: &str) -> Result<(), tool_desktop::DesktopError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn desktop_tools_join_the_turn_behind_policy() {
+        let invoke_turn = vec![
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: "d1".to_string(),
+                name: "desktop.invoke_element".to_string(),
+                arguments: serde_json::json!({
+                    "window_id": "w1",
+                    "element_id": "e1",
+                })
+                .to_string(),
+            }),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ];
+        let grant = policy_core::GrantedScope {
+            principal_kind: capability_core::PrincipalKind::Agent,
+            capability: capability_core::Capability::DesktopControl,
+            scope: capability_core::ResourceScope::new(vec![
+                capability_core::Resource::Window("w1".to_string()),
+            ]),
+            lifetime: policy_core::GrantLifetime::Persistent,
+        };
+        let provider = QueueProvider::new(vec![invoke_turn, text_turn("pressed")]);
+        let harness = harness_with(provider, vec![grant]);
+
+        // With the stub backend the model never sees desktop tools; with a
+        // backend installed they join the turn like any other tool source.
+        harness.runtime.set_desktop_backend(Arc::new(FakeDesktop));
+        harness.runtime.send_message("press save".to_string()).unwrap();
+        let done = wait_for(&harness, "agent.turn_done");
+        let executed = done.data["executed"].as_array().unwrap();
+        assert_eq!(executed.len(), 1, "{executed:?}");
+        assert_eq!(executed[0]["name"], "desktop.invoke_element");
+        assert_eq!(executed[0]["output"]["ok"], true);
     }
 
     #[test]

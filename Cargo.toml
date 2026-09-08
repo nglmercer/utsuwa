@@ -18,6 +18,7 @@ members = [
     "crates/plugin-core",
     "crates/plugin-wasm",
     "crates/memory",
+    "crates/tool-desktop",
 ]
 exclude = ["src-tauri"]
 
@@ -54,6 +55,7 @@ memory = { path = "crates/memory" }
 plugin-core = { path = "crates/plugin-core" }
 plugin-wasm = { path = "crates/plugin-wasm" }
 tool-core = { path = "crates/tool-core" }
+tool-desktop = { path = "crates/tool-desktop" }
 tool-filesystem = { path = "crates/tool-filesystem" }
 tool-process = { path = "crates/tool-process" }
 tokio = { version = "1", features = ["full"] }

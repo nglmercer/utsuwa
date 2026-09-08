@@ -16,6 +16,7 @@ secret-core.workspace = true
 mcp-runtime.workspace = true
 memory.workspace = true
 plugin-wasm.workspace = true
+tool-desktop.workspace = true
 tool-core.workspace = true
 tool-filesystem.workspace = true
 tool-process.workspace = true
