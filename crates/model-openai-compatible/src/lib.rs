@@ -730,6 +730,91 @@ mod tests {
     }
 
     #[test]
+    fn openai_request_uses_standard_function_tool_shape() {
+        let mut request = ModelRequest::new(vec![ModelMessage::user("inspect")]);
+        request.tools.push(model_core::ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: "Read a file".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        });
+
+        let tool = &request_body("test-model", &request)["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "filesystem.read");
+        assert_eq!(tool["function"]["description"], "Read a file");
+        assert_eq!(tool["function"]["parameters"]["required"][0], "path");
+    }
+
+    #[test]
+    fn assembler_preserves_multiple_tool_calls_and_split_arguments() {
+        let mut asm = SseAssembler::default();
+        let line = |delta: serde_json::Value, finish_reason: Option<&str>| {
+            let mut choice = serde_json::json!({"delta": delta});
+            if let Some(reason) = finish_reason {
+                choice["finish_reason"] = serde_json::Value::String(reason.to_string());
+            }
+            format!("data: {}", serde_json::json!({"choices": [choice]}))
+        };
+
+        asm.feed_line(&line(
+            serde_json::json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "read-1",
+                    "function": {"name": "filesystem.read", "arguments": "{\"path\":\""}
+                }]
+            }),
+            None,
+        ));
+        asm.feed_line(&line(
+            serde_json::json!({
+                "tool_calls": [{
+                    "index": 1,
+                    "id": "status-1",
+                    "function": {"name": "process.status", "arguments": "{\"handle\":\""}
+                }]
+            }),
+            None,
+        ));
+        asm.feed_line(&line(
+            serde_json::json!({
+                "tool_calls": [
+                    {"index": 0, "function": {"arguments": "notes.txt\"}"}},
+                    {"index": 1, "function": {"arguments": "proc-1\"}"}}
+                ]
+            }),
+            Some("tool_calls"),
+        ));
+
+        assert_eq!(
+            asm.pop(),
+            Some(ModelStreamEvent::ToolCall(ToolCall {
+                id: "read-1".to_string(),
+                name: "filesystem.read".to_string(),
+                arguments: r#"{"path":"notes.txt"}"#.to_string(),
+            }))
+        );
+        assert_eq!(
+            asm.pop(),
+            Some(ModelStreamEvent::ToolCall(ToolCall {
+                id: "status-1".to_string(),
+                name: "process.status".to_string(),
+                arguments: r#"{"handle":"proc-1"}"#.to_string(),
+            }))
+        );
+        assert_eq!(
+            asm.pop(),
+            Some(ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls
+            })
+        );
+    }
+
+    #[test]
     fn done_marker_without_finish_reason_still_terminates() {
         let mut asm = SseAssembler::default();
         asm.feed_line(r#"data: {"choices":[{"delta":{"content":"x"}}]}"#);
@@ -797,6 +882,7 @@ mod tests {
         let body = anthropic_request_body("claude-test", &request);
         assert_eq!(body["system"], "system prompt");
         assert_eq!(body["tools"][0]["name"], "process.spawn");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
         assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call-1");
@@ -808,9 +894,18 @@ mod tests {
         assembler.feed_line(
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"system.echo","input":{}}}"#,
         );
-        assembler.feed_line(
-            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"text\":\"hi\"}"}}"#,
-        );
+        let input_delta = |partial_json: &str| {
+            format!(
+                "data: {}",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": partial_json}
+                })
+            )
+        };
+        assembler.feed_line(&input_delta(r##"{"text":""##));
+        assembler.feed_line(&input_delta(r#"hi"}"#));
         assembler.feed_line(r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#);
         assembler.feed_line(r#"data: {"type":"message_stop"}"#);
         assert_eq!(

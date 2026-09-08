@@ -1,5 +1,10 @@
 import { browser } from '$app/environment';
-import { getBridge, HOST_EVENT, isHostEvent } from './bridge';
+import {
+	getBridge,
+	HOST_EVENT,
+	isHostEvent,
+	NATIVE_BRIDGE_UNAVAILABLE_ERROR
+} from './bridge';
 import {
 	initialAgentChatState,
 	parseAgentTurnEvent,
@@ -44,7 +49,7 @@ export async function sendAgentMessage(
 	onDelta?: (fullContent: string) => void
 ): Promise<TurnDone> {
 	const bridge = getBridge();
-	if (!bridge) throw new Error('agent.send_message needs the native host bridge');
+	if (!bridge) throw new Error(NATIVE_BRIDGE_UNAVAILABLE_ERROR);
 	attachAgentListener();
 	state = reduceAgentSend(state);
 

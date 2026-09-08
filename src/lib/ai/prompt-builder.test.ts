@@ -133,6 +133,17 @@ test('systemEvent renders an <event> layer in both modes', () => {
 	assert.ok(!plain.includes('<event>'));
 });
 
+test('native prompts explain tool behavior without hard-coding a tool list', () => {
+	const native = buildSystemPrompt(makeContext({ nativeRuntime: true }));
+	assert.ok(native.includes('<native_agent_tools>'));
+	assert.ok(native.includes('use the tools supplied with the current model request'));
+	assert.ok(native.includes('Never claim a tool operation succeeded'));
+	assert.ok(!native.includes('filesystem.list'));
+
+	const browser = buildSystemPrompt(makeContext());
+	assert.ok(!browser.includes('<native_agent_tools>'));
+});
+
 test('extraction prompt only mentions images when there are images', () => {
 	assert.ok(buildExtractionSystemPrompt(true).includes('showed the companion an image'));
 	assert.ok(!buildExtractionSystemPrompt(false).includes('showed the companion an image'));

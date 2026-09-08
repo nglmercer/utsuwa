@@ -765,6 +765,17 @@ impl AgentRuntime {
         self.attach_plugin_tools(&mut registry);
         self.attach_memory_tools(&mut registry);
         self.attach_desktop_tools(&mut registry);
+        let tool_ids: Vec<String> = registry
+            .list()
+            .into_iter()
+            .map(|metadata| metadata.id.0)
+            .collect();
+        tracing::debug!(
+            native_bridge = true,
+            registered_tool_count = tool_ids.len(),
+            registered_tool_ids = ?tool_ids,
+            "native agent tool registry ready"
+        );
         let authorizer = QueueAuthorizer {
             approvals: Arc::clone(&self.approvals),
             task_id: task_id.clone(),
@@ -879,8 +890,9 @@ impl AgentRuntime {
 }
 
 /// Tools the agent may call, all behind policy + tickets: the
-/// filesystem plugin's declared capabilities (read/search/patch/write)
-/// plus structured process execution (spawn/status/kill, no shell).
+/// filesystem plugin's declared capabilities (list/stat/read/read_range/
+/// search_text/glob/patch/write) plus structured process execution
+/// (spawn/status/kill, no shell).
 fn default_registry(processes: &Arc<ProcessManager>) -> Result<ToolRegistry, RuntimeError> {
     let mut registry = ToolRegistry::new();
     let mut fs_plugins = tool_filesystem::plugin::FsPluginRegistry::new();
@@ -936,6 +948,7 @@ fn provider_factory_with_secrets(
         // by treating them as generic OpenAI-compatible endpoints.
         let provider = get(SETTING_PROVIDER)?.unwrap_or_else(|| "openai-compatible".to_string());
         let api_key = resolve_api_key(&storage, secrets.as_ref())?;
+        tracing::debug!(provider = %provider, model = %name, "native agent provider selected");
         if provider == "anthropic" {
             let api_key = api_key.ok_or(RuntimeError::ModelNotConfigured)?;
             Ok(Arc::new(AnthropicClient::new(base_url, api_key, name)) as Arc<dyn ModelProvider>)
@@ -1131,8 +1144,25 @@ mod tests {
         assert_eq!(done.data["text"], "hello there");
         assert!(harness.approvals.lock().unwrap().list().is_empty());
         let tools = &provider.seen.lock().unwrap()[0].tools;
-        assert!(tools.iter().any(|tool| tool.name == "filesystem.read"));
-        assert!(tools.iter().any(|tool| tool.name == "process.spawn"));
+        let expected = [
+            "filesystem.list",
+            "filesystem.stat",
+            "filesystem.read",
+            "filesystem.read_range",
+            "filesystem.search_text",
+            "filesystem.glob",
+            "filesystem.patch",
+            "filesystem.write",
+            "process.spawn",
+            "process.status",
+            "process.kill",
+        ];
+        for tool_id in expected {
+            assert!(
+                tools.iter().any(|tool| tool.name == tool_id),
+                "native request is missing {tool_id}"
+            );
+        }
     }
 
     #[test]
@@ -1185,6 +1215,123 @@ mod tests {
             .unwrap()
             .contains("project notes alpha"));
         assert!(harness.approvals.lock().unwrap().list().is_empty());
+    }
+
+    #[test]
+    fn native_filesystem_read_round_trip_reaches_final_model_response() {
+        struct ReadbackProvider {
+            calls: Mutex<usize>,
+            seen: Mutex<Vec<ModelRequest>>,
+            path: String,
+        }
+
+        #[async_trait::async_trait]
+        impl ModelProvider for ReadbackProvider {
+            async fn stream(
+                &self,
+                request: ModelRequest,
+            ) -> Result<model_core::ModelStream, ModelError> {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                let call_number = *calls;
+                drop(calls);
+                self.seen.lock().unwrap().push(request.clone());
+
+                // The first call suspends for approval; after approval the
+                // host intentionally re-runs the model so it can re-issue
+                // the tool call, then receives a third call with the result.
+                let turn = if call_number <= 2 {
+                    read_turn(&self.path)
+                } else {
+                    let result = request
+                        .messages
+                        .iter()
+                        .find_map(|message| message.tool_result.as_ref())
+                        .expect("tool result must be attached before the final model call");
+                    let output: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                    let content = output["content"].as_str().unwrap_or_default();
+                    text_turn(&format!("The file says: {content}"))
+                };
+                Ok(Box::pin(futures_util::stream::iter(
+                    turn.into_iter().map(Ok),
+                )))
+            }
+        }
+
+        let (dir, path) = temp_project("native-round-trip");
+        std::fs::write(&path, "hello from utsuwa").unwrap();
+        let provider = Arc::new(ReadbackProvider {
+            calls: Mutex::new(0),
+            seen: Mutex::new(Vec::new()),
+            path: path.clone(),
+        });
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let runtime = AgentRuntime::start_with_factory(
+            Arc::clone(&approvals),
+            None,
+            None,
+            Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }),
+            Arc::new({
+                let provider = Arc::clone(&provider);
+                move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)
+            }),
+        )
+        .unwrap();
+        let harness = Harness {
+            runtime,
+            approvals,
+            events,
+        };
+
+        harness
+            .runtime
+            .send_message("read notes.txt".to_string())
+            .unwrap();
+        let requested = wait_for(&harness, "permission.requested");
+        assert_eq!(requested.data["capability"], "FilesystemRead");
+        let suspended = wait_for(&harness, "agent.turn_suspended");
+        let request_id = suspended.data["request_id"].as_str().unwrap().to_string();
+        let pending = harness.approvals.lock().unwrap().list()[0].clone();
+        assert_eq!(pending.id, request_id);
+
+        harness
+            .approvals
+            .lock()
+            .unwrap()
+            .decide(&request_id, Some(policy_core::GrantLifetime::Session))
+            .unwrap();
+        harness.runtime.notify_decided(&request_id, true);
+
+        let done = wait_for(&harness, "agent.turn_done");
+        assert_eq!(done.data["text"], "The file says: hello from utsuwa");
+        assert_eq!(done.data["executed"].as_array().unwrap().len(), 1);
+        assert_eq!(done.data["executed"][0]["name"], "filesystem.read");
+        assert_eq!(
+            done.data["executed"][0]["output"]["content"],
+            "hello from utsuwa"
+        );
+
+        let seen = provider.seen.lock().unwrap();
+        assert!(seen[0]
+            .tools
+            .iter()
+            .any(|tool| tool.name == "filesystem.read"));
+        // The approved turn re-issues the call once; the following model
+        // request is the first one that can contain its result.
+        let result = seen[2]
+            .messages
+            .iter()
+            .find_map(|message| message.tool_result.as_ref())
+            .expect("native tool result must be in the next model request");
+        assert_eq!(result.tool_call_id, "r1");
+        assert!(!result.is_error);
+        assert!(result.content.contains("hello from utsuwa"));
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

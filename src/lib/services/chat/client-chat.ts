@@ -38,7 +38,8 @@ function getCurrentSiteOrigin(): string | undefined {
 
 /**
  * Stream chat completions directly from provider APIs.
- * Used for local providers and Tauri builds where SvelteKit server routes aren't available.
+ * Used for local providers in a normal browser. The native host uses
+ * AgentRuntime instead so its tool registry and approval loop stay in charge.
  */
 export async function streamChatDirect(
 	options: ChatOptions,

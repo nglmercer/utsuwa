@@ -1,7 +1,8 @@
 // The one companion send/stream pipeline, shared by the main app and the
 // desktop overlay. Both pages used to carry ~180 near-identical lines each,
 // which had already drifted (the overlay forgot to filter empty messages). This
-// centralizes prompt building, streaming (direct vs. server route), the
+// centralizes prompt building, streaming (native agent, direct, or server
+// route), the
 // post-turn processing, keepsakes, TTS, and the talking animation. Pages provide
 // a small set of hooks to sync their own reactive state.
 import { characterStore } from '$lib/stores/character.svelte';
@@ -22,9 +23,10 @@ import { extractReminderTags, tryExtractReminderFromUserMessage } from '$lib/uti
 import { reminderStore } from '$lib/stores/reminders.svelte';
 import { getWorkingMemory, ensureSession } from '$lib/engine/memory';
 import { toOpenAIContent, type ContentPart } from '$lib/services/chat/content';
-import { isDesktopBuild } from '$lib/services/platform';
+import { isDesktopBuildExpected, isNativeRuntimeAvailable } from '$lib/services/platform';
 import { sendAgentMessage } from '$lib/services/native/agent.svelte';
 import { syncNativeModelProvider } from '$lib/services/native/model-settings';
+import { selectCompanionTransport } from './transport';
 import type { LLMProvider, TTSProvider } from '$lib/types';
 import type { EventDefinition } from '$lib/types/events';
 
@@ -49,7 +51,8 @@ async function buildCompanionPrompt(
 	userMessage: string,
 	hasImages: boolean,
 	contextSize?: number,
-	systemEvent?: string
+	systemEvent?: string,
+	nativeRuntime = false
 ): Promise<string> {
 	const workingMemory = getWorkingMemory();
 	const context: PromptContext = {
@@ -62,7 +65,8 @@ async function buildCompanionPrompt(
 		contextSize,
 		pendingReminders: reminderStore.upcoming.map((r) => ({ triggerAt: r.triggerAt, content: r.content })),
 		sessionStartedAt: workingMemory.sessionStartedAt,
-		systemEvent
+		systemEvent,
+		nativeRuntime
 	};
 	return buildSystemPrompt(context);
 }
@@ -196,12 +200,31 @@ export async function sendCompanionMessage(
 		}
 
 		const contextSize = (consciousnessSettings.contextSize as number | undefined) || undefined;
-		const systemPrompt = await buildCompanionPrompt(content, images.length > 0, contextSize, systemEvent ? content : undefined);
 		const providerConfig = settingsStore.getProviderConfig(provider);
 		const apiKey = providerConfig.apiKey;
 		const providerMeta = getLLMProvider(provider);
-		const desktopBuild = isDesktopBuild();
-		if (!desktopBuild && providerMeta?.requiresApiKey && !apiKey) {
+		const nativeHostAvailable = isNativeRuntimeAvailable();
+		const transport = selectCompanionTransport({
+			nativeHostAvailable,
+			nativeBuildExpected: isDesktopBuildExpected(),
+			localProvider: providerMeta?.isLocal === true
+		});
+		const nativeRuntime = transport === 'native-agent';
+		if (import.meta.env.DEV) {
+			console.debug('[Chat] companion transport selected', {
+				nativeBridgeDetected: nativeHostAvailable,
+				chatTransport: transport,
+				provider
+			});
+		}
+		const systemPrompt = await buildCompanionPrompt(
+			content,
+			images.length > 0,
+			contextSize,
+			systemEvent ? content : undefined,
+			nativeRuntime
+		);
+		if (!nativeRuntime && providerMeta?.requiresApiKey && !apiKey) {
 			throw new Error(`Please configure API key for ${providerMeta.name} in Settings > Providers`);
 		}
 
@@ -234,7 +257,7 @@ export async function sendCompanionMessage(
 			: {};
 
 		let fullContent = '';
-		if (desktopBuild) {
+		if (transport === 'native-agent') {
 			// The desktop companion always goes through AgentRuntime. This is the
 			// only model path that can expose native tools and enforce approvals.
 			const nativeSettingsReady = await syncNativeModelProvider(provider, selectedModel);
@@ -255,7 +278,7 @@ export async function sendCompanionMessage(
 					onDelta
 				)
 			).text;
-		} else if (providerMeta?.isLocal) {
+		} else if (transport === 'direct') {
 			// Local providers still use the existing direct browser transport on
 			// web builds, where there is no native host.
 			await new Promise<void>((resolve, reject) => {
@@ -303,10 +326,10 @@ export async function sendCompanionMessage(
 				model: selectedModel,
 				// The native runtime owns the model key on desktop. Do not pass it
 				// back into frontend post-processing state.
-				apiKey: desktopBuild ? undefined : apiKey || undefined,
+				apiKey: nativeRuntime ? undefined : apiKey || undefined,
 				baseURL,
 				hasImages: images.length > 0,
-				nativeRuntime: desktopBuild
+				nativeRuntime
 			},
 			systemEvent,
 			debug: import.meta.env.DEV

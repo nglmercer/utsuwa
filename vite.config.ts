@@ -9,11 +9,9 @@ export default defineConfig({
 	plugins: [sveltekit(), tailwindcss()],
 	define: {
 		'import.meta.env.VITE_APP_VERSION': JSON.stringify(pkg.version),
-		// True only for native desktop builds (UTSUWA_NATIVE=1, set when
-		// building the frontend for the app-host webview). Baked in at
-		// build time so routing decisions never depend on
-		// runtime-injected globals.
-		__IS_DESKTOP__: JSON.stringify(!!process.env.UTSUWA_NATIVE)
+		// Native packaging hint. Runtime bridge detection in platform.ts remains
+		// authoritative for dev WebViews, which may load Vite without this env.
+		__IS_DESKTOP__: JSON.stringify(process.env.UTSUWA_NATIVE === '1')
 	},
 	ssr: {
 		noExternal: ['bits-ui']

@@ -74,9 +74,10 @@ The 3D avatar system uses Three.js with Threlte (a Svelte wrapper) for integrati
 
 ### Chat System
 
-Messages flow through two transports:
+Messages flow through three transports:
+- **Native AgentRuntime (native host):** `sendAgentMessage()` over the `window.utsuwa` bridge; the Rust runtime supplies tools and enforces policy/approvals
+- **Direct fetch (web + local providers):** streams straight from the provider (`src/lib/services/chat/client-chat.ts`) — no native filesystem/process tools
 - **Server route (web + cloud providers):** SvelteKit route using the xsAI SDK (`src/routes/api/chat/+server.ts`)
-- **Direct fetch (local providers + desktop):** streams straight from the provider (`src/lib/services/chat/client-chat.ts`) — used for Ollama/LM Studio and all Tauri builds
 
 **Key files:**
 - `src/lib/components/chat/BottomChatBar.svelte` — User input interface (text, voice, and showing images)
@@ -349,10 +350,13 @@ The desktop app runs the same SvelteKit application inside `crates/app-host`, a 
 
 ### Platform Layer
 
-A small platform module marks desktop-only routing. It is build-time, never runtime-detected:
+A small platform module separates the packaging hint from actual host presence. A
+native WebView injects `window.utsuwa` before page scripts run, so bridge
+presence is authoritative for runtime routing; the build flag remains useful
+for static/CSP and packaged-build expectations:
 
 **Key files:**
-- `src/lib/services/platform/platform.ts` — `isDesktopBuild()` (baked in via `UTSUWA_NATIVE=1`)
+- `src/lib/services/platform/platform.ts` — `isNativeRuntimeAvailable()` and `isDesktopBuild()`
 - `crates/app-host/src/dispatcher.rs` — typed IPC methods
 - `crates/app-host/src/protocol.rs` — `companion://app` custom scheme + navigation policy
 
@@ -361,10 +365,15 @@ A small platform module marks desktop-only routing. It is build-time, never runt
 import { isDesktopBuild } from '$lib/services/platform';
 
 if (isDesktopBuild()) {
-  // Native-host-only routing (no server routes exist there)
+  // Native-host-only UI and provider-settings routing
   await fetchModelsDirect(providerId, apiKey, baseUrl);
 }
 ```
+
+Companion chat uses the more specific runtime decision: a valid bridge always
+selects `sendAgentMessage()`, a browser local provider uses direct fetch, and a
+browser cloud provider uses `/api/chat`. A packaged native build with no
+bridge fails loudly instead of sending a tool-less request.
 
 ### Single-Window Architecture
 

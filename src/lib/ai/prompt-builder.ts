@@ -26,6 +26,8 @@ export interface PromptContext {
 	// Optional system event text (e.g. a fired reminder) delivered as an event
 	// block instead of a user turn.
 	systemEvent?: string;
+	// True only when this prompt is sent through the native Rust agent runtime.
+	nativeRuntime?: boolean;
 }
 
 function getContextMemoryBudget(contextSize?: number): MemoryBudget | undefined {
@@ -83,6 +85,7 @@ export function buildSystemPrompt(context: PromptContext): string {
 		buildMemoryLayer(context),
 		...(context.hasImages ? [buildBeingShownLayer()] : []),
 		buildEventLayer(context),
+		...(context.nativeRuntime ? [buildNativeAgentLayer()] : []),
 		buildInstructionLayer(context)
 	].filter((layer): layer is string => layer !== null);
 
@@ -150,6 +153,7 @@ Energy: ${energyDesc} (${ctx.state.energy}/100)
 
 	const eventLayer = buildEventLayer(ctx);
 	if (eventLayer) parts.push(eventLayer);
+	if (ctx.nativeRuntime) parts.push(buildNativeAgentLayer());
 
 	// Simple instructions (no relationship mechanics)
 	parts.push(`<instructions>
@@ -177,6 +181,20 @@ In Companion Mode, only mood and energy change. Do NOT suggest affection, trust,
 </instructions>`);
 
 	return parts.join('\n\n');
+}
+
+function buildNativeAgentLayer(): string {
+	return `<native_agent_tools>
+Native tools may be available in this session.
+
+When the user asks you to inspect, search, read, modify, or create local files, run commands, use memory, or interact with supported desktop functionality, use the tools supplied with the current model request.
+
+Do not claim that you lack filesystem, process, memory, plugin, MCP, or desktop access without first checking the tools available in the current turn.
+
+If a tool requires permission, issue the tool call normally so the application can request permission from the user.
+
+Never claim a tool operation succeeded unless the corresponding tool result confirms success.
+</native_agent_tools>`;
 }
 
 // System layer - meta instructions
@@ -563,4 +581,3 @@ export function truncateChatHistory<T extends { role: string; content: unknown }
 	const keptHistoryCount = messagesWithSystem.length - 1;
 	return messages.slice(-keptHistoryCount);
 }
-

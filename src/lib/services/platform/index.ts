@@ -1,4 +1,9 @@
-export { isDesktopBuild } from './platform';
+export {
+	isDesktopBuild,
+	isDesktopBuildExpected,
+	isNativeRuntimeAvailable,
+	hasNativeHost
+} from './platform';
 
 export {
 	setWindowPosition,

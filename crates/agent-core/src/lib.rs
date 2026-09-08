@@ -1,8 +1,7 @@
-//! Minimal agent runtime (plan Phase 14, Task 11).
+//! Native agent runtime (plan Phase 14+).
 //!
-//! Scope: one model turn without tools. The agent owns conversation state
-//! and streams text; tool calling, permission flow, and multi-iteration
-//! loops arrive in Task 12+. Hard limits apply from the first turn.
+//! The agent owns conversation state, streams text, and runs the bounded
+//! model → tool → model loop behind the policy/capability boundary.
 
 use audit_core::{AuditOutcome, AuditRecord, AuditSink};
 use capability_core::{AgentId, CapabilityRequest, CapabilityTicket, InvocationId, Principal};
@@ -344,6 +343,7 @@ impl Agent {
             .iter()
             .map(ToolDefinition::from_metadata)
             .collect();
+        let tool_ids: Vec<String> = tool_defs.iter().map(|tool| tool.name.clone()).collect();
         let invocation_id = InvocationId::fresh();
         let mut executed = Vec::new();
         let mut truncated = false;
@@ -353,10 +353,25 @@ impl Agent {
             let mut request = ModelRequest::new(messages.clone());
             request.max_tokens = Some(1024);
             request.tools = tool_defs.clone();
+            debug_assert_eq!(request.tools.len(), tool_defs.len());
+            tracing::debug!(
+                tool_count = request.tools.len(),
+                tool_ids = ?tool_ids,
+                "native agent model request includes tool definitions"
+            );
             let (text, calls, turn_truncated) = self.stream_turn(request).await?;
             truncated |= turn_truncated;
             final_text = text.clone();
             if calls.is_empty() {
+                if !tool_defs.is_empty() {
+                    // This is useful for distinguishing a missing Utsuwa
+                    // registry from a provider/model that accepted `tools`
+                    // but chose to return ordinary text.
+                    tracing::debug!(
+                        tool_count = tool_defs.len(),
+                        "model returned text after tools were supplied; tool calling may be unsupported"
+                    );
+                }
                 messages.push(ModelMessage::assistant(text.clone(), Vec::new()));
                 return Ok(AgentOutcome {
                     invocation_id,
@@ -374,6 +389,11 @@ impl Agent {
             let mut prepared = Vec::new();
             let mut results = Vec::new();
             for call in calls.iter().take(available) {
+                tracing::debug!(
+                    tool_call_id = %call.id,
+                    tool_name = %call.name,
+                    "model requested native tool"
+                );
                 if let Some(output) = self.replayed_output(registry, call) {
                     executed.push(ExecutedTool {
                         id: call.id.clone(),
@@ -714,6 +734,11 @@ impl Agent {
                     Some(elapsed_ms),
                     mutation,
                 );
+                tracing::debug!(
+                    tool_name = %call.name,
+                    success = true,
+                    "native tool execution succeeded"
+                );
                 self.emit(AgentEvent::ToolFinished {
                     id: call.id,
                     name: call.name,
@@ -729,6 +754,11 @@ impl Agent {
                     err.to_string(),
                     Some(elapsed_ms),
                     None,
+                );
+                tracing::debug!(
+                    tool_name = %call.name,
+                    success = false,
+                    "native tool execution failed"
                 );
                 self.emit(AgentEvent::ToolFinished {
                     id: call.id,
@@ -1006,6 +1036,78 @@ mod tests {
             model_core::ModelRole::Assistant
         );
         assert_eq!(outcome.messages.last().unwrap().content, "done");
+    }
+
+    #[tokio::test]
+    async fn multiple_tool_calls_keep_ids_and_results_in_transcript_order() {
+        let provider = Arc::new(QueueProvider::new(vec![
+            vec![
+                ModelStreamEvent::ToolCall(ToolCall {
+                    id: "call-a".to_string(),
+                    name: "system.echo".to_string(),
+                    arguments: r#"{"text":"a"}"#.to_string(),
+                }),
+                ModelStreamEvent::ToolCall(ToolCall {
+                    id: "call-b".to_string(),
+                    name: "system.echo".to_string(),
+                    arguments: r#"{"text":"b"}"#.to_string(),
+                }),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            text_turn("both results received"),
+        ]));
+        let outcome = Agent::new(Arc::clone(&provider) as Arc<dyn ModelProvider>)
+            .turn_with_tools(
+                vec![ModelMessage::user("echo twice")],
+                &registry_with_echo(),
+                &AuthorizationContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "both results received");
+        assert_eq!(outcome.executed.len(), 2);
+        assert_eq!(outcome.messages.len(), 5);
+        assert_eq!(outcome.messages[1].tool_calls[0].id, "call-a");
+        assert_eq!(outcome.messages[1].tool_calls[1].id, "call-b");
+        assert_eq!(
+            outcome.messages[2]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .tool_call_id,
+            "call-a"
+        );
+        assert_eq!(
+            outcome.messages[3]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .tool_call_id,
+            "call-b"
+        );
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].tools[0].name, "system.echo");
+        assert_eq!(
+            seen[1].messages[2]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .tool_call_id,
+            "call-a"
+        );
+        assert_eq!(
+            seen[1].messages[3]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .tool_call_id,
+            "call-b"
+        );
     }
 
     #[tokio::test]

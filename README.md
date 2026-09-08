@@ -211,12 +211,24 @@ To run the desktop app from source, you'll need the [Rust toolchain](https://rus
 # Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Run the desktop app (bundled frontend served by the host)
+# Build and run the desktop app (bundled frontend served by the host)
+pnpm build:native
 cargo run
 
-# Or against the Svelte dev server (run `pnpm dev` alongside)
+# Native frontend development (run this in one terminal)
+pnpm dev:native
+
+# Then run the Rust host in another terminal
 cargo run -- --dev
 ```
+
+Browser development uses `pnpm dev` and does not provide native filesystem or
+process access. Native development uses `pnpm dev:native` together with
+`cargo run -- --dev`; the Rust host installs the `window.utsuwa` IPC bridge and
+owns the permission-controlled AgentRuntime tools. The native runtime also
+detects that bridge at runtime, so a native host started against a plain
+`pnpm dev` server still uses AgentRuntime rather than silently falling back to
+a tool-less web request.
 
 #### Configuration
 
@@ -288,8 +300,10 @@ utsuwa/
 
 ```bash
 pnpm dev          # Start web development server
+pnpm dev:native   # Start Vite with the native packaging hint for the WebView
 pnpm test         # Run the test suite (node --test)
 pnpm build        # Build web app for production
+pnpm build:native # Build the static frontend for the native host
 pnpm preview      # Preview production build
 pnpm lint         # Type-check the project (svelte-check)
 pnpm check        # Same as lint (alias)

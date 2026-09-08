@@ -31,11 +31,21 @@ pnpm build
 cargo run
 ```
 
-`cargo run` serves the bundled frontend from `build/`. For frontend development with hot reload, run `pnpm dev` alongside and launch the host against it:
+`cargo run` serves the bundled frontend from `build/`. For frontend development with hot reload, run the native Vite script alongside the host:
 
 ```bash
+pnpm dev:native
 cargo run -- --dev
 ```
+
+`pnpm dev` remains the browser-only workflow. It does not expose the Rust
+filesystem or process runtime when opened in a normal browser. The native host
+installs `window.utsuwa`; Utsuwa uses that runtime bridge as the authoritative
+signal for native chat and routes native turns through AgentRuntime, including
+its policy, capability-ticket, and approval checks. A native WebView can still
+use AgentRuntime if it is pointed at a plain `pnpm dev` server, but
+`pnpm dev:native` also sets the packaging hint used for static/build-specific
+behavior.
 
 ## Updating
 
@@ -105,6 +115,6 @@ The desktop app uses:
 - **app-host** — Rust native host: agent runtime, tools, plugins, policy, storage
 - **wry + GTK** — WebView embedded in a GTK window (Wayland and X11 from one binary)
 - **Same SvelteKit codebase** — No fork, shared components
-- **Build-time detection** — `isDesktopBuild()` (baked in via `UTSUWA_NATIVE=1`) for desktop-only routing
+- **Runtime detection** — `isNativeRuntimeAvailable()` checks the injected `window.utsuwa` bridge; `UTSUWA_NATIVE=1` remains a packaging/build hint
 
 For architecture details, see [Architecture Overview](/docs/technology/architecture).

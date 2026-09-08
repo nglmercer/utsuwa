@@ -8,7 +8,7 @@ import { createHighlighter } from 'shiki/bundle/web';
 // Native Rust host (winit+wry) production builds set UTSUWA_NATIVE=1 to get
 // the same static output + locked-down CSP the Tauri desktop build uses.
 const isTauri = !!process.env.TAURI_ENV_PLATFORM;
-const isDesktop = isTauri || !!process.env.UTSUWA_NATIVE;
+const isDesktop = isTauri || process.env.UTSUWA_NATIVE === '1';
 
 const highlighter = await createHighlighter({
 	themes: ['github-light', 'github-dark'],

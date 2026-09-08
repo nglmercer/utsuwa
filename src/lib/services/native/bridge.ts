@@ -7,6 +7,14 @@ export interface UtsuwaBridge {
 	invoke(method: string, params?: Record<string, unknown>): Promise<unknown>;
 }
 
+/**
+ * A packaged build is expected to have this bridge before page scripts run.
+ * Keep the message stable because it is also used when native routing detects
+ * a broken host instead of falling back to a tool-less provider request.
+ */
+export const NATIVE_BRIDGE_UNAVAILABLE_ERROR =
+	'Native host runtime was expected but the Utsuwa IPC bridge is unavailable.';
+
 declare global {
 	interface Window {
 		utsuwa?: UtsuwaBridge;
@@ -15,7 +23,8 @@ declare global {
 
 export function getBridge(): UtsuwaBridge | null {
 	if (typeof window === 'undefined') return null;
-	return window.utsuwa ?? null;
+	const bridge = window.utsuwa;
+	return bridge && typeof bridge.invoke === 'function' ? bridge : null;
 }
 
 /** Host event channel name the bridge dispatches (`utsuwa-host-event`). */

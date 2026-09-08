@@ -19,7 +19,9 @@
 	"type": "module",
 	"scripts": {
 		"dev": "vite dev",
+		"dev:native": "node scripts/vite-native.mjs dev",
 		"build": "vite build",
+		"build:native": "node scripts/vite-native.mjs build",
 		"postbuild": "pagefind --site .vercel/output/static || pagefind --site build || echo 'Pagefind indexing skipped (no static HTML found)'",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
