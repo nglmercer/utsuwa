@@ -2,7 +2,7 @@ import { streamText } from '@xsai/stream-text';
 import { env } from '$env/dynamic/private';
 import type { RequestHandler } from './$types';
 import type { LLMProvider } from '$lib/types';
-import { ensureOpenAIPath, getChatBaseUrl } from '$lib/services/providers/local-endpoints';
+import { getChatBaseUrl } from '$lib/services/providers/local-endpoints';
 import { assertSafeProviderUrl } from '$lib/services/providers/url-guard';
 import { sanitizeProviderError } from '$lib/services/providers/provider-errors';
 import { DEFAULT_CHAT_BASE_URLS } from '$lib/services/providers/provider-defaults';
@@ -49,12 +49,8 @@ export const POST: RequestHandler = async ({ request }) => {
 		if (typedProvider === 'anthropic') {
 			providerBaseURL = providerBaseURL || DEFAULT_CHAT_BASE_URLS.anthropic;
 			headers['anthropic-dangerous-direct-browser-access'] = 'true';
-		} else if (isLocalProvider) {
+		} else if (isLocalProvider || typedProvider === 'openai-compatible') {
 			providerBaseURL = getChatBaseUrl(typedProvider, providerBaseURL);
-		} else if (typedProvider === 'openai-compatible') {
-			// Same /v1 normalization as model discovery, so a base URL that
-			// populates the dropdown can't then 404 on chat.
-			providerBaseURL = providerBaseURL ? ensureOpenAIPath(providerBaseURL) : providerBaseURL;
 		} else {
 			// Use default base URL for provider
 			providerBaseURL = providerBaseURL || DEFAULT_CHAT_BASE_URLS[typedProvider];

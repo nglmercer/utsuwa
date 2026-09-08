@@ -1,5 +1,6 @@
 // Module types
 export * from './module';
+export type { ModelCapabilities, ModelInfo, ToolCallingSupport } from '$lib/services/providers/model-capabilities';
 
 // LLM Provider IDs
 export type LLMProvider =
@@ -27,6 +28,6 @@ export interface ProviderConfig {
 	speed?: number;
 	pitch?: number;
 	volume?: number;
-	cachedModels?: Array<{ id: string; name: string }>;
+	cachedModels?: import('$lib/services/providers/model-capabilities').ModelInfo[];
 	modelsFetchedAt?: number;
 }

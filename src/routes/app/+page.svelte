@@ -44,6 +44,7 @@
 	import { getLLMProvider, providerSupportsVision } from '$lib/services/providers/registry';
 	import { isLocalLLMProvider } from '$lib/services/providers/local-endpoints';
 	import { canShowImages } from '$lib/services/providers/vision';
+	import { settingsStore } from '$lib/stores/settings.svelte';
 	import { onDestroy } from 'svelte';
 	import { sendCompanionMessage, type SendCompanionMessageOptions } from '$lib/services/chat/companion-chat';
 	import { createReminderFiredHandler } from '$lib/services/chat/reminder-chat';
@@ -145,6 +146,8 @@
 		const provider = cs.activeProvider as string;
 		const model = cs.activeModel as string;
 		if (!provider) return false;
+		const discovered = settingsStore.getCachedModels(provider)?.find((entry) => entry.id === model);
+		if (discovered?.capabilities?.vision !== undefined) return discovered.capabilities.vision;
 		return canShowImages(providerSupportsVision(provider), isLocalLLMProvider(provider), model);
 	});
 

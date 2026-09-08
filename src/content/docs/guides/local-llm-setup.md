@@ -120,17 +120,20 @@ Open LM Studio and browse the built-in model catalog. Search for a model, click 
 1. Go to the **Server** tab in LM Studio
 2. Click **Start Server**
 
-This starts an OpenAI-compatible API on `http://localhost:1234`.
+This starts an OpenAI-compatible API on `http://localhost:1234`. Utsuwa uses
+the chat base `http://localhost:1234/v1`; entering the bare host is also safe
+because Utsuwa normalizes it automatically.
 
 ### Connecting to Utsuwa
 
 1. Open the **Controls** panel (sliders icon, top right) and click **Settings** (gear)
 2. Navigate to the **Character** tab and open the **AI Services** section
 3. Enable the Chat (LLM) toggle, then select **LM Studio** from the provider dropdown
-4. Leave the base URL as `http://localhost:1234/v1` unless you changed LM Studio's port
-5. Utsuwa will fetch models from the running LM Studio server. Click the refresh icon if you load a different model.
-6. Select the loaded model from the dropdown
-7. Start chatting
+4. Leave the base URL as `http://localhost:1234/v1` unless you changed LM Studio's port (a bare `http://localhost:1234` also works)
+5. Click **Test Connection** to verify the server, endpoint, model, and any reported tool/vision capabilities
+6. Utsuwa will fetch models from the running LM Studio server. Click the refresh icon if you load a different model.
+7. Select the loaded model from the dropdown
+8. Start chatting
 
 ## Recommended Models
 
@@ -150,7 +153,7 @@ If you're running the LLM server on a different machine or non-default port, ent
 - Remote machine: `http://192.168.1.50:11434`
 - Custom port: `http://localhost:8080`
 
-For Ollama, either `http://localhost:11434` or `http://localhost:11434/v1` works. Utsuwa uses `/api/tags` for model discovery and `/v1/chat/completions` for chat.
+For Ollama, either `http://localhost:11434` or `http://localhost:11434/v1` works. Utsuwa uses `/api/tags` for model discovery and `/v1/chat/completions` for chat. Do not paste the full `/v1/chat/completions` URL into the base URL field; Utsuwa strips that suffix safely if it is pasted.
 
 ## Troubleshooting
 

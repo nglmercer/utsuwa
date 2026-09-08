@@ -94,6 +94,47 @@
 						onblur={provider.custom ? undefined : () => state.debouncedFetchLLMModels()}
 					/>
 				</div>
+				<div class="connection-actions">
+					<button
+						class="test-connection-btn"
+						disabled={state.llmHealthLoading}
+						onclick={() => state.testLLMConnection()}
+					>
+						{state.llmHealthLoading ? 'Testing…' : 'Test Connection'}
+					</button>
+				</div>
+				{#if state.llmHealth}
+					{@const health = state.llmHealth}
+					<div class="provider-health" role="status">
+						<p class:ok={health.reachable} class:bad={!health.reachable}>
+							<Icon name={health.reachable ? 'check' : 'x'} size={13} />
+							Server reachable
+						</p>
+						<p class:ok={health.endpointValid} class:bad={!health.endpointValid}>
+							<Icon name={health.endpointValid ? 'check' : 'x'} size={13} />
+							API endpoint valid
+						</p>
+						<p class:ok={health.modelAvailable} class:bad={!health.modelAvailable}>
+							<Icon name={health.modelAvailable ? 'check' : 'x'} size={13} />
+							Model found
+						</p>
+						{#if health.toolCalling}
+							<p class:ok={health.toolCalling === 'native' || health.toolCalling === 'compatible'} class:bad={health.toolCalling === 'unsupported'}>
+								<Icon name={health.toolCalling === 'unsupported' ? 'x' : 'check'} size={13} />
+								Tool use: {health.toolCalling}
+							</p>
+						{/if}
+						{#if health.vision !== undefined}
+							<p class:ok={health.vision} class:bad={!health.vision}>
+								<Icon name={health.vision ? 'check' : 'x'} size={13} />
+								Vision: {health.vision ? 'supported' : 'not supported'}
+							</p>
+						{/if}
+						{#if health.error}
+							<p class="provider-note error">{health.error}</p>
+						{/if}
+					</div>
+				{/if}
 				{#if provider?.isLocal && !state.llmFetchError}
 					{@render troubleHelp()}
 				{/if}
@@ -273,6 +314,59 @@
 
 	.provider-error .provider-help {
 		margin: 0;
+	}
+
+	.connection-actions {
+		display: flex;
+		justify-content: flex-end;
+		margin-top: 0.375rem;
+	}
+
+	.test-connection-btn {
+		padding: 0.35rem 0.65rem;
+		border: 1px solid var(--bg-tertiary);
+		border-radius: var(--radius-md);
+		background: var(--bg-tertiary);
+		color: var(--text-secondary);
+		font: inherit;
+		font-size: 0.75rem;
+		cursor: pointer;
+	}
+
+	.test-connection-btn:hover:not(:disabled) {
+		color: var(--text-primary);
+		border-color: var(--accent);
+	}
+
+	.test-connection-btn:disabled {
+		opacity: 0.6;
+		cursor: wait;
+	}
+
+	.provider-health {
+		display: grid;
+		gap: 0.2rem;
+		margin-top: 0.5rem;
+		padding: 0.5rem 0.625rem;
+		border-radius: var(--radius-md);
+		background: var(--bg-secondary);
+	}
+
+	.provider-health p {
+		display: flex;
+		align-items: center;
+		gap: 0.35rem;
+		margin: 0;
+		font-size: 0.72rem;
+		color: var(--text-tertiary);
+	}
+
+	.provider-health p.ok {
+		color: var(--color-success, #4ade80);
+	}
+
+	.provider-health p.bad {
+		color: var(--color-error);
 	}
 
 	.provider-help {

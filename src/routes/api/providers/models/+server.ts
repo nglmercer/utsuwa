@@ -2,18 +2,14 @@ import { env } from '$env/dynamic/private';
 import type { RequestHandler } from './$types';
 import type { LLMProvider } from '$lib/types';
 import {
-	ensureOpenAIPath,
+	getLMStudioApiBaseUrl,
 	getModelsBaseUrl,
 	isLocalLLMProvider,
 	looksLikeOllama
 } from '$lib/services/providers/local-endpoints';
 import { assertSafeProviderUrl } from '$lib/services/providers/url-guard';
 import { DEFAULT_MODELS_BASE_URLS } from '$lib/services/providers/provider-defaults';
-
-interface ModelInfo {
-	id: string;
-	name: string;
-}
+import { parseLMStudioModelCapabilities, type ModelInfo } from '$lib/services/providers/model-capabilities';
 
 interface FetchModelsResponse {
 	models: ModelInfo[];
@@ -96,18 +92,52 @@ async function fetchOllamaModels(baseUrl: string): Promise<ModelInfo[]> {
 	const data = await response.json();
 	return (data.models || []).map((m: { name: string }) => ({
 		id: m.name,
-		name: m.name
+		name: m.name,
+		capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
 	}));
 }
 
-async function fetchLMStudioModels(baseUrl: string): Promise<ModelInfo[]> {
-	const response = await fetch(`${baseUrl}/models`);
-	if (!response.ok) throw new Error(`Failed to fetch models: ${response.statusText}`);
-	const data = await response.json();
-	return data.data.map((m: { id: string }) => ({
-		id: m.id,
-		name: m.id
-	}));
+async function fetchLMStudioModels(baseUrl: string, apiKey?: string): Promise<ModelInfo[]> {
+	const root = getLMStudioApiBaseUrl(baseUrl);
+	const candidates = [`${root}/api/v1/models`, `${root}/api/v0/models`, `${root}/models`];
+	const headers: Record<string, string> = {};
+	if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+	let lastResponse: Response | undefined;
+	for (const url of candidates) {
+		const response = await fetch(url, { headers });
+		lastResponse = response;
+		if (response.ok) {
+			const data = (await response.json()) as Record<string, unknown>;
+			const records = Array.isArray(data.models)
+				? data.models
+				: Array.isArray(data.data)
+					? data.data
+					: [];
+			return records
+				.filter((record): record is Record<string, unknown> => {
+					if (!record || typeof record !== 'object') return false;
+					return record.type === undefined || record.type === 'llm' || record.type === 'vlm';
+				})
+				.map((record) => {
+					const id =
+						typeof record.key === 'string'
+							? record.key
+							: typeof record.id === 'string'
+								? record.id
+								: '';
+					const name =
+						typeof record.display_name === 'string'
+							? record.display_name
+							: typeof record.name === 'string'
+								? record.name
+								: id;
+					return { id, name: name || id, capabilities: parseLMStudioModelCapabilities(record) };
+				})
+				.filter((model) => model.id.length > 0);
+		}
+		if (response.status !== 404) break;
+	}
+	throw new Error(`Failed to fetch models: ${lastResponse?.statusText || 'endpoint unavailable'}`);
 }
 
 async function fetchDeepSeekModels(apiKey: string, baseUrl: string): Promise<ModelInfo[]> {
@@ -193,7 +223,7 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		// Remove trailing slash for consistency
 		const cleanBaseUrl =
-			providerId === 'ollama' || providerId === 'lmstudio'
+			providerId === 'ollama' || providerId === 'lmstudio' || providerId === 'openai-compatible'
 				? getModelsBaseUrl(providerId, effectiveBaseUrl)
 				: effectiveBaseUrl.replace(/\/+$/, '');
 
@@ -222,8 +252,11 @@ export const POST: RequestHandler = async ({ request }) => {
 				if (looksLikeOllama(cleanBaseUrl)) {
 					models = await fetchOllamaModels(cleanBaseUrl);
 				} else {
-					const normalizedUrl = ensureOpenAIPath(cleanBaseUrl);
-					models = await fetchOpenAIModels(apiKey, normalizedUrl);
+					// Custom endpoints own their path semantics; do not assume `/v1`.
+					models = (await fetchOpenAIModels(apiKey, cleanBaseUrl)).map((model) => ({
+						...model,
+						capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
+					}));
 				}
 				break;
 			}
@@ -235,7 +268,7 @@ export const POST: RequestHandler = async ({ request }) => {
 				models = await fetchOllamaModels(cleanBaseUrl);
 				break;
 			case 'lmstudio':
-				models = await fetchLMStudioModels(cleanBaseUrl);
+				models = await fetchLMStudioModels(cleanBaseUrl, apiKey);
 				break;
 			case 'deepseek':
 				if (!apiKey) throw new Error('API key required for DeepSeek');

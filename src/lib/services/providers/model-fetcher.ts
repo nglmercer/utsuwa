@@ -1,11 +1,9 @@
 import { isDesktopBuild } from '$lib/services/platform';
 import { fetchModelsDirect } from './client-models';
 import { isLocalLLMProvider } from './local-endpoints';
+import type { ModelInfo } from './model-capabilities';
 
-export interface ModelInfo {
-	id: string;
-	name: string;
-}
+export type { ModelInfo } from './model-capabilities';
 
 export interface FetchModelsResult {
 	models: ModelInfo[];

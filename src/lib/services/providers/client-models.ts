@@ -1,17 +1,13 @@
 import type { LLMProvider } from '$lib/types';
 import {
-	ensureOpenAIPath,
 	getLocalProviderConnectionHint,
+	getLMStudioApiBaseUrl,
 	getModelsBaseUrl,
 	isLocalLLMProvider,
 	looksLikeOllama
 } from './local-endpoints';
 import { DEFAULT_MODELS_BASE_URLS } from './provider-defaults.ts';
-
-interface ModelInfo {
-	id: string;
-	name: string;
-}
+import { parseLMStudioModelCapabilities, type ModelInfo } from './model-capabilities';
 
 const MODEL_FILTERS: Record<string, RegExp> = {
 	openai: /^(gpt-|o1-|o3-|chatgpt-4o-)/,
@@ -43,6 +39,58 @@ function normalizeModelName(id: string, providerId: string): string {
 	return name;
 }
 
+async function fetchLMStudioModels(baseUrl: string, headers: Record<string, string>): Promise<ModelInfo[]> {
+	const root = getLMStudioApiBaseUrl(baseUrl);
+	const candidates = [`${root}/api/v1/models`, `${root}/api/v0/models`, `${root}/models`];
+	let lastResponse: Response | undefined;
+
+	for (const url of candidates) {
+		const response = await fetch(url, { headers });
+		lastResponse = response;
+		if (response.ok) {
+			const data = (await response.json()) as Record<string, unknown>;
+			const records = Array.isArray(data.models)
+				? data.models
+				: Array.isArray(data.data)
+					? data.data
+					: [];
+			return records
+				.filter((record): record is Record<string, unknown> => {
+					if (!record || typeof record !== 'object') return false;
+					const type = record.type;
+					return type === undefined || type === 'llm' || type === 'vlm';
+				})
+				.map((record) => {
+					const id =
+						typeof record.key === 'string'
+							? record.key
+							: typeof record.id === 'string'
+								? record.id
+								: '';
+					const displayName =
+						typeof record.display_name === 'string'
+							? record.display_name
+							: typeof record.name === 'string'
+								? record.name
+								: id;
+					return {
+						id,
+						name: displayName || id,
+						capabilities: parseLMStudioModelCapabilities(record)
+					};
+				})
+				.filter((model) => model.id.length > 0);
+		}
+
+		// Older LM Studio releases do not expose the newer metadata endpoint.
+		// Only fall back on a missing endpoint; auth/server failures should remain
+		// visible instead of being disguised as a different API failure.
+		if (response.status !== 404) break;
+	}
+
+	throw new Error(`Failed to fetch models: ${lastResponse?.statusText || 'endpoint unavailable'}`);
+}
+
 /**
  * Fetch models directly from provider APIs.
  * Used in Tauri builds where SvelteKit server routes aren't available.
@@ -53,7 +101,7 @@ export async function fetchModelsDirect(
 	baseUrl?: string
 ): Promise<{ models: ModelInfo[]; error?: string }> {
 	const cleanBaseUrl =
-		providerId === 'ollama' || providerId === 'lmstudio'
+		providerId === 'ollama' || providerId === 'lmstudio' || providerId === 'openai-compatible'
 			? getModelsBaseUrl(providerId, baseUrl)
 			: (baseUrl || DEFAULT_MODELS_BASE_URLS[providerId] || '').replace(/\/+$/, '');
 
@@ -90,16 +138,19 @@ export async function fetchModelsDirect(
 					const data = await res.json();
 					models = (data.models || []).map((m: { name: string }) => ({
 						id: m.name,
-						name: m.name
+						name: m.name,
+						capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
 					}));
 				} else {
-					const normalizedUrl = ensureOpenAIPath(cleanBaseUrl);
-					const res = await fetch(`${normalizedUrl}/models`, { headers });
+					// Custom providers own their path semantics. Do not add `/v1`
+					// here; a custom gateway may use `/openai`, `/api`, or no prefix.
+					const res = await fetch(`${cleanBaseUrl}/models`, { headers });
 					if (!res.ok) throw new Error(`Failed to fetch models: ${res.statusText}`);
 					const data = await res.json();
 					models = (data.data || []).map((m: { id: string }) => ({
 						id: m.id,
-						name: m.id
+						name: m.id,
+						capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
 					}));
 				}
 				break;
@@ -123,15 +174,15 @@ export async function fetchModelsDirect(
 				const data = await res.json();
 				models = (data.models || []).map((m: { name: string }) => ({
 					id: m.name,
-					name: m.name
+					name: m.name,
+					capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
 				}));
 				break;
 			}
 			case 'lmstudio': {
-				const res = await fetch(`${cleanBaseUrl}/models`);
-				if (!res.ok) throw new Error(`Failed to fetch models: ${res.statusText}`);
-				const data = await res.json();
-				models = data.data.map((m: { id: string }) => ({ id: m.id, name: m.id }));
+				const headers: Record<string, string> = {};
+				if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+				models = await fetchLMStudioModels(cleanBaseUrl, headers);
 				break;
 			}
 			case 'google': {

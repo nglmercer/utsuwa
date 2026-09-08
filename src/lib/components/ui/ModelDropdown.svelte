@@ -1,10 +1,12 @@
 <script lang="ts">
 	import { DropdownMenu } from 'bits-ui';
 	import { Icon } from '$lib/components/ui';
+	import type { ModelCapabilities } from '$lib/services/providers/model-capabilities';
 
 	interface Model {
 		id: string;
 		name: string;
+		capabilities?: ModelCapabilities;
 	}
 
 	interface Props {
@@ -52,6 +54,21 @@
 	function handleSelect(modelId: string) {
 		searchQuery = '';
 		onSelect(modelId);
+	}
+
+	function toolBadge(capabilities?: ModelCapabilities): string | null {
+		switch (capabilities?.toolCallingSupport) {
+			case 'native':
+				return 'Tool use';
+			case 'compatible':
+				return 'Tool-compatible';
+			case 'unsupported':
+				return 'No tool use';
+			case 'unknown':
+				return 'Tool use: unknown';
+			default:
+				return null;
+		}
 	}
 
 	// Clear the search filter when the dropdown closes so reopening starts fresh.
@@ -105,6 +122,14 @@
 							onSelect={() => handleSelect(model.id)}
 						>
 							<span class="model-name">{model.name}</span>
+							<span class="model-badges">
+								{#if model.capabilities?.vision}
+									<span class="model-badge">Vision</span>
+								{/if}
+								{#if toolBadge(model.capabilities)}
+									<span class="model-badge">{toolBadge(model.capabilities)}</span>
+								{/if}
+							</span>
 							{#if value === model.id}
 								<span class="check-icon">
 									<Icon name="check" size={14} strokeWidth={2.5} />
@@ -337,6 +362,22 @@
 		font-size: 0.8125rem;
 		font-weight: 500;
 		color: var(--text-primary);
+	}
+
+	.model-badges {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 0.25rem;
+	}
+
+	.model-badge {
+		padding: 0.1rem 0.3rem;
+		border-radius: 999px;
+		background: var(--bg-secondary);
+		color: var(--text-tertiary);
+		font-size: 0.65rem;
+		white-space: nowrap;
 	}
 
 	.check-icon {

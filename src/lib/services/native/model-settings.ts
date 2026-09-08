@@ -1,4 +1,5 @@
 import { getBridge } from './bridge';
+import { buildNativeModelProviderParams, normalizeNativeBaseUrl } from './model-settings-logic';
 import { getLLMProvider } from '$lib/services/providers/registry';
 import { modulesStore } from '$lib/stores/modules.svelte';
 import { settingsStore } from '$lib/stores/settings.svelte';
@@ -13,6 +14,17 @@ export interface NativeModelProviderConfig {
 	apiKey?: string;
 }
 
+/** Normalize at the native boundary too, so a caller or an older saved value
+ * cannot reintroduce the LM Studio/Ollama `/v1` routing bug. */
+export function normalizeNativeModelProviderConfig(
+	config: NativeModelProviderConfig
+): NativeModelProviderConfig {
+	return {
+		...config,
+		baseUrl: normalizeNativeBaseUrl(config.provider, config.baseUrl)
+	};
+}
+
 /** Persist one complete model configuration in the host. Web builds simply
  * return because their server route owns provider configuration. */
 export async function setNativeModelProvider(
@@ -20,12 +32,7 @@ export async function setNativeModelProvider(
 ): Promise<boolean> {
 	const bridge = getBridge();
 	if (!bridge) return false;
-	await bridge.invoke('settings.set_model_provider', {
-		provider: config.provider,
-		base_url: config.baseUrl,
-		model: config.model,
-		...(config.apiKey !== undefined ? { api_key: config.apiKey } : {})
-	});
+	await bridge.invoke('settings.set_model_provider', buildNativeModelProviderParams(config));
 	return true;
 }
 

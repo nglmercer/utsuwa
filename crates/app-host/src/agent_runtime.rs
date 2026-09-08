@@ -938,7 +938,7 @@ fn provider_factory_with_secrets(
                 .map_err(|e| RuntimeError::Settings(e.to_string()))
                 .map(|v| v.and_then(|v| v.as_str().map(str::to_string)))
         };
-        let base_url = get(SETTING_BASE_URL)?
+        let raw_base_url = get(SETTING_BASE_URL)?
             .filter(|s| !s.is_empty())
             .ok_or(RuntimeError::ModelNotConfigured)?;
         let name = get(SETTING_MODEL_NAME)?
@@ -947,8 +947,21 @@ fn provider_factory_with_secrets(
         // Older databases may lack the provider id, so retain compatibility
         // by treating them as generic OpenAI-compatible endpoints.
         let provider = get(SETTING_PROVIDER)?.unwrap_or_else(|| "openai-compatible".to_string());
+        // Frontend synchronization normalizes this already, but older native
+        // databases can contain a bare LM Studio/Ollama host or a pasted full
+        // endpoint. Normalize at the provider boundary as a defense in depth.
+        let base_url = if provider == "anthropic" {
+            raw_base_url.trim_end_matches('/').to_string()
+        } else {
+            normalize_provider_base_url(&provider, &raw_base_url)
+        };
         let api_key = resolve_api_key(&storage, secrets.as_ref())?;
-        tracing::debug!(provider = %provider, model = %name, "native agent provider selected");
+        tracing::debug!(
+            provider = %provider,
+            model = %name,
+            normalized_base_url = %sanitize_provider_url_for_log(&base_url),
+            "native agent provider selected"
+        );
         if provider == "anthropic" {
             let api_key = api_key.ok_or(RuntimeError::ModelNotConfigured)?;
             Ok(Arc::new(AnthropicClient::new(base_url, api_key, name)) as Arc<dyn ModelProvider>)
@@ -962,6 +975,32 @@ fn provider_factory_with_secrets(
             )
         }
     })
+}
+
+/// Normalize only endpoint semantics known by the native provider factory.
+/// LM Studio and Ollama expose their OpenAI-compatible chat API below `/v1`;
+/// arbitrary OpenAI-compatible gateways keep their configured path intact.
+pub fn normalize_provider_base_url(provider: &str, base_url: &str) -> String {
+    let mut normalized = base_url.trim().trim_end_matches('/').to_string();
+    const CHAT_SUFFIX: &str = "/chat/completions";
+    if normalized.to_ascii_lowercase().ends_with(CHAT_SUFFIX) {
+        normalized.truncate(normalized.len() - CHAT_SUFFIX.len());
+    }
+
+    if matches!(provider, "lmstudio" | "ollama")
+        && !normalized.to_ascii_lowercase().ends_with("/v1")
+    {
+        normalized.push_str("/v1");
+    }
+    normalized
+}
+
+fn sanitize_provider_url_for_log(base_url: &str) -> String {
+    base_url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(base_url)
+        .to_string()
 }
 
 fn provider_requires_api_key(provider: &str) -> bool {
@@ -1016,6 +1055,37 @@ mod tests {
     use super::*;
     use model_core::{FinishReason, ModelError, ModelRequest, ModelStreamEvent, ToolCall};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn provider_base_url_normalization_is_provider_aware() {
+        assert_eq!(
+            normalize_provider_base_url("lmstudio", "http://localhost:1234"),
+            "http://localhost:1234/v1"
+        );
+        assert_eq!(
+            normalize_provider_base_url("lmstudio", "http://localhost:1234/v1/"),
+            "http://localhost:1234/v1"
+        );
+        assert_eq!(
+            normalize_provider_base_url("lmstudio", "http://localhost:1234/v1/chat/completions"),
+            "http://localhost:1234/v1"
+        );
+        assert_eq!(
+            normalize_provider_base_url("ollama", "http://localhost:11434/"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            normalize_provider_base_url("openai-compatible", "http://localhost:9000/custom"),
+            "http://localhost:9000/custom"
+        );
+        assert_eq!(
+            normalize_provider_base_url(
+                "openai-compatible",
+                "http://localhost:9000/custom/chat/completions"
+            ),
+            "http://localhost:9000/custom"
+        );
+    }
 
     /// Scripted multi-turn provider: pops one scripted turn per call.
     struct QueueProvider {

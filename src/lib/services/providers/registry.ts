@@ -1,5 +1,6 @@
 // Provider Registry - All LLM and TTS providers
 import { DEFAULT_CHAT_BASE_URLS } from './provider-defaults.ts';
+import type { ModelInfo } from './model-capabilities';
 
 export interface ProviderMetadata {
 	id: string;
@@ -19,7 +20,7 @@ export interface ProviderMetadata {
 	// only. Local providers (Ollama/LM Studio) leave this unset and rely on a
 	// per-model heuristic, since vision depends on the installed model.
 	supportsVision?: boolean;
-	models?: Array<{ id: string; name: string }>;
+	models?: ModelInfo[];
 	voices?: Array<{ id: string; name: string }>;
 }
 

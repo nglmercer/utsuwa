@@ -124,6 +124,23 @@ Utsuwa supports popular cloud and local LLMs. For endpoints that speak the OpenA
 | **Local** | Ollama, LM Studio |
 | **OpenAI-Compatible** | OpenRouter, Together, vLLM, LiteLLM, etc. |
 
+#### LM Studio and Ollama local endpoints
+
+For LM Studio, start the local server and load a model before connecting Utsuwa.
+The recommended base URL is `http://localhost:1234/v1`; a bare
+`http://localhost:1234` is normalized automatically. Ollama works the same way
+with `http://localhost:11434` or `http://localhost:11434/v1`. Enter a provider
+base URL, not the full `/chat/completions` endpoint.
+
+Utsuwa uses the OpenAI-compatible `/v1/chat/completions` API for local model
+chat. In the desktop app, filesystem, process, memory, MCP, plugin, and
+supported desktop tools are supplied by the Rust host and remain behind the
+normal policy and approval flow. A browser-only session can connect to a local
+model when CORS permits it, but does not have native filesystem or process
+access. Models that report native tool-use training are recommended; models
+without that metadata are still allowed, but may choose to answer with text
+instead of issuing a tool call.
+
 #### Context Window and Memory Budget
 
 The **Context Window** setting is available for every LLM provider. When enabled, it tells Utsuwa how many tokens the selected model can process. The app then:

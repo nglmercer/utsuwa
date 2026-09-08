@@ -1,6 +1,5 @@
 import type { LLMProvider } from '$lib/types';
 import {
-	ensureOpenAIPath,
 	getChatBaseUrl,
 	getLocalProviderConnectionHint,
 	isLocalLLMProvider
@@ -36,6 +35,29 @@ function getCurrentSiteOrigin(): string | undefined {
 	return typeof window !== 'undefined' ? window.location.origin : undefined;
 }
 
+async function readResponsePrefix(response: Response, maxBytes: number): Promise<string> {
+	const reader = response.body?.getReader();
+	if (!reader) return '';
+	const decoder = new TextDecoder();
+	let text = '';
+	let bytesRead = 0;
+	try {
+		while (bytesRead < maxBytes) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const remaining = maxBytes - bytesRead;
+			const chunk = value.slice(0, remaining);
+			bytesRead += chunk.byteLength;
+			text += decoder.decode(chunk, { stream: bytesRead < maxBytes });
+			if (chunk.byteLength < value.byteLength) break;
+		}
+		text += decoder.decode();
+		return text;
+	} finally {
+		reader.releaseLock();
+	}
+}
+
 /**
  * Stream chat completions directly from provider APIs.
  * Used for local providers in a normal browser. The native host uses
@@ -56,13 +78,12 @@ export async function streamChatDirect(
 		return;
 	}
 
-	// Custom endpoints get the same /v1 normalization as model discovery, so a
-	// base URL that populates the dropdown can't then 404 on chat.
-	const providerBaseURL = isLocal
+	// Local providers get their known `/v1` normalization. Custom endpoints keep
+	// their configured path, so gateways mounted below `/openai` or `/api` are
+	// not rewritten to a path they do not implement.
+	const providerBaseURL = isLocal || provider === 'openai-compatible'
 		? getChatBaseUrl(provider, baseURL)
-		: provider === 'openai-compatible' && baseURL
-			? ensureOpenAIPath(baseURL)
-			: baseURL || DEFAULT_CHAT_BASE_URLS[provider];
+		: baseURL || DEFAULT_CHAT_BASE_URLS[provider];
 	if (!providerBaseURL) {
 		onError(`Unknown provider: ${provider}`);
 		return;
@@ -120,7 +141,7 @@ export async function streamChatDirect(
 		const response = await fetch(url, { method: 'POST', headers, body });
 
 		if (!response.ok) {
-			const bodyText = await response.text().catch(() => '');
+			const bodyText = await readResponsePrefix(response, 8192).catch(() => '');
 			let msg = `Provider error (${response.status})`;
 			if (looksLikeHtml(bodyText)) {
 				msg = htmlEndpointError(providerBaseURL);
@@ -140,6 +161,24 @@ export async function streamChatDirect(
 		const contentType = response.headers.get('content-type') || '';
 		if (contentType.includes('text/html')) {
 			onError(htmlEndpointError(providerBaseURL));
+			return;
+		}
+		if (!contentType.toLowerCase().includes('text/event-stream')) {
+			const responseBody = await readResponsePrefix(response, 8192).catch(() => '');
+			let detail = '';
+			try {
+				const parsed = JSON.parse(responseBody);
+				const error = parsed?.error;
+				detail = typeof error === 'string' ? error : error?.message || parsed?.message || '';
+			} catch {
+				detail = responseBody.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ' ').trim();
+			}
+			onError(
+				sanitizeProviderError(
+					`Expected an SSE response from ${providerBaseURL}/chat/completions${detail ? `: ${detail}` : ''}`,
+					providerBaseURL
+				)
+			);
 			return;
 		}
 
@@ -221,11 +260,9 @@ export async function extractStateUpdates(options: ExtractOptions): Promise<stri
 	const isLocal = isLocalLLMProvider(provider);
 	if (!apiKey && !isLocal && provider !== 'openai-compatible') return null;
 
-	const base = isLocal
+	const base = isLocal || provider === 'openai-compatible'
 		? getChatBaseUrl(provider, baseURL)
-		: provider === 'openai-compatible' && baseURL
-			? ensureOpenAIPath(baseURL)
-			: baseURL || DEFAULT_CHAT_BASE_URLS[provider];
+		: baseURL || DEFAULT_CHAT_BASE_URLS[provider];
 	if (!base) return null;
 
 	const trimmedBase = base.replace(/\/+$/, '');

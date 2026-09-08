@@ -12,7 +12,9 @@ import {
 	isLocalSTTProvider,
 	getSTTBaseUrl,
 	getLocalSTTConnectionHint,
-	ensureOpenAIPath, looksLikeOllama
+	ensureOpenAIPath,
+	stripChatCompletionsPath,
+	looksLikeOllama
 } from './local-endpoints.ts';
 
 test('identifies local STT providers', () => {
@@ -62,6 +64,27 @@ test('normalizes LM Studio root URL to OpenAI-compatible v1 URL', () => {
 	assert.equal(getChatBaseUrl('lmstudio', 'http://localhost:1234'), 'http://localhost:1234/v1');
 	assert.equal(getModelsBaseUrl('lmstudio', 'http://localhost:1234'), 'http://localhost:1234/v1');
 	assert.equal(getChatBaseUrl('lmstudio', 'http://localhost:1234/v1'), 'http://localhost:1234/v1');
+	assert.equal(
+		getModelsBaseUrl('lmstudio', 'http://localhost:1234/v1/chat/completions'),
+		'http://localhost:1234/v1'
+	);
+	assert.equal(
+		getChatBaseUrl('lmstudio', 'http://localhost:1234/v1/chat/completions'),
+		'http://localhost:1234/v1'
+	);
+	assert.equal(getChatBaseUrl('ollama', 'http://localhost:11434/chat/completions'), 'http://localhost:11434/v1');
+});
+
+test('custom OpenAI-compatible base URLs preserve their configured path', () => {
+	assert.equal(getChatBaseUrl('openai-compatible', 'http://localhost:9000/custom'), 'http://localhost:9000/custom');
+	assert.equal(
+		getChatBaseUrl('openai-compatible', 'http://localhost:9000/custom/chat/completions'),
+		'http://localhost:9000/custom'
+	);
+	assert.equal(
+		getModelsBaseUrl('openai-compatible', 'http://localhost:9000/custom/chat/completions'),
+		'http://localhost:9000/custom'
+	);
 });
 
 test('provides local provider troubleshooting hints', () => {
@@ -126,7 +149,7 @@ test('provides OmniVoice troubleshooting hint with CORS guidance', () => {
 	assert.match(hint, /CORS/);
 });
 
-// --- ensureOpenAIPath (shared by model discovery and custom-endpoint chat) ---
+// --- ensureOpenAIPath (used only by providers whose API contract is /v1) ---
 
 test('ensureOpenAIPath appends /v1 to bare base URLs', () => {
 	assert.equal(ensureOpenAIPath('https://api.together.xyz'), 'https://api.together.xyz/v1');
@@ -136,6 +159,11 @@ test('ensureOpenAIPath appends /v1 to bare base URLs', () => {
 test('ensureOpenAIPath leaves /v1 URLs unchanged', () => {
 	assert.equal(ensureOpenAIPath('https://api.openai.com/v1'), 'https://api.openai.com/v1');
 	assert.equal(ensureOpenAIPath('https://api.openai.com/v1/'), 'https://api.openai.com/v1');
+});
+
+test('chat endpoint stripping is idempotent', () => {
+	assert.equal(stripChatCompletionsPath('http://localhost:1234/v1/chat/completions'), 'http://localhost:1234/v1');
+	assert.equal(stripChatCompletionsPath('http://localhost:1234/v1/'), 'http://localhost:1234/v1');
 });
 
 // --- looksLikeOllama ---

@@ -27,6 +27,7 @@ import { isDesktopBuildExpected, isNativeRuntimeAvailable } from '$lib/services/
 import { sendAgentMessage } from '$lib/services/native/agent.svelte';
 import { syncNativeModelProvider } from '$lib/services/native/model-settings';
 import { selectCompanionTransport } from './transport';
+import { filterEmptyAssistantPlaceholders } from './history';
 import type { LLMProvider, TTSProvider } from '$lib/types';
 import type { EventDefinition } from '$lib/types/events';
 
@@ -75,7 +76,7 @@ async function buildCompanionPrompt(
 // image bytes; prior turns stay text. Empty messages are dropped (the assistant
 // placeholder, and any stray blank turn) so we never send an empty message.
 function buildMessages(images: PreparedImage[]) {
-	const history = chatStore.messages.slice(0, -1).filter((m) => m.content || m.images?.length);
+	const history = filterEmptyAssistantPlaceholders(chatStore.messages.slice(0, -1));
 	return history.map((m, idx) => {
 		const isCurrentTurn = idx === history.length - 1 && images.length > 0;
 		if (!isCurrentTurn) {

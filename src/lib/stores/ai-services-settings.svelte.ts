@@ -4,6 +4,10 @@ import { getLLMProvider, getTTSProvider } from '$lib/services/providers/registry
 import { defaultVoiceForProvider } from '$lib/services/tts/provider-utils';
 import { syncNativeModelProvider } from '$lib/services/native/model-settings';
 import {
+	checkLLMProviderHealth,
+	type ProviderHealth
+} from '$lib/services/providers/health-check';
+import {
 	fetchModels,
 	getCachedModelsForProvider,
 	debounce,
@@ -37,7 +41,10 @@ export function createLlmSettingsState() {
 	let llmIsLoading = $state(false);
 	let llmFetchError = $state<string | null>(null);
 	let llmDynamicModels = $state<ModelInfo[] | null>(null);
+	let llmHealth = $state<ProviderHealth | null>(null);
+	let llmHealthLoading = $state(false);
 	let lastLocalLLMFetchKey = $state('');
+	let llmHealthTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const staticLLMModels = $derived.by(() => {
 		const providerId = consciousnessSettings.activeProvider as string;
@@ -121,6 +128,7 @@ export function createLlmSettingsState() {
 				llmIsLoading = false;
 				llmFetchError = error ?? 'Could not fetch installed models';
 				llmDynamicModels = provider.isLocal ? [] : null;
+				scheduleLLMHealthCheck(0);
 			},
 			onEmpty: () => {
 				llmIsLoading = false;
@@ -137,6 +145,17 @@ export function createLlmSettingsState() {
 
 	const debouncedFetchLLMModels = debounce(fetchLLMModels, 300);
 
+	function scheduleLLMHealthCheck(delayMs = 350) {
+		if (llmHealthTimer) clearTimeout(llmHealthTimer);
+		const providerId = consciousnessSettings.activeProvider as string;
+		const provider = providerId ? getLLMProvider(providerId) : undefined;
+		if (!provider?.isLocal && !provider?.custom) return;
+		llmHealthTimer = setTimeout(() => {
+			llmHealthTimer = undefined;
+			void testLLMConnection();
+		}, delayMs);
+	}
+
 	function handleLLMProviderChange(providerId: string) {
 		modulesStore.setModuleSetting('consciousness', 'activeProvider', providerId);
 		const provider = getLLMProvider(providerId);
@@ -144,6 +163,7 @@ export function createLlmSettingsState() {
 		llmDynamicModels = null;
 		llmFetchError = null;
 		llmIsLoading = false;
+		llmHealth = null;
 
 		const cached = getCachedModelsForProvider(providerId);
 		if (cached) {
@@ -167,6 +187,7 @@ export function createLlmSettingsState() {
 				console.error('[Native model settings] sync failed:', error);
 			});
 		}
+		scheduleLLMHealthCheck();
 	}
 
 	function handleLLMNumberSetting(key: string, value: number | undefined) {
@@ -176,25 +197,31 @@ export function createLlmSettingsState() {
 
 	function handleLLMModelChange(modelId: string) {
 		modulesStore.setModuleSetting('consciousness', 'activeModel', modelId);
+		llmHealth = null;
 		void syncNativeModelProvider(consciousnessSettings.activeProvider as string, modelId).catch((error) => {
 			console.error('[Native model settings] sync failed:', error);
 		});
+		scheduleLLMHealthCheck();
 	}
 
 	function handleLLMBaseUrlChange(providerId: string, baseUrl: string) {
 		settingsStore.setProviderConfig(providerId, { baseUrl });
 		llmFetchError = null;
+		llmHealth = null;
 		void syncNativeModelProvider(providerId).catch((error) => {
 			console.error('[Native model settings] sync failed:', error);
 		});
+		scheduleLLMHealthCheck();
 	}
 
 	function handleApiKeyChange(providerId: string, apiKey: string) {
 		llmFetchError = null;
+		llmHealth = null;
 		applyApiKey(providerId, apiKey);
 		void syncNativeModelProvider(providerId, undefined, apiKey).catch((error) => {
 			console.error('[Native model settings] sync failed:', error);
 		});
+		scheduleLLMHealthCheck();
 	}
 
 	function handleLLMApiKeyBlur() {
@@ -204,6 +231,27 @@ export function createLlmSettingsState() {
 		const config = settingsStore.getProviderConfig(providerId);
 		if (config.apiKey && provider && !provider.isLocal) {
 			debouncedFetchLLMModels();
+		}
+	}
+
+	async function testLLMConnection() {
+		if (llmHealthTimer) {
+			clearTimeout(llmHealthTimer);
+			llmHealthTimer = undefined;
+		}
+		const providerId = consciousnessSettings.activeProvider as string;
+		if (!providerId) return;
+		const config = settingsStore.getProviderConfig(providerId);
+		llmHealthLoading = true;
+		try {
+			llmHealth = await checkLLMProviderHealth(
+				providerId,
+				config.apiKey,
+				config.baseUrl,
+				consciousnessSettings.activeModel as string
+			);
+		} finally {
+			llmHealthLoading = false;
 		}
 	}
 
@@ -227,6 +275,12 @@ export function createLlmSettingsState() {
 		get llmModels() {
 			return llmModels;
 		},
+		get llmHealth() {
+			return llmHealth;
+		},
+		get llmHealthLoading() {
+			return llmHealthLoading;
+		},
 		get llmHasApiKey() {
 			return llmHasApiKey;
 		},
@@ -245,6 +299,7 @@ export function createLlmSettingsState() {
 		handleLLMBaseUrlChange,
 		handleApiKeyChange,
 		handleLLMApiKeyBlur,
+		testLLMConnection,
 		toggleLLM
 	};
 }

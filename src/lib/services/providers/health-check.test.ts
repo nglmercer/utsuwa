@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {
 	checkTTSProviderHealth,
 	getTTSProviderHealth,
-	subscribeTTSProviderHealth
+	subscribeTTSProviderHealth,
+	checkLLMProviderHealth
 } from './health-check.ts';
 
 test('OmniVoice health check returns healthy when /health responds ok', async () => {
@@ -79,3 +80,69 @@ test('Health status is readable after check and notifies subscribers', async () 
 	unsubscribe();
 });
 
+test('LM Studio health check normalizes the host and reports model capabilities', async () => {
+	const requests: string[] = [];
+	globalThis.fetch = (input: string | URL | Request) => {
+		requests.push(String(input));
+		return Promise.resolve(
+			new Response(
+				JSON.stringify({
+					models: [
+						{
+							key: 'qwen-tool',
+							display_name: 'Qwen Tool',
+							type: 'llm',
+							capabilities: { vision: true, trained_for_tool_use: true }
+						}
+					]
+				}),
+				{ status: 200, headers: { 'Content-Type': 'application/json' } }
+			)
+		);
+	};
+
+	const health = await checkLLMProviderHealth(
+		'lmstudio',
+		undefined,
+		'http://localhost:1234',
+		'qwen-tool'
+	);
+
+	assert.deepEqual(requests, ['http://localhost:1234/api/v1/models']);
+	assert.equal(health.reachable, true);
+	assert.equal(health.endpointValid, true);
+	assert.equal(health.modelAvailable, true);
+	assert.equal(health.toolCalling, 'native');
+	assert.equal(health.vision, true);
+});
+
+test('LM Studio health falls back to the legacy metadata endpoint', async () => {
+	const requests: string[] = [];
+	globalThis.fetch = (input: string | URL | Request) => {
+		const url = String(input);
+		requests.push(url);
+		if (url.endsWith('/api/v1/models')) {
+			return Promise.resolve(new Response('not found', { status: 404 }));
+		}
+		return Promise.resolve(
+			new Response(JSON.stringify({ data: [{ id: 'legacy-model', capabilities: [] }] }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' }
+			})
+		);
+	};
+
+	const health = await checkLLMProviderHealth(
+		'lmstudio',
+		undefined,
+		'http://localhost:1235/v1',
+		'legacy-model'
+	);
+
+	assert.deepEqual(requests, [
+		'http://localhost:1235/api/v1/models',
+		'http://localhost:1235/api/v0/models'
+	]);
+	assert.equal(health.modelAvailable, true);
+	assert.equal(health.toolCalling, 'unknown');
+});

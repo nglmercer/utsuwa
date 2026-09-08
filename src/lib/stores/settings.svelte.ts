@@ -6,6 +6,8 @@ import { modulesStore } from '$lib/stores/modules.svelte';
 import { DEFAULT_HOTKEYS, type HotkeyConfig } from '$lib/services/platform/hotkeys';
 import { getBridge } from '$lib/services/native/bridge';
 import { isDesktopBuild } from '$lib/services/platform';
+import { getChatBaseUrl } from '$lib/services/providers/local-endpoints';
+import type { ModelInfo } from '$lib/services/providers/model-capabilities';
 
 export type ProviderCategory = 'llm' | 'tts' | 'stt';
 
@@ -108,7 +110,10 @@ function createSettingsStore() {
 			// upgrade cannot silently discard the user's credential.
 			if (activeProvider && activeConfig?.apiKey && !nativeHasKey) {
 				const model = activeModel || activeMeta?.models?.[0]?.id || '';
-				const baseUrl = activeConfig.baseUrl || activeMeta?.defaultBaseUrl || '';
+				const baseUrl = getChatBaseUrl(
+					activeProvider,
+					activeConfig.baseUrl || activeMeta?.defaultBaseUrl || ''
+				);
 				if (model && baseUrl) {
 					await bridge.invoke('settings.set_model_provider', {
 						provider: activeProvider,
@@ -287,14 +292,14 @@ function createSettingsStore() {
 	// Cached models management
 	const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
-	function setCachedModels(providerId: string, models: Array<{ id: string; name: string }>) {
+	function setCachedModels(providerId: string, models: ModelInfo[]) {
 		setProviderConfig(providerId, {
 			cachedModels: models,
 			modelsFetchedAt: Date.now()
 		});
 	}
 
-	function getCachedModels(providerId: string): Array<{ id: string; name: string }> | null {
+	function getCachedModels(providerId: string): ModelInfo[] | null {
 		const config = providerConfigs[providerId];
 		if (!config?.cachedModels) return null;
 

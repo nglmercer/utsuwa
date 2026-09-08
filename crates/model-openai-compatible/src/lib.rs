@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const MAX_PROVIDER_ERROR_BODY: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleClient {
@@ -63,14 +64,7 @@ impl ModelProvider for OpenAICompatibleClient {
             .send()
             .await
             .map_err(|e| ModelError::Transport(e.to_string()))?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable error body>".to_string());
-            return Err(ModelError::Provider { status, message });
-        }
+        let response = validate_streaming_response(response, &self.url()).await?;
         let byte_stream = response.bytes_stream();
         let state = StreamState {
             buffer: String::new(),
@@ -132,14 +126,7 @@ impl ModelProvider for AnthropicClient {
             .send()
             .await
             .map_err(|e| ModelError::Transport(e.to_string()))?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unreadable error body>".to_string());
-            return Err(ModelError::Provider { status, message });
-        }
+        let response = validate_streaming_response(response, &self.url()).await?;
         let state = AnthropicStreamState {
             buffer: String::new(),
             assembler: AnthropicAssembler::default(),
@@ -154,6 +141,127 @@ impl ModelProvider for AnthropicClient {
             }
         });
         Ok(Box::pin(stream))
+    }
+}
+
+/// HTTP status alone is not enough for a streaming request. Some local
+/// servers return a JSON diagnostic with HTTP 200 when the path is wrong; only
+/// an SSE content type is a valid response for these adapters.
+async fn validate_streaming_response(
+    response: reqwest::Response,
+    endpoint: &str,
+) -> Result<reqwest::Response, ModelError> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if !status.is_success() {
+        let body = read_limited_provider_body(response).await;
+        return Err(ModelError::Provider {
+            status: status.as_u16(),
+            message: classify_provider_error(status.as_u16(), &body),
+        });
+    }
+
+    if content_type
+        .to_ascii_lowercase()
+        .contains("text/event-stream")
+    {
+        return Ok(response);
+    }
+
+    let body = read_limited_provider_body(response).await;
+    let detail =
+        extract_provider_error(&body).unwrap_or_else(|| sanitize_provider_error_body(&body));
+    let detail = if detail.is_empty() {
+        "the provider returned no diagnostic body".to_string()
+    } else {
+        detail
+    };
+    let endpoint = sanitize_provider_endpoint(endpoint);
+    Err(ModelError::InvalidResponse(format!(
+        "expected SSE response from model provider at {endpoint}, got HTTP {} with content-type {content_type:?}: {detail}",
+        status.as_u16()
+    )))
+}
+
+/// Read only a small diagnostic prefix. A provider can return an HTML page or
+/// an unexpectedly large JSON document for a bad endpoint; never buffer that
+/// entire response just to produce an error message.
+async fn read_limited_provider_body(response: reqwest::Response) -> String {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::with_capacity(MAX_PROVIDER_ERROR_BODY + 1);
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else { break };
+        let remaining = MAX_PROVIDER_ERROR_BODY + 1 - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if body.len() > MAX_PROVIDER_ERROR_BODY {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
+}
+
+fn sanitize_provider_endpoint(endpoint: &str) -> String {
+    let endpoint = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
+    sanitize_provider_error_body(endpoint)
+}
+
+fn classify_provider_error(status: u16, body: &str) -> String {
+    let detail = extract_provider_error(body).unwrap_or_else(|| sanitize_provider_error_body(body));
+    let prefix = match status {
+        401 | 403 => "authentication or authorization failed",
+        404 => "model or provider endpoint was not found",
+        429 => "provider rate limit reached",
+        500..=599 => "provider server error",
+        _ => "provider rejected the request",
+    };
+    if detail.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}: {detail}")
+    }
+}
+
+fn extract_provider_error(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    let detail = value
+        .get("error")
+        .and_then(|error| {
+            error
+                .as_str()
+                .or_else(|| error.get("message").and_then(Value::as_str))
+        })
+        .or_else(|| value.get("message").and_then(Value::as_str))?;
+    let sanitized = sanitize_provider_error_body(detail);
+    (!sanitized.is_empty()).then_some(sanitized)
+}
+
+/// Keep provider diagnostics useful without allowing an HTML page, binary
+/// response, or echoed credential to flood the UI/logs.
+pub fn sanitize_provider_error_body(body: &str) -> String {
+    let mut output = String::with_capacity(body.len().min(MAX_PROVIDER_ERROR_BODY + 1));
+    for character in body.chars() {
+        if output.len() > MAX_PROVIDER_ERROR_BODY {
+            break;
+        }
+        if character == '\n' || character == '\r' || character == '\t' || !character.is_control() {
+            output.push(character);
+        }
+    }
+    let output = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    if output.len() > MAX_PROVIDER_ERROR_BODY {
+        let mut end = MAX_PROVIDER_ERROR_BODY;
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &output[..end])
+    } else {
+        output
     }
 }
 
@@ -944,7 +1052,7 @@ mod tests {
                         .and_then(|v| v.trim().parse().ok())
                 })
                 .unwrap_or(0);
-            let mut body = head[body_start..].as_bytes().to_vec();
+            let mut body = head.as_bytes()[body_start..].to_vec();
             while body.len() < len {
                 let n = socket.read(&mut buf).await.unwrap();
                 body.extend_from_slice(&buf[..n]);
@@ -985,6 +1093,49 @@ mod tests {
             ]
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_200_json_error_is_rejected_before_sse_parsing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await.unwrap();
+            socket
+				.write_all(
+					b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"error\":\"Unexpected endpoint or method\"}",
+				)
+				.await
+				.unwrap();
+        });
+
+        let client = OpenAICompatibleClient::new(format!("http://{addr}"), None, "test-model");
+        let error = match client
+            .stream(ModelRequest::new(vec![ModelMessage::user("hi")]))
+            .await
+        {
+            Ok(_) => panic!("JSON error response must not become an SSE stream"),
+            Err(error) => error,
+        };
+        match error {
+            ModelError::InvalidResponse(message) => {
+                assert!(message.contains("expected SSE response"));
+                assert!(message.contains("Unexpected endpoint or method"));
+                assert!(message.contains("content-type"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn provider_error_body_is_capped_and_control_characters_are_removed() {
+        let body = format!("\u{0000}{}", "x".repeat(20_000));
+        let sanitized = sanitize_provider_error_body(&body);
+        assert!(sanitized.len() <= MAX_PROVIDER_ERROR_BODY + '…'.len_utf8());
+        assert!(!sanitized.contains('\u{0000}'));
     }
 
     #[tokio::test]

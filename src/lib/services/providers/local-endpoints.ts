@@ -8,13 +8,19 @@ function trimTrailingSlashes(url: string): string {
 	return url.replace(/\/+$/, '');
 }
 
+/** Remove a pasted OpenAI chat endpoint while retaining the provider base. */
+export function stripChatCompletionsPath(url: string): string {
+	return trimTrailingSlashes(url).replace(/\/chat\/completions$/i, '');
+}
+
 function stripOpenAIPath(url: string): string {
-	return trimTrailingSlashes(url).replace(/\/v1$/, '');
+	return stripChatCompletionsPath(url).replace(/\/v1$/i, '');
 }
 
 export function ensureOpenAIPath(url: string): string {
-	const cleanUrl = trimTrailingSlashes(url);
-	return cleanUrl.endsWith('/v1') ? cleanUrl : `${cleanUrl}/v1`;
+	const cleanUrl = stripChatCompletionsPath(url);
+	if (!cleanUrl) return cleanUrl;
+	return /\/v1$/i.test(cleanUrl) ? cleanUrl : `${cleanUrl}/v1`;
 }
 
 // A default local Ollama reached through the OpenAI-compatible provider: its
@@ -90,7 +96,7 @@ export function getOmniVoiceConnectionHint(baseUrl?: string, siteOrigin?: string
 }
 
 export function getModelsBaseUrl(providerId: string, baseUrl?: string): string {
-	const cleanUrl = trimTrailingSlashes(baseUrl || DEFAULT_BASE_URLS[providerId] || '');
+	const cleanUrl = stripChatCompletionsPath(baseUrl || DEFAULT_BASE_URLS[providerId] || '');
 
 	if (providerId === 'ollama') {
 		return stripOpenAIPath(cleanUrl);
@@ -104,13 +110,18 @@ export function getModelsBaseUrl(providerId: string, baseUrl?: string): string {
 }
 
 export function getChatBaseUrl(providerId: string, baseUrl?: string): string {
-	const cleanUrl = trimTrailingSlashes(baseUrl || DEFAULT_BASE_URLS[providerId] || '');
+	const cleanUrl = stripChatCompletionsPath(baseUrl || DEFAULT_BASE_URLS[providerId] || '');
 
 	if (providerId === 'ollama' || providerId === 'lmstudio') {
 		return ensureOpenAIPath(cleanUrl);
 	}
 
 	return cleanUrl;
+}
+
+/** LM Studio's metadata API is rooted at the server origin, not `/v1`. */
+export function getLMStudioApiBaseUrl(baseUrl?: string): string {
+	return stripOpenAIPath(getChatBaseUrl('lmstudio', baseUrl));
 }
 
 export function getLocalProviderConnectionHint(
