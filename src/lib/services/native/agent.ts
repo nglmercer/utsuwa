@@ -28,7 +28,21 @@ export interface TurnSuspended {
 	request_id: string;
 }
 
+export interface AgentHistoryMessage {
+	role: 'system' | 'user' | 'assistant';
+	content: unknown;
+}
+
+export interface AgentSendOptions {
+	history?: AgentHistoryMessage[];
+	systemPrompt?: string;
+	appendUserMessage?: boolean;
+}
+
 export type AgentTurnEvent =
+	| { kind: 'delta'; delta: string }
+	| { kind: 'tool_started'; id: string; name: string }
+	| { kind: 'tool_finished'; id: string; name: string; ok: boolean }
 	| { kind: 'done'; done: TurnDone }
 	| { kind: 'suspended'; suspended: TurnSuspended }
 	| { kind: 'failed'; error: string }
@@ -39,6 +53,16 @@ export type AgentTurnEvent =
 export function parseAgentTurnEvent(event: string, data: unknown): AgentTurnEvent | null {
 	const d = data as Record<string, unknown> | null;
 	switch (event) {
+		case 'agent.text_delta':
+			return typeof d?.delta === 'string' ? { kind: 'delta', delta: d.delta } : null;
+		case 'agent.tool_started':
+			return typeof d?.id === 'string' && typeof d?.name === 'string'
+				? { kind: 'tool_started', id: d.id, name: d.name }
+				: null;
+		case 'agent.tool_finished':
+			return typeof d?.id === 'string' && typeof d?.name === 'string' && typeof d?.ok === 'boolean'
+				? { kind: 'tool_finished', id: d.id, name: d.name, ok: d.ok }
+				: null;
 		case 'agent.turn_done': {
 			if (typeof d?.text !== 'string') return null;
 			return {
@@ -76,8 +100,15 @@ function parseExecutedSteps(value: unknown): ExecutedStep[] {
 }
 
 /** IPC params for starting a turn. The host rejects empty/oversize text. */
-export function sendParams(text: string): { method: 'agent.send_message'; params: { text: string } } {
-	return { method: 'agent.send_message', params: { text } };
+export function sendParams(
+	text: string,
+	options: AgentSendOptions = {}
+): { method: 'agent.send_message'; params: Record<string, unknown> } {
+	const params: Record<string, unknown> = { text };
+	if (options.history?.length) params.history = options.history;
+	if (options.systemPrompt !== undefined) params.system_prompt = options.systemPrompt;
+	if (options.appendUserMessage !== undefined) params.append_user_message = options.appendUserMessage;
+	return { method: 'agent.send_message', params };
 }
 
 /** One-line status for the turn indicator. */
@@ -113,6 +144,11 @@ export function initialAgentChatState(): AgentChatState {
 /** Pure state transition for one parsed turn event. */
 export function reduceAgentEvent(state: AgentChatState, event: AgentTurnEvent): AgentChatState {
 	switch (event.kind) {
+		case 'delta':
+			return { ...state, phase: 'running', latest: state.latest + event.delta, error: null };
+		case 'tool_started':
+		case 'tool_finished':
+			return { ...state, phase: 'running' };
 		case 'done':
 			return {
 				phase: 'idle',
@@ -137,5 +173,5 @@ export function reduceAgentEvent(state: AgentChatState, event: AgentTurnEvent): 
 
 /** State transition for a locally-sent message (turn starts running). */
 export function reduceAgentSend(state: AgentChatState): AgentChatState {
-	return { ...state, phase: 'running', error: null };
+	return { ...state, phase: 'running', latest: '', executed: [], requestId: null, error: null };
 }

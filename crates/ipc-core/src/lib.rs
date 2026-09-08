@@ -40,6 +40,10 @@ pub enum IpcMethod {
     SettingsGet,
     #[serde(rename = "settings.set")]
     SettingsSet,
+    #[serde(rename = "settings.get_model_provider")]
+    SettingsGetModelProvider,
+    #[serde(rename = "settings.set_model_provider")]
+    SettingsSetModelProvider,
     #[serde(rename = "activity.list")]
     ActivityList,
     #[serde(rename = "plugin.list")]
@@ -127,8 +131,7 @@ impl IpcRequest {
     /// Parse and validate an untrusted frontend string. Unknown methods fail
     /// here because [`IpcMethod`] has no catch-all variant.
     pub fn parse(raw: &str) -> Result<Self, IpcParseError> {
-        serde_json::from_str(raw)
-            .map_err(|e| IpcParseError::InvalidEnvelope(e.to_string()))
+        serde_json::from_str(raw).map_err(|e| IpcParseError::InvalidEnvelope(e.to_string()))
     }
 }
 

@@ -98,7 +98,13 @@ impl AssetServer {
         if path.is_dir() {
             path.push("index.html");
         }
-        if !path.is_file() && uri.path().split('/').next_back().is_some_and(|last| !last.contains('.')) {
+        if !path.is_file()
+            && uri
+                .path()
+                .split('/')
+                .next_back()
+                .is_some_and(|last| !last.contains('.'))
+        {
             // SPA route (e.g. `/app`, `/overlay`) → client-side router.
             path = self.root.join("index.html");
         }
@@ -190,7 +196,12 @@ fn hex_val(b: u8) -> Option<u8> {
 /// `https://*`, `http://*` (non-localhost), `file://*`, and unknown schemes
 /// are blocked — external links become explicit host operations.
 pub fn is_navigation_allowed(url: &str, dev_mode: bool) -> bool {
-    if url.starts_with(&format!("{APP_SCHEME}://{APP_HOST}/")) {
+    let custom_scheme = url::Url::parse(url).ok().is_some_and(|parsed| {
+        parsed.scheme() == APP_SCHEME
+            && parsed.host_str() == Some(APP_HOST)
+            && parsed.path().starts_with('/')
+    });
+    if custom_scheme {
         return true;
     }
     if dev_mode && crate::is_dev_url(url) {
@@ -228,10 +239,22 @@ mod tests {
     #[test]
     fn traversal_and_wrong_host_fail_closed() {
         let (_d, s) = server_with(&[("index.html", "hi")]);
-        assert_eq!(get(&s, "companion://app/../secret").status(), StatusCode::FORBIDDEN);
-        assert_eq!(get(&s, "companion://app/%2e%2e/secret").status(), StatusCode::FORBIDDEN);
-        assert_eq!(get(&s, "companion://evil/index.html").status(), StatusCode::FORBIDDEN);
-        assert_eq!(get(&s, "https://example.com/").status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            get(&s, "companion://app/../secret").status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(&s, "companion://app/%2e%2e/secret").status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(&s, "companion://evil/index.html").status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(&s, "https://example.com/").status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[cfg(unix)]
@@ -253,7 +276,10 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.body().as_ref(), b"<app>");
         // Unknown extension-bearing file is a real 404, not the fallback.
-        assert_eq!(get(&s, "companion://app/missing.js").status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(&s, "companion://app/missing.js").status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]
@@ -264,6 +290,14 @@ mod tests {
     #[test]
     fn navigation_policy() {
         assert!(is_navigation_allowed("companion://app/index.html", false));
+        assert!(!is_navigation_allowed(
+            "companion://app.attacker/index.html",
+            false
+        ));
+        assert!(!is_navigation_allowed(
+            "companion://app@attacker/index.html",
+            false
+        ));
         assert!(!is_navigation_allowed("https://example.com/", false));
         assert!(!is_navigation_allowed("http://localhost:5173/", false));
         assert!(is_navigation_allowed("http://localhost:5173/", true));

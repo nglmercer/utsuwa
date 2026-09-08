@@ -1,7 +1,11 @@
 import { browser } from '$app/environment';
 import type { ProviderConfig } from '$lib/types';
 import { LLM_PROVIDERS, TTS_PROVIDERS, STT_PROVIDERS } from '$lib/services/providers/registry';
+import { getLLMProvider } from '$lib/services/providers/registry';
+import { modulesStore } from '$lib/stores/modules.svelte';
 import { DEFAULT_HOTKEYS, type HotkeyConfig } from '$lib/services/platform/hotkeys';
+import { getBridge } from '$lib/services/native/bridge';
+import { isDesktopBuild } from '$lib/services/platform';
 
 export type ProviderCategory = 'llm' | 'tts' | 'stt';
 
@@ -9,6 +13,9 @@ function createSettingsStore() {
 	// Provider configurations (keyed by provider id)
 	// This is the SINGLE SOURCE OF TRUTH for credentials
 	let providerConfigs = $state<Record<string, ProviderConfig>>({});
+	// A desktop key is write-only in the native host. This status lets the
+	// settings UI treat a saved key as configured without reading it back.
+	let nativeModelKeyProviders = $state<Record<string, boolean>>({});
 
 	// Track which providers have been explicitly added by user
 	let addedProviders = $state<Record<string, boolean>>({});
@@ -54,18 +61,96 @@ function createSettingsStore() {
 				console.error('Failed to load settings:', e);
 			}
 		}
+		if (isDesktopBuild()) void hydrateNativeModelSettings();
 	}
 
 	function save() {
 		if (browser) {
+			const persistedProviderConfigs = Object.fromEntries(
+				Object.entries(providerConfigs).map(([providerId, config]) => {
+					if (isDesktopBuild() && LLM_PROVIDERS.some((provider) => provider.id === providerId)) {
+						const { apiKey: _apiKey, ...withoutApiKey } = config;
+						return [providerId, withoutApiKey];
+					}
+					return [providerId, config];
+				})
+			);
 			localStorage.setItem(
 				'utsuwa-settings',
 				JSON.stringify({
-					providerConfigs,
+					providerConfigs: persistedProviderConfigs,
 					addedProviders,
 					hotkeys
 				})
 			);
+		}
+	}
+
+	async function hydrateNativeModelSettings() {
+		const bridge = getBridge();
+		if (!bridge) return;
+		try {
+			const result = (await bridge.invoke('settings.get_model_provider', {})) as Record<string, unknown>;
+			const provider = typeof result.provider === 'string' ? result.provider : '';
+			const moduleSettings = modulesStore.getModuleSettings('consciousness');
+			const activeProvider = moduleSettings.activeProvider as string | undefined;
+			const activeModel = moduleSettings.activeModel as string | undefined;
+			const activeConfig = activeProvider ? providerConfigs[activeProvider] : undefined;
+			const activeMeta = activeProvider ? getLLMProvider(activeProvider) : undefined;
+			const nativeHasKey = result.has_api_key === true && (!activeProvider || provider === activeProvider);
+
+			// Migrate a pre-native desktop key before the first sanitized save. If
+			// the host cannot accept it, leave the legacy value in place so an
+			// upgrade cannot silently discard the user's credential.
+			if (activeProvider && activeConfig?.apiKey && !nativeHasKey) {
+				const model = activeModel || activeMeta?.models?.[0]?.id || '';
+				const baseUrl = activeConfig.baseUrl || activeMeta?.defaultBaseUrl || '';
+				if (model && baseUrl) {
+					await bridge.invoke('settings.set_model_provider', {
+						provider: activeProvider,
+						base_url: baseUrl,
+						model,
+						api_key: activeConfig.apiKey
+					});
+					providerConfigs[activeProvider] = Object.fromEntries(
+						Object.entries(activeConfig).filter(([key]) => key !== 'apiKey')
+					) as ProviderConfig;
+					nativeModelKeyProviders = {
+						...nativeModelKeyProviders,
+						[activeProvider]: true
+					};
+				}
+			} else if (activeProvider && activeConfig?.apiKey && nativeHasKey) {
+				providerConfigs[activeProvider] = Object.fromEntries(
+					Object.entries(activeConfig).filter(([key]) => key !== 'apiKey')
+				) as ProviderConfig;
+			}
+
+			if (!provider) {
+				save();
+				return;
+			}
+			modulesStore.setModuleSetting('consciousness', 'activeProvider', provider);
+			if (typeof result.model === 'string' && result.model) {
+				modulesStore.setModuleSetting('consciousness', 'activeModel', result.model);
+			}
+			nativeModelKeyProviders = {
+				...nativeModelKeyProviders,
+				[provider]: nativeHasKey
+			};
+			const baseUrl = typeof result.base_url === 'string' ? result.base_url : '';
+			if (baseUrl) {
+				providerConfigs[provider] = {
+					...providerConfigs[provider],
+					baseUrl
+				};
+			}
+			// Re-save after startup hydration so a legacy desktop key is scrubbed
+			// from localStorage even when the user has not opened Settings yet.
+			save();
+		} catch {
+			// A plain browser or an older host has no native settings endpoint;
+			// local settings remain usable until the bridge is upgraded.
 		}
 	}
 
@@ -126,7 +211,6 @@ function createSettingsStore() {
 	// Check if a provider is properly configured (has required credentials)
 	function isProviderConfigured(providerId: string): boolean {
 		const config = providerConfigs[providerId];
-		if (!config) return false;
 
 		// Find the provider metadata to check if it requires an API key
 		const llmProvider = LLM_PROVIDERS.find((p) => p.id === providerId);
@@ -135,13 +219,16 @@ function createSettingsStore() {
 		const provider = llmProvider || ttsProvider || sttProvider;
 
 		if (!provider) return false;
+		if (!config && !(isDesktopBuild() && nativeModelKeyProviders[providerId] === true)) {
+			return false;
+		}
 
 		// Local providers don't require API keys
 		if (provider.isLocal) return true;
 		if (!provider.requiresApiKey) return true;
 
 		// For providers that require API key, check if it's set
-		return !!config.apiKey;
+		return !!config?.apiKey || (isDesktopBuild() && nativeModelKeyProviders[providerId] === true);
 	}
 
 	// Get all configured providers for a category

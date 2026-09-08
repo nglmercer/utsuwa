@@ -12,7 +12,9 @@ use model_core::{
     ToolDefinition, ToolResult,
 };
 use policy_core::{AuthorizationContext, AuthorizationDecision};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tool_core::{ToolContext, ToolOutput, ToolRegistry};
 use tracing::Instrument as _;
 
@@ -73,12 +75,134 @@ pub struct AgentTurn {
     pub truncated: bool,
 }
 
+/// Events emitted while a native turn is running. The host maps these to
+/// frontend events so text and tool status use the same runtime path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentEvent {
+    TextDelta(String),
+    ToolStarted { id: String, name: String },
+    ToolFinished { id: String, name: String, ok: bool },
+}
+
+pub type AgentEventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
+/// Task-scoped replay cache for tools with external effects. When approval
+/// suspends a later model call, the host resumes with the transcript that
+/// already contains earlier tool results. If the model repeats one of those
+/// calls, return the original result instead of repeating its side effect.
+#[derive(Default)]
+pub struct ToolReplayCache {
+    outputs: Mutex<HashMap<String, ToolOutput>>,
+}
+
+impl ToolReplayCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        metadata: &tool_core::ToolMetadata,
+    ) -> Option<ToolOutput> {
+        if !is_side_effecting(metadata) {
+            return None;
+        }
+        self.outputs
+            .lock()
+            .ok()
+            .and_then(|outputs| outputs.get(&replay_key(name, args)).cloned())
+    }
+
+    fn insert(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        metadata: &tool_core::ToolMetadata,
+        output: ToolOutput,
+    ) {
+        if !is_side_effecting(metadata) {
+            return;
+        }
+        if let Ok(mut outputs) = self.outputs.lock() {
+            outputs.insert(replay_key(name, args), output);
+        }
+    }
+}
+
+fn is_side_effecting(metadata: &tool_core::ToolMetadata) -> bool {
+    metadata
+        .effects
+        .iter()
+        .any(|effect| !matches!(effect, tool_core::ToolEffect::ReadOnly))
+}
+
+/// Stable enough for a repeated model call: object keys are sorted so a
+/// semantically identical JSON object cannot evade the task replay guard by
+/// changing key order.
+fn replay_key(name: &str, args: &serde_json::Value) -> String {
+    fn canonical(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(object) => {
+                let mut keys: Vec<_> = object.keys().collect();
+                keys.sort_unstable();
+                let mut sorted = serde_json::Map::new();
+                for key in keys {
+                    if let Some(value) = object.get(key) {
+                        sorted.insert(key.clone(), canonical(value));
+                    }
+                }
+                serde_json::Value::Object(sorted)
+            }
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.iter().map(canonical).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    format!("{name}:{}", canonical(args))
+}
+
+/// Authorization boundary used by the tool loop. The ordinary public API
+/// uses an immutable policy snapshot; the host supplies a queue-backed
+/// implementation that consumes once grants before invocation.
+pub trait ToolAuthorizer: Send + Sync {
+    fn authorize(
+        &self,
+        principal: &Principal,
+        request: &CapabilityRequest,
+    ) -> AuthorizationDecision;
+
+    /// Commit authority immediately before a tool can cause an effect.
+    fn commit(&self, _principal: &Principal, _request: &CapabilityRequest) -> bool {
+        true
+    }
+}
+
+struct ContextAuthorizer<'a> {
+    context: &'a AuthorizationContext,
+}
+
+impl ToolAuthorizer for ContextAuthorizer<'_> {
+    fn authorize(
+        &self,
+        principal: &Principal,
+        request: &CapabilityRequest,
+    ) -> AuthorizationDecision {
+        policy_core::authorize(principal, request, self.context)
+    }
+}
+
 pub struct Agent {
     provider: Arc<dyn ModelProvider>,
     agent_id: AgentId,
     system_prompt: Option<String>,
     limits: AgentLimits,
     audit: Option<Arc<dyn AuditSink>>,
+    event_sink: Option<AgentEventSink>,
+    replay_cache: Option<Arc<ToolReplayCache>>,
 }
 
 impl Agent {
@@ -89,6 +213,8 @@ impl Agent {
             system_prompt: None,
             limits: AgentLimits::default(),
             audit: None,
+            event_sink: None,
+            replay_cache: None,
         }
     }
 
@@ -115,12 +241,36 @@ impl Agent {
         self
     }
 
+    pub fn with_event_sink(mut self, sink: AgentEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
+    /// Reuse successful side-effect results for the lifetime of one host
+    /// task. The cache is intentionally supplied by the host so it survives
+    /// an approval suspension but never survives task cancellation/restart.
+    pub fn with_replay_cache(mut self, cache: Arc<ToolReplayCache>) -> Self {
+        self.replay_cache = Some(cache);
+        self
+    }
+
+    fn emit(&self, event: AgentEvent) {
+        if let Some(sink) = &self.event_sink {
+            sink(event);
+        }
+    }
+
     /// Run one model turn: prepend the system prompt, stream the response,
     /// accumulate text. Tool calls in the response are ignored here — use
     /// [`Agent::turn_with_tools`] to execute them.
     pub async fn turn(&self, mut messages: Vec<ModelMessage>) -> Result<AgentTurn, AgentError> {
-        if let Some(prompt) = &self.system_prompt {
-            messages.insert(0, ModelMessage::system(prompt.clone()));
+        if !messages
+            .first()
+            .is_some_and(|message| message.role == model_core::ModelRole::System)
+        {
+            if let Some(prompt) = &self.system_prompt {
+                messages.insert(0, ModelMessage::system(prompt.clone()));
+            }
         }
         let mut request = ModelRequest::new(messages);
         request.max_tokens = Some(1024);
@@ -155,8 +305,22 @@ impl Agent {
         registry: &ToolRegistry,
         policy: &AuthorizationContext,
     ) -> Result<AgentOutcome, AgentError> {
+        let authorizer = ContextAuthorizer { context: policy };
+        self.turn_with_tools_authorized(messages, registry, &authorizer)
+            .await
+    }
+
+    /// Run a tool-calling turn against a live authorization boundary. The
+    /// host uses this entry point so preflight and grant consumption share
+    /// the same approval queue.
+    pub async fn turn_with_tools_authorized(
+        &self,
+        messages: Vec<ModelMessage>,
+        registry: &ToolRegistry,
+        authorizer: &dyn ToolAuthorizer,
+    ) -> Result<AgentOutcome, AgentError> {
         let turn_span = tracing::info_span!("agent.turn", agent = %self.agent_id);
-        self.turn_with_tools_inner(messages, registry, policy)
+        self.turn_with_tools_inner(messages, registry, authorizer)
             .instrument(turn_span)
             .await
     }
@@ -165,10 +329,15 @@ impl Agent {
         &self,
         mut messages: Vec<ModelMessage>,
         registry: &ToolRegistry,
-        policy: &AuthorizationContext,
+        authorizer: &dyn ToolAuthorizer,
     ) -> Result<AgentOutcome, AgentError> {
-        if let Some(prompt) = &self.system_prompt {
-            messages.insert(0, ModelMessage::system(prompt.clone()));
+        if !messages
+            .first()
+            .is_some_and(|message| message.role == model_core::ModelRole::System)
+        {
+            if let Some(prompt) = &self.system_prompt {
+                messages.insert(0, ModelMessage::system(prompt.clone()));
+            }
         }
         let tool_defs: Vec<ToolDefinition> = registry
             .list()
@@ -188,6 +357,7 @@ impl Agent {
             truncated |= turn_truncated;
             final_text = text.clone();
             if calls.is_empty() {
+                messages.push(ModelMessage::assistant(text.clone(), Vec::new()));
                 return Ok(AgentOutcome {
                     invocation_id,
                     text,
@@ -197,34 +367,29 @@ impl Agent {
                     messages: messages.clone(),
                 });
             }
+            // Preflight every call before invoking any of them. A later
+            // approval request therefore cannot arrive after an earlier
+            // side effect has already happened.
+            let available = self.limits.max_tool_calls.saturating_sub(executed.len());
+            let mut prepared = Vec::new();
             let mut results = Vec::new();
-            for call in &calls {
-                if executed.len() >= self.limits.max_tool_calls {
-                    break;
+            for call in calls.iter().take(available) {
+                if let Some(output) = self.replayed_output(registry, call) {
+                    executed.push(ExecutedTool {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        output: output.clone(),
+                    });
+                    results.push(ModelMessage::tool_result(ToolResult {
+                        tool_call_id: call.id.clone(),
+                        content: truncate_json(&output.content, self.limits.max_tool_output_bytes),
+                        is_error: false,
+                    }));
+                    continue;
                 }
-                match self.execute_call(registry, policy, call).await {
-                    Ok(output) => {
-                        executed.push(ExecutedTool {
-                            id: call.id.clone(),
-                            name: call.name.clone(),
-                            output: output.clone(),
-                        });
-                        results.push(ModelMessage::tool_result(ToolResult {
-                            tool_call_id: call.id.clone(),
-                            content: truncate_json(
-                                &output.content,
-                                self.limits.max_tool_output_bytes,
-                            ),
-                            is_error: false,
-                        }));
-                    }
+                match self.prepare_call(registry, authorizer, call) {
+                    Ok(prepared_call) => prepared.push(prepared_call),
                     Err(PendingOrFailed::Pending(pending)) => {
-                        // Transcript WITHOUT the dangling assistant call:
-                        // appending it would leave a tool call with no
-                        // result, which providers reject. The host resumes
-                        // by noting the approval outcome and re-running
-                        // the turn, so the model re-issues (or drops) the
-                        // call against the updated policy context.
                         return Ok(AgentOutcome {
                             invocation_id,
                             text,
@@ -243,9 +408,51 @@ impl Agent {
                     }
                 }
             }
+            for prepared_call in prepared {
+                let call_id = prepared_call.call.id.clone();
+                let call_name = prepared_call.call.name.clone();
+                match self.execute_prepared(authorizer, prepared_call).await {
+                    Ok(output) => {
+                        executed.push(ExecutedTool {
+                            id: call_id.clone(),
+                            name: call_name.clone(),
+                            output: output.clone(),
+                        });
+                        results.push(ModelMessage::tool_result(ToolResult {
+                            tool_call_id: call_id,
+                            content: truncate_json(
+                                &output.content,
+                                self.limits.max_tool_output_bytes,
+                            ),
+                            is_error: false,
+                        }));
+                    }
+                    Err(PendingOrFailed::Failed(message)) => {
+                        results.push(ModelMessage::tool_result(ToolResult {
+                            tool_call_id: call_id.clone(),
+                            content: message,
+                            is_error: true,
+                        }));
+                    }
+                    Err(PendingOrFailed::Pending(_)) => {
+                        // `execute_prepared` only commits already-approved
+                        // calls; a pending result here would indicate a
+                        // broken authorizer implementation.
+                        results.push(ModelMessage::tool_result(ToolResult {
+                            tool_call_id: call_id,
+                            content: "authorization changed during execution".to_string(),
+                            is_error: true,
+                        }));
+                    }
+                }
+            }
             messages.push(ModelMessage::assistant(text, calls));
             messages.extend(results);
         }
+        // The loop limit is a completed, bounded outcome as well. The last
+        // assistant tool-call message and its results were already appended
+        // above; do not add a synthetic assistant message that the model
+        // never produced.
         Ok(AgentOutcome {
             invocation_id,
             text: final_text,
@@ -278,12 +485,21 @@ impl Agent {
                         break;
                     }
                     text.push_str(&delta);
+                    self.emit(AgentEvent::TextDelta(delta));
                 }
                 ModelStreamEvent::ToolCall(call) => calls.push(call),
                 ModelStreamEvent::Done { .. } => break,
             }
         }
         Ok((text, calls, truncated))
+    }
+
+    fn replayed_output(&self, registry: &ToolRegistry, call: &ToolCall) -> Option<ToolOutput> {
+        let cache = self.replay_cache.as_ref()?;
+        let tool = registry.resolve(&call.name).ok()?;
+        let args = serde_json::from_str(&call.arguments).ok()?;
+        let metadata = tool.metadata();
+        cache.get(&call.name, &args, &metadata)
     }
 
     fn audit(
@@ -306,13 +522,8 @@ impl Agent {
         mutation: Option<tool_core::MutationEvidence>,
     ) {
         if let Some(sink) = &self.audit {
-            let mut record = AuditRecord::now(
-                self.principal(),
-                capability,
-                resource,
-                outcome,
-                detail,
-            );
+            let mut record =
+                AuditRecord::now(self.principal(), capability, resource, outcome, detail);
             if let Some(ms) = duration_ms {
                 record = record.with_duration(ms);
             }
@@ -323,13 +534,14 @@ impl Agent {
         }
     }
 
-    /// Resolve, authorize, and execute one tool call.
-    async fn execute_call(
+    /// Resolve and authorize a call without invoking it. All calls in one
+    /// model response pass this phase before any prepared call executes.
+    fn prepare_call(
         &self,
         registry: &ToolRegistry,
-        policy: &AuthorizationContext,
+        authorizer: &dyn ToolAuthorizer,
         call: &ToolCall,
-    ) -> Result<ToolOutput, PendingOrFailed> {
+    ) -> Result<PreparedCall, PendingOrFailed> {
         let tool = registry.resolve(&call.name).map_err(|e| {
             self.audit(None, None, AuditOutcome::Failed, e.to_string());
             PendingOrFailed::Failed(e.to_string())
@@ -343,7 +555,7 @@ impl Agent {
         // resource (least privilege) and bound to this invocation. Brokers
         // re-validate it; the ticket — never the decision — opens the OS.
         let requirement = tool.required_capability(&args);
-        let mut ticket = None;
+        let mut ticket_ttl = None;
         if let Some(requirement) = requirement.clone() {
             let principal = self.principal();
             let request = CapabilityRequest {
@@ -351,15 +563,9 @@ impl Agent {
                 capability: requirement.capability.clone(),
                 resource: requirement.resource.clone(),
             };
-            match policy_core::authorize(&principal, &request, policy) {
-                AuthorizationDecision::Allow { ticket_ttl } => {
-                    ticket = Some(CapabilityTicket::mint(
-                        principal,
-                        requirement.capability,
-                        capability_core::ResourceScope::new(vec![requirement.resource]),
-                        InvocationId::fresh(),
-                        ticket_ttl,
-                    ));
+            match authorizer.authorize(&principal, &request) {
+                AuthorizationDecision::Allow { ticket_ttl: ttl } => {
+                    ticket_ttl = Some(ttl);
                 }
                 AuthorizationDecision::Deny { reason } => {
                     self.audit(
@@ -368,7 +574,9 @@ impl Agent {
                         AuditOutcome::Denied,
                         reason.clone(),
                     );
-                    return Err(PendingOrFailed::Failed(format!("denied by policy: {reason}")));
+                    return Err(PendingOrFailed::Failed(format!(
+                        "denied by policy: {reason}"
+                    )));
                 }
                 AuthorizationDecision::RequireUserApproval { reason } => {
                     self.audit(
@@ -386,9 +594,81 @@ impl Agent {
                 }
             }
         }
+        Ok(PreparedCall {
+            call: call.clone(),
+            tool,
+            args,
+            requirement,
+            ticket_ttl,
+        })
+    }
+
+    /// Consume live authority, mint the invocation ticket, and invoke one
+    /// already-preflighted call.
+    async fn execute_prepared(
+        &self,
+        authorizer: &dyn ToolAuthorizer,
+        prepared: PreparedCall,
+    ) -> Result<ToolOutput, PendingOrFailed> {
+        let PreparedCall {
+            call,
+            tool,
+            args,
+            requirement,
+            ticket_ttl,
+        } = prepared;
+        let metadata = tool.metadata();
+        if let Some(cache) = &self.replay_cache {
+            if let Some(output) = cache.get(&call.name, &args, &metadata) {
+                self.emit(AgentEvent::ToolStarted {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                });
+                self.audit(
+                    None,
+                    None,
+                    AuditOutcome::Executed,
+                    format!("{} replayed prior result; side effect skipped", call.name),
+                );
+                self.emit(AgentEvent::ToolFinished {
+                    id: call.id,
+                    name: call.name,
+                    ok: true,
+                });
+                return Ok(output);
+            }
+        }
+        let ticket = if let (Some(requirement), Some(ttl)) = (&requirement, ticket_ttl) {
+            let principal = self.principal();
+            let request = CapabilityRequest {
+                principal: principal.clone(),
+                capability: requirement.capability.clone(),
+                resource: requirement.resource.clone(),
+            };
+            if !authorizer.commit(&principal, &request) {
+                self.audit(
+                    Some(request.capability),
+                    Some(request.resource),
+                    AuditOutcome::Denied,
+                    "grant was revoked or already consumed before execution".to_string(),
+                );
+                return Err(PendingOrFailed::Failed(
+                    "permission is no longer available for this tool call".to_string(),
+                ));
+            }
+            Some(CapabilityTicket::mint(
+                principal,
+                requirement.capability.clone(),
+                capability_core::ResourceScope::new(vec![requirement.resource.clone()]),
+                InvocationId::fresh(),
+                ttl,
+            ))
+        } else {
+            None
+        };
         let invocation_id = ticket
             .as_ref()
-            .map(|t| t.invocation_id.clone())
+            .map(|t| t.invocation_id)
             .unwrap_or_else(InvocationId::fresh);
         let mut ctx = ToolContext {
             principal: self.principal(),
@@ -410,12 +690,19 @@ impl Agent {
         };
         // Span carries the tool name only: arguments may embed secrets
         // and are never log fields.
+        self.emit(AgentEvent::ToolStarted {
+            id: call.id.clone(),
+            name: call.name.clone(),
+        });
         let span = tracing::info_span!("tool.invoke", tool = %call.name);
         let started = std::time::Instant::now();
-        let outcome = tool.invoke(ctx, args).instrument(span).await;
+        let outcome = tool.invoke(ctx, args.clone()).instrument(span).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match outcome {
             Ok(output) => {
+                if let Some(cache) = &self.replay_cache {
+                    cache.insert(&call.name, &args, &metadata, output.clone());
+                }
                 // Mutation evidence (if the tool attached any) joins the
                 // audit record: path + before/after hashes, never contents.
                 let mutation = output.mutation.clone();
@@ -427,6 +714,11 @@ impl Agent {
                     Some(elapsed_ms),
                     mutation,
                 );
+                self.emit(AgentEvent::ToolFinished {
+                    id: call.id,
+                    name: call.name,
+                    ok: true,
+                });
                 Ok(output)
             }
             Err(err) => {
@@ -438,6 +730,11 @@ impl Agent {
                     Some(elapsed_ms),
                     None,
                 );
+                self.emit(AgentEvent::ToolFinished {
+                    id: call.id,
+                    name: call.name,
+                    ok: false,
+                });
                 Err(PendingOrFailed::Failed(err.to_string()))
             }
         }
@@ -451,6 +748,14 @@ pub struct PendingApproval {
     pub capability: capability_core::Capability,
     pub resource: capability_core::Resource,
     pub reason: String,
+}
+
+struct PreparedCall {
+    call: ToolCall,
+    tool: Arc<dyn tool_core::Tool>,
+    args: serde_json::Value,
+    requirement: Option<tool_core::CapabilityRequirement>,
+    ticket_ttl: Option<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -562,12 +867,14 @@ mod tests {
 
     #[tokio::test]
     async fn output_cap_truncates() {
-        let agent = Agent::new(provider(vec![ModelStreamEvent::TextDelta("abcdef".to_string())]))
-            .with_limits(AgentLimits {
-                max_output_bytes: 3,
-                max_stream_events: 100,
-                ..AgentLimits::default()
-            });
+        let agent = Agent::new(provider(vec![ModelStreamEvent::TextDelta(
+            "abcdef".to_string(),
+        )]))
+        .with_limits(AgentLimits {
+            max_output_bytes: 3,
+            max_stream_events: 100,
+            ..AgentLimits::default()
+        });
         let turn = agent.turn(vec![ModelMessage::user("hi")]).await.unwrap();
         assert!(turn.truncated);
         assert!(turn.text.len() <= 3);
@@ -694,6 +1001,104 @@ mod tests {
         assert_eq!(result.tool_call_id, "c1");
         assert!(result.content.contains("ping"));
         assert!(!result.is_error);
+        assert_eq!(
+            outcome.messages.last().unwrap().role,
+            model_core::ModelRole::Assistant
+        );
+        assert_eq!(outcome.messages.last().unwrap().content, "done");
+    }
+
+    #[tokio::test]
+    async fn replay_cache_prevents_a_second_side_effect_for_the_same_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingEffect {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl tool_core::Tool for CountingEffect {
+            fn metadata(&self) -> tool_core::ToolMetadata {
+                tool_core::ToolMetadata {
+                    id: capability_core::ToolId::new("test.effect"),
+                    description: "count one external effect".to_string(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    effects: vec![tool_core::ToolEffect::FilesystemWrite],
+                }
+            }
+
+            fn required_capability(
+                &self,
+                _args: &serde_json::Value,
+            ) -> Option<tool_core::CapabilityRequirement> {
+                Some(tool_core::CapabilityRequirement {
+                    capability: capability_core::Capability::FilesystemWrite,
+                    resource: capability_core::Resource::Path("/work/replay.txt".into()),
+                })
+            }
+
+            async fn invoke(
+                &self,
+                _ctx: tool_core::ToolContext,
+                _args: serde_json::Value,
+            ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+                let count = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(tool_core::ToolOutput::new(
+                    serde_json::json!({ "count": count }),
+                ))
+            }
+        }
+
+        let call = |id: &str| {
+            vec![
+                ModelStreamEvent::ToolCall(ToolCall {
+                    id: id.to_string(),
+                    name: "test.effect".to_string(),
+                    arguments: r#"{"value":"same"}"#.to_string(),
+                }),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ]
+        };
+        let provider = Arc::new(QueueProvider::new(vec![
+            call("first"),
+            text_turn("first done"),
+            call("repeated"),
+            text_turn("second done"),
+        ]));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = tool_core::ToolRegistry::new();
+        registry
+            .register(Arc::new(CountingEffect {
+                calls: Arc::clone(&calls),
+            }))
+            .unwrap();
+        let policy = AuthorizationContext {
+            grants: vec![policy_core::GrantedScope::new(
+                capability_core::PrincipalKind::Agent,
+                capability_core::Capability::FilesystemWrite,
+                capability_core::ResourceScope::new(vec![capability_core::Resource::Path(
+                    "/work".into(),
+                )]),
+                policy_core::GrantLifetime::Session,
+                None,
+                None,
+            )],
+            ..AuthorizationContext::default()
+        };
+        let agent = Agent::new(provider).with_replay_cache(Arc::new(ToolReplayCache::new()));
+        let first = agent
+            .turn_with_tools(vec![ModelMessage::user("first")], &registry, &policy)
+            .await
+            .unwrap();
+        let second = agent
+            .turn_with_tools(vec![ModelMessage::user("second")], &registry, &policy)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.executed[0].output.content["count"], 1);
+        assert_eq!(second.executed[0].output.content["count"], 1);
     }
 
     /// A tool declaring a privileged requirement stops the turn for approval
@@ -759,6 +1164,120 @@ mod tests {
         assert!(outcome.executed.is_empty());
         // Model was consulted exactly once — no second turn after pending.
         assert_eq!(provider.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_blocks_all_side_effects_until_every_call_is_authorized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SideEffectTool {
+            count: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl tool_core::Tool for SideEffectTool {
+            fn metadata(&self) -> tool_core::ToolMetadata {
+                tool_core::ToolMetadata {
+                    id: capability_core::ToolId::new("test.first_side_effect"),
+                    description: "first side effect".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    effects: vec![tool_core::ToolEffect::FilesystemWrite],
+                }
+            }
+            fn required_capability(
+                &self,
+                _args: &serde_json::Value,
+            ) -> Option<tool_core::CapabilityRequirement> {
+                Some(tool_core::CapabilityRequirement {
+                    capability: capability_core::Capability::FilesystemWrite,
+                    resource: capability_core::Resource::Path("/work/first".into()),
+                })
+            }
+            async fn invoke(
+                &self,
+                _ctx: tool_core::ToolContext,
+                _args: serde_json::Value,
+            ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+                self.count.fetch_add(1, Ordering::SeqCst);
+                Ok(tool_core::ToolOutput::new(serde_json::json!({"ok": true})))
+            }
+        }
+
+        struct NeedsApprovalTool;
+        #[async_trait::async_trait]
+        impl tool_core::Tool for NeedsApprovalTool {
+            fn metadata(&self) -> tool_core::ToolMetadata {
+                tool_core::ToolMetadata {
+                    id: capability_core::ToolId::new("test.second_side_effect"),
+                    description: "second side effect".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    effects: vec![tool_core::ToolEffect::FilesystemWrite],
+                }
+            }
+            fn required_capability(
+                &self,
+                _args: &serde_json::Value,
+            ) -> Option<tool_core::CapabilityRequirement> {
+                Some(tool_core::CapabilityRequirement {
+                    capability: capability_core::Capability::FilesystemWrite,
+                    resource: capability_core::Resource::Path("/work/second".into()),
+                })
+            }
+            async fn invoke(
+                &self,
+                _ctx: tool_core::ToolContext,
+                _args: serde_json::Value,
+            ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+                panic!("preflight must stop before the second call")
+            }
+        }
+
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let mut registry = tool_core::ToolRegistry::new();
+        registry
+            .register(Arc::new(SideEffectTool {
+                count: Arc::clone(&first_count),
+            }))
+            .unwrap();
+        registry.register(Arc::new(NeedsApprovalTool)).unwrap();
+        let provider = Arc::new(QueueProvider::new(vec![vec![
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: "first".to_string(),
+                name: "test.first_side_effect".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: "second".to_string(),
+                name: "test.second_side_effect".to_string(),
+                arguments: "{}".to_string(),
+            }),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ]]));
+        let first_grant = policy_core::GrantedScope::new(
+            capability_core::PrincipalKind::Agent,
+            capability_core::Capability::FilesystemWrite,
+            capability_core::ResourceScope::new(vec![capability_core::Resource::Path(
+                "/work/first".into(),
+            )]),
+            policy_core::GrantLifetime::Session,
+            None,
+            None,
+        );
+        let agent = Agent::new(provider);
+        let outcome = agent
+            .turn_with_tools(
+                vec![ModelMessage::user("do both")],
+                &registry,
+                &AuthorizationContext {
+                    grants: vec![first_grant],
+                    ..AuthorizationContext::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.pending_approval.unwrap().tool_call.id, "second");
+        assert_eq!(first_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -835,11 +1354,22 @@ mod tests {
             grants: vec![policy_core::GrantedScope {
                 principal_kind: capability_core::PrincipalKind::Agent,
                 capability: capability_core::Capability::FilesystemRead,
-                scope: capability_core::ResourceScope::new(vec![
-                    capability_core::Resource::Path(root.clone()),
-                ]),
+                scope: capability_core::ResourceScope::new(vec![capability_core::Resource::Path(
+                    root.clone(),
+                )]),
                 lifetime: policy_core::GrantLifetime::Session,
+                ..policy_core::GrantedScope::new(
+                    capability_core::PrincipalKind::Agent,
+                    capability_core::Capability::FilesystemRead,
+                    capability_core::ResourceScope::new(vec![capability_core::Resource::Path(
+                        root.clone(),
+                    )]),
+                    policy_core::GrantLifetime::Session,
+                    None,
+                    None,
+                )
             }],
+            ..AuthorizationContext::default()
         };
         let agent = Agent::new(provider);
         let outcome = agent
@@ -889,7 +1419,11 @@ mod tests {
         };
         // Three scripted read turns (one per run); the loop's follow-up
         // model call after the approved execution falls back to Done.
-        let provider = Arc::new(QueueProvider::new(vec![read_turn(), read_turn(), read_turn()]));
+        let provider = Arc::new(QueueProvider::new(vec![
+            read_turn(),
+            read_turn(),
+            read_turn(),
+        ]));
         let mut registry = tool_core::ToolRegistry::new();
         registry
             .register(Arc::new(tool_filesystem::ReadTool {
@@ -1089,8 +1623,14 @@ mod tests {
                 .expect("executed record");
             let evidence = executed.mutation.as_ref().expect("mutation evidence");
             assert_eq!(evidence.path, target_str);
-            assert_eq!(evidence.before_sha256.as_deref(), Some(hash(b"version one").as_str()));
-            assert_eq!(evidence.after_sha256.as_deref(), Some(hash(b"version two").as_str()));
+            assert_eq!(
+                evidence.before_sha256.as_deref(),
+                Some(hash(b"version one").as_str())
+            );
+            assert_eq!(
+                evidence.after_sha256.as_deref(),
+                Some(hash(b"version two").as_str())
+            );
         }
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1118,5 +1658,32 @@ mod tests {
         // 1 initial + 3 loop turns = 4 model calls max, then stop.
         assert!(outcome.executed.len() <= 3);
         assert!(outcome.pending_approval.is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_turn_keeps_the_model_tool_exchange_exactly_once() {
+        let provider = Arc::new(QueueProvider::new(vec![vec![
+            echo_call("c1"),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ]]));
+        let agent = Agent::new(provider).with_limits(AgentLimits {
+            max_iterations: 1,
+            ..AgentLimits::default()
+        });
+        let outcome = agent
+            .turn_with_tools(
+                vec![ModelMessage::user("hi")],
+                &registry_with_echo(),
+                &AuthorizationContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.messages.len(), 3);
+        assert_eq!(outcome.messages[1].role, model_core::ModelRole::Assistant);
+        assert_eq!(outcome.messages[1].tool_calls.len(), 1);
+        assert_eq!(outcome.messages[2].role, model_core::ModelRole::Tool);
     }
 }

@@ -4,7 +4,8 @@
 //! No shell, ever: the executable and its arguments travel as separate
 //! strings into [`std::process::Command`], so shell metacharacters are
 //! inert data. Spawning requires a `ProcessSpawn` ticket scoped to the
-//! resolved executable; `status`/`kill` act on unguessable handle ids
+//! complete resolved executable, argv, cwd, and environment delta;
+//! `status`/`kill` act on unguessable handle ids
 //! (knowledge of the handle is the authority — handles are minted per
 //! spawn and never derived from user input).
 //!
@@ -345,10 +346,12 @@ impl ProcessManager {
     pub fn status(&self, handle: &str) -> Result<StatusSnapshot, ToolError> {
         self.poll(handle)?;
         let inner = self.lock()?;
-        let proc_ = inner
-            .procs
-            .get(handle)
-            .ok_or_else(|| invalid("process.status", format!("unknown process handle '{handle}'")))?;
+        let proc_ = inner.procs.get(handle).ok_or_else(|| {
+            invalid(
+                "process.status",
+                format!("unknown process handle '{handle}'"),
+            )
+        })?;
         let pid = proc_.child.as_ref().map(|c| c.id()).unwrap_or(0);
         Ok(StatusSnapshot {
             handle: handle.to_string(),
@@ -423,7 +426,11 @@ fn drain_stream(
                 let Some(proc_) = inner.procs.get_mut(handle) else {
                     break;
                 };
-                let target = if is_stdout { &mut proc_.stdout } else { &mut proc_.stderr };
+                let target = if is_stdout {
+                    &mut proc_.stdout
+                } else {
+                    &mut proc_.stderr
+                };
                 let room = cap.saturating_sub(target.len());
                 if room == 0 {
                     proc_.output_truncated = true;
@@ -453,12 +460,15 @@ fn is_secret_name(name: &str) -> bool {
 
 /// Injection vectors with no legitimate per-child use.
 fn is_injection_name(name: &str) -> bool {
-    matches!(name, "LD_PRELOAD" | "DYLD_INSERT_LIBRARIES")
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "LD_PRELOAD" | "DYLD_INSERT_LIBRARIES"
+    )
 }
 
 /// Inherited environment minus secrets and injection variables. Explicit
-/// caller deltas (`SpawnSpec::env`) are applied on top — passing a
-/// credential there is always a deliberate act, never ambient leakage.
+/// caller deltas (`SpawnSpec::env`) are applied on top after the parser
+/// rejects loader injection variables.
 pub fn sanitized_inherited_env() -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(name, _)| !is_secret_name(name) && !is_injection_name(name))
@@ -501,19 +511,21 @@ pub fn resolve_executable(requested: &str) -> Result<PathBuf, ToolError> {
 
 // -- ticket validation -----------------------------------------------------
 
-/// The spawn ticket must cover `ProcessSpawn` on the resolved executable.
-/// Mirrors the filesystem broker: the ticket — never the decision — opens
-/// the OS.
-fn authorized_executable(ctx: &ToolContext, executable: &Path) -> Result<(), ToolError> {
+/// The spawn ticket must cover the complete resolved invocation. The ticket
+/// — never the policy decision — opens the OS.
+fn authorized_process(ctx: &ToolContext, spec: &SpawnSpec) -> Result<(), ToolError> {
     let ticket = ctx.ticket.as_ref().ok_or_else(|| {
-        denied(
-            "no capability ticket: route process spawns through the agent + policy engine",
-        )
+        denied("no capability ticket: route process spawns through the agent + policy engine")
     })?;
     let request = CapabilityRequest {
         principal: ctx.principal.clone(),
         capability: Capability::ProcessSpawn,
-        resource: Resource::Executable(executable.to_path_buf()),
+        resource: Resource::Process {
+            executable: spec.executable.clone(),
+            args: spec.args.clone(),
+            cwd: spec.cwd.clone(),
+            env: sorted_env(&spec.env),
+        },
     };
     ticket
         .check(&ctx.principal, &request, &ctx.invocation_id)
@@ -528,10 +540,19 @@ fn authorized_executable(ctx: &ToolContext, executable: &Path) -> Result<(), Too
                         "ticket bound to a different invocation",
                     capability_core::TicketError::CapabilityMismatch
                     | capability_core::TicketError::ScopeMismatch =>
-                        "ticket does not cover this executable",
+                        "ticket does not cover this executable, arguments, cwd, or environment",
                 }
             ))
         })
+}
+
+fn sorted_env(env: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut entries: Vec<_> = env
+        .iter()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
 }
 
 // -- tools -----------------------------------------------------------------
@@ -574,14 +595,110 @@ fn capped_str(tool: &str, what: &str, value: &str, max: usize) -> Result<String,
     Ok(value.to_string())
 }
 
-fn parse_timeout_ms(value: Option<&serde_json::Value>, limits: &ProcessLimits) -> Result<Duration, ToolError> {
+fn parse_timeout_ms(
+    value: Option<&serde_json::Value>,
+    limits: &ProcessLimits,
+) -> Result<Duration, ToolError> {
     let Some(value) = value else {
         return Ok(limits.default_timeout);
     };
-    let ms = value.as_u64().ok_or_else(|| {
-        invalid("process.spawn", "timeout_ms must be a non-negative integer")
-    })?;
+    let ms = value
+        .as_u64()
+        .ok_or_else(|| invalid("process.spawn", "timeout_ms must be a non-negative integer"))?;
     Ok(Duration::from_millis(ms).clamp(Duration::from_secs(1), limits.max_timeout))
+}
+
+/// Parse and resolve every part of a spawn request once. The same resolved
+/// plan feeds policy, ticket validation, and `Command`, so approval cannot
+/// be obtained for one cwd/argv/env and execution silently use another.
+fn parse_spawn_spec(
+    args: &serde_json::Value,
+    limits: &ProcessLimits,
+) -> Result<SpawnSpec, ToolError> {
+    const TOOL: &str = "process.spawn";
+    let executable_raw = args
+        .get("executable")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid(TOOL, "missing required 'executable'"))?;
+    let executable_raw = capped_str(TOOL, "executable", executable_raw, 1024)?;
+    if executable_raw.is_empty() {
+        return Err(invalid(TOOL, "'executable' must not be empty"));
+    }
+    let executable = resolve_executable(&executable_raw)?;
+
+    let mut call_args = Vec::new();
+    if let Some(args_value) = args.get("args") {
+        let list = args_value
+            .as_array()
+            .ok_or_else(|| invalid(TOOL, "'args' must be an array of strings"))?;
+        if list.len() > 256 {
+            return Err(invalid(TOOL, "'args' exceeds 256 entries"));
+        }
+        for (i, item) in list.iter().enumerate() {
+            let text = item
+                .as_str()
+                .ok_or_else(|| invalid(TOOL, format!("'args[{i}]' must be a string")))?;
+            call_args.push(capped_str(TOOL, &format!("'args[{i}]'"), text, 8192)?);
+        }
+    }
+
+    let cwd = match args.get("cwd").and_then(|v| v.as_str()) {
+        None => std::env::current_dir()
+            .map_err(|e| failed(TOOL, format!("cannot determine working directory: {e}")))?,
+        Some(raw) => {
+            let raw = capped_str(TOOL, "cwd", raw, 1024)?;
+            let path = PathBuf::from(&raw);
+            if !path.is_absolute() {
+                return Err(invalid(TOOL, "'cwd' must be an absolute path"));
+            }
+            if !path.is_dir() {
+                return Err(invalid(TOOL, format!("'cwd' is not a directory: {raw}")));
+            }
+            path
+        }
+    };
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|e| failed(TOOL, format!("cannot resolve working directory: {e}")))?;
+
+    let mut env = HashMap::new();
+    if let Some(env_value) = args.get("env") {
+        let map = env_value
+            .as_object()
+            .ok_or_else(|| invalid(TOOL, "'env' must be an object of strings"))?;
+        if map.len() > 64 {
+            return Err(invalid(TOOL, "'env' exceeds 64 entries"));
+        }
+        for (name, value) in map {
+            let value = value
+                .as_str()
+                .ok_or_else(|| invalid(TOOL, format!("'env.{name}' must be a string")))?;
+            check_no_nul(TOOL, &format!("'env.{name}'"), name)?;
+            check_no_nul(TOOL, &format!("'env.{name}'"), value)?;
+            if name.is_empty() || name.len() > 256 || value.len() > 8192 {
+                return Err(invalid(
+                    TOOL,
+                    format!("'env.{name}' has an oversized name or value"),
+                ));
+            }
+            if is_injection_name(name) {
+                return Err(invalid(
+                    TOOL,
+                    format!("'env.{name}' is not allowed for process isolation"),
+                ));
+            }
+            env.insert(name.clone(), value.to_string());
+        }
+    }
+
+    let timeout = parse_timeout_ms(args.get("timeout_ms"), limits)?;
+    Ok(SpawnSpec {
+        executable,
+        args: call_args,
+        cwd,
+        env,
+        timeout,
+    })
 }
 
 /// Spawn a structured child process. High risk: the agent runtime routes
@@ -614,93 +731,27 @@ impl Tool for SpawnTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let executable = args.get("executable")?.as_str()?;
-        // Resolve best-effort for the policy request; the broker
-        // re-resolves and re-validates before touching the OS.
-        let resource = match resolve_executable(executable) {
-            Ok(path) => Resource::Executable(path),
-            Err(_) => Resource::Executable(PathBuf::from(executable)),
-        };
+        let spec = parse_spawn_spec(args, &self.limits).ok()?;
         Some(CapabilityRequirement {
             capability: Capability::ProcessSpawn,
-            resource,
+            resource: Resource::Process {
+                executable: spec.executable,
+                args: spec.args,
+                cwd: spec.cwd,
+                env: sorted_env(&spec.env),
+            },
         })
     }
 
-    async fn invoke(&self, ctx: ToolContext, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
-        const TOOL: &str = "process.spawn";
-        let executable_raw = args
-            .get("executable")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| invalid(TOOL, "missing required 'executable'"))?;
-        let executable_raw = capped_str(TOOL, "executable", executable_raw, 1024)?;
-        if executable_raw.is_empty() {
-            return Err(invalid(TOOL, "'executable' must not be empty"));
-        }
-        let executable = resolve_executable(&executable_raw)?;
-        authorized_executable(&ctx, &executable)?;
-
-        let mut call_args = Vec::new();
-        if let Some(args_value) = args.get("args") {
-            let list = args_value
-                .as_array()
-                .ok_or_else(|| invalid(TOOL, "'args' must be an array of strings"))?;
-            if list.len() > 256 {
-                return Err(invalid(TOOL, "'args' exceeds 256 entries"));
-            }
-            for (i, item) in list.iter().enumerate() {
-                let text = item
-                    .as_str()
-                    .ok_or_else(|| invalid(TOOL, format!("'args[{i}]' must be a string")))?;
-                call_args.push(capped_str(TOOL, &format!("'args[{i}]'"), text, 8192)?);
-            }
-        }
-
-        let cwd = match args.get("cwd").and_then(|v| v.as_str()) {
-            None => std::env::current_dir()
-                .map_err(|e| failed(TOOL, format!("cannot determine working directory: {e}")))?,
-            Some(raw) => {
-                let raw = capped_str(TOOL, "cwd", raw, 1024)?;
-                let path = PathBuf::from(&raw);
-                if !path.is_absolute() {
-                    return Err(invalid(TOOL, "'cwd' must be an absolute path"));
-                }
-                if !path.is_dir() {
-                    return Err(invalid(TOOL, format!("'cwd' is not a directory: {raw}")));
-                }
-                path
-            }
-        };
-
-        let mut env = HashMap::new();
-        if let Some(env_value) = args.get("env") {
-            let map = env_value
-                .as_object()
-                .ok_or_else(|| invalid(TOOL, "'env' must be an object of strings"))?;
-            if map.len() > 64 {
-                return Err(invalid(TOOL, "'env' exceeds 64 entries"));
-            }
-            for (name, value) in map {
-                let value = value
-                    .as_str()
-                    .ok_or_else(|| invalid(TOOL, format!("'env.{name}' must be a string")))?;
-                check_no_nul(TOOL, &format!("'env.{name}'"), name)?;
-                check_no_nul(TOOL, &format!("'env.{name}'"), value)?;
-                if name.is_empty() || name.len() > 256 || value.len() > 8192 {
-                    return Err(invalid(TOOL, format!("'env.{name}' has an oversized name or value")));
-                }
-                env.insert(name.clone(), value.to_string());
-            }
-        }
-
-        let timeout = parse_timeout_ms(args.get("timeout_ms"), &self.limits)?;
-        let (handle, pid) = self.manager.spawn(&SpawnSpec {
-            executable,
-            args: call_args,
-            cwd,
-            env,
-            timeout,
-        })?;
+    async fn invoke(
+        &self,
+        ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let spec = parse_spawn_spec(&args, &self.limits)?;
+        authorized_process(&ctx, &spec)?;
+        let timeout = spec.timeout;
+        let (handle, pid) = self.manager.spawn(&spec)?;
         Ok(ToolOutput::new(serde_json::json!({
             "handle": handle,
             "pid": pid,
@@ -720,7 +771,8 @@ impl Tool for StatusTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new("process.status"),
-            description: "Poll a spawned process: state, exit code, captured stdout/stderr.".to_string(),
+            description: "Poll a spawned process: state, exit code, captured stdout/stderr."
+                .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": { "handle": { "type": "string" } },
@@ -734,7 +786,11 @@ impl Tool for StatusTool {
         None
     }
 
-    async fn invoke(&self, _ctx: ToolContext, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    async fn invoke(
+        &self,
+        _ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
         const TOOL: &str = "process.status";
         let handle = args
             .get("handle")
@@ -778,7 +834,11 @@ impl Tool for KillTool {
         None
     }
 
-    async fn invoke(&self, _ctx: ToolContext, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+    async fn invoke(
+        &self,
+        _ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
         const TOOL: &str = "process.kill";
         let handle = args
             .get("handle")

@@ -9,7 +9,8 @@ use model_core::{
     FinishReason, ModelError, ModelMessage, ModelProvider, ModelRequest, ModelRole, ModelStream,
     ModelStreamEvent, ToolCall,
 };
-use std::collections::BTreeMap;
+use serde_json::Value;
+use std::collections::{BTreeMap, VecDeque};
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
@@ -22,7 +23,11 @@ pub struct OpenAICompatibleClient {
 }
 
 impl OpenAICompatibleClient {
-    pub fn new(base_url: impl Into<String>, api_key: Option<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -81,6 +86,400 @@ impl ModelProvider for OpenAICompatibleClient {
             }
         });
         Ok(Box::pin(stream))
+    }
+}
+
+/// Anthropic Messages adapter. It lives beside the OpenAI-compatible adapter
+/// because both produce the same provider-neutral stream consumed by the
+/// agent loop.
+#[derive(Debug, Clone)]
+pub struct AnthropicClient {
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+impl AnthropicClient {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            api_key: api_key.into(),
+            model: model.into(),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("{}/messages", self.base_url)
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for AnthropicClient {
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+        let body = anthropic_request_body(&self.model, &request);
+        let response = self
+            .http
+            .post(self.url())
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unreadable error body>".to_string());
+            return Err(ModelError::Provider { status, message });
+        }
+        let state = AnthropicStreamState {
+            buffer: String::new(),
+            assembler: AnthropicAssembler::default(),
+            bytes: Box::pin(response.bytes_stream()),
+            finished: false,
+        };
+        let stream = futures_util::stream::unfold(state, |mut state| async move {
+            match next_anthropic_event(&mut state).await {
+                Ok(Some(event)) => Some((Ok(event), state)),
+                Ok(None) => None,
+                Err(err) => Some((Err(err), state)),
+            }
+        });
+        Ok(Box::pin(stream))
+    }
+}
+
+struct AnthropicStreamState {
+    buffer: String,
+    assembler: AnthropicAssembler,
+    bytes: std::pin::Pin<
+        Box<dyn futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
+    >,
+    finished: bool,
+}
+
+async fn next_anthropic_event(
+    state: &mut AnthropicStreamState,
+) -> Result<Option<ModelStreamEvent>, ModelError> {
+    loop {
+        if let Some(event) = state.assembler.pop() {
+            return Ok(Some(event));
+        }
+        if state.finished {
+            return Ok(None);
+        }
+        match state.bytes.next().await {
+            Some(Ok(chunk)) => {
+                state.buffer.push_str(
+                    std::str::from_utf8(&chunk)
+                        .map_err(|e| ModelError::InvalidResponse(e.to_string()))?,
+                );
+                feed_anthropic_lines(state);
+            }
+            Some(Err(e)) => return Err(ModelError::Transport(e.to_string())),
+            None => {
+                state.finished = true;
+                state.assembler.finish();
+            }
+        }
+    }
+}
+
+fn feed_anthropic_lines(state: &mut AnthropicStreamState) {
+    while let Some(pos) = state.buffer.find('\n') {
+        let line = state.buffer[..pos].trim_end_matches('\r').to_string();
+        state.buffer.drain(..=pos);
+        state.assembler.feed_line(&line);
+    }
+}
+
+#[derive(Debug, Default)]
+struct AnthropicAssembler {
+    queued: VecDeque<ModelStreamEvent>,
+    tools: BTreeMap<u32, AnthropicToolFragment>,
+    finish_reason: Option<FinishReason>,
+    done: bool,
+}
+
+#[derive(Debug, Default)]
+struct AnthropicToolFragment {
+    id: String,
+    name: String,
+    input_json: String,
+}
+
+impl AnthropicAssembler {
+    fn pop(&mut self) -> Option<ModelStreamEvent> {
+        self.queued.pop_front()
+    }
+
+    fn feed_line(&mut self, line: &str) {
+        if self.done {
+            return;
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            if data == "[DONE]" {
+                self.finish();
+            }
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("content_block_start") => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let Some(block) = value.get("content_block") else {
+                    return;
+                };
+                if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                    let fragment = self.tools.entry(index).or_default();
+                    fragment.id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    fragment.name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                }
+            }
+            Some("content_block_delta") => {
+                let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let Some(delta) = value.get("delta") else {
+                    return;
+                };
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            if !text.is_empty() {
+                                self.queued
+                                    .push_back(ModelStreamEvent::TextDelta(text.to_string()));
+                            }
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                            self.tools
+                                .entry(index)
+                                .or_default()
+                                .input_json
+                                .push_str(partial);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some("message_delta") => {
+                if let Some(reason) = value
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                {
+                    self.finish_reason = Some(map_anthropic_finish_reason(reason));
+                }
+            }
+            Some("message_stop") => self.finish(),
+            _ => {}
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        for fragment in std::mem::take(&mut self.tools).into_values() {
+            if !fragment.name.is_empty() {
+                self.queued.push_back(ModelStreamEvent::ToolCall(ToolCall {
+                    id: fragment.id,
+                    name: fragment.name,
+                    arguments: if fragment.input_json.is_empty() {
+                        "{}".to_string()
+                    } else {
+                        fragment.input_json
+                    },
+                }));
+            }
+        }
+        self.queued.push_back(ModelStreamEvent::Done {
+            finish_reason: self.finish_reason.unwrap_or(FinishReason::Stop),
+        });
+    }
+}
+
+fn map_anthropic_finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "end_turn" | "stop_sequence" => FinishReason::Stop,
+        "tool_use" => FinishReason::ToolCalls,
+        "max_tokens" => FinishReason::Length,
+        _ => FinishReason::Other,
+    }
+}
+
+fn anthropic_request_body(model: &str, request: &ModelRequest) -> Value {
+    let system = request
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::System)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "max_tokens": request.max_tokens.unwrap_or(1024),
+        "messages": anthropic_messages(&request.messages),
+        "tools": request.tools.iter().map(|tool| serde_json::json!({
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.input_schema,
+        })).collect::<Vec<_>>(),
+    });
+    if !system.is_empty() {
+        body["system"] = Value::String(system);
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    body
+}
+
+fn anthropic_messages(messages: &[ModelMessage]) -> Vec<Value> {
+    let mut output = Vec::new();
+    for message in messages {
+        match message.role {
+            ModelRole::System => {}
+            ModelRole::User => append_anthropic_message(
+                &mut output,
+                "user",
+                anthropic_content(message.content_value.as_ref(), &message.content),
+            ),
+            ModelRole::Assistant => append_anthropic_message(
+                &mut output,
+                "assistant",
+                anthropic_assistant_content(message),
+            ),
+            ModelRole::Tool => {
+                if let Some(result) = &message.tool_result {
+                    let mut block = serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": result.tool_call_id,
+                        "content": result.content,
+                    });
+                    if result.is_error {
+                        block["is_error"] = Value::Bool(true);
+                    }
+                    append_anthropic_message(&mut output, "user", Value::Array(vec![block]));
+                }
+            }
+        }
+    }
+    output
+}
+
+fn anthropic_assistant_content(message: &ModelMessage) -> Value {
+    if message.tool_calls.is_empty() {
+        return anthropic_content(message.content_value.as_ref(), &message.content);
+    }
+    let mut blocks = Vec::new();
+    if !message.content.is_empty() {
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+    for call in &message.tool_calls {
+        let input = serde_json::from_str::<Value>(&call.arguments)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        blocks.push(serde_json::json!({
+            "type": "tool_use",
+            "id": call.id,
+            "name": call.name,
+            "input": input,
+        }));
+    }
+    Value::Array(blocks)
+}
+
+fn anthropic_content(value: Option<&Value>, fallback: &str) -> Value {
+    let Some(value) = value else {
+        return Value::String(fallback.to_string());
+    };
+    match value {
+        Value::String(text) => Value::String(text.clone()),
+        Value::Array(parts) => {
+            let blocks = parts
+                .iter()
+                .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                    Some("text") => part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(|text| serde_json::json!({"type":"text","text":text})),
+                    Some("image_url") => {
+                        let url = part
+                            .get("image_url")
+                            .and_then(|image| image.get("url"))
+                            .and_then(Value::as_str)?;
+                        let data = url.strip_prefix("data:")?;
+                        let (media_type, data) = data.split_once(";base64,")?;
+                        Some(serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data,
+                            },
+                        }))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if blocks.is_empty() {
+                Value::String(fallback.to_string())
+            } else {
+                Value::Array(blocks)
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+fn append_anthropic_message(messages: &mut Vec<Value>, role: &str, content: Value) {
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some(role) {
+            let existing = last
+                .get_mut("content")
+                .map(Value::take)
+                .unwrap_or(Value::Null);
+            let mut blocks = anthropic_blocks(existing);
+            blocks.extend(anthropic_blocks(content));
+            last["content"] = Value::Array(blocks);
+            return;
+        }
+    }
+    messages.push(serde_json::json!({ "role": role, "content": content }));
+}
+
+fn anthropic_blocks(content: Value) -> Vec<Value> {
+    match content {
+        Value::Array(blocks) => blocks,
+        Value::String(text) => vec![serde_json::json!({"type":"text","text":text})],
+        other => vec![other],
     }
 }
 
@@ -184,7 +583,8 @@ impl SseAssembler {
         };
         if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
             if !text.is_empty() {
-                self.queued.push_back(ModelStreamEvent::TextDelta(text.to_string()));
+                self.queued
+                    .push_back(ModelStreamEvent::TextDelta(text.to_string()));
             }
         }
         if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
@@ -263,7 +663,11 @@ fn wire_message(message: &ModelMessage) -> serde_json::Value {
         ModelRole::Assistant => "assistant",
         ModelRole::Tool => "tool",
     };
-    let mut value = serde_json::json!({ "role": role, "content": message.content });
+    let content = message
+        .content_value
+        .clone()
+        .unwrap_or_else(|| serde_json::Value::String(message.content.clone()));
+    let mut value = serde_json::json!({ "role": role, "content": content });
     if !message.tool_calls.is_empty() {
         value["tool_calls"] = message
             .tool_calls
@@ -300,8 +704,14 @@ mod tests {
         asm.feed_line(
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"xt\":\"hi\"}"}}]},"finish_reason":"tool_calls"}]}"#,
         );
-        assert_eq!(asm.pop(), Some(ModelStreamEvent::TextDelta("Hello".to_string())));
-        assert_eq!(asm.pop(), Some(ModelStreamEvent::TextDelta(" world".to_string())));
+        assert_eq!(
+            asm.pop(),
+            Some(ModelStreamEvent::TextDelta("Hello".to_string()))
+        );
+        assert_eq!(
+            asm.pop(),
+            Some(ModelStreamEvent::TextDelta(" world".to_string()))
+        );
         assert_eq!(
             asm.pop(),
             Some(ModelStreamEvent::ToolCall(ToolCall {
@@ -325,7 +735,10 @@ mod tests {
         asm.feed_line(r#"data: {"choices":[{"delta":{"content":"x"}}]}"#);
         asm.feed_line("data: [DONE]");
         asm.feed_line(r#"data: {"choices":[{"delta":{"content":"late"}}]}"#);
-        assert_eq!(asm.pop(), Some(ModelStreamEvent::TextDelta("x".to_string())));
+        assert_eq!(
+            asm.pop(),
+            Some(ModelStreamEvent::TextDelta("x".to_string()))
+        );
         assert_eq!(
             asm.pop(),
             Some(ModelStreamEvent::Done {
@@ -333,6 +746,87 @@ mod tests {
             })
         );
         assert_eq!(asm.pop(), None);
+    }
+
+    #[test]
+    fn wire_message_preserves_tool_result_content_and_multimodal_content() {
+        let tool = ModelMessage::tool_result(model_core::ToolResult {
+            tool_call_id: "call-1".to_string(),
+            content: r#"{"ok":true}"#.to_string(),
+            is_error: false,
+        });
+        let wire = wire_message(&tool);
+        assert_eq!(wire["role"], "tool");
+        assert_eq!(wire["tool_call_id"], "call-1");
+        assert_eq!(wire["content"], r#"{"ok":true}"#);
+
+        let multimodal = ModelMessage::from_wire(
+            ModelRole::User,
+            serde_json::json!([
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}
+            ]),
+        );
+        assert_eq!(wire_message(&multimodal)["content"][1]["type"], "image_url");
+    }
+
+    #[test]
+    fn anthropic_request_preserves_tools_and_tool_results() {
+        let mut request = ModelRequest::new(vec![
+            ModelMessage::system("system prompt"),
+            ModelMessage::user("run it"),
+            ModelMessage::assistant(
+                "",
+                vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "process.spawn".to_string(),
+                    arguments: r#"{"executable":"echo"}"#.to_string(),
+                }],
+            ),
+            ModelMessage::tool_result(model_core::ToolResult {
+                tool_call_id: "call-1".to_string(),
+                content: r#"{"ok":true}"#.to_string(),
+                is_error: false,
+            }),
+        ]);
+        request.tools.push(model_core::ToolDefinition {
+            name: "process.spawn".to_string(),
+            description: "run one command".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        let body = anthropic_request_body("claude-test", &request);
+        assert_eq!(body["system"], "system prompt");
+        assert_eq!(body["tools"][0]["name"], "process.spawn");
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call-1");
+    }
+
+    #[test]
+    fn anthropic_stream_assembles_text_and_tool_input() {
+        let mut assembler = AnthropicAssembler::default();
+        assembler.feed_line(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"system.echo","input":{}}}"#,
+        );
+        assembler.feed_line(
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"text\":\"hi\"}"}}"#,
+        );
+        assembler.feed_line(r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#);
+        assembler.feed_line(r#"data: {"type":"message_stop"}"#);
+        assert_eq!(
+            assembler.pop(),
+            Some(ModelStreamEvent::ToolCall(ToolCall {
+                id: "c1".to_string(),
+                name: "system.echo".to_string(),
+                arguments: r#"{"text":"hi"}"#.to_string(),
+            }))
+        );
+        assert_eq!(
+            assembler.pop(),
+            Some(ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls
+            })
+        );
     }
 
     /// End-to-end against a mock OpenAI-compatible server: verifies the

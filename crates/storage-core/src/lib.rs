@@ -7,14 +7,14 @@
 //! Secrets are intentionally out of scope: API keys live in the OS keychain
 //! (plan Phase 33); this crate stores only non-secret settings and grants.
 
-use policy_core::{GrantedScope, GrantLifetime};
+use policy_core::{GrantLifetime, GrantedScope};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -54,8 +54,8 @@ impl Storage {
         let version: i32 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < SCHEMA_VERSION {
-            self.conn.execute_batch(&format!(
+        if version < 1 {
+            self.conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS settings (
                      key TEXT PRIMARY KEY,
                      value TEXT NOT NULL
@@ -66,9 +66,26 @@ impl Storage {
                      capability TEXT NOT NULL,
                      scope_json TEXT NOT NULL,
                      lifetime TEXT NOT NULL DEFAULT 'Persistent'
-                 );
-                 PRAGMA user_version = {SCHEMA_VERSION};",
-            ))?;
+                 );",
+            )?;
+        }
+        if version < 2 {
+            // v1 grants did not retain their in-memory identity/lifetime
+            // metadata. Existing rows are persistent by definition; use the
+            // SQLite row id as a stable fallback identity.
+            self.conn.execute_batch(
+                "ALTER TABLE grants ADD COLUMN grant_id TEXT;
+                 ALTER TABLE grants ADD COLUMN task_id TEXT;
+                 ALTER TABLE grants ADD COLUMN turn_id TEXT;
+                 ALTER TABLE grants ADD COLUMN created_at INTEGER;
+                 ALTER TABLE grants ADD COLUMN expires_at INTEGER;
+                 ALTER TABLE grants ADD COLUMN uses_remaining INTEGER;
+                 UPDATE grants SET grant_id = CAST(id AS TEXT) WHERE grant_id IS NULL;",
+            )?;
+        }
+        if version < SCHEMA_VERSION {
+            self.conn
+                .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         }
         Ok(())
     }
@@ -119,9 +136,21 @@ impl Storage {
         let cap = serde_json::to_string(&grant.capability)?;
         let scope = serde_json::to_string(&grant.scope)?;
         self.conn.execute(
-            "INSERT INTO grants (principal_kind, capability, scope_json, lifetime)
-             VALUES (?1, ?2, ?3, 'Persistent')",
-            params![kind, cap, scope],
+            "INSERT INTO grants
+                (principal_kind, capability, scope_json, lifetime, grant_id,
+                 task_id, turn_id, created_at, expires_at, uses_remaining)
+             VALUES (?1, ?2, ?3, 'Persistent', ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                kind,
+                cap,
+                scope,
+                grant.id,
+                grant.task_id,
+                grant.turn_id,
+                grant.created_at as i64,
+                grant.expires_at.map(|value| value as i64),
+                grant.uses_remaining.map(|value| value as i64),
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -129,7 +158,9 @@ impl Storage {
     /// Load all stored persistent grants, oldest first.
     pub fn load_grants(&self) -> Result<Vec<StoredGrant>, StorageError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, principal_kind, capability, scope_json FROM grants
+            "SELECT id, principal_kind, capability, scope_json, grant_id,
+                    task_id, turn_id, created_at, expires_at, uses_remaining
+             FROM grants
              WHERE lifetime = 'Persistent' ORDER BY id ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -137,35 +168,76 @@ impl Storage {
             let kind: String = row.get(1)?;
             let cap: String = row.get(2)?;
             let scope: String = row.get(3)?;
-            Ok((id, kind, cap, scope))
+            let grant_id: Option<String> = row.get(4)?;
+            let task_id: Option<String> = row.get(5)?;
+            let turn_id: Option<String> = row.get(6)?;
+            let created_at: Option<i64> = row.get(7)?;
+            let expires_at: Option<i64> = row.get(8)?;
+            let uses_remaining: Option<i64> = row.get(9)?;
+            Ok((
+                id,
+                kind,
+                cap,
+                scope,
+                grant_id,
+                task_id,
+                turn_id,
+                created_at,
+                expires_at,
+                uses_remaining,
+            ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, kind, cap, scope) = row?;
-            let grant = GrantedScope {
-                principal_kind: serde_json::from_str(&kind).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                capability: serde_json::from_str(&cap).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                scope: serde_json::from_str(&scope).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        3,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
-                lifetime: GrantLifetime::Persistent,
-            };
+            let (
+                id,
+                kind,
+                cap,
+                scope,
+                grant_id,
+                task_id,
+                turn_id,
+                created_at,
+                expires_at,
+                uses_remaining,
+            ) = row?;
+            let principal_kind = serde_json::from_str(&kind).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            let capability = serde_json::from_str(&cap).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            let scope = serde_json::from_str(&scope).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            let mut grant = GrantedScope::new(
+                principal_kind,
+                capability,
+                scope,
+                GrantLifetime::Persistent,
+                None,
+                None,
+            );
+            // The SQLite row id remains the durable identity exposed by
+            // StoredGrant; keep it stable in the in-memory grant as well.
+            grant.id = grant_id.unwrap_or_else(|| id.to_string());
+            grant.task_id = task_id;
+            grant.turn_id = turn_id;
+            grant.created_at = created_at.unwrap_or_default().max(0) as u64;
+            grant.expires_at = expires_at.map(|value| value.max(0) as u64);
+            grant.uses_remaining = uses_remaining.map(|value| value.max(0) as u32);
             out.push(StoredGrant { id, grant });
         }
         Ok(out)
@@ -173,7 +245,9 @@ impl Storage {
 
     /// Revoke a stored grant by row id.
     pub fn delete_grant(&self, id: i64) -> Result<(), StorageError> {
-        let n = self.conn.execute("DELETE FROM grants WHERE id = ?1", [id])?;
+        let n = self
+            .conn
+            .execute("DELETE FROM grants WHERE id = ?1", [id])?;
         if n == 0 {
             return Err(StorageError::GrantNotFound(id));
         }
@@ -226,12 +300,12 @@ pub fn persistent_grant_hook(
     store: Arc<Mutex<Storage>>,
 ) -> Arc<dyn Fn(&GrantedScope) -> Result<(), String> + Send + Sync> {
     Arc::new(move |grant: &GrantedScope| {
-        let store = store.lock().map_err(|_| "storage lock failed".to_string())?;
+        let store = store
+            .lock()
+            .map_err(|_| "storage lock failed".to_string())?;
         store
             .save_grant(grant)
             .map(|_| ())
             .map_err(|e| e.to_string())
     })
 }
-
-

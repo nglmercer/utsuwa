@@ -11,6 +11,8 @@
 		type ModelInfo
 	} from '$lib/services/providers/use-model-fetch';
 	import { DOCS_URL } from '$lib/config/site';
+	import { syncNativeModelProvider } from '$lib/services/native/model-settings';
+	import { isDesktopBuild } from '$lib/services/platform';
 
 	const LOCAL_LLM_DOCS_URL = `${DOCS_URL}/guides/local-llm-setup#allowing-utsuwa-to-reach-ollama`;
 
@@ -95,8 +97,7 @@
 			return !!config.baseUrl && !!(llmSettings.activeModel as string);
 		}
 		if (!provider.requiresApiKey) return true;
-		const config = settingsStore.getProviderConfig(provider.id);
-		return !!config.apiKey;
+		return settingsStore.isProviderConfigured(provider.id);
 	});
 
 	// Fetch LLM models from provider API
@@ -120,10 +121,15 @@
 				llmIsLoading = false;
 				llmDynamicModels = models;
 				const currentModel = llmSettings.activeModel as string;
-				const modelExists = models.some((m) => m.id === currentModel);
-				if (!currentModel || !modelExists) {
-					modulesStore.setModuleSetting('consciousness', 'activeModel', models[0].id);
-				}
+					const modelExists = models.some((m) => m.id === currentModel);
+					if (!currentModel || !modelExists) {
+						modulesStore.setModuleSetting('consciousness', 'activeModel', models[0].id);
+						if (targetProvider) {
+							void syncNativeModelProvider(targetProvider, models[0].id).catch((error) => {
+								console.error('[Native model settings] sync failed:', error);
+							});
+						}
+					}
 			},
 			onError: (error) => {
 				llmIsLoading = false;
@@ -230,10 +236,19 @@
 		if (provider?.isLocal || !provider?.requiresApiKey) {
 			settingsStore.markProviderAdded(providerId);
 		}
+		const initialModel = provider?.models?.[0]?.id;
+		if (initialModel) {
+			void syncNativeModelProvider(providerId, initialModel).catch((error) => {
+				console.error('[Native model settings] sync failed:', error);
+			});
+		}
 	}
 
 	function handleLLMModelChange(modelId: string) {
 		modulesStore.setModuleSetting('consciousness', 'activeModel', modelId);
+		void syncNativeModelProvider(llmSettings.activeProvider as string, modelId).catch((error) => {
+			console.error('[Native model settings] sync failed:', error);
+		});
 	}
 
 	function handleLLMApiKeyChange(apiKey: string) {
@@ -243,6 +258,9 @@
 			if (apiKey) {
 				settingsStore.markProviderAdded(llmProvider.id);
 			}
+			void syncNativeModelProvider(llmProvider.id, undefined, apiKey).catch((error) => {
+				console.error('[Native model settings] sync failed:', error);
+			});
 		}
 	}
 
@@ -257,6 +275,9 @@
 		if (llmProvider) {
 			settingsStore.setProviderConfig(llmProvider.id, { baseUrl });
 			llmFetchError = null;
+			void syncNativeModelProvider(llmProvider.id).catch((error) => {
+				console.error('[Native model settings] sync failed:', error);
+			});
 		}
 	}
 
@@ -348,7 +369,11 @@
 
 	<div class="security-note">
 		<Icon name="lock" size={14} />
-		<span>Your API keys are stored locally in your browser. We never store them on our servers.</span>
+		<span
+			>{isDesktopBuild()
+				? 'Desktop API keys are stored in the native OS keychain. Web keys stay in this browser and are never sent to our servers.'
+				: 'API keys stay in this browser and are never sent to our servers.'}</span
+		>
 	</div>
 
 	<!-- LLM Section -->

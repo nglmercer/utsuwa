@@ -6,9 +6,12 @@
 //! operations are unrepresentable (see `ipc-core`: they are not members of
 //! [`IpcMethod`], so they cannot even parse).
 
-use crate::agent_runtime::AgentRuntime;
+use crate::agent_runtime::{AgentRequest, AgentRuntime};
 use capability_core::{Capability, PrincipalKind, Resource, ResourceScope};
-use ipc_core::{ErrorCode, HostEvent, IpcErrorBody, IpcErrorResponse, IpcMethod, IpcRequest, IpcResponse};
+use ipc_core::{
+    ErrorCode, HostEvent, IpcErrorBody, IpcErrorResponse, IpcMethod, IpcRequest, IpcResponse,
+};
+use model_core::{ModelMessage, ModelRole};
 use policy_core::{ApprovalQueue, GrantLifetime, QueueError};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -31,6 +34,7 @@ pub struct Dispatcher {
     agent: Option<Arc<AgentRuntime>>,
     storage: Option<Arc<Mutex<storage_core::Storage>>>,
     audit: Option<Arc<audit_core::InMemorySink>>,
+    secrets: Option<Arc<dyn secret_core::SecretStore>>,
 }
 
 impl Clone for Dispatcher {
@@ -41,6 +45,7 @@ impl Clone for Dispatcher {
             agent: self.agent.clone(),
             storage: self.storage.clone(),
             audit: self.audit.clone(),
+            secrets: self.secrets.clone(),
         }
     }
 }
@@ -53,6 +58,7 @@ impl Dispatcher {
             agent: None,
             storage: None,
             audit: None,
+            secrets: None,
         }
     }
 
@@ -78,6 +84,13 @@ impl Dispatcher {
     /// Attach the shared audit sink (`activity.list`).
     pub fn with_audit(mut self, audit: Arc<audit_core::InMemorySink>) -> Self {
         self.audit = Some(audit);
+        self
+    }
+
+    /// Attach the same host secret store used by the model provider. The
+    /// frontend never receives the key back through IPC.
+    pub fn with_secret_store(mut self, secrets: Arc<dyn secret_core::SecretStore>) -> Self {
+        self.secrets = Some(secrets);
         self
     }
 
@@ -139,6 +152,8 @@ impl Dispatcher {
             IpcMethod::AgentCancel => self.agent_cancel(),
             IpcMethod::SettingsGet => self.settings_get(request),
             IpcMethod::SettingsSet => self.settings_set(request),
+            IpcMethod::SettingsGetModelProvider => self.settings_get_model_provider(),
+            IpcMethod::SettingsSetModelProvider => self.settings_set_model_provider(request),
             IpcMethod::ActivityList => self.activity_list(request),
             IpcMethod::PluginList => self.plugin_list(),
             IpcMethod::PluginEnable => self.plugin_manage(request, PluginOp::Enable),
@@ -156,12 +171,14 @@ impl Dispatcher {
             code: ErrorCode::Internal,
             message: "approval queue is not attached".to_string(),
         })?;
-        let id = request.params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
-            IpcErrorBody {
+        let id = request
+            .params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| IpcErrorBody {
                 code: ErrorCode::InvalidParams,
                 message: "permission reply needs a string 'id'".to_string(),
-            }
-        })?;
+            })?;
         let lifetime = if approve {
             Some(parse_lifetime(
                 request.params.get("lifetime").and_then(|v| v.as_str()),
@@ -253,7 +270,8 @@ impl Dispatcher {
         if policy_core::is_secret_path(&Resource::Path(canonical.clone())) {
             return Err(IpcErrorBody {
                 code: ErrorCode::InvalidParams,
-                message: "secret paths keep per-file approval and cannot be granted in bulk".to_string(),
+                message: "secret paths keep per-file approval and cannot be granted in bulk"
+                    .to_string(),
             });
         }
         Ok(canonical)
@@ -378,29 +396,78 @@ impl Dispatcher {
             message: err.to_string(),
         })?;
         drop(queue);
-        let home = Self::home_dir().ok().map(|p| p.to_string_lossy().into_owned());
+        let home = Self::home_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned());
         Ok(serde_json::json!({ "grants": grants, "home": home }))
     }
 
     /// Start (or supersede) an agent turn. Returns immediately; the text,
     /// tool results, and approval prompts arrive as host events
     /// (`agent.turn_done`, `permission.requested`, …).
+    fn parse_agent_history(value: Option<&Value>) -> Result<Vec<ModelMessage>, IpcErrorBody> {
+        let Some(value) = value else {
+            return Ok(Vec::new());
+        };
+        let entries = value.as_array().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::InvalidParams,
+            message: "agent.send_message 'history' must be an array".to_string(),
+        })?;
+        if entries.len() > 100 {
+            return Err(IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "agent.send_message 'history' exceeds 100 messages".to_string(),
+            });
+        }
+        entries
+            .iter()
+            .map(|entry| {
+                let object = entry.as_object().ok_or_else(|| IpcErrorBody {
+                    code: ErrorCode::InvalidParams,
+                    message: "agent history entries must be objects".to_string(),
+                })?;
+                let role = match object.get("role").and_then(Value::as_str) {
+                    Some("system") => ModelRole::System,
+                    Some("user") => ModelRole::User,
+                    Some("assistant") => ModelRole::Assistant,
+                    _ => {
+                        return Err(IpcErrorBody {
+                            code: ErrorCode::InvalidParams,
+                            message: "agent history role must be system, user, or assistant"
+                                .to_string(),
+                        })
+                    }
+                };
+                let content = object.get("content").cloned().unwrap_or(Value::Null);
+                Ok(ModelMessage::from_wire(role, content))
+            })
+            .collect()
+    }
+
     fn agent_send(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
         let agent = self.agent.as_ref().ok_or_else(|| IpcErrorBody {
             code: ErrorCode::Internal,
             message: "agent runtime is not attached".to_string(),
         })?;
-        let text = request.params.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
-            IpcErrorBody {
+        let text = request
+            .params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| IpcErrorBody {
                 code: ErrorCode::InvalidParams,
                 message: "agent.send_message needs a string 'text'".to_string(),
-            }
-        })?;
+            })?;
         let text = text.trim();
-        if text.is_empty() {
+        let history = Self::parse_agent_history(request.params.get("history"))?;
+        let append_user_message = request
+            .params
+            .get("append_user_message")
+            .and_then(Value::as_bool)
+            .unwrap_or(history.is_empty());
+        if text.is_empty() && history.is_empty() {
             return Err(IpcErrorBody {
                 code: ErrorCode::InvalidParams,
-                message: "agent.send_message needs a non-empty 'text'".to_string(),
+                message: "agent.send_message needs text or history".to_string(),
             });
         }
         if text.len() > 32 * 1024 {
@@ -409,10 +476,31 @@ impl Dispatcher {
                 message: "agent.send_message 'text' exceeds 32 KiB".to_string(),
             });
         }
-        agent.send_message(text.to_string()).map_err(|err| IpcErrorBody {
-            code: ErrorCode::Internal,
-            message: err.to_string(),
-        })?;
+        let system_prompt = request
+            .params
+            .get("system_prompt")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if system_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.len() > 128 * 1024)
+        {
+            return Err(IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "agent.send_message 'system_prompt' exceeds 128 KiB".to_string(),
+            });
+        }
+        agent
+            .send_request(AgentRequest {
+                text: text.to_string(),
+                history,
+                system_prompt,
+                append_user_message,
+            })
+            .map_err(|err| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: err.to_string(),
+            })?;
         Ok(serde_json::json!({ "ok": true, "accepted": true }))
     }
 
@@ -447,12 +535,14 @@ impl Dispatcher {
             code: ErrorCode::Internal,
             message: "agent runtime is not attached".to_string(),
         })?;
-        let id = request.params.get("id").and_then(|v| v.as_str()).ok_or_else(|| {
-            IpcErrorBody {
+        let id = request
+            .params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| IpcErrorBody {
                 code: ErrorCode::InvalidParams,
                 message: "plugin lifecycle methods need a string 'id'".to_string(),
-            }
-        })?;
+            })?;
         if id.is_empty() || id.len() > 128 {
             return Err(IpcErrorBody {
                 code: ErrorCode::InvalidParams,
@@ -485,12 +575,20 @@ impl Dispatcher {
             code: ErrorCode::Internal,
             message: "storage is not attached".to_string(),
         })?;
-        let key = request.params.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
-            IpcErrorBody {
+        let key = request
+            .params
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| IpcErrorBody {
                 code: ErrorCode::InvalidParams,
                 message: "settings.get needs a string 'key'".to_string(),
-            }
-        })?;
+            })?;
+        if key == "model.api_key" {
+            // Credentials are write-only through the keychain-backed model
+            // endpoint; exposing the legacy row would reintroduce a frontend
+            // secret channel.
+            return Ok(serde_json::json!({ "value": null }));
+        }
         let storage = storage.lock().map_err(|_| IpcErrorBody {
             code: ErrorCode::Internal,
             message: "storage lock failed".to_string(),
@@ -502,25 +600,35 @@ impl Dispatcher {
         Ok(serde_json::json!({ "value": value }))
     }
 
-    /// Write a JSON setting to SQLite storage. Model credentials use
-    /// `model.base_url` / `model.api_key` / `model.name` (OS keychain
-    /// arrives with plan Phase 33; the key never leaves this host except
-    /// to the configured provider).
+    /// Write a JSON setting to SQLite storage. Model identity must go through
+    /// the keychain-backed model endpoint; the generic settings path cannot
+    /// write or expose model credentials.
     fn settings_set(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
         let storage = self.storage.as_ref().ok_or_else(|| IpcErrorBody {
             code: ErrorCode::Internal,
             message: "storage is not attached".to_string(),
         })?;
-        let key = request.params.get("key").and_then(|v| v.as_str()).ok_or_else(|| {
-            IpcErrorBody {
+        let key = request
+            .params
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| IpcErrorBody {
                 code: ErrorCode::InvalidParams,
                 message: "settings.set needs a string 'key'".to_string(),
-            }
-        })?;
+            })?;
         if key.is_empty() || key.len() > 256 {
             return Err(IpcErrorBody {
                 code: ErrorCode::InvalidParams,
                 message: "settings.set 'key' must be 1-256 chars".to_string(),
+            });
+        }
+        if matches!(
+            key,
+            "model.provider" | "model.base_url" | "model.name" | "model.api_key"
+        ) {
+            return Err(IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "model settings must use settings.set_model_provider".to_string(),
             });
         }
         let value = request.params.get("value").cloned().unwrap_or(Value::Null);
@@ -528,11 +636,181 @@ impl Dispatcher {
             code: ErrorCode::Internal,
             message: "storage lock failed".to_string(),
         })?;
-        storage.set_setting(key, &value).map_err(|err| IpcErrorBody {
-            code: ErrorCode::Internal,
-            message: err.to_string(),
-        })?;
+        storage
+            .set_setting(key, &value)
+            .map_err(|err| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: err.to_string(),
+            })?;
         Ok(serde_json::json!({ "ok": true }))
+    }
+
+    /// Read the non-secret model identity and whether the native secret store
+    /// contains its key. The key itself is never returned to the WebView.
+    fn settings_get_model_provider(&self) -> Result<Value, IpcErrorBody> {
+        let storage = self.storage.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "storage is not attached".to_string(),
+        })?;
+        let storage = storage.lock().map_err(|_| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "storage lock failed".to_string(),
+        })?;
+        let read_string = |key: &str| -> Result<Option<String>, IpcErrorBody> {
+            storage
+                .get_setting(key)
+                .map_err(|err| IpcErrorBody {
+                    code: ErrorCode::Internal,
+                    message: err.to_string(),
+                })
+                .map(|value| value.and_then(|value| value.as_str().map(str::to_string)))
+        };
+        let provider = read_string("model.provider")?.unwrap_or_default();
+        let base_url = read_string("model.base_url")?.unwrap_or_default();
+        let model = read_string("model.name")?.unwrap_or_default();
+        drop(storage);
+        let has_api_key = self
+            .secrets
+            .as_ref()
+            .map(|secrets| {
+                secrets
+                    .get(secret_core::ACCOUNT_MODEL_API_KEY)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|key| !key.is_empty())
+            })
+            .unwrap_or(false);
+        Ok(serde_json::json!({
+            "provider": provider,
+            "base_url": base_url,
+            "model": model,
+            "has_api_key": has_api_key,
+        }))
+    }
+
+    /// Atomically synchronize the model identity/configuration with native
+    /// storage. The API key takes the parallel OS-keychain path and is never
+    /// written to SQLite or returned to the WebView.
+    fn settings_set_model_provider(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
+        let storage = self.storage.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "storage is not attached".to_string(),
+        })?;
+        let provider = request
+            .params
+            .get("provider")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "settings.set_model_provider needs 'provider'".to_string(),
+            })?;
+        let base_url = request
+            .params
+            .get("base_url")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "settings.set_model_provider needs 'base_url'".to_string(),
+            })?;
+        let model = request
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: "settings.set_model_provider needs 'model'".to_string(),
+            })?;
+        let base_url = validate_model_base_url(base_url)?;
+        for (name, value) in [
+            ("provider", provider),
+            ("base_url", base_url.as_str()),
+            ("model", model),
+        ] {
+            if value.len() > 4096 {
+                return Err(IpcErrorBody {
+                    code: ErrorCode::InvalidParams,
+                    message: format!("settings.set_model_provider '{name}' is too long"),
+                });
+            }
+        }
+
+        let requested_key = request
+            .params
+            .get("api_key")
+            .map(|key_value| {
+                key_value.as_str().ok_or_else(|| IpcErrorBody {
+                    code: ErrorCode::InvalidParams,
+                    message: "settings.set_model_provider 'api_key' must be a string".to_string(),
+                })
+            })
+            .transpose()?;
+
+        // Update the key first. If SQLite fails, restore the old key so the
+        // native model configuration remains coherent.
+        let old_key = self.secrets.as_ref().and_then(|secrets| {
+            secrets
+                .get(secret_core::ACCOUNT_MODEL_API_KEY)
+                .ok()
+                .flatten()
+        });
+        if let Some(key) = requested_key {
+            let secrets = self.secrets.as_ref().ok_or_else(|| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: "secret store is not attached".to_string(),
+            })?;
+            if key.is_empty() {
+                secrets
+                    .delete(secret_core::ACCOUNT_MODEL_API_KEY)
+                    .map_err(|err| IpcErrorBody {
+                        code: ErrorCode::Internal,
+                        message: format!("could not clear model API key: {err}"),
+                    })?;
+            } else {
+                secrets
+                    .set(secret_core::ACCOUNT_MODEL_API_KEY, key)
+                    .map_err(|err| IpcErrorBody {
+                        code: ErrorCode::Internal,
+                        message: format!("could not store model API key: {err}"),
+                    })?;
+            }
+        }
+        let storage_result = {
+            let storage = storage.lock().map_err(|_| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: "storage lock failed".to_string(),
+            })?;
+            storage
+                .set_setting(
+                    "model.provider",
+                    &Value::String(provider.trim().to_string()),
+                )
+                .and_then(|_| {
+                    storage.set_setting("model.base_url", &Value::String(base_url.clone()))
+                })
+                .and_then(|_| {
+                    storage.set_setting("model.name", &Value::String(model.trim().to_string()))
+                })
+                // Remove the old plaintext migration row after the key has
+                // reached the native secret store.
+                .and_then(|_| storage.delete_setting("model.api_key").map(|_| ()))
+        };
+        if let Err(err) = storage_result {
+            if let (Some(secrets), Some(previous)) = (self.secrets.as_ref(), old_key.as_deref()) {
+                let _ = secrets.set(secret_core::ACCOUNT_MODEL_API_KEY, previous);
+            } else if requested_key.is_some() {
+                if let Some(secrets) = self.secrets.as_ref() {
+                    let _ = secrets.delete(secret_core::ACCOUNT_MODEL_API_KEY);
+                }
+            }
+            return Err(IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: err.to_string(),
+            });
+        }
+        Ok(serde_json::json!({ "ok": true, "provider": provider, "model": model }))
     }
 
     /// Recent audit records, newest first, for the Activity panel
@@ -597,6 +875,25 @@ fn internal_error_script(id: &str) -> String {
         false,
         r#"{"code":"internal","message":"failed to encode response"}"#,
     )
+}
+
+fn validate_model_base_url(raw: &str) -> Result<String, IpcErrorBody> {
+    let value = raw.trim();
+    let parsed = url::Url::parse(value).map_err(|_| IpcErrorBody {
+        code: ErrorCode::InvalidParams,
+        message: "model base_url must be a valid http(s) URL".to_string(),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(IpcErrorBody {
+            code: ErrorCode::InvalidParams,
+            message: "model base_url must use http(s) without embedded credentials".to_string(),
+        });
+    }
+    Ok(value.to_string())
 }
 
 /// Dialog lifetime strings → [`GrantLifetime`]. Defaults to `Once` so a
@@ -670,15 +967,12 @@ mod tests {
     fn approve_records_grant_and_deny_clears() {
         use capability_core::{Capability, Resource};
         let queue = Arc::new(Mutex::new(ApprovalQueue::new()));
-        let pending = queue
-            .lock()
-            .unwrap()
-            .submit(
-                capability_core::Principal::User,
-                Capability::FilesystemRead,
-                Resource::Path("/work".into()),
-                "test".to_string(),
-            );
+        let pending = queue.lock().unwrap().submit(
+            capability_core::Principal::User,
+            Capability::FilesystemRead,
+            Resource::Path("/work".into()),
+            "test".to_string(),
+        );
         let dispatcher = dispatcher().with_approvals(queue.clone());
         let script = dispatcher
             .handle_message(&format!(
@@ -737,10 +1031,7 @@ mod tests {
     #[test]
     fn broad_read_grant_revoke_roundtrip() {
         use capability_core::{Capability, Principal, Resource};
-        let dir = std::env::temp_dir().join(format!(
-            "utsuwa-grant-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("utsuwa-grant-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let storage = temp_storage("grants");
@@ -761,22 +1052,17 @@ mod tests {
             .unwrap();
         assert!(script.contains("__resolve(\"30\", true"), "{script}");
         assert_eq!(queue.lock().unwrap().context().grants.len(), 1);
-        assert_eq!(
-            storage
-                .lock()
-                .unwrap()
-                .load_grants()
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(storage.lock().unwrap().load_grants().unwrap().len(), 1);
 
         // The grant authorizes agent reads underneath (and reports home).
         let script = dispatcher
             .handle_message(r#"{"id":"31","method":"permission.grants","params":{}}"#)
             .unwrap();
         assert!(script.contains("__resolve(\"31\", true"), "{script}");
-        assert!(script.contains(&dir.to_string_lossy().to_string()), "{script}");
+        assert!(
+            script.contains(&dir.to_string_lossy().to_string()),
+            "{script}"
+        );
         let ctx = queue.lock().unwrap().context();
         let req = capability_core::CapabilityRequest {
             principal: Principal::Agent(capability_core::AgentId::new("a")),
@@ -798,12 +1084,7 @@ mod tests {
         assert!(script.contains("__resolve(\"32\", true"), "{script}");
         assert!(script.contains("\"removed\":2"), "{script}");
         assert!(queue.lock().unwrap().context().grants.is_empty());
-        assert!(storage
-            .lock()
-            .unwrap()
-            .load_grants()
-            .unwrap()
-            .is_empty());
+        assert!(storage.lock().unwrap().load_grants().unwrap().is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -813,9 +1094,18 @@ mod tests {
         let queue = Arc::new(Mutex::new(ApprovalQueue::new()));
         let dispatcher = dispatcher().with_approvals(queue);
         for (id, params) in [
-            ("40", r#"{"capability":"FilesystemWrite","lifetime":"persistent"}"#),
-            ("41", r#"{"capability":"FilesystemRead","path":"/no/such/dir/utsuwa","lifetime":"persistent"}"#),
-            ("42", r#"{"capability":"FilesystemRead","path":"relative/path","lifetime":"persistent"}"#),
+            (
+                "40",
+                r#"{"capability":"FilesystemWrite","lifetime":"persistent"}"#,
+            ),
+            (
+                "41",
+                r#"{"capability":"FilesystemRead","path":"/no/such/dir/utsuwa","lifetime":"persistent"}"#,
+            ),
+            (
+                "42",
+                r#"{"capability":"FilesystemRead","path":"relative/path","lifetime":"persistent"}"#,
+            ),
             ("43", r#"{"capability":"FilesystemRead","lifetime":"once"}"#),
         ] {
             let script = dispatcher
@@ -823,7 +1113,10 @@ mod tests {
                     r#"{{"id":"{id}","method":"permission.grant","params":{params}}}"#
                 ))
                 .unwrap();
-            assert!(script.contains(&format!("__resolve(\"{id}\", false")), "{script}");
+            assert!(
+                script.contains(&format!("__resolve(\"{id}\", false")),
+                "{script}"
+            );
         }
         // Secret roots are refused even from their owner.
         let ssh = std::env::temp_dir().join(format!("utsuwa-grant-ssh-{}", std::process::id()));
@@ -856,9 +1149,7 @@ mod tests {
             None,
             None,
             emit,
-            Arc::new(|| {
-                Err(crate::agent_runtime::RuntimeError::ModelNotConfigured)
-            }),
+            Arc::new(|| Err(crate::agent_runtime::RuntimeError::ModelNotConfigured)),
         )
         .unwrap()
     }
@@ -883,6 +1174,71 @@ mod tests {
             .handle_message(r#"{"id":"32","method":"settings.get","params":{"key":"theme"}}"#)
             .unwrap();
         assert!(script.contains("\"value\":\"dark\""), "{script}");
+    }
+
+    #[test]
+    fn model_settings_use_native_storage_and_keychain_only() {
+        use secret_core::SecretStore;
+
+        let storage = temp_storage("model-settings");
+        let secrets: Arc<dyn SecretStore> = Arc::new(secret_core::MemoryStore::default());
+        let dispatcher = dispatcher()
+            .with_storage(Arc::clone(&storage))
+            .with_secret_store(Arc::clone(&secrets));
+        let script = dispatcher
+            .handle_message(
+                r#"{"id":"35","method":"settings.set_model_provider","params":{"provider":"openai","base_url":"https://api.openai.com/v1/","model":"gpt-test","api_key":"sk-test-secret"}}"#,
+            )
+            .unwrap();
+        assert!(script.contains("__resolve(\"35\", true"), "{script}");
+        assert!(
+            !script.contains("sk-test-secret"),
+            "secret returned over IPC: {script}"
+        );
+
+        let store = storage.lock().unwrap();
+        assert_eq!(
+            store.get_setting("model.provider").unwrap(),
+            Some(serde_json::json!("openai"))
+        );
+        assert_eq!(
+            store.get_setting("model.base_url").unwrap(),
+            Some(serde_json::json!("https://api.openai.com/v1/"))
+        );
+        assert_eq!(
+            store.get_setting("model.name").unwrap(),
+            Some(serde_json::json!("gpt-test"))
+        );
+        assert_eq!(store.get_setting("model.api_key").unwrap(), None);
+        drop(store);
+        assert_eq!(
+            secrets.get(secret_core::ACCOUNT_MODEL_API_KEY).unwrap(),
+            Some("sk-test-secret".to_string())
+        );
+
+        let script = dispatcher
+            .handle_message(r#"{"id":"36","method":"settings.get_model_provider","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("\"provider\":\"openai\""), "{script}");
+        assert!(script.contains("\"has_api_key\":true"), "{script}");
+        assert!(
+            !script.contains("sk-test-secret"),
+            "secret returned over IPC: {script}"
+        );
+
+        let script = dispatcher
+            .handle_message(
+                r#"{"id":"38","method":"settings.set_model_provider","params":{"provider":"custom","base_url":"file:///etc/passwd","model":"m"}}"#,
+            )
+            .unwrap();
+        assert!(script.contains("__resolve(\"38\", false"), "{script}");
+
+        let script = dispatcher
+            .handle_message(
+                r#"{"id":"37","method":"settings.set","params":{"key":"model.api_key","value":"bad"}}"#,
+            )
+            .unwrap();
+        assert!(script.contains("__resolve(\"37\", false"), "{script}");
     }
 
     #[test]
@@ -939,10 +1295,7 @@ mod tests {
     fn plugin_lifecycle_through_ipc() {
         let root = plugin_root("lifecycle");
         let agent = stub_runtime();
-        agent
-            .plugin_manager()
-            .discover_dir(&root)
-            .unwrap();
+        agent.plugin_manager().discover_dir(&root).unwrap();
         agent.plugin_manager().load("echo").unwrap();
         let dispatcher = dispatcher().with_agent(agent);
 
@@ -998,7 +1351,9 @@ mod tests {
     fn agent_send_validates_text() {
         let dispatcher = dispatcher().with_agent(stub_runtime());
         let script = dispatcher
-            .handle_message(r#"{"id":"40","method":"agent.send_message","params":{"text":"hello"}}"#)
+            .handle_message(
+                r#"{"id":"40","method":"agent.send_message","params":{"text":"hello"}}"#,
+            )
             .unwrap();
         assert!(script.contains("__resolve(\"40\", true"), "{script}");
         assert!(script.contains("\"accepted\":true"), "{script}");
@@ -1009,7 +1364,10 @@ mod tests {
                     r#"{{"id":"{id}","method":"agent.send_message","params":{params}}}"#
                 ))
                 .unwrap();
-            assert!(script.contains(&format!("__resolve(\"{id}\", false")), "{script}");
+            assert!(
+                script.contains(&format!("__resolve(\"{id}\", false")),
+                "{script}"
+            );
         }
 
         let script = dispatcher

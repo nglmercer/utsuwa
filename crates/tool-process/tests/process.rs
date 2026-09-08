@@ -16,20 +16,61 @@ fn manager() -> std::sync::Arc<ProcessManager> {
     ProcessManager::new(ProcessLimits::default())
 }
 
-/// Context carrying a fresh ticket for `ProcessSpawn` on `executable`.
-fn ticketed_ctx(executable: &PathBuf) -> ToolContext {
+/// Context carrying a fresh ticket for one complete `process.spawn` plan.
+fn ticketed_ctx_for(executable: &PathBuf, args: &serde_json::Value) -> ToolContext {
+    let call_args = args
+        .get("args")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let cwd = args
+        .get("cwd")
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap())
+        .canonicalize()
+        .unwrap();
+    let mut env = args
+        .get("env")
+        .and_then(|value| value.as_object())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .as_str()
+                        .map(|value| (name.clone(), value.to_string()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    env.sort_by(|left, right| left.0.cmp(&right.0));
     let principal = Principal::Agent(AgentId::new("test-agent"));
     let invocation = InvocationId::fresh();
     let ticket = CapabilityTicket::mint(
         principal.clone(),
         Capability::ProcessSpawn,
-        ResourceScope::new(vec![Resource::Executable(executable.clone())]),
+        ResourceScope::new(vec![Resource::Process {
+            executable: executable.clone(),
+            args: call_args,
+            cwd,
+            env,
+        }]),
         invocation.clone(),
         Duration::from_secs(120),
     );
     let mut ctx = ToolContext::new(principal).with_ticket(ticket);
     ctx.invocation_id = invocation;
     ctx
+}
+
+fn ticketed_ctx(executable: &PathBuf) -> ToolContext {
+    ticketed_ctx_for(executable, &serde_json::json!({ "args": [] }))
 }
 
 fn spawn_args(executable: &str, args: &[&str]) -> serde_json::Value {
@@ -87,7 +128,7 @@ async fn echo_runs_and_reports_output() {
     let status = StatusTool { manager };
     let (handle, _pid) = spawn_ok(
         &spawn,
-        ticketed_ctx(&echo),
+        ticketed_ctx_for(&echo, &spawn_args("echo", &["hello", "world"])),
         spawn_args("echo", &["hello", "world"]),
     )
     .await;
@@ -127,7 +168,7 @@ async fn shell_metacharacters_are_inert_data() {
     let status = StatusTool { manager };
     let (handle, _) = spawn_ok(
         &spawn,
-        ticketed_ctx(&echo),
+        ticketed_ctx_for(&echo, &spawn_args("echo", &["$(whoami)", "`id`", "a;b"])),
         spawn_args("echo", &["$(whoami)", "`id`", "a;b"]),
     )
     .await;
@@ -163,7 +204,15 @@ async fn secrets_do_not_reach_children_implicitly() {
     let status = StatusTool { manager };
     let out = spawn
         .invoke(
-            ticketed_ctx(&env_bin),
+            ticketed_ctx_for(
+                &env_bin,
+                &serde_json::json!({
+                    "executable": "env",
+                    "args": [],
+                    "env": { "UTSUWA_TEST_EXPLICIT_DELTA": "delta-value" },
+                    "timeout_ms": 15_000,
+                }),
+            ),
             serde_json::json!({
                 "executable": "env",
                 "args": [],
@@ -177,7 +226,10 @@ async fn secrets_do_not_reach_children_implicitly() {
     let content = wait_for_state(&status, handle, "exited", Duration::from_secs(10)).await;
     std::env::remove_var("UTSUWA_TEST_SECRET_TOKEN");
     let stdout = content["stdout"].as_str().unwrap();
-    assert!(!stdout.contains("super-secret-value"), "inherited secret reached child");
+    assert!(
+        !stdout.contains("super-secret-value"),
+        "inherited secret reached child"
+    );
     assert!(stdout.contains("UTSUWA_TEST_EXPLICIT_DELTA=delta-value"));
 }
 
@@ -192,7 +244,14 @@ async fn timeout_kills_long_children() {
     let status = StatusTool { manager };
     let out = spawn
         .invoke(
-            ticketed_ctx(&sleep),
+            ticketed_ctx_for(
+                &sleep,
+                &serde_json::json!({
+                    "executable": "sleep",
+                    "args": ["30"],
+                    "timeout_ms": 1_000,
+                }),
+            ),
             serde_json::json!({
                 "executable": "sleep",
                 "args": ["30"],
@@ -219,10 +278,15 @@ async fn kill_is_forceful_and_idempotent() {
         manager: manager.clone(),
         limits: ProcessLimits::default(),
     };
-    let status = StatusTool { manager: manager.clone() };
+    let status = StatusTool {
+        manager: manager.clone(),
+    };
     let kill = KillTool { manager };
     let out = spawn
-        .invoke(ticketed_ctx(&sleep), spawn_args("sleep", &["30"]))
+        .invoke(
+            ticketed_ctx_for(&sleep, &spawn_args("sleep", &["30"])),
+            spawn_args("sleep", &["30"]),
+        )
         .await
         .unwrap();
     let handle = out.content["handle"].as_str().unwrap().to_string();
@@ -264,11 +328,75 @@ async fn spawn_requires_a_covering_ticket() {
     // Ticket for another executable does not authorize this one.
     let other = PathBuf::from("/usr/bin/sleep");
     let err = spawn
-        .invoke(ticketed_ctx(&other), spawn_args("echo", &["hi"]))
+        .invoke(
+            ticketed_ctx_for(&other, &spawn_args("echo", &["hi"])),
+            spawn_args("echo", &["hi"]),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("does not authorize"), "{err}");
     let _ = echo;
+}
+
+#[test]
+fn process_requirement_contains_argv_cwd_and_environment() {
+    let manager = manager();
+    let spawn = SpawnTool {
+        manager,
+        limits: ProcessLimits::default(),
+    };
+    let args = serde_json::json!({
+        "executable": "echo",
+        "args": ["approved"],
+        "cwd": std::env::current_dir().unwrap().to_string_lossy(),
+        "env": { "MODE": "check" },
+    });
+    let requirement = spawn.required_capability(&args).expect("valid spawn plan");
+    assert_eq!(requirement.capability, Capability::ProcessSpawn);
+    let Resource::Process {
+        executable,
+        args: approved_args,
+        cwd,
+        env,
+    } = requirement.resource
+    else {
+        panic!("process.spawn must require a complete process resource")
+    };
+    assert_eq!(
+        executable,
+        tool_process::resolve_executable("echo").unwrap()
+    );
+    assert_eq!(approved_args, vec!["approved".to_string()]);
+    assert_eq!(
+        cwd,
+        std::env::current_dir().unwrap().canonicalize().unwrap()
+    );
+    assert_eq!(env, vec![("MODE".to_string(), "check".to_string())]);
+}
+
+#[tokio::test]
+async fn loader_injection_environment_is_rejected_even_when_explicit() {
+    let manager = manager();
+    let echo = tool_process::resolve_executable("echo").unwrap();
+    let spawn = SpawnTool {
+        manager,
+        limits: ProcessLimits::default(),
+    };
+    let err = spawn
+        .invoke(
+            ticketed_ctx(&echo),
+            serde_json::json!({
+                "executable": "echo",
+                "env": { "ld_preload": "/tmp/evil.so" },
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not allowed for process isolation"),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -284,9 +412,13 @@ async fn unknown_handles_and_bad_args_fail_closed() {
     let ctx = ToolContext::new(Principal::Agent(AgentId::new("x")));
     for tool_name in ["process.status", "process.kill"] {
         let tool: Box<dyn Tool> = if tool_name == "process.status" {
-            Box::new(StatusTool { manager: status.manager.clone() })
+            Box::new(StatusTool {
+                manager: status.manager.clone(),
+            })
         } else {
-            Box::new(KillTool { manager: kill.manager.clone() })
+            Box::new(KillTool {
+                manager: kill.manager.clone(),
+            })
         };
         let err = tool
             .invoke(ctx.clone(), serde_json::json!({ "handle": "proc-0-999" }))
@@ -359,7 +491,10 @@ async fn table_full_evicts_finished_first() {
         if snapshot.state != "running" {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(10), "sleeper never died");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "sleeper never died"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     // Finished entries are evicted to make room.

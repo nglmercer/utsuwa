@@ -77,15 +77,15 @@ fn configure_builder(
         }
     };
 
-    let mut builder = WebViewBuilder::new().with_url(&initial_url).with_navigation_handler(
-        move |url| {
+    let mut builder = WebViewBuilder::new()
+        .with_url(&initial_url)
+        .with_navigation_handler(move |url| {
             let allowed = protocol::is_navigation_allowed(&url, dev_mode);
             if !allowed {
                 tracing::warn!(%url, "blocked navigation outside companion://app");
             }
             allowed
-        },
-    );
+        });
     builder = builder.with_new_window_req_handler(|url| {
         tracing::warn!(%url, "blocked new-window request (needs host.open_external_url)");
         false
@@ -160,9 +160,7 @@ fn run_gtk(
         Ok(webview) => webview,
         Err(err) => {
             tracing::error!(%err, "failed to create webview");
-            tracing::error!(
-                "XWayland fallback still available: env -u WAYLAND_DISPLAY cargo run"
-            );
+            tracing::error!("XWayland fallback still available: env -u WAYLAND_DISPLAY cargo run");
             std::process::exit(1);
         }
     };
@@ -243,18 +241,14 @@ impl HostApp {
                 tracing::warn!("dropping ipc reply: event loop closed");
             }
         });
-        let builder = match configure_builder(
-            &self.config,
-            &self.dispatcher,
-            self.reply_tx.clone(),
-            waker,
-        ) {
-            Some(builder) => builder,
-            None => {
-                event_loop.exit();
-                return;
-            }
-        };
+        let builder =
+            match configure_builder(&self.config, &self.dispatcher, self.reply_tx.clone(), waker) {
+                Some(builder) => builder,
+                None => {
+                    event_loop.exit();
+                    return;
+                }
+            };
         match builder.build(&window) {
             Ok(webview) => {
                 self.window = Some(window);
@@ -319,7 +313,7 @@ fn run_winit(
 
 /// Shared host startup: storage, audit, approvals, dispatcher, and the
 /// agent runtime. The UI runner (GTK or winit) takes over afterwards.
-fn start_host(emit: EmitFn) -> Dispatcher {
+fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
     // SQLite state: settings KV + persistent grants. A host without
     // storage still runs — approvals go in-memory and every launch
     // re-prompts (fail-closed for authority, open for availability).
@@ -354,17 +348,54 @@ fn start_host(emit: EmitFn) -> Dispatcher {
             ApprovalQueue::new().with_sink(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>)
         }
     }));
+    if dev_grant_workspace {
+        match std::env::current_dir().and_then(|path| path.canonicalize()) {
+            Ok(workspace) => {
+                let is_secret_root = policy_core::is_secret_path(&capability_core::Resource::Path(
+                    workspace.clone(),
+                ));
+                let is_home = std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .and_then(|home| std::path::PathBuf::from(home).canonicalize().ok())
+                    .is_some_and(|home| home == workspace);
+                if !is_secret_root && !is_home {
+                    if let Ok(queue) = approvals.lock() {
+                        if let Err(err) = queue.grant_direct(
+                            capability_core::PrincipalKind::Agent,
+                            capability_core::Capability::FilesystemRead,
+                            capability_core::ResourceScope::new(vec![
+                                capability_core::Resource::Path(workspace.clone()),
+                            ]),
+                            policy_core::GrantLifetime::Session,
+                            format!("developer workspace grant for {}", workspace.display()),
+                        ) {
+                            tracing::error!(%err, "could not install developer workspace grant");
+                        }
+                    }
+                } else {
+                    tracing::warn!(path = %workspace.display(), "refusing developer grant for home or secret root");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(%err, "cannot resolve current directory for developer grant")
+            }
+        }
+    }
     let version = env!("CARGO_PKG_VERSION").to_string();
-    let mut dispatcher =
-        Dispatcher::new(version).with_approvals(Arc::clone(&approvals)).with_audit(Arc::clone(&audit));
+    let secrets = secret_core::system("utsuwa");
+    let mut dispatcher = Dispatcher::new(version)
+        .with_approvals(Arc::clone(&approvals))
+        .with_audit(Arc::clone(&audit))
+        .with_secret_store(Arc::clone(&secrets));
     if let Some(store) = &storage {
         dispatcher = dispatcher.with_storage(Arc::clone(store));
     }
-    match app_host::agent_runtime::AgentRuntime::start(
+    match app_host::agent_runtime::AgentRuntime::start_with_secrets(
         approvals,
         storage,
         Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
         emit,
+        secrets,
     ) {
         Ok(runtime) => {
             // Durable memory beside state.db; an unopenable file falls
@@ -372,7 +403,9 @@ fn start_host(emit: EmitFn) -> Dispatcher {
             let memory_path = storage_core::default_state_dir("utsuwa").join("memory.db");
             match memory::MemoryStore::open(&memory_path) {
                 Ok(store) => runtime.set_memory_store(Arc::new(store)),
-                Err(err) => tracing::error!(%err, "failed to open memory.db; using in-memory memory"),
+                Err(err) => {
+                    tracing::error!(%err, "failed to open memory.db; using in-memory memory")
+                }
             }
             dispatcher = dispatcher.with_agent(runtime);
         }
@@ -390,6 +423,7 @@ fn main() {
         .init();
 
     let dev = std::env::args().any(|arg| arg == "--dev");
+    let dev_grant_workspace = std::env::args().any(|arg| arg == "--dev-grant-workspace");
     let config = if dev {
         AppHostConfig::dev(env!("CARGO_PKG_VERSION"))
     } else {
@@ -412,7 +446,7 @@ fn main() {
                 tracing::warn!("dropping agent event: reply queue closed");
             }
         });
-        let dispatcher = start_host(emit);
+        let dispatcher = start_host(emit, dev_grant_workspace);
         run_gtk(config, dispatcher, reply_tx, reply_rx);
     }
 
@@ -433,7 +467,7 @@ fn main() {
                 tracing::warn!("dropping agent event: event loop closed");
             }
         });
-        let dispatcher = start_host(emit);
+        let dispatcher = start_host(emit, dev_grant_workspace);
         run_winit(config, dispatcher, reply_tx, reply_rx, event_loop);
     }
 }

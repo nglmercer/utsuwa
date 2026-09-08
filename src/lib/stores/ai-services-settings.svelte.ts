@@ -2,6 +2,7 @@ import { modulesStore } from '$lib/stores/modules.svelte';
 import { settingsStore } from '$lib/stores/settings.svelte';
 import { getLLMProvider, getTTSProvider } from '$lib/services/providers/registry';
 import { defaultVoiceForProvider } from '$lib/services/tts/provider-utils';
+import { syncNativeModelProvider } from '$lib/services/native/model-settings';
 import {
 	fetchModels,
 	getCachedModelsForProvider,
@@ -111,6 +112,9 @@ export function createLlmSettingsState() {
 				const nextModel = selectDefaultModel(models, currentModel);
 				if (nextModel !== currentModel) {
 					modulesStore.setModuleSetting('consciousness', 'activeModel', nextModel);
+					void syncNativeModelProvider(provider.id, nextModel).catch((error) => {
+						console.error('[Native model settings] sync failed:', error);
+					});
 				}
 			},
 			onError: (error) => {
@@ -157,6 +161,12 @@ export function createLlmSettingsState() {
 		if (provider?.isLocal || !provider?.requiresApiKey) {
 			settingsStore.markProviderAdded(providerId);
 		}
+		const initialModel = provider?.models?.[0]?.id;
+		if (initialModel) {
+			void syncNativeModelProvider(providerId, initialModel).catch((error) => {
+				console.error('[Native model settings] sync failed:', error);
+			});
+		}
 	}
 
 	function handleLLMNumberSetting(key: string, value: number | undefined) {
@@ -166,16 +176,25 @@ export function createLlmSettingsState() {
 
 	function handleLLMModelChange(modelId: string) {
 		modulesStore.setModuleSetting('consciousness', 'activeModel', modelId);
+		void syncNativeModelProvider(consciousnessSettings.activeProvider as string, modelId).catch((error) => {
+			console.error('[Native model settings] sync failed:', error);
+		});
 	}
 
 	function handleLLMBaseUrlChange(providerId: string, baseUrl: string) {
 		settingsStore.setProviderConfig(providerId, { baseUrl });
 		llmFetchError = null;
+		void syncNativeModelProvider(providerId).catch((error) => {
+			console.error('[Native model settings] sync failed:', error);
+		});
 	}
 
 	function handleApiKeyChange(providerId: string, apiKey: string) {
 		llmFetchError = null;
 		applyApiKey(providerId, apiKey);
+		void syncNativeModelProvider(providerId, undefined, apiKey).catch((error) => {
+			console.error('[Native model settings] sync failed:', error);
+		});
 	}
 
 	function handleLLMApiKeyBlur() {

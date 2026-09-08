@@ -73,20 +73,22 @@
 				>
 					Allow once
 				</button>
-				<button
-					class="perm-btn perm-allow"
-					onclick={() => answer(current.id, 'task')}
-					disabled={!!answering}
-				>
-					Allow for task
-				</button>
-				<button
-					class="perm-btn perm-allow"
-					onclick={() => answer(current.id, 'session')}
-					disabled={!!answering}
-				>
-					Allow for session
-				</button>
+				{#if !current.requiresOnce}
+					<button
+						class="perm-btn perm-allow"
+						onclick={() => answer(current.id, 'task')}
+						disabled={!!answering}
+					>
+						Allow for task
+					</button>
+					<button
+						class="perm-btn perm-allow"
+						onclick={() => answer(current.id, 'session')}
+						disabled={!!answering}
+					>
+						Allow for session
+					</button>
+				{/if}
 			</div>
 		</div>
 	</div>

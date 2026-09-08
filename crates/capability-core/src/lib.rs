@@ -119,15 +119,33 @@ pub enum Capability {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Resource {
     Path(PathBuf),
-    HostPort { host: String, port: u16 },
+    HostPort {
+        host: String,
+        port: u16,
+    },
     Executable(PathBuf),
+    /// One fully specified process invocation. Arguments, cwd, and explicit
+    /// environment deltas are part of the authority so an approval for one
+    /// command cannot silently expand into "this executable with anything".
+    Process {
+        executable: PathBuf,
+        args: Vec<String>,
+        cwd: PathBuf,
+        env: Vec<(String, String)>,
+    },
     Application(String),
     Window(String),
     /// A tool served by an MCP server. Matched exactly (server + tool):
     /// a grant for one MCP tool never covers another.
-    McpTool { server: String, tool: String },
+    McpTool {
+        server: String,
+        tool: String,
+    },
     /// A tool served by a WASM plugin. Matched exactly like [`Resource::McpTool`].
-    PluginTool { plugin: String, tool: String },
+    PluginTool {
+        plugin: String,
+        tool: String,
+    },
 }
 
 /// A granted scope: the set of resources a capability may touch.
@@ -143,8 +161,9 @@ impl ResourceScope {
     }
 
     /// Scope check without filesystem access: compares lexical
-    /// normalization (caller canonicalizes before calling). Never accepts a
-    /// scope escape — a resource outside every granted root fails closed.
+    /// normalization (callers canonicalize filesystem resources before
+    /// calling). Never accepts a scope escape — a resource outside every
+    /// granted root fails closed.
     pub fn allows(&self, resource: &Resource) -> bool {
         self.resources
             .iter()
@@ -176,8 +195,25 @@ fn path_covers(scope: &Path, resource: &Path) -> bool {
 fn scope_covers(scope: &Resource, resource: &Resource) -> bool {
     match (scope, resource) {
         (Resource::Path(s), Resource::Path(r)) => path_covers(s, r),
-        (Resource::Executable(s), Resource::Executable(r)) => {
-            path_covers(s, r) || normalized(s).file_name() == normalized(r).file_name()
+        (Resource::Executable(s), Resource::Executable(r)) => path_covers(s, r),
+        (
+            Resource::Process {
+                executable: se,
+                args: sa,
+                cwd: sc,
+                env: sv,
+            },
+            Resource::Process {
+                executable: re,
+                args: ra,
+                cwd: rc,
+                env: rv,
+            },
+        ) => {
+            normalized(se) == normalized(re)
+                && sa == ra
+                && normalized(sc) == normalized(rc)
+                && sv == rv
         }
         (Resource::HostPort { host: sh, port: sp }, Resource::HostPort { host: rh, port: rp }) => {
             sh.eq_ignore_ascii_case(rh) && sp == rp
@@ -185,12 +221,24 @@ fn scope_covers(scope: &Resource, resource: &Resource) -> bool {
         (Resource::Application(s), Resource::Application(r)) => s == r,
         (Resource::Window(s), Resource::Window(r)) => s == r,
         (
-            Resource::McpTool { server: ss, tool: st },
-            Resource::McpTool { server: rs, tool: rt },
+            Resource::McpTool {
+                server: ss,
+                tool: st,
+            },
+            Resource::McpTool {
+                server: rs,
+                tool: rt,
+            },
         ) => ss == rs && st == rt,
         (
-            Resource::PluginTool { plugin: sp, tool: st },
-            Resource::PluginTool { plugin: rp, tool: rt },
+            Resource::PluginTool {
+                plugin: sp,
+                tool: st,
+            },
+            Resource::PluginTool {
+                plugin: rp,
+                tool: rt,
+            },
         ) => sp == rp && st == rt,
         _ => false,
     }
@@ -291,7 +339,9 @@ mod tests {
     #[test]
     fn path_scope_covers_children_but_not_siblings_or_escapes() {
         let scope = ResourceScope::new(vec![Resource::Path(PathBuf::from("/home/u/Projects"))]);
-        assert!(scope.allows(&Resource::Path(PathBuf::from("/home/u/Projects/app/main.rs"))));
+        assert!(scope.allows(&Resource::Path(PathBuf::from(
+            "/home/u/Projects/app/main.rs"
+        ))));
         assert!(!scope.allows(&Resource::Path(PathBuf::from("/home/u/Other/x"))));
         // `..` that escapes the root fails closed.
         assert!(!scope.allows(&Resource::Path(PathBuf::from(
@@ -316,6 +366,35 @@ mod tests {
         assert!(!scope.allows(&Resource::HostPort {
             host: "evil.example".to_string(),
             port: 443,
+        }));
+    }
+
+    #[test]
+    fn process_scope_covers_only_the_approved_invocation() {
+        let scope = ResourceScope::new(vec![Resource::Process {
+            executable: PathBuf::from("/usr/bin/python3"),
+            args: vec!["script.py".to_string()],
+            cwd: PathBuf::from("/work"),
+            env: vec![("MODE".to_string(), "check".to_string())],
+        }]);
+        let same = Resource::Process {
+            executable: PathBuf::from("/usr/bin/./python3"),
+            args: vec!["script.py".to_string()],
+            cwd: PathBuf::from("/work/./"),
+            env: vec![("MODE".to_string(), "check".to_string())],
+        };
+        assert!(scope.allows(&same));
+        assert!(!scope.allows(&Resource::Process {
+            executable: PathBuf::from("/usr/bin/python3"),
+            args: vec!["other.py".to_string()],
+            cwd: PathBuf::from("/work"),
+            env: vec![("MODE".to_string(), "check".to_string())],
+        }));
+        assert!(!scope.allows(&Resource::Process {
+            executable: PathBuf::from("/usr/bin/python3"),
+            args: vec!["script.py".to_string()],
+            cwd: PathBuf::from("/tmp"),
+            env: vec![("MODE".to_string(), "check".to_string())],
         }));
     }
 
@@ -371,7 +450,11 @@ mod tests {
             Err(TicketError::CapabilityMismatch)
         );
         assert_eq!(
-            ticket.check(&principal, &r(Capability::FilesystemRead), &InvocationId::fresh()),
+            ticket.check(
+                &principal,
+                &r(Capability::FilesystemRead),
+                &InvocationId::fresh()
+            ),
             Err(TicketError::InvocationMismatch)
         );
         let other = Principal::Agent(AgentId::new("x"));
@@ -393,7 +476,11 @@ mod tests {
             Duration::from_secs(0),
         );
         // Empty scope + immediate expiry: both fail; expiry is checked first.
-        let r = req(principal.clone(), Capability::ScreenCapture, Resource::Window("w".into()));
+        let r = req(
+            principal.clone(),
+            Capability::ScreenCapture,
+            Resource::Window("w".into()),
+        );
         assert_eq!(
             ticket.check(&principal, &r, &inv),
             Err(TicketError::Expired)

@@ -66,7 +66,16 @@ impl AppHostConfig {
 /// HTTP URLs are loadable in dev mode. Everything else must go through the
 /// custom scheme or an explicit `host.open_external_url` approval.
 pub fn is_dev_url(url: &str) -> bool {
-    url.starts_with("http://localhost:") || url.starts_with("http://127.0.0.1:")
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "http"
+        && parsed.port().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"))
 }
 
 /// In-process host: events go to an unbounded channel consumed by the
@@ -138,8 +147,11 @@ mod tests {
         use super::is_dev_url;
         assert!(is_dev_url("http://localhost:5173/app"));
         assert!(is_dev_url("http://127.0.0.1:5173/"));
+        assert!(is_dev_url("http://[::1]:5173/"));
         assert!(!is_dev_url("https://example.com/"));
         assert!(!is_dev_url("http://192.168.1.2:5173/"));
+        assert!(!is_dev_url("http://localhost.attacker.com:5173/"));
+        assert!(!is_dev_url("http://127.0.0.1.evil.com:5173/"));
         assert!(!is_dev_url("file:///etc/passwd"));
     }
 

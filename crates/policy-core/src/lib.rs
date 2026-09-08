@@ -7,7 +7,7 @@
 
 use capability_core::{Capability, CapabilityRequest, Principal, PrincipalKind, Resource};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// How long a grant lives once approved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,10 +22,16 @@ pub enum GrantLifetime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthorizationDecision {
     /// May mint a ticket with this TTL.
-    Allow { ticket_ttl: Duration },
-    Deny { reason: String },
+    Allow {
+        ticket_ttl: Duration,
+    },
+    Deny {
+        reason: String,
+    },
     /// Block on explicit frontend approval first.
-    RequireUserApproval { reason: String },
+    RequireUserApproval {
+        reason: String,
+    },
 }
 
 /// Ambient facts the policy may consider. Persistent grants live in SQLite
@@ -36,15 +42,100 @@ pub enum AuthorizationDecision {
 pub struct AuthorizationContext {
     /// Previously approved persistent/session grants to honor.
     pub grants: Vec<GrantedScope>,
+    /// The task currently being authorized. Task and once grants are bound
+    /// to this identity and never become ambient authority.
+    pub task_id: Option<String>,
+    /// The model turn currently being authorized. Once grants are also
+    /// bound to this identity and are consumed atomically before execution.
+    pub turn_id: Option<String>,
 }
 
 /// A standing grant previously approved by the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrantedScope {
+    /// Stable identity for audit/debugging and future revocation APIs.
+    #[serde(default)]
+    pub id: String,
     pub principal_kind: PrincipalKind,
     pub capability: Capability,
     pub scope: capability_core::ResourceScope,
     pub lifetime: GrantLifetime,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default = "unix_millis")]
+    pub created_at: u64,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub uses_remaining: Option<u32>,
+}
+
+impl GrantedScope {
+    /// Create a grant with the narrowest lifetime metadata for the approval
+    /// that produced it. Task/once grants carry the current task and turn;
+    /// session/persistent grants intentionally do not.
+    pub fn new(
+        principal_kind: PrincipalKind,
+        capability: Capability,
+        scope: capability_core::ResourceScope,
+        lifetime: GrantLifetime,
+        task_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> Self {
+        let bound = matches!(lifetime, GrantLifetime::Once | GrantLifetime::Task);
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            principal_kind,
+            capability,
+            scope,
+            lifetime,
+            task_id: bound.then_some(task_id).flatten(),
+            turn_id: bound.then_some(turn_id).flatten(),
+            created_at: unix_millis(),
+            expires_at: None,
+            uses_remaining: (lifetime == GrantLifetime::Once).then_some(1),
+        }
+    }
+
+    /// Whether this grant is valid for the current authorization context.
+    pub fn is_active(&self, context: &AuthorizationContext) -> bool {
+        if self
+            .expires_at
+            .is_some_and(|expires| expires <= unix_millis())
+        {
+            return false;
+        }
+        if self.lifetime == GrantLifetime::Once && self.uses_remaining.unwrap_or(0) == 0 {
+            return false;
+        }
+        if let Some(task_id) = &self.task_id {
+            if context.task_id.as_ref() != Some(task_id) {
+                return false;
+            }
+        }
+        if let Some(turn_id) = &self.turn_id {
+            if context.turn_id.as_ref() != Some(turn_id) {
+                return false;
+            }
+        }
+        match self.lifetime {
+            GrantLifetime::Task => self.task_id.is_some() && context.task_id.is_some(),
+            // A host task binds Once grants to a turn. The unbound form is
+            // retained for the small public/context API, where a queue can
+            // still provide a one-use grant without task metadata.
+            GrantLifetime::Once => self.turn_id.is_none() || context.turn_id.is_some(),
+            GrantLifetime::Session | GrantLifetime::Persistent => true,
+        }
+    }
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Capability risk class: reads/observation can be pre-approved, mutations
@@ -67,6 +158,37 @@ fn is_mutation_or_control(cap: &Capability) -> bool {
             | McpInvoke
             | PluginInvoke
     )
+}
+
+fn is_dangerous_process(resource: &Resource) -> bool {
+    let Resource::Process { executable, .. } = resource else {
+        return false;
+    };
+    let Some(name) = executable.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    // Windows appends `.exe`; interpreters commonly append a version
+    // (`python3.12`, `ruby3.3`, `perl5.38`). All of those forms remain a
+    // fresh-approval surface.
+    let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    let versioned = |prefix: &str| {
+        stem.strip_prefix(prefix).is_some_and(|suffix| {
+            suffix.is_empty() || suffix.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        })
+    };
+    matches!(
+        stem,
+        "sh" | "bash" | "zsh" | "fish" | "node" | "nodejs" | "pwsh" | "cmd"
+    ) || versioned("python")
+        || versioned("ruby")
+        || versioned("perl")
+        || stem.starts_with("powershell")
+}
+
+fn requires_fresh_approval(capability: &Capability, resource: &Resource) -> bool {
+    is_secret_path(resource)
+        || (*capability == Capability::ProcessSpawn && is_dangerous_process(resource))
 }
 
 /// Default ticket TTLs: short for approvals, longer for harmless reads.
@@ -108,6 +230,25 @@ pub fn authorize(
         };
     }
 
+    // Standing grant covering this exact capability + resource?
+    let kind = principal.kind();
+    let requires_fresh = requires_fresh_approval(&request.capability, &request.resource);
+    for grant in &context.grants {
+        if grant.principal_kind == kind
+            && grant.capability == request.capability
+            && grant.scope.allows(&request.resource)
+            && grant.is_active(context)
+            // A sensitive approval is represented by a bound/one-use grant,
+            // so the operation can resume exactly once without turning a
+            // secret path or interpreter into standing authority.
+            && (!requires_fresh || grant.lifetime == GrantLifetime::Once)
+        {
+            return AuthorizationDecision::Allow {
+                ticket_ttl: default_ttl(is_mutation_or_control(&request.capability)),
+            };
+        }
+    }
+
     // Secret paths are never silently allowed: no standing grant covers
     // them, however broad. The user can still approve each access in the
     // dialog — explicit, audited, and never inherited from a home-folder
@@ -121,17 +262,16 @@ pub fn authorize(
         };
     }
 
-    // Standing grant covering this exact capability + resource?
-    let kind = principal.kind();
-    for grant in &context.grants {
-        if grant.principal_kind == kind
-            && grant.capability == request.capability
-            && grant.scope.allows(&request.resource)
-        {
-            return AuthorizationDecision::Allow {
-                ticket_ttl: default_ttl(is_mutation_or_control(&request.capability)),
-            };
-        }
+    // Script interpreters and shells turn otherwise narrow argv approvals
+    // into a general code-execution surface. They always need a fresh user
+    // decision, even when an older executable-only grant exists.
+    if request.capability == Capability::ProcessSpawn && is_dangerous_process(&request.resource) {
+        return AuthorizationDecision::RequireUserApproval {
+            reason: format!(
+                "process.spawn for a shell or script interpreter needs fresh approval: {:?}",
+                request.resource
+            ),
+        };
     }
 
     // The user themselves acting locally: allow, tickets still scope it.
@@ -164,6 +304,14 @@ pub struct PendingRequest {
     pub capability: Capability,
     pub resource: Resource,
     pub reason: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// Sensitive path/interpreter requests can only be approved for one use;
+    /// the frontend hides broader lifetime choices for these requests.
+    #[serde(default)]
+    pub requires_once: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -193,9 +341,7 @@ pub struct ApprovalQueue {
     /// Called with every newly approved `Persistent` grant before it takes
     /// effect. The host installs a `storage-core` writer here; an error
     /// fails the decision and leaves the request pending.
-    persist: Option<
-        std::sync::Arc<dyn Fn(&GrantedScope) -> Result<(), String> + Send + Sync>,
-    >,
+    persist: Option<std::sync::Arc<dyn Fn(&GrantedScope) -> Result<(), String> + Send + Sync>>,
 }
 
 impl Default for ApprovalQueue {
@@ -252,7 +398,11 @@ impl ApprovalQueue {
 
     /// Snapshot of grants approved so far (seeded + decided).
     pub fn grants_snapshot(&self) -> Vec<GrantedScope> {
-        self.inner.lock().expect("approval queue lock").grants.clone()
+        self.inner
+            .lock()
+            .expect("approval queue lock")
+            .grants
+            .clone()
     }
 
     /// Publish a pending request. Returns its stable id for the dialog and
@@ -264,15 +414,34 @@ impl ApprovalQueue {
         resource: Resource,
         reason: String,
     ) -> PendingRequest {
+        self.submit_for_task(principal, capability, resource, reason, None, None)
+    }
+
+    /// Publish an approval request bound to a live agent task/turn. The
+    /// binding is copied into the resulting grant, so a later turn cannot
+    /// reuse an approval that belonged to an abandoned task.
+    pub fn submit_for_task(
+        &self,
+        principal: Principal,
+        capability: Capability,
+        resource: Resource,
+        reason: String,
+        task_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> PendingRequest {
         let mut inner = self.inner.lock().expect("approval queue lock");
         let id = format!("perm-{}", inner.next_id);
         inner.next_id += 1;
+        let requires_once = requires_fresh_approval(&capability, &resource);
         let request = PendingRequest {
             id: id.clone(),
             principal,
             capability,
             resource,
             reason,
+            task_id,
+            turn_id,
+            requires_once,
         };
         inner.pending.insert(id, request.clone());
         if let Some(sink) = &self.sink {
@@ -299,11 +468,7 @@ impl ApprovalQueue {
     /// on approval. Either way the request leaves the queue — except when
     /// persisting a `Persistent` approval fails, in which case nothing is
     /// granted and the request stays pending for a retry.
-    pub fn decide(
-        &self,
-        id: &str,
-        lifetime: Option<GrantLifetime>,
-    ) -> Result<bool, QueueError> {
+    pub fn decide(&self, id: &str, lifetime: Option<GrantLifetime>) -> Result<bool, QueueError> {
         let _span = tracing::info_span!("permission.decide", request = %id).entered();
         // Phase 1: peek at the request without removing it, so a storage
         // failure below cannot lose a pending approval.
@@ -313,17 +478,29 @@ impl ApprovalQueue {
                 .pending
                 .get(id)
                 .ok_or_else(|| QueueError::UnknownId(id.to_string()))?;
-            lifetime.map(|lifetime| GrantedScope {
-                principal_kind: request.principal.kind(),
-                capability: request.capability.clone(),
-                scope: capability_core::ResourceScope::new(vec![request.resource.clone()]),
-                lifetime,
+            lifetime.map(|lifetime| {
+                let lifetime = if request.requires_once {
+                    GrantLifetime::Once
+                } else {
+                    lifetime
+                };
+                GrantedScope::new(
+                    request.principal.kind(),
+                    request.capability.clone(),
+                    capability_core::ResourceScope::new(vec![request.resource.clone()]),
+                    lifetime,
+                    request.task_id.clone(),
+                    request.turn_id.clone(),
+                )
             })
         };
         // Phase 2: durable write first (outside the queue lock — the hook
         // does I/O). Only `Persistent` grants reach storage; without a hook
         // (tests, ephemeral hosts) they live in memory like the rest.
-        if let Some(grant) = grant.as_ref().filter(|g| g.lifetime == GrantLifetime::Persistent) {
+        if let Some(grant) = grant
+            .as_ref()
+            .filter(|g| g.lifetime == GrantLifetime::Persistent)
+        {
             if let Some(persist) = &self.persist {
                 persist(grant).map_err(QueueError::Persist)?;
             }
@@ -367,12 +544,14 @@ impl ApprovalQueue {
         lifetime: GrantLifetime,
         reason: String,
     ) -> Result<GrantedScope, QueueError> {
-        let grant = GrantedScope {
+        let grant = GrantedScope::new(
             principal_kind,
-            capability: capability.clone(),
-            scope: scope.clone(),
+            capability.clone(),
+            scope.clone(),
             lifetime,
-        };
+            None,
+            None,
+        );
         if lifetime == GrantLifetime::Persistent {
             if let Some(persist) = &self.persist {
                 persist(&grant).map_err(QueueError::Persist)?;
@@ -405,16 +584,86 @@ impl ApprovalQueue {
     ) -> usize {
         let mut inner = self.inner.lock().expect("approval queue lock");
         let before = inner.grants.len();
-        inner.grants.retain(|g| !(g.capability == *capability && g.scope == *scope));
+        inner
+            .grants
+            .retain(|g| !(g.capability == *capability && g.scope == *scope));
         before - inner.grants.len()
     }
 
     /// Snapshot of standing grants (seed + approvals) for agent turns.
     pub fn context(&self) -> AuthorizationContext {
+        self.context_for(None, None)
+    }
+
+    /// Snapshot grants together with the task/turn identity being resumed.
+    pub fn context_for(
+        &self,
+        task_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> AuthorizationContext {
         let inner = self.inner.lock().expect("approval queue lock");
         AuthorizationContext {
             grants: inner.grants.clone(),
+            task_id,
+            turn_id,
         }
+    }
+
+    /// Evaluate a request against a live task/turn snapshot.
+    pub fn authorize_for(
+        &self,
+        principal: &Principal,
+        request: &CapabilityRequest,
+        task_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> AuthorizationDecision {
+        let context = self.context_for(task_id, turn_id);
+        authorize(principal, request, &context)
+    }
+
+    /// Atomically consume a grant immediately before a privileged tool is
+    /// invoked. Once grants disappear here, a retry or a second call cannot
+    /// execute through the same approval.
+    pub fn consume_for(
+        &self,
+        principal: &Principal,
+        request: &CapabilityRequest,
+        task_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> bool {
+        if *principal == Principal::User {
+            return true;
+        }
+        let context = AuthorizationContext {
+            grants: Vec::new(),
+            task_id: task_id.map(str::to_string),
+            turn_id: turn_id.map(str::to_string),
+        };
+        let mut inner = self.inner.lock().expect("approval queue lock");
+        let Some(index) = inner.grants.iter().position(|grant| {
+            grant.principal_kind == principal.kind()
+                && grant.capability == request.capability
+                && grant.scope.allows(&request.resource)
+                && grant.is_active(&context)
+        }) else {
+            return false;
+        };
+        if inner.grants[index].lifetime == GrantLifetime::Once {
+            inner.grants.remove(index);
+        }
+        true
+    }
+
+    /// Drop task and once grants when a task reaches a terminal state.
+    pub fn end_task(&self, task_id: &str) {
+        let mut inner = self.inner.lock().expect("approval queue lock");
+        inner.grants.retain(|grant| {
+            !matches!(grant.lifetime, GrantLifetime::Task | GrantLifetime::Once)
+                || grant.task_id.as_deref() != Some(task_id)
+        });
+        inner
+            .pending
+            .retain(|_, request| request.task_id.as_deref() != Some(task_id));
     }
 }
 
@@ -424,10 +673,17 @@ impl ApprovalQueue {
 pub fn is_secret_path(resource: &Resource) -> bool {
     match resource {
         Resource::Path(p) => {
-            let s = p.to_string_lossy();
-            [".ssh", ".aws", ".gnupg", ".config", ".pki", "secrets"]
-                .iter()
-                .any(|seg| s.split('/').any(|c| c == *seg))
+            use std::path::Component;
+            p.components().any(|component| {
+                let Component::Normal(name) = component else {
+                    return false;
+                };
+                let name = name.to_string_lossy();
+                matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    ".ssh" | ".aws" | ".gnupg" | ".credentials" | ".config" | ".pki" | "secrets"
+                )
+            })
         }
         _ => false,
     }
@@ -440,7 +696,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn ctx() -> AuthorizationContext {
-        AuthorizationContext { grants: vec![] }
+        AuthorizationContext {
+            grants: vec![],
+            ..AuthorizationContext::default()
+        }
     }
 
     fn read_req() -> CapabilityRequest {
@@ -455,7 +714,10 @@ mod tests {
     fn agent_read_without_grant_requires_approval() {
         let r = read_req();
         let d = authorize(&r.principal, &r, &ctx());
-        assert!(matches!(d, AuthorizationDecision::RequireUserApproval { .. }));
+        assert!(matches!(
+            d,
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
     }
 
     #[test]
@@ -467,7 +729,17 @@ mod tests {
                 capability: Capability::FilesystemRead,
                 scope: ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
                 lifetime: GrantLifetime::Session,
+                ..GrantedScope::new(
+                    PrincipalKind::Agent,
+                    Capability::FilesystemRead,
+                    ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
+                    GrantLifetime::Session,
+                    Some("task-1".to_string()),
+                    Some("turn-1".to_string()),
+                )
             }],
+            task_id: Some("task-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
         };
         // read_req targets /work/main.rs — inside the granted tree.
         let d = authorize(&r.principal, &r, &granting);
@@ -481,7 +753,10 @@ mod tests {
             ..read_req()
         };
         let d = authorize(&r.principal, &r, &ctx());
-        assert!(matches!(d, AuthorizationDecision::RequireUserApproval { .. }));
+        assert!(matches!(
+            d,
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
     }
 
     #[test]
@@ -508,7 +783,17 @@ mod tests {
                 capability: Capability::FilesystemWrite,
                 scope: ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
                 lifetime: GrantLifetime::Task,
+                ..GrantedScope::new(
+                    PrincipalKind::BuiltinTool,
+                    Capability::FilesystemWrite,
+                    ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
+                    GrantLifetime::Task,
+                    Some("task-1".to_string()),
+                    Some("turn-1".to_string()),
+                )
             }],
+            task_id: Some("task-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
         };
         assert!(matches!(
             authorize(&principal, &r, &granting),
@@ -521,6 +806,89 @@ mod tests {
         };
         assert!(matches!(
             authorize(&principal, &elsewhere, &granting),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn dangerous_interpreters_always_need_fresh_approval() {
+        let principal = Principal::Agent(AgentId::new("a"));
+        let resource = Resource::Process {
+            executable: PathBuf::from("/usr/bin/python3.12"),
+            args: vec!["script.py".to_string()],
+            cwd: PathBuf::from("/work"),
+            env: vec![],
+        };
+        let request = CapabilityRequest {
+            principal: principal.clone(),
+            capability: Capability::ProcessSpawn,
+            resource: resource.clone(),
+        };
+        let grant = GrantedScope::new(
+            PrincipalKind::Agent,
+            Capability::ProcessSpawn,
+            ResourceScope::new(vec![resource]),
+            GrantLifetime::Persistent,
+            None,
+            None,
+        );
+        let decision = authorize(
+            &principal,
+            &request,
+            &AuthorizationContext {
+                grants: vec![grant],
+                ..AuthorizationContext::default()
+            },
+        );
+        assert!(matches!(
+            decision,
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn sensitive_approvals_resume_once_even_if_broader_lifetime_was_requested() {
+        let queue = ApprovalQueue::new();
+        let principal = Principal::Agent(AgentId::new("a"));
+        let task_id = Some("task-sensitive".to_string());
+        let turn_id = Some("turn-sensitive".to_string());
+        let resource = Resource::Path(PathBuf::from("/work/.ssh/id_rsa"));
+        let request = CapabilityRequest {
+            principal: principal.clone(),
+            capability: Capability::FilesystemRead,
+            resource: resource.clone(),
+        };
+        let pending = queue.submit_for_task(
+            principal.clone(),
+            request.capability.clone(),
+            resource,
+            "read key".to_string(),
+            task_id.clone(),
+            turn_id.clone(),
+        );
+        assert!(pending.requires_once);
+        assert_eq!(
+            queue.decide(&pending.id, Some(GrantLifetime::Session)),
+            Ok(true)
+        );
+        assert_eq!(queue.grants_snapshot()[0].lifetime, GrantLifetime::Once);
+        assert!(matches!(
+            queue.authorize_for(&principal, &request, task_id, turn_id),
+            AuthorizationDecision::Allow { .. }
+        ));
+        assert!(queue.consume_for(
+            &principal,
+            &request,
+            Some("task-sensitive"),
+            Some("turn-sensitive")
+        ));
+        assert!(matches!(
+            queue.authorize_for(
+                &principal,
+                &request,
+                Some("task-sensitive".to_string()),
+                Some("turn-sensitive".to_string())
+            ),
             AuthorizationDecision::RequireUserApproval { .. }
         ));
     }
@@ -573,21 +941,119 @@ mod tests {
     }
 
     #[test]
+    fn grant_lifetimes_are_bound_and_consumed() {
+        let queue = ApprovalQueue::new();
+        let principal = Principal::Agent(AgentId::new("a"));
+        let request = CapabilityRequest {
+            principal: principal.clone(),
+            capability: Capability::FilesystemWrite,
+            resource: Resource::Path(PathBuf::from("/work/file.txt")),
+        };
+
+        let once = queue.submit_for_task(
+            principal.clone(),
+            request.capability.clone(),
+            request.resource.clone(),
+            "write once".to_string(),
+            Some("task-1".to_string()),
+            Some("turn-1".to_string()),
+        );
+        assert_eq!(queue.decide(&once.id, Some(GrantLifetime::Once)), Ok(true));
+        assert!(matches!(
+            queue.authorize_for(
+                &principal,
+                &request,
+                Some("task-1".to_string()),
+                Some("turn-1".to_string())
+            ),
+            AuthorizationDecision::Allow { .. }
+        ));
+        assert!(queue.consume_for(&principal, &request, Some("task-1"), Some("turn-1")));
+        assert!(!queue.consume_for(&principal, &request, Some("task-1"), Some("turn-1")));
+        assert!(matches!(
+            queue.authorize_for(
+                &principal,
+                &request,
+                Some("task-1".to_string()),
+                Some("turn-1".to_string())
+            ),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+
+        let task = queue.submit_for_task(
+            principal.clone(),
+            request.capability.clone(),
+            request.resource.clone(),
+            "write during task".to_string(),
+            Some("task-2".to_string()),
+            Some("turn-2".to_string()),
+        );
+        assert_eq!(queue.decide(&task.id, Some(GrantLifetime::Task)), Ok(true));
+        assert!(matches!(
+            queue.authorize_for(
+                &principal,
+                &request,
+                Some("task-2".to_string()),
+                Some("turn-2".to_string())
+            ),
+            AuthorizationDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            queue.authorize_for(
+                &principal,
+                &request,
+                Some("other-task".to_string()),
+                Some("turn-2".to_string())
+            ),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+        queue.end_task("task-2");
+        assert!(matches!(
+            queue.authorize_for(
+                &principal,
+                &request,
+                Some("task-2".to_string()),
+                Some("turn-2".to_string())
+            ),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+
+        let session = queue.submit(
+            principal.clone(),
+            request.capability.clone(),
+            request.resource.clone(),
+            "write for session".to_string(),
+        );
+        assert_eq!(
+            queue.decide(&session.id, Some(GrantLifetime::Session)),
+            Ok(true)
+        );
+        assert!(matches!(
+            queue.authorize_for(&principal, &request, Some("new-task".to_string()), None),
+            AuthorizationDecision::Allow { .. }
+        ));
+    }
+
+    #[test]
     fn persistent_approve_calls_hook_before_granting() {
         use std::sync::{Arc, Mutex};
         let seen = Arc::new(Mutex::new(Vec::new()));
         let probe = seen.clone();
-        let queue = ApprovalQueue::new().on_persistent_grant(Arc::new(move |grant: &GrantedScope| {
-            probe.lock().unwrap().push(grant.clone());
-            Ok(())
-        }));
+        let queue =
+            ApprovalQueue::new().on_persistent_grant(Arc::new(move |grant: &GrantedScope| {
+                probe.lock().unwrap().push(grant.clone());
+                Ok(())
+            }));
         let req = queue.submit(
             Principal::Agent(AgentId::new("a")),
             Capability::FilesystemRead,
             Resource::Path(PathBuf::from("/work/f")),
             "read".to_string(),
         );
-        assert_eq!(queue.decide(&req.id, Some(GrantLifetime::Persistent)), Ok(true));
+        assert_eq!(
+            queue.decide(&req.id, Some(GrantLifetime::Persistent)),
+            Ok(true)
+        );
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].lifetime, GrantLifetime::Persistent);
@@ -610,7 +1076,10 @@ mod tests {
             Resource::Path(PathBuf::from("/work/f")),
             "read".to_string(),
         );
-        assert_eq!(queue.decide(&req.id, Some(GrantLifetime::Session)), Ok(true));
+        assert_eq!(
+            queue.decide(&req.id, Some(GrantLifetime::Session)),
+            Ok(true)
+        );
         assert_eq!(*calls.lock().unwrap(), 0);
         assert_eq!(queue.context().grants.len(), 1);
     }
@@ -618,9 +1087,8 @@ mod tests {
     #[test]
     fn persist_failure_leaves_request_pending() {
         use std::sync::Arc;
-        let queue = ApprovalQueue::new().on_persistent_grant(Arc::new(|_: &GrantedScope| {
-            Err("disk full".to_string())
-        }));
+        let queue = ApprovalQueue::new()
+            .on_persistent_grant(Arc::new(|_: &GrantedScope| Err("disk full".to_string())));
         let req = queue.submit(
             Principal::Agent(AgentId::new("a")),
             Capability::FilesystemRead,
@@ -643,6 +1111,14 @@ mod tests {
             capability: Capability::FilesystemRead,
             scope: ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
             lifetime: GrantLifetime::Persistent,
+            ..GrantedScope::new(
+                PrincipalKind::Agent,
+                Capability::FilesystemRead,
+                ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
+                GrantLifetime::Persistent,
+                None,
+                None,
+            )
         };
         let queue = ApprovalQueue::new().with_grants(vec![persistent.clone()]);
         assert_eq!(queue.grants_snapshot(), vec![persistent]);
@@ -656,6 +1132,14 @@ mod tests {
             capability: Capability::FilesystemRead,
             scope: ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
             lifetime: GrantLifetime::Session,
+            ..GrantedScope::new(
+                PrincipalKind::Agent,
+                Capability::FilesystemRead,
+                ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
+                GrantLifetime::Session,
+                None,
+                None,
+            )
         }]);
     }
 
@@ -664,24 +1148,53 @@ mod tests {
         assert!(is_secret_path(&Resource::Path(PathBuf::from(
             "/home/u/.ssh/id_ed25519"
         ))));
+        for directory in [
+            ".aws",
+            ".gnupg",
+            ".credentials",
+            ".config",
+            ".pki",
+            "secrets",
+        ] {
+            assert!(is_secret_path(&Resource::Path(
+                PathBuf::from("/home/u").join(directory).join("file")
+            )));
+        }
         assert!(!is_secret_path(&Resource::Path(PathBuf::from(
             "/work/main.rs"
         ))));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_secret_directories_use_path_components() {
+        assert!(is_secret_path(&Resource::Path(PathBuf::from(
+            r"C:\Users\Bob\.ssh\id_ed25519"
+        ))));
+        assert!(is_secret_path(&Resource::Path(PathBuf::from(
+            r"C:\Users\Bob\.AWS\credentials"
+        ))));
+        assert!(!is_secret_path(&Resource::Path(PathBuf::from(
+            r"C:\Users\Bob\notes.txt"
+        ))));
+    }
+
     fn grant_home() -> GrantedScope {
-        GrantedScope {
-            principal_kind: PrincipalKind::Agent,
-            capability: Capability::FilesystemRead,
-            scope: ResourceScope::new(vec![Resource::Path(PathBuf::from("/home/u"))]),
-            lifetime: GrantLifetime::Persistent,
-        }
+        GrantedScope::new(
+            PrincipalKind::Agent,
+            Capability::FilesystemRead,
+            ResourceScope::new(vec![Resource::Path(PathBuf::from("/home/u"))]),
+            GrantLifetime::Persistent,
+            None,
+            None,
+        )
     }
 
     #[test]
     fn broad_grant_covers_ordinary_files_but_never_secrets() {
         let ctx = AuthorizationContext {
             grants: vec![grant_home()],
+            ..AuthorizationContext::default()
         };
         let ordinary = CapabilityRequest {
             principal: Principal::Agent(AgentId::new("a")),
@@ -707,8 +1220,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let stored: Arc<Mutex<Vec<GrantedScope>>> = Arc::new(Mutex::new(Vec::new()));
         let hook_store = Arc::clone(&stored);
-        let queue = ApprovalQueue::new()
-            .on_persistent_grant(Arc::new(move |grant: &GrantedScope| {
+        let queue =
+            ApprovalQueue::new().on_persistent_grant(Arc::new(move |grant: &GrantedScope| {
                 hook_store.lock().expect("hook lock").push(grant.clone());
                 Ok(())
             }));

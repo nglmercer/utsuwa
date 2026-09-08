@@ -27,6 +27,8 @@ export interface CompanionTurnInput {
 		apiKey?: string;
 		baseURL?: string;
 		hasImages: boolean;
+		/** The desktop host already owns the model call and key. */
+		nativeRuntime?: boolean;
 	};
 	// When true, the turn is a system event (e.g. a fired reminder). Skip user-
 	// specific side effects like sentiment analysis, baseline stat updates,
@@ -89,7 +91,7 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 
 	// Decoupled fallback: the model skipped the inline JSON, so ask a dedicated
 	// forced-JSON call to extract mood + memory from the exchange.
-	if (!llmUpdates) {
+	if (!llmUpdates && !llm.nativeRuntime) {
 		const extracted = await extractStateUpdates({
 			provider: llm.provider as LLMProvider,
 			model: llm.model,

@@ -78,10 +78,15 @@ fn authorized_path(
     let ticket = ctx.ticket.as_ref().ok_or_else(|| {
         denied("no capability ticket: route filesystem access through the agent + policy engine")
     })?;
-    check_ticket(ticket, ctx, &capability, path)?;
     let target = path.canonicalize().map_err(|_| {
-        failed(format!("cannot access '{}': no such file or unreadable", path.display()))
+        failed(format!(
+            "cannot access '{}': no such file or unreadable",
+            path.display()
+        ))
     })?;
+    // Resolve symlinks before checking the ticket. Policy, grants, tickets,
+    // broker checks, and audit records must all authorize this same target.
+    check_ticket(ticket, ctx, &capability, &target)?;
     // Scope roots are canonicalized too, so a symlink inside the granted
     // tree pointing outside can never satisfy the prefix check.
     let mut roots = Vec::new();
@@ -119,7 +124,6 @@ fn authorized_write_path(
     let ticket = ctx.ticket.as_ref().ok_or_else(|| {
         denied("no capability ticket: route filesystem access through the agent + policy engine")
     })?;
-    check_ticket(ticket, ctx, &capability, path)?;
     if std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
@@ -144,40 +148,37 @@ fn authorized_write_path(
         }
     }
     let in_scope = |target: &Path| roots.iter().any(|root| target.starts_with(root));
-    if normalized.exists() {
-        let target = normalized.canonicalize().map_err(|_| {
-            failed(format!("cannot access '{}': unreadable", path.display()))
-        })?;
-        if !in_scope(&target) {
-            return Err(denied(format!(
-                "'{}' is outside the granted scope",
+    let (target, create) = if normalized.exists() {
+        let target = normalized
+            .canonicalize()
+            .map_err(|_| failed(format!("cannot access '{}': unreadable", path.display())))?;
+        (target, false)
+    } else {
+        if normalized.file_name().is_none() {
+            return Err(ToolError::InvalidArgs {
+                tool: "filesystem".to_string(),
+                message: "path must name a file".to_string(),
+            });
+        }
+        let target = resolve_target(&normalized).ok_or_else(|| {
+            failed(format!(
+                "cannot access '{}': no reachable parent directory",
                 path.display()
-            )));
-        }
-        if target.is_dir() {
-            return Err(failed(format!("'{}' is a directory", path.display())));
-        }
-        return Ok((target, false));
-    }
-    if normalized.file_name().is_none() {
-        return Err(ToolError::InvalidArgs {
-            tool: "filesystem".to_string(),
-            message: "path must name a file".to_string(),
-        });
-    }
-    let target = resolve_target(&normalized).ok_or_else(|| {
-        failed(format!(
-            "cannot access '{}': no reachable parent directory",
-            path.display()
-        ))
-    })?;
+            ))
+        })?;
+        (target, true)
+    };
+    check_ticket(ticket, ctx, &capability, &target)?;
     if !in_scope(&target) {
         return Err(denied(format!(
             "'{}' is outside the granted scope",
             path.display()
         )));
     }
-    Ok((target, true))
+    if !create && target.is_dir() {
+        return Err(failed(format!("'{}' is a directory", path.display())));
+    }
+    Ok((target, create))
 }
 
 /// Lexical absolute-path normalization: resolves `.`, `..`, and
@@ -243,9 +244,7 @@ fn check_ticket(
         .map_err(|err| match err {
             TicketError::Expired => denied("capability ticket expired"),
             TicketError::PrincipalMismatch => denied("ticket bound to a different principal"),
-            TicketError::InvocationMismatch => {
-                denied("ticket bound to a different invocation")
-            }
+            TicketError::InvocationMismatch => denied("ticket bound to a different invocation"),
             TicketError::CapabilityMismatch | TicketError::ScopeMismatch => {
                 denied("ticket does not cover this capability/resource")
             }
@@ -253,9 +252,12 @@ fn check_ticket(
 }
 
 fn requirement(capability: Capability, path: &Path) -> CapabilityRequirement {
+    let resolved = lexical_normalize(path)
+        .and_then(|normalized| resolve_target(&normalized))
+        .unwrap_or_else(|| path.to_path_buf());
     CapabilityRequirement {
         capability,
-        resource: Resource::Path(path.to_path_buf()),
+        resource: Resource::Path(resolved),
     }
 }
 
@@ -291,7 +293,9 @@ impl tool_core::Tool for ListTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        arg_path(args).ok().map(|path| requirement(Capability::FilesystemRead, &path))
+        arg_path(args)
+            .ok()
+            .map(|path| requirement(Capability::FilesystemRead, &path))
     }
 
     async fn invoke(
@@ -341,7 +345,9 @@ impl tool_core::Tool for StatTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        arg_path(args).ok().map(|path| requirement(Capability::FilesystemRead, &path))
+        arg_path(args)
+            .ok()
+            .map(|path| requirement(Capability::FilesystemRead, &path))
     }
 
     async fn invoke(
@@ -380,7 +386,9 @@ impl tool_core::Tool for ReadTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        arg_path(args).ok().map(|path| requirement(Capability::FilesystemRead, &path))
+        arg_path(args)
+            .ok()
+            .map(|path| requirement(Capability::FilesystemRead, &path))
     }
 
     async fn invoke(
@@ -423,7 +431,9 @@ impl tool_core::Tool for ReadRangeTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        arg_path(args).ok().map(|path| requirement(Capability::FilesystemRead, &path))
+        arg_path(args)
+            .ok()
+            .map(|path| requirement(Capability::FilesystemRead, &path))
     }
 
     async fn invoke(
@@ -431,18 +441,20 @@ impl tool_core::Tool for ReadRangeTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let offset = args.get("offset").and_then(|v| v.as_u64()).ok_or_else(|| {
-            ToolError::InvalidArgs {
-                tool: "filesystem".to_string(),
-                message: "missing unsigned 'offset'".to_string(),
-            }
-        })?;
-        let length = args.get("length").and_then(|v| v.as_u64()).ok_or_else(|| {
-            ToolError::InvalidArgs {
-                tool: "filesystem".to_string(),
-                message: "missing unsigned 'length'".to_string(),
-            }
-        })?;
+        let offset =
+            args.get("offset")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "filesystem".to_string(),
+                    message: "missing unsigned 'offset'".to_string(),
+                })?;
+        let length =
+            args.get("length")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| ToolError::InvalidArgs {
+                    tool: "filesystem".to_string(),
+                    message: "missing unsigned 'length'".to_string(),
+                })?;
         let length = length.min(self.limits.max_read_bytes as u64);
         let path = authorized_path(&ctx, Capability::FilesystemRead, &arg_path(&args)?)?;
         let bytes = read_capped(&path, offset, length)?;
@@ -502,7 +514,9 @@ impl tool_core::Tool for SearchTextTool {
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         // Invalid roots fail closed downstream (no ticket → broker denies).
-        search_root(args).ok().map(|path| requirement(Capability::FilesystemRead, &path))
+        search_root(args)
+            .ok()
+            .map(|path| requirement(Capability::FilesystemRead, &path))
     }
 
     async fn invoke(
@@ -633,7 +647,9 @@ impl tool_core::Tool for GlobTool {
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         // Invalid roots fail closed downstream (no ticket → broker denies).
-        search_root(args).ok().map(|path| requirement(Capability::FilesystemRead, &path))
+        search_root(args)
+            .ok()
+            .map(|path| requirement(Capability::FilesystemRead, &path))
     }
 
     async fn invoke(
@@ -841,7 +857,9 @@ impl tool_core::Tool for PatchTool {
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         // Invalid paths fail closed downstream (no ticket → broker denies).
-        arg_path(args).ok().map(|path| requirement(Capability::FilesystemWrite, &path))
+        arg_path(args)
+            .ok()
+            .map(|path| requirement(Capability::FilesystemWrite, &path))
     }
 
     async fn invoke(
@@ -935,7 +953,9 @@ impl tool_core::Tool for WriteTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        arg_path(args).ok().map(|path| requirement(Capability::FilesystemWrite, &path))
+        arg_path(args)
+            .ok()
+            .map(|path| requirement(Capability::FilesystemWrite, &path))
     }
 
     async fn invoke(
@@ -953,7 +973,10 @@ impl tool_core::Tool for WriteTool {
         if content.len() > self.limits.max_write_bytes {
             return Err(ToolError::InvalidArgs {
                 tool: "filesystem".to_string(),
-                message: format!("content exceeds the {} byte limit", self.limits.max_write_bytes),
+                message: format!(
+                    "content exceeds the {} byte limit",
+                    self.limits.max_write_bytes
+                ),
             });
         }
         let (path, created) =
@@ -1031,21 +1054,25 @@ fn read_capped(path: &Path, offset: u64, length: u64) -> Result<CappedBytes, Too
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capability_core::{
-        AgentId, InvocationId, Principal, ResourceScope, TicketId,
-    };
+    use capability_core::{AgentId, InvocationId, Principal, ResourceScope, TicketId};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tool_core::Tool;
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
     impl TestDir {
         fn create() -> Self {
+            let sequence = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "utsuwa-fs-test-{}",
+                "utsuwa-fs-test-{}-{}-{}",
+                std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
-                    .as_nanos()
+                    .as_nanos(),
+                sequence
             ));
             std::fs::create_dir_all(path.join("sub")).unwrap();
             std::fs::write(path.join("hello.txt"), "hello world").unwrap();
@@ -1124,7 +1151,10 @@ mod tests {
         let file = dir.0.join("hello.txt");
         // Ticket scopes the exact file (least privilege, as the agent mints).
         let out = read
-            .invoke(agent_ctx(&file), serde_json::json!({"path": file.to_string_lossy()}))
+            .invoke(
+                agent_ctx(&file),
+                serde_json::json!({"path": file.to_string_lossy()}),
+            )
             .await
             .unwrap();
         assert_eq!(out.content["content"], "hello world");
@@ -1143,7 +1173,7 @@ mod tests {
             Principal::Agent(AgentId::new("a")),
             Capability::FilesystemRead,
             Resource::Path(dir.0.clone()),
-            );
+        );
         // Invocation binding must match the ticket under test.
         ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id.clone();
         let err = read
@@ -1185,7 +1215,7 @@ mod tests {
             Principal::Agent(AgentId::new("a")),
             Capability::FilesystemRead,
             Resource::Path(dir.0.clone()),
-            );
+        );
         ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id.clone();
         let err = read
             .invoke(ctx, serde_json::json!({"path": target.to_string_lossy()}))
@@ -1194,12 +1224,57 @@ mod tests {
         assert!(matches!(err, ToolError::Denied { .. }), "{err:?}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn required_capability_resolves_symlink_before_policy() {
+        use std::os::unix::fs::symlink;
+        let dir = TestDir::create();
+        symlink("/etc", dir.0.join("link")).unwrap();
+        let read = ReadTool {
+            limits: FilesystemLimits::default(),
+        };
+
+        let escaped = dir.0.join("link/hostname");
+        let requirement = read
+            .required_capability(&serde_json::json!({"path": escaped}))
+            .expect("valid absolute path");
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(PathBuf::from("/etc/hostname").canonicalize().unwrap())
+        );
+        let Resource::Path(resolved) = &requirement.resource else {
+            panic!("filesystem requirement must be a path")
+        };
+        assert!(!resolved.starts_with(&dir.0));
+
+        let valid = dir.0.join("hello.txt");
+        let requirement = read
+            .required_capability(&serde_json::json!({"path": valid}))
+            .expect("valid workspace file");
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(dir.0.join("hello.txt").canonicalize().unwrap())
+        );
+    }
+
     fn search_tree() -> TestDir {
         let dir = TestDir::create();
-        std::fs::write(dir.0.join("main.rs"), "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
-        std::fs::write(dir.0.join("sub").join("lib.rs"), "fn helper() {}\n// needle here\n").unwrap();
+        std::fs::write(
+            dir.0.join("main.rs"),
+            "fn main() {\n    println!(\"hi\");\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.0.join("sub").join("lib.rs"),
+            "fn helper() {}\n// needle here\n",
+        )
+        .unwrap();
         std::fs::write(dir.0.join("sub").join("notes.txt"), "needle in text\n").unwrap();
-        std::fs::write(dir.0.join("binary.bin"), vec![0u8, 1, 2, b'n', b'e', b'e', b'd', b'l', b'e']).unwrap();
+        std::fs::write(
+            dir.0.join("binary.bin"),
+            vec![0u8, 1, 2, b'n', b'e', b'e', b'd', b'l', b'e'],
+        )
+        .unwrap();
         dir
     }
 
@@ -1223,8 +1298,12 @@ mod tests {
         assert!(!out.truncated);
         let matches = out.content["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 2, "{matches:?}");
-        assert!(matches.iter().any(|m| m["path"] == "sub/lib.rs" && m["line"] == 2));
-        assert!(matches.iter().any(|m| m["path"] == "sub/notes.txt" && m["line"] == 1));
+        assert!(matches
+            .iter()
+            .any(|m| m["path"] == "sub/lib.rs" && m["line"] == 2));
+        assert!(matches
+            .iter()
+            .any(|m| m["path"] == "sub/notes.txt" && m["line"] == 1));
         // The binary containing the same bytes is skipped.
         assert!(!matches.iter().any(|m| m["path"] == "binary.bin"));
     }
@@ -1261,10 +1340,13 @@ mod tests {
             Principal::Agent(AgentId::new("a")),
             Capability::FilesystemRead,
             Resource::Path(dir.0.join("sub")),
-            );
+        );
         ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id.clone();
         let err = search
-            .invoke(ctx, serde_json::json!({"root": dir.0.to_string_lossy(), "pattern": "x"}))
+            .invoke(
+                ctx,
+                serde_json::json!({"root": dir.0.to_string_lossy(), "pattern": "x"}),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied { .. }), "{err:?}");
@@ -1279,7 +1361,10 @@ mod tests {
         let run = |pattern: &str| {
             let dir_path = dir.0.to_string_lossy().into_owned();
             let ctx = search_ctx(&dir);
-            glob.invoke(ctx, serde_json::json!({"root": dir_path, "pattern": pattern}))
+            glob.invoke(
+                ctx,
+                serde_json::json!({"root": dir_path, "pattern": pattern}),
+            )
         };
         let out = run("**/*.rs").await.unwrap();
         let mut paths: Vec<&str> = out.content["paths"]

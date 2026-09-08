@@ -61,7 +61,7 @@ impl AuditRecord {
             timestamp_ms: unix_millis(),
             principal,
             capability,
-            resource,
+            resource: resource.map(redact_resource),
             outcome,
             detail: redact_detail(&detail.into()),
             duration_ms: None,
@@ -77,6 +77,28 @@ impl AuditRecord {
     pub fn with_mutation(mut self, evidence: tool_core::MutationEvidence) -> Self {
         self.mutation = Some(evidence);
         self
+    }
+}
+
+/// Keep the process shape visible in Activity while ensuring an argv/env
+/// value that happens to contain a credential cannot become an audit secret.
+fn redact_resource(resource: Resource) -> Resource {
+    match resource {
+        Resource::Process {
+            executable,
+            args,
+            cwd,
+            env,
+        } => Resource::Process {
+            executable,
+            args: args.iter().map(|arg| redact_detail(arg)).collect(),
+            cwd,
+            env: env
+                .iter()
+                .map(|(name, value)| (name.clone(), redact_detail(value)))
+                .collect(),
+        },
+        other => other,
     }
 }
 
@@ -265,6 +287,32 @@ mod tests {
         assert_eq!(record.duration_ms, Some(42));
         let plain = AuditRecord::now(principal(), None, None, AuditOutcome::Denied, "no");
         assert_eq!(plain.duration_ms, None);
+    }
+
+    #[test]
+    fn process_resource_values_are_redacted_in_audit() {
+        let record = AuditRecord::now(
+            principal(),
+            Some(Capability::ProcessSpawn),
+            Some(Resource::Process {
+                executable: "/usr/bin/curl".into(),
+                args: vec![
+                    "--header".to_string(),
+                    "Authorization: sk-secret-token".to_string(),
+                ],
+                cwd: "/work".into(),
+                env: vec![("TOKEN".to_string(), "sk-another-secret".to_string())],
+            }),
+            AuditOutcome::ApprovalRequested,
+            "process plan",
+        );
+        let Resource::Process { args, env, .. } = record.resource.unwrap() else {
+            panic!("expected process resource")
+        };
+        assert!(!args[1].contains("sk-secret-token"));
+        assert!(!env[0].1.contains("sk-another-secret"));
+        assert!(args[1].contains("[redacted]"));
+        assert!(env[0].1.contains("[redacted]"));
     }
 
     #[test]

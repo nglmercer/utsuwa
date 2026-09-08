@@ -23,6 +23,8 @@ import { reminderStore } from '$lib/stores/reminders.svelte';
 import { getWorkingMemory, ensureSession } from '$lib/engine/memory';
 import { toOpenAIContent, type ContentPart } from '$lib/services/chat/content';
 import { isDesktopBuild } from '$lib/services/platform';
+import { sendAgentMessage } from '$lib/services/native/agent.svelte';
+import { syncNativeModelProvider } from '$lib/services/native/model-settings';
 import type { LLMProvider, TTSProvider } from '$lib/types';
 import type { EventDefinition } from '$lib/types/events';
 
@@ -198,7 +200,8 @@ export async function sendCompanionMessage(
 		const providerConfig = settingsStore.getProviderConfig(provider);
 		const apiKey = providerConfig.apiKey;
 		const providerMeta = getLLMProvider(provider);
-		if (providerMeta?.requiresApiKey && !apiKey) {
+		const desktopBuild = isDesktopBuild();
+		if (!desktopBuild && providerMeta?.requiresApiKey && !apiKey) {
 			throw new Error(`Please configure API key for ${providerMeta.name} in Settings > Providers`);
 		}
 
@@ -231,9 +234,30 @@ export async function sendCompanionMessage(
 			: {};
 
 		let fullContent = '';
-		if (isDesktopBuild() || providerMeta?.isLocal) {
-			// Native desktop builds have no server routes, so (like local
-			// providers everywhere) they call the provider API directly.
+		if (desktopBuild) {
+			// The desktop companion always goes through AgentRuntime. This is the
+			// only model path that can expose native tools and enforce approvals.
+			const nativeSettingsReady = await syncNativeModelProvider(provider, selectedModel);
+			if (!nativeSettingsReady) {
+				throw new Error('Native model settings are unavailable or incomplete');
+			}
+			fullContent = (
+				await sendAgentMessage(
+					content,
+					{
+						history: messages.map((message) => ({
+							role: message.role,
+							content: toOpenAIContent(message.content)
+						})),
+						systemPrompt,
+						appendUserMessage: !systemEvent
+					},
+					onDelta
+				)
+			).text;
+		} else if (providerMeta?.isLocal) {
+			// Local providers still use the existing direct browser transport on
+			// web builds, where there is no native host.
 			await new Promise<void>((resolve, reject) => {
 				streamChatDirect(
 					{
@@ -277,9 +301,12 @@ export async function sendCompanionMessage(
 			llm: {
 				provider,
 				model: selectedModel,
-				apiKey: apiKey || undefined,
+				// The native runtime owns the model key on desktop. Do not pass it
+				// back into frontend post-processing state.
+				apiKey: desktopBuild ? undefined : apiKey || undefined,
 				baseURL,
-				hasImages: images.length > 0
+				hasImages: images.length > 0,
+				nativeRuntime: desktopBuild
 			},
 			systemEvent,
 			debug: import.meta.env.DEV

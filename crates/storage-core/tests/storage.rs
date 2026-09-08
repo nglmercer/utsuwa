@@ -1,7 +1,7 @@
 //! Storage round-trips: settings KV, persistent grants, revocation.
 
 use capability_core::{Capability, PrincipalKind, Resource, ResourceScope};
-use policy_core::{GrantedScope, GrantLifetime};
+use policy_core::{GrantLifetime, GrantedScope};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -18,12 +18,14 @@ fn temp_db(name: &str) -> PathBuf {
 }
 
 fn sample_grant(lifetime: GrantLifetime) -> GrantedScope {
-    GrantedScope {
-        principal_kind: PrincipalKind::Agent,
-        capability: Capability::FilesystemRead,
-        scope: ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
+    GrantedScope::new(
+        PrincipalKind::Agent,
+        Capability::FilesystemRead,
+        ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
         lifetime,
-    }
+        None,
+        None,
+    )
 }
 
 #[test]
@@ -70,11 +72,12 @@ fn grants_persist_and_revoke() {
     let store = Storage::open(&db).unwrap();
     assert!(store.load_grants().unwrap().is_empty());
 
-    let id = store.save_grant(&sample_grant(GrantLifetime::Persistent)).unwrap();
+    let expected = sample_grant(GrantLifetime::Persistent);
+    let id = store.save_grant(&expected).unwrap();
     let loaded = store.load_grants().unwrap();
     assert_eq!(loaded.len(), 1);
     assert_eq!(loaded[0].id, id);
-    assert_eq!(loaded[0].grant, sample_grant(GrantLifetime::Persistent));
+    assert_eq!(loaded[0].grant, expected);
 
     // Reopen: grant still there.
     drop(store);
@@ -95,7 +98,11 @@ fn grants_persist_and_revoke() {
 fn non_persistent_grants_rejected() {
     let db = temp_db("lifetimes");
     let store = Storage::open(&db).unwrap();
-    for lifetime in [GrantLifetime::Once, GrantLifetime::Task, GrantLifetime::Session] {
+    for lifetime in [
+        GrantLifetime::Once,
+        GrantLifetime::Task,
+        GrantLifetime::Session,
+    ] {
         assert!(matches!(
             store.save_grant(&sample_grant(lifetime)),
             Err(StorageError::NonPersistentGrant(_))
@@ -110,10 +117,11 @@ fn persistent_grant_hook_writes_through() {
     let store = Arc::new(Mutex::new(Storage::open(&db).unwrap()));
     let hook = persistent_grant_hook(store.clone());
 
-    hook(&sample_grant(GrantLifetime::Persistent)).unwrap();
+    let expected = sample_grant(GrantLifetime::Persistent);
+    hook(&expected).unwrap();
     let loaded = store.lock().unwrap().load_grants().unwrap();
     assert_eq!(loaded.len(), 1);
-    assert_eq!(loaded[0].grant, sample_grant(GrantLifetime::Persistent));
+    assert_eq!(loaded[0].grant, expected);
 
     // Narrower lifetimes never reach the database.
     assert!(hook(&sample_grant(GrantLifetime::Session)).is_err());

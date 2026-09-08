@@ -5,6 +5,10 @@ import {
 	parseAgentTurnEvent,
 	reduceAgentEvent,
 	reduceAgentSend,
+	sendParams,
+	type AgentSendOptions,
+	type AgentTurnEvent,
+	type TurnDone,
 	type AgentChatState
 } from './agent';
 
@@ -34,16 +38,70 @@ export function agentChatState(): AgentChatState {
 }
 
 /** Start a host turn. Throws when no native bridge is present (plain browser). */
-export async function sendAgentMessage(text: string): Promise<unknown> {
+export async function sendAgentMessage(
+	text: string,
+	options: AgentSendOptions = {},
+	onDelta?: (fullContent: string) => void
+): Promise<TurnDone> {
 	const bridge = getBridge();
 	if (!bridge) throw new Error('agent.send_message needs the native host bridge');
+	attachAgentListener();
 	state = reduceAgentSend(state);
-	try {
-		return await bridge.invoke('agent.send_message', { text });
-	} catch (err) {
-		state = { ...state, phase: 'idle', error: err instanceof Error ? err.message : String(err) };
-		throw err;
-	}
+
+	return await new Promise<TurnDone>((resolve, reject) => {
+		let fullContent = '';
+		let waitingForApproval = false;
+		let settled = false;
+		const cleanup = () => window.removeEventListener(HOST_EVENT, onEvent);
+		const fail = (error: unknown) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			const message = error instanceof Error ? error.message : String(error);
+			state = { ...state, phase: 'idle', error: message };
+			reject(new Error(message));
+		};
+		const onEvent = (event: Event) => {
+			if (!isHostEvent(event)) return;
+			const detail = (event as CustomEvent).detail;
+			const parsed = parseAgentTurnEvent(detail?.event, detail?.data) as AgentTurnEvent | null;
+			if (!parsed) return;
+			switch (parsed.kind) {
+				case 'delta':
+					if (waitingForApproval) {
+						fullContent = '';
+						waitingForApproval = false;
+					}
+					fullContent += parsed.delta;
+					onDelta?.(fullContent);
+					break;
+				case 'suspended':
+					waitingForApproval = true;
+					fullContent = parsed.suspended.text;
+					onDelta?.(fullContent);
+					break;
+				case 'done':
+					if (settled) return;
+					settled = true;
+					cleanup();
+					onDelta?.(parsed.done.text);
+					resolve(parsed.done);
+					break;
+				case 'failed':
+					fail(parsed.error);
+					break;
+				case 'cancelled':
+					fail('agent turn cancelled');
+					break;
+				case 'tool_started':
+				case 'tool_finished':
+					break;
+			}
+		};
+		window.addEventListener(HOST_EVENT, onEvent);
+		const params = sendParams(text, options);
+		bridge.invoke(params.method, params.params).catch(fail);
+	});
 }
 
 /** Abandon the in-flight turn. No-op without a bridge. */

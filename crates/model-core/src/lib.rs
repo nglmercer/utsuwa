@@ -36,6 +36,10 @@ pub struct ToolResult {
 pub struct ModelMessage {
     pub role: ModelRole,
     pub content: String,
+    /// Provider-neutral structured content for multimodal user messages.
+    /// Plain text keeps this as `None`; adapters use this value when it is
+    /// present instead of flattening images or other content parts.
+    pub content_value: Option<serde_json::Value>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_result: Option<ToolResult>,
 }
@@ -45,6 +49,7 @@ impl ModelMessage {
         Self {
             role: ModelRole::System,
             content: content.into(),
+            content_value: None,
             tool_calls: vec![],
             tool_result: None,
         }
@@ -54,6 +59,7 @@ impl ModelMessage {
         Self {
             role: ModelRole::User,
             content: content.into(),
+            content_value: None,
             tool_calls: vec![],
             tool_result: None,
         }
@@ -63,17 +69,42 @@ impl ModelMessage {
         Self {
             role: ModelRole::Assistant,
             content: content.into(),
+            content_value: None,
             tool_calls,
             tool_result: None,
         }
     }
 
     pub fn tool_result(result: ToolResult) -> Self {
+        let content = result.content.clone();
         Self {
             role: ModelRole::Tool,
-            content: String::new(),
+            content,
+            content_value: None,
             tool_calls: vec![],
             tool_result: Some(result),
+        }
+    }
+
+    /// Construct a message from the JSON content shape used by the frontend
+    /// and OpenAI-compatible providers. Arrays are retained verbatim so
+    /// image parts survive the native runtime boundary.
+    pub fn from_wire(role: ModelRole, content: serde_json::Value) -> Self {
+        let text = match &content {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(|text| text.as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            other => other.to_string(),
+        };
+        Self {
+            role,
+            content: text,
+            content_value: Some(content),
+            tool_calls: vec![],
+            tool_result: None,
         }
     }
 }
@@ -137,7 +168,9 @@ pub enum ModelStreamEvent {
     TextDelta(String),
     /// A complete tool call assembled from provider deltas.
     ToolCall(ToolCall),
-    Done { finish_reason: FinishReason },
+    Done {
+        finish_reason: FinishReason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

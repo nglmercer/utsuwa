@@ -7,7 +7,7 @@ export type GrantLifetime = 'once' | 'task' | 'session' | 'persistent';
 export type LifetimeChoice = GrantLifetime | 'deny';
 
 export interface ResourceSummary {
-	kind: 'path' | 'host' | 'executable' | 'application' | 'window' | 'unknown';
+	kind: 'path' | 'host' | 'executable' | 'process' | 'application' | 'window' | 'unknown';
 	label: string;
 }
 
@@ -17,6 +17,8 @@ export interface PermissionRequest {
 	capability: string;
 	resource: ResourceSummary;
 	reason: string;
+	/** Sensitive paths/interpreters can only be approved for one use. */
+	requiresOnce: boolean;
 }
 
 export type RiskLevel = 'observe' | 'mutate' | 'control';
@@ -51,7 +53,8 @@ export function parsePermissionRequest(data: unknown): PermissionRequest | null 
 		principal: summarizePrincipal(d.principal),
 		capability: d.capability,
 		resource: summarizeResource(d.resource),
-		reason: typeof d.reason === 'string' ? d.reason : ''
+		reason: typeof d.reason === 'string' ? d.reason : '',
+		requiresOnce: d.requires_once === true
 	};
 }
 
@@ -78,6 +81,20 @@ function summarizeResource(resource: unknown): ResourceSummary {
 	const r = resource as Record<string, unknown>;
 	if (typeof r.Path === 'string') return { kind: 'path', label: r.Path };
 	if (typeof r.Executable === 'string') return { kind: 'executable', label: r.Executable };
+	if (typeof r.Process === 'object' && r.Process !== null) {
+		const process = r.Process as Record<string, unknown>;
+		const executable = typeof process.executable === 'string' ? process.executable : 'unknown executable';
+		const args = Array.isArray(process.args)
+			? process.args.filter((arg): arg is string => typeof arg === 'string')
+			: [];
+		const cwd = typeof process.cwd === 'string' ? process.cwd : 'unknown cwd';
+		const env = process.env && typeof process.env === 'object' ? process.env : [];
+		const envCount = Array.isArray(env) ? env.length : Object.keys(env).length;
+		return {
+			kind: 'process',
+			label: `${executable}${args.length ? ` ${args.join(' ')}` : ''} (cwd ${cwd}${envCount ? `, ${envCount} env change${envCount === 1 ? '' : 's'}` : ''})`
+		};
+	}
 	if (typeof r.Application === 'string') return { kind: 'application', label: r.Application };
 	if (typeof r.Window === 'string') return { kind: 'window', label: r.Window };
 	if (typeof r.HostPort === 'object' && r.HostPort !== null) {
