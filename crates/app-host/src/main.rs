@@ -288,7 +288,16 @@ fn main() {
         Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
         emit,
     ) {
-        Ok(runtime) => dispatcher = dispatcher.with_agent(runtime),
+        Ok(runtime) => {
+            // Durable memory beside state.db; an unopenable file falls
+            // back to the runtime's isolated in-memory store (logged).
+            let memory_path = storage_core::default_state_dir("utsuwa").join("memory.db");
+            match memory::MemoryStore::open(&memory_path) {
+                Ok(store) => runtime.set_memory_store(Arc::new(store)),
+                Err(err) => tracing::error!(%err, "failed to open memory.db; using in-memory memory"),
+            }
+            dispatcher = dispatcher.with_agent(runtime);
+        }
         Err(err) => tracing::error!(%err, "agent runtime unavailable; agent.* methods will fail"),
     }
     let mut app = HostApp {

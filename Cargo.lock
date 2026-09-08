@@ -140,6 +140,7 @@ dependencies = [
  "gtk",
  "ipc-core",
  "mcp-runtime",
+ "memory",
  "model-core",
  "model-openai-compatible",
  "plugin-wasm",
@@ -2377,6 +2378,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "memory"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tool-core",
 ]
 
 [[package]]

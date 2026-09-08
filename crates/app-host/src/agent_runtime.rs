@@ -84,6 +84,7 @@ pub struct AgentRuntime {
     processes: Arc<ProcessManager>,
     mcp: Arc<McpManager>,
     plugins: Arc<plugin_wasm::PluginRuntime>,
+    memory: Mutex<Arc<memory::MemoryStore>>,
     storage: Option<Arc<Mutex<Storage>>>,
     state: Mutex<State>,
     executor: tokio::runtime::Runtime,
@@ -133,6 +134,10 @@ impl AgentRuntime {
             plugins: Arc::new(
                 plugin_wasm::PluginRuntime::new().map_err(|e| RuntimeError::Tools(e.to_string()))?,
             ),
+            memory: Mutex::new(Arc::new(
+                memory::MemoryStore::open_in_memory()
+                    .map_err(|e| RuntimeError::Tools(e.to_string()))?,
+            )),
             storage,
             state: Mutex::new(State {
                 generation: 0,
@@ -182,6 +187,26 @@ impl AgentRuntime {
     /// which is rebuilt per turn through [`PluginRuntime::register_enabled`].
     pub fn plugin_manager(&self) -> &Arc<plugin_wasm::PluginRuntime> {
         &self.plugins
+    }
+
+    /// Install the durable memory store (boot only; last call wins). Each
+    /// turn's registry serves `memory.remember` / `memory.recall` /
+    /// `memory.forget` from the current store. Without this call the
+    /// runtime uses an isolated in-memory store (tests, headless runs).
+    pub fn set_memory_store(&self, store: Arc<memory::MemoryStore>) {
+        if let Ok(mut slot) = self.memory.lock() {
+            *slot = store;
+        }
+    }
+
+    /// The current memory store (tests and diagnostics).
+    pub fn memory_store(&self) -> Arc<memory::MemoryStore> {
+        self.memory.lock().map(|s| Arc::clone(&s)).unwrap_or_else(|_| {
+            Arc::new(
+                memory::MemoryStore::open_in_memory()
+                    .expect("in-memory memory store always opens"),
+            )
+        })
     }
 
     /// Sync the MCP server set from settings and register every enabled
@@ -244,6 +269,28 @@ impl AgentRuntime {
                 }
             }
             Err(e) => tracing::warn!(error = %e, "plugin registration failed"),
+        }
+    }
+
+    /// Register the memory tools from the current store. Best-effort:
+    /// a poisoned slot logs and skips, never fails the turn.
+    fn attach_memory_tools(&self, registry: &mut ToolRegistry) {
+        let store = match self.memory.lock() {
+            Ok(store) => Arc::clone(&store),
+            Err(_) => {
+                tracing::warn!("memory store lock failed; skipping memory tools this turn");
+                return;
+            }
+        };
+        for tool in [
+            Arc::new(memory::tools::RememberTool { store: store.clone() })
+                as Arc<dyn tool_core::Tool>,
+            Arc::new(memory::tools::RecallTool { store: store.clone() }),
+            Arc::new(memory::tools::ForgetTool { store }),
+        ] {
+            if let Err(e) = registry.register(tool) {
+                tracing::warn!(error = %e, "memory tool registration failed");
+            }
         }
     }
 
@@ -399,6 +446,7 @@ impl AgentRuntime {
         };
         self.attach_mcp_tools(&mut registry).await;
         self.attach_plugin_tools(&mut registry);
+        self.attach_memory_tools(&mut registry);
         let policy = match self.approvals.lock() {
             Ok(queue) => queue.context(),
             Err(_) => {
@@ -893,6 +941,45 @@ mod tests {
         assert_eq!(last["output"]["stdout"], "build-ok\n");
         // No approval was needed: the session grant covered the spawn.
         assert!(harness.approvals.lock().unwrap().list().is_empty());
+    }
+
+    #[test]
+    fn memory_tools_roundtrip_without_approval() {
+        let remember_turn = vec![
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: "m1".to_string(),
+                name: "memory.remember".to_string(),
+                arguments: serde_json::json!({
+                    "text": "concise answers preferred",
+                    "tags": ["style"],
+                    "importance": 6,
+                })
+                .to_string(),
+            }),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ];
+        let provider = QueueProvider::new(vec![remember_turn, text_turn("noted")]);
+        let harness = harness(provider);
+
+        harness.runtime.send_message("remember this".to_string()).unwrap();
+        let done = wait_for(&harness, "agent.turn_done");
+        let executed = done.data["executed"].as_array().unwrap();
+        assert_eq!(executed.len(), 1, "{executed:?}");
+        assert_eq!(executed[0]["name"], "memory.remember");
+        assert!(executed[0]["output"]["id"].as_i64().unwrap() > 0);
+        // Pure notebook tools need no approval dance.
+        assert!(harness.approvals.lock().unwrap().list().is_empty());
+        // The fact survives in the runtime's store and recalls by keyword.
+        let entries = harness
+            .runtime
+            .memory_store()
+            .recall("concise", 5)
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "concise answers preferred");
+        assert_eq!(entries[0].importance, 6);
     }
 
     #[test]
