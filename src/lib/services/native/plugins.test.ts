@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
 	isServing,
+	isUnsafe,
 	listPlugins,
 	managePlugin,
 	parsePluginInfo,
@@ -35,6 +36,19 @@ describe('parsePluginInfo', () => {
 		]) {
 			assert.equal(parsePluginInfo(bad), null);
 		}
+	});
+});
+
+describe('isUnsafe', () => {
+	it('flags native runtimes and defaults the rest to sandboxed', () => {
+		assert.equal(isUnsafe({ ...RECORD, runtime: 'native' }), true);
+		assert.equal(isUnsafe({ ...RECORD, runtime: 'wasm' }), false);
+		assert.equal(isUnsafe(RECORD), false);
+	});
+
+	it('round-trips the runtime field when the host sends it', () => {
+		const native = { ...RECORD, runtime: 'native' };
+		assert.deepEqual(parsePluginInfo(native), native);
 	});
 });
 

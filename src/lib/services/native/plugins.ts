@@ -15,6 +15,9 @@ export interface PluginInfo {
 	name: string;
 	version: string;
 	trust: string;
+	/** Host runtime kind: 'wasm', or 'native' for unsafe plugins. Absent
+	 * on older hosts — treated as sandboxed WASM. */
+	runtime?: string;
 	state: string;
 	tools: string[];
 }
@@ -39,7 +42,7 @@ export function parsePluginInfo(data: unknown): PluginInfo | null {
 	) {
 		return null;
 	}
-	return {
+	const info: PluginInfo = {
 		id: d.id,
 		name: d.name,
 		version: d.version,
@@ -47,6 +50,14 @@ export function parsePluginInfo(data: unknown): PluginInfo | null {
 		state: d.state,
 		tools: [...(d.tools as string[])]
 	};
+	if (typeof d.runtime === 'string') info.runtime = d.runtime;
+	return info;
+}
+
+/** True for unsafe (native) plugins: code that runs outside the WASM
+ * sandbox and needs explicit user approval before enabling. */
+export function isUnsafe(plugin: PluginInfo): boolean {
+	return plugin.runtime === 'native';
 }
 
 /** True when the plugin is serving tools to the agent this turn. */

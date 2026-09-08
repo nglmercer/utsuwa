@@ -427,3 +427,45 @@ async fn lifecycle_disable_and_reload() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// Unsafe plugins end-to-end: a native package discovers and validates,
+/// reports `runtime == "native"` to the UI, but this runtime never loads
+/// it — not before approval, and not after either. Approval alone
+/// executes nothing; execution waits for the plugin-host process.
+#[tokio::test]
+async fn native_plugin_never_loads_in_process() {
+    let root = test_dir("native");
+    let id = "dev.example.native";
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "[plugin]\nid = \"dev.example.native\"\nname = \"Native\"\nversion = \"1.0.0\"\napi = 1\ntrust = \"trusted-native\"\n\n\
+         [runtime]\ntype = \"native\"\n\n\
+         [[tools]]\nname = \"run\"\ndescription = \"unsafe tool\"\n",
+    )
+    .unwrap();
+    // Fake machine code: non-empty, not WebAssembly.
+    std::fs::write(dir.join("plugin.native"), [0x7f, b'E', b'L', b'F', 0x02]).unwrap();
+
+    let rt = Arc::new(PluginRuntime::new().unwrap());
+    let ids = rt.discover_dir(&root).unwrap();
+    assert!(ids.contains(&id.to_string()), "discovered: {ids:?}");
+    let info = rt.infos().into_iter().find(|i| i.id == id).unwrap();
+    assert_eq!(info.runtime, "native");
+    assert_eq!(info.trust, "trusted-native");
+
+    // Refused before approval, with state untouched…
+    let err = rt.load(id).unwrap_err().to_string();
+    assert!(err.contains("refusing in-process load"), "{err}");
+    assert!(rt.enable(id).is_err());
+    // …and refused after approval too: approval is not execution.
+    rt.allow_native(id).unwrap();
+    let err = rt.load(id).unwrap_err().to_string();
+    assert!(err.contains("refusing in-process load"), "{err}");
+    // Nothing registers, no instance exists behind the back.
+    let mut reg = ToolRegistry::new();
+    assert!(rt.register_enabled(&mut reg).unwrap().is_empty());
+
+    std::fs::remove_dir_all(&root).ok();
+}

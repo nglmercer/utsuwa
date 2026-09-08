@@ -141,10 +141,40 @@ impl PluginRuntime {
         Ok(ids)
     }
 
+    /// Explicit user approval for one unsafe (native) plugin. Wires to
+    /// the registry allowlist; the settings UI calls this, never
+    /// discovery. Approval alone executes nothing — native modules have
+    /// no in-process loader (see [`PluginRuntime::load`]).
+    pub fn allow_native(&self, id: &str) -> Result<(), WasmError> {
+        self.lock_registry()?.allow_native(id);
+        Ok(())
+    }
+
     /// Validate + instantiate a discovered plugin. A record already on
     /// `Validated` (fresh from [`PluginRegistry::update`]) skips the
     /// re-validation step and instantiates directly.
+    ///
+    /// Native plugins are refused here unconditionally: this runtime is
+    /// the WASM sandbox, and native code runs only in the out-of-process
+    /// plugin-host (plan Phase 26). Even an allow-listed, enabled native
+    /// record loads nothing — `register_enabled` skips it with a warning.
     pub fn load(&self, id: &str) -> Result<(), WasmError> {
+        // Refuse before touching lifecycle state: a refused load leaves
+        // the record exactly as discovered, so the denial is stateless
+        // and retrying it can never accumulate authority.
+        let runtime = {
+            let registry = self.lock_registry()?;
+            registry
+                .get(id)
+                .ok_or_else(|| WasmError::Unknown(id.to_string()))?
+                .manifest
+                .runtime
+        };
+        if runtime == plugin_core::RuntimeKind::Native {
+            return Err(WasmError::Engine(format!(
+                "refusing in-process load of native plugin '{id}': native code executes only in the plugin-host process"
+            )));
+        }
         let bytes = {
             let mut registry = self.lock_registry()?;
             let state = registry
@@ -833,15 +863,17 @@ pub fn trust_label(trust: TrustLevel) -> &'static str {
     trust.as_str()
 }
 
-/// UI/IPC view of one known plugin: identity, trust, lifecycle state,
-/// and tool names. State and trust are plain strings so the frontend
-/// never parses Rust enums.
+/// UI/IPC view of one known plugin: identity, trust, runtime kind,
+/// lifecycle state, and tool names. State, trust, and runtime are plain
+/// strings so the frontend never parses Rust enums. The Plugins panel
+/// uses `runtime == "native"` to badge unsafe plugins distinctly.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PluginInfo {
     pub id: String,
     pub name: String,
     pub version: String,
     pub trust: String,
+    pub runtime: String,
     pub state: String,
     pub tools: Vec<String>,
 }
@@ -862,6 +894,7 @@ impl PluginRuntime {
                 name: record.manifest.name.clone(),
                 version: record.manifest.version.clone(),
                 trust: record.manifest.trust.as_str().to_string(),
+                runtime: record.manifest.runtime.as_str().to_string(),
                 state: record.state.as_str().to_string(),
                 tools: record.manifest.tools.iter().map(|t| t.name.clone()).collect(),
             })

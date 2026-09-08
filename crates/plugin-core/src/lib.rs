@@ -11,8 +11,13 @@
 //! plugins/
 //! └── dev.example.plugin/
 //!     ├── plugin.toml
-//!     └── plugin.wasm
+//!     └── plugin.wasm        # or plugin.native for unsafe plugins
 //! ```
+//!
+//! Unsafe (native) plugins validate and gate but never execute here:
+//! enabling one needs [`PluginRegistry::allow_native`], and no loader
+//! exists in this process (plan Phase 26 reserves execution for the
+//! out-of-process plugin-host).
 
 use capability_core::PluginId;
 use serde::{Deserialize, Serialize};
@@ -25,6 +30,10 @@ pub const SUPPORTED_MANIFEST_API: u32 = 1;
 /// Expected filenames inside a plugin directory.
 pub const MANIFEST_FILE: &str = "plugin.toml";
 pub const MODULE_FILE: &str = "plugin.wasm";
+/// Native module filename. Read for discovery only — the host ships no
+/// native loader, so these bytes are never executed in-process (plan
+/// Phase 26 reserves execution for the out-of-process plugin-host).
+pub const NATIVE_MODULE_FILE: &str = "plugin.native";
 
 /// WASM magic prefix, checked before any engine touches the bytes.
 pub const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6D];
@@ -41,6 +50,11 @@ pub enum PluginError {
     Transition(String, String),
     #[error("io error: {0}")]
     Io(String),
+    /// A native (unsafe) plugin was asked to enable without explicit
+    /// user allow-listing. Default-deny: this is the only error that
+    /// distinguishes "not yet approved" from a broken plugin.
+    #[error("native plugin '{0}' is not allow-listed: unsafe plugins need explicit user approval")]
+    NativeNotAllowed(String),
 }
 
 /// Trust tier of a plugin origin (plan Phase 25). Risk metadata only —
@@ -80,10 +94,32 @@ struct PluginMeta {
     trust: TrustLevel,
 }
 
+/// Plugin execution kind. `wasm` runs sandboxed in-process; `native`
+/// (unsafe) marks a module for the out-of-process plugin-host, which
+/// this host does not ship yet — native records validate and gate but
+/// never execute here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeKind {
+    #[default]
+    Wasm,
+    Native,
+}
+
+impl RuntimeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeKind::Wasm => "wasm",
+            RuntimeKind::Native => "native",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RuntimeSpec {
     #[serde(rename = "type")]
-    kind: String,
+    #[serde(default)]
+    kind: RuntimeKind,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +177,7 @@ pub struct PluginManifest {
     pub name: String,
     pub version: String,
     pub trust: TrustLevel,
+    pub runtime: RuntimeKind,
     pub filesystem: FilesystemPermissions,
     pub network: NetworkPermissions,
     pub process: ProcessPermissions,
@@ -179,8 +216,22 @@ impl PluginManifest {
                 meta.api
             )));
         }
-        if file.runtime.kind != "wasm" {
-            return Err(bad("only runtime.type = \"wasm\" is supported"));
+        // Unsafe pairing rules (plan Phase 25): native execution and
+        // the trusted-native label imply each other. Anything else is a
+        // confused manifest and rejected here, not at load time.
+        match (file.runtime.kind, meta.trust) {
+            (RuntimeKind::Native, TrustLevel::TrustedNative) => {}
+            (RuntimeKind::Native, _) => {
+                return Err(bad(
+                    "runtime.type = \"native\" requires trust = \"trusted-native\"",
+                ));
+            }
+            (_, TrustLevel::TrustedNative) => {
+                return Err(bad(
+                    "trust = \"trusted-native\" requires runtime.type = \"native\"",
+                ));
+            }
+            _ => {}
         }
         let mut seen = std::collections::HashSet::new();
         for tool in &file.tools {
@@ -205,6 +256,7 @@ impl PluginManifest {
             name: meta.name,
             version: meta.version,
             trust: meta.trust,
+            runtime: file.runtime.kind,
             filesystem: file.permissions.filesystem,
             network: file.permissions.network,
             process: file.permissions.process,
@@ -254,9 +306,15 @@ pub struct PluginRecord {
 /// Directory-backed plugin registry: discover → validate → load → enable,
 /// with disable / unload / reload / remove. State transitions are checked;
 /// illegal ones fail instead of silently reordering.
+///
+/// Native (unsafe) plugins default to denied: [`PluginRegistry::enable`]
+/// refuses them unless the id was explicitly allow-listed through
+/// [`PluginRegistry::allow_native`] — the host wires that call to a user
+/// approval (settings UI), never to discovery.
 #[derive(Default)]
 pub struct PluginRegistry {
     plugins: HashMap<String, PluginRecord>,
+    native_allowlist: std::collections::HashSet<String>,
 }
 
 impl PluginRegistry {
@@ -291,6 +349,7 @@ impl PluginRegistry {
                             name: id.clone(),
                             version: String::new(),
                             trust: TrustLevel::UnsignedWasm,
+                            runtime: RuntimeKind::Wasm,
                             filesystem: FilesystemPermissions::default(),
                             network: NetworkPermissions::default(),
                             process: ProcessPermissions::default(),
@@ -307,6 +366,23 @@ impl PluginRegistry {
 
     pub fn get(&self, id: &str) -> Option<&PluginRecord> {
         self.plugins.get(id)
+    }
+
+    /// Explicit user approval for one unsafe plugin: records that the
+    /// user accepted native execution for this id. Never called during
+    /// discovery — only from a user approval surface.
+    pub fn allow_native(&mut self, id: &str) {
+        self.native_allowlist.insert(id.to_string());
+    }
+
+    /// Withdraw a previous unsafe approval. A serving native plugin
+    /// keeps serving until disabled; the next `enable` is refused.
+    pub fn deny_native(&mut self, id: &str) {
+        self.native_allowlist.remove(id);
+    }
+
+    pub fn is_native_allowed(&self, id: &str) -> bool {
+        self.native_allowlist.contains(id)
     }
 
     pub fn ids(&self) -> Vec<String> {
@@ -353,6 +429,17 @@ impl PluginRegistry {
     }
 
     pub fn enable(&mut self, id: &str) -> Result<(), PluginError> {
+        let record = self
+            .plugins
+            .get(id)
+            .ok_or_else(|| PluginError::Unknown(id.to_string()))?;
+        // Unsafe gate: a native module runs outside every sandbox, so
+        // enabling one needs explicit user approval even when its
+        // manifest claims trusted-native. Self-claimed trust is a label;
+        // the allowlist is the decision.
+        if record.manifest.runtime == RuntimeKind::Native && !self.is_native_allowed(id) {
+            return Err(PluginError::NativeNotAllowed(id.to_string()));
+        }
         self.transition(
             id,
             PluginState::Enabled,
@@ -421,10 +508,29 @@ fn load_plugin_dir(dir: &Path) -> Result<PluginRecord, PluginError> {
     let text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| PluginError::Io(format!("{}: {e}", manifest_path.display())))?;
     let manifest = PluginManifest::parse_toml(&text)?;
-    let module_path = dir.join(MODULE_FILE);
+    // Native modules are discovered (bytes read for hashing/display) but
+    // never validated as code and never executed in-process: no loader
+    // lives in this host. A native manifest pointing at WASM bytes is a
+    // confused package and rejected.
+    let module_path = dir.join(match manifest.runtime {
+        RuntimeKind::Wasm => MODULE_FILE,
+        RuntimeKind::Native => NATIVE_MODULE_FILE,
+    });
     let bytes = std::fs::read(&module_path)
         .map_err(|e| PluginError::Io(format!("{}: {e}", module_path.display())))?;
-    check_wasm_magic(&bytes)?;
+    match manifest.runtime {
+        RuntimeKind::Wasm => check_wasm_magic(&bytes)?,
+        RuntimeKind::Native => {
+            if bytes.is_empty() {
+                return Err(PluginError::Module("native module is empty".to_string()));
+            }
+            if bytes.len() >= 4 && bytes[..4] == WASM_MAGIC {
+                return Err(PluginError::Module(
+                    "native module holds WebAssembly bytes: use runtime.type = \"wasm\"".to_string(),
+                ));
+            }
+        }
+    }
     // Directory name and manifest id must agree: prevents a directory
     // named `trusted` from loading a manifest claiming another id.
     if let Some(dir_name) = dir.file_name().map(|n| n.to_string_lossy().to_string()) {
@@ -504,7 +610,6 @@ description = "Summarize text"
             ("verified", TrustLevel::Verified),
             ("unsigned-wasm", TrustLevel::UnsignedWasm),
             ("local-dev", TrustLevel::LocalDevelopment),
-            ("trusted-native", TrustLevel::TrustedNative),
         ] {
             let m = PluginManifest::parse_toml(&format!(
                 "[plugin]\nid = \"x\"\nname = \"x\"\nversion = \"1\"\napi = 1\ntrust = \"{text}\"\n[runtime]\ntype = \"wasm\"\n"
@@ -512,6 +617,12 @@ description = "Summarize text"
             .unwrap();
             assert_eq!(m.trust, level);
         }
+        // trusted-native is not a WASM label: it requires runtime native
+        // (covered in native_manifest_requires_trusted_native_and_vice_versa).
+        assert!(PluginManifest::parse_toml(
+            "[plugin]\nid = \"x\"\nname = \"x\"\nversion = \"1\"\napi = 1\ntrust = \"trusted-native\"\n[runtime]\ntype = \"wasm\"\n"
+        )
+        .is_err());
     }
 
     fn plugin_dir(tag: &str, manifest: &str, module: &[u8]) -> std::path::PathBuf {
@@ -605,6 +716,94 @@ description = "Summarize text"
 
         // Unknown plugins stay unknown.
         assert!(registry.update("no.such.plugin", &plug).is_err());
+    }
+
+    const NATIVE_MANIFEST: &str = r#"
+[plugin]
+id = "dev.example.native"
+name = "Native"
+version = "1.0.0"
+api = 1
+trust = "trusted-native"
+
+[runtime]
+type = "native"
+"#;
+
+    #[test]
+    fn native_manifest_requires_trusted_native_and_vice_versa() {
+        // Native + trusted-native validates.
+        let m = PluginManifest::parse_toml(NATIVE_MANIFEST).unwrap();
+        assert_eq!(m.runtime, RuntimeKind::Native);
+        assert_eq!(m.trust, TrustLevel::TrustedNative);
+        // Native without the label is rejected…
+        let unsigned = NATIVE_MANIFEST.replace("trusted-native", "unsigned-wasm");
+        assert!(PluginManifest::parse_toml(&unsigned).is_err());
+        // …and the label on a WASM plugin is rejected too.
+        let mislabeled = MANIFEST.replace("unsigned-wasm", "trusted-native");
+        assert!(PluginManifest::parse_toml(&mislabeled).is_err());
+        // Unknown runtime types stay rejected.
+        let bogus = MANIFEST.replace("type = \"wasm\"", "type = \"cuda\"");
+        assert!(PluginManifest::parse_toml(&bogus).is_err());
+    }
+
+    fn native_dir(tag: &str, manifest: &str, module: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("utsuwa-native-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plug = dir.join("dev.example.native");
+        std::fs::create_dir_all(&plug).unwrap();
+        std::fs::write(plug.join(MANIFEST_FILE), manifest).unwrap();
+        std::fs::write(plug.join(NATIVE_MODULE_FILE), module).unwrap();
+        dir
+    }
+
+    #[test]
+    fn native_plugins_default_denied_until_allow_listed() {
+        // Fake ELF magic: non-empty, not WebAssembly.
+        let dir = native_dir("gate", NATIVE_MANIFEST, &[0x7f, b'E', b'L', b'F', 0x01]);
+        let mut registry = PluginRegistry::new();
+        registry.discover_dir(&dir);
+        let record = registry.get("dev.example.native").unwrap();
+        assert_eq!(record.state, PluginState::Discovered);
+        assert_eq!(record.manifest.runtime, RuntimeKind::Native);
+
+        registry.validate("dev.example.native").unwrap();
+        registry.mark_loaded("dev.example.native").unwrap();
+        // Default-deny: enabling an unsafe plugin without user approval
+        // fails with a dedicated error, not a lifecycle error.
+        assert_eq!(
+            registry.enable("dev.example.native"),
+            Err(PluginError::NativeNotAllowed("dev.example.native".to_string()))
+        );
+        // Explicit user approval unlocks the transition…
+        registry.allow_native("dev.example.native");
+        assert!(registry.is_native_allowed("dev.example.native"));
+        registry.enable("dev.example.native").unwrap();
+        assert_eq!(registry.enabled().len(), 1);
+        // …and withdrawing it blocks the next enable.
+        registry.disable("dev.example.native").unwrap();
+        registry.deny_native("dev.example.native");
+        assert!(registry.enable("dev.example.native").is_err());
+    }
+
+    #[test]
+    fn native_discovery_rejects_confused_packages() {
+        // WASM bytes behind a native manifest: rejected at discovery.
+        let dir = native_dir("confused", NATIVE_MANIFEST, &wasm_bytes());
+        let mut registry = PluginRegistry::new();
+        registry.discover_dir(&dir);
+        assert!(matches!(
+            registry.get("dev.example.native").unwrap().state,
+            PluginState::Failed(_)
+        ));
+        // Empty native module: rejected too.
+        let dir = native_dir("empty", NATIVE_MANIFEST, &[]);
+        let mut registry = PluginRegistry::new();
+        registry.discover_dir(&dir);
+        assert!(matches!(
+            registry.get("dev.example.native").unwrap().state,
+            PluginState::Failed(_)
+        ));
     }
 
     #[test]
