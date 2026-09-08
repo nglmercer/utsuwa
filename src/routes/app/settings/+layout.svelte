@@ -12,6 +12,8 @@
 		{ href: localPath('app', '/settings/tts'), label: 'TTS', icon: 'volume' },
 		{ href: localPath('app', '/settings/stt'), label: 'STT', icon: 'mic' },
 		{ href: localPath('app', '/settings/data'), label: 'Data', icon: 'database' },
+		{ href: localPath('app', '/settings/activity'), label: 'Activity', icon: 'file-text' },
+		{ href: localPath('app', '/settings/plugins'), label: 'Plugins', icon: 'circle-dot' },
 		{ href: localPath('app', '/settings/developer'), label: 'Developer', icon: 'code' }
 	]);
 
