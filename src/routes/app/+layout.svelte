@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onNavigate } from '$app/navigation';
-	import UpdateBanner from '$lib/components/updater/UpdateBanner.svelte';
 	import PermissionDialog from '$lib/components/permissions/PermissionDialog.svelte';
 
 	let { children } = $props();
@@ -23,7 +22,6 @@
 
 <div class="app">
 	{@render children()}
-	<UpdateBanner />
 	<PermissionDialog />
 </div>
 

@@ -22,7 +22,7 @@ import { extractReminderTags, tryExtractReminderFromUserMessage } from '$lib/uti
 import { reminderStore } from '$lib/stores/reminders.svelte';
 import { getWorkingMemory, ensureSession } from '$lib/engine/memory';
 import { toOpenAIContent, type ContentPart } from '$lib/services/chat/content';
-import { isTauri } from '$lib/services/platform';
+import { isDesktopBuild } from '$lib/services/platform';
 import type { LLMProvider, TTSProvider } from '$lib/types';
 import type { EventDefinition } from '$lib/types/events';
 
@@ -231,8 +231,9 @@ export async function sendCompanionMessage(
 			: {};
 
 		let fullContent = '';
-		if (isTauri() || providerMeta?.isLocal) {
-			// Desktop and local providers call the provider API directly.
+		if (isDesktopBuild() || providerMeta?.isLocal) {
+			// Native desktop builds have no server routes, so (like local
+			// providers everywhere) they call the provider API directly.
 			await new Promise<void>((resolve, reject) => {
 				streamChatDirect(
 					{

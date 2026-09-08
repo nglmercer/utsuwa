@@ -131,31 +131,21 @@ src/
 │   ├── app/           # Main application                                [product]
 │   ├── api/           # Server routes (chat proxy, model discovery)     [product]
 │   ├── blog/, docs/   # Website routes                                  [website]
-│   ├── overlay/       # Desktop overlay window                          [product]
 │   └── +page.svelte   # Landing page                                    [website]
 └── app.css            # Global styles and design tokens
-src-tauri/              # Tauri desktop shell (Rust)
+crates/                 # Rust workspace: agent runtime, tools, plugins, native host
 ```
 
 ## Releases
 
-Desktop builds are produced automatically by CI. There's no need to build installers on your own machine for a release.
-
-Maintainers cut a release by pushing a version tag:
+Desktop binaries are built locally with Cargo; there is currently no installer pipeline (the previous Tauri-based release workflow was removed with `src-tauri/`):
 
 ```bash
-# Bump the version in package.json, src-tauri/Cargo.toml, and src-tauri/tauri.conf.json first
-git tag v0.9.0
-git push origin v0.9.0
+pnpm build          # Frontend assets into build/
+cargo build --release -p app-host
 ```
 
-The [`Release` workflow](.github/workflows/release.yml) then builds the app on macOS, Windows, and Linux runners in parallel and attaches the installers to a **draft** GitHub Release:
-
-- **macOS** — `.dmg` (universal: Apple Silicon + Intel)
-- **Windows** — `.exe` installer
-- **Linux** — `.AppImage`, `.deb`, and `.rpm`
-
-A maintainer reviews the draft, edits the release notes, and publishes it. You can also trigger the workflow manually from the Actions tab to verify a build without cutting a release.
+Packaging (`.dmg` / `.exe` / `.AppImage` / `.deb` / `.rpm`) and any release automation need a new workflow.
 
 ## Questions?
 

@@ -4,7 +4,7 @@
 	import CameraSettingsPanel from '$lib/components/ui/CameraSettingsPanel.svelte';
 	import ArUnsupportedModal from '$lib/components/ui/ArUnsupportedModal.svelte';
 	import { localPath } from '$lib/config/links';
-	import { isTauri } from '$lib/services/platform';
+	
 	import { arStore } from '$lib/stores/ar.svelte';
 	import { displayStore } from '$lib/stores/display.svelte';
 	import { getColorMode, cycleColorMode, type ColorMode } from '$lib/utils/color-mode';
@@ -30,7 +30,7 @@
 		sidebarOpen = false,
 		onSidebarToggle
 	}: Props = $props();
-	let showOverlayBtn = $state(false);
+
 	let clusterOpen = $state(false);
 	let remindersOpen = $state(false);
 	let showCamera = $state(false);
@@ -59,7 +59,6 @@
 	);
 
 	onMount(() => {
-		showOverlayBtn = isTauri();
 		colorMode = getColorMode();
 
 		// Close dropdowns when clicking anywhere outside the root element
@@ -99,19 +98,7 @@
 		onDismissRecentFired?.(id);
 	}
 
-	async function launchOverlay() {
-		try {
-			const { invoke } = await import('@tauri-apps/api/core');
-			const { getCurrentWindow } = await import('@tauri-apps/api/window');
 
-			// Show overlay and hide main window
-			await invoke('show_overlay');
-			const mainWindow = getCurrentWindow();
-			await mainWindow.hide();
-		} catch (e) {
-			console.error('Failed to launch overlay:', e);
-		}
-	}
 </script>
 
 <div class="top-right-buttons" bind:this={rootEl}>
@@ -188,11 +175,6 @@
 				title="Chat history"
 			>
 				<Icon name="message" size={20} />
-			</button>
-		{/if}
-		{#if showOverlayBtn}
-			<button class="icon-btn overlay-btn" onclick={launchOverlay} aria-label="Launch overlay" title="Launch Overlay Mode">
-				<Icon name="monitor" size={20} />
 			</button>
 		{/if}
 		<button class="icon-btn" onclick={onInfoClick} aria-label="App info">
@@ -348,22 +330,6 @@
 	.cluster-trigger.open,
 	.cluster-item.active {
 		color: var(--accent);
-	}
-
-	/* Overlay button - accent action */
-	.overlay-btn {
-		background: var(--accent);
-		border-color: transparent;
-		color: #fff;
-	}
-
-	.overlay-btn:hover {
-		background: var(--accent-hover);
-		color: #fff;
-	}
-
-	.overlay-btn:active {
-		color: #fff;
 	}
 
 	.reminder-wrapper {

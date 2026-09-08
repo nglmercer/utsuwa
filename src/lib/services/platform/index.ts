@@ -1,4 +1,4 @@
-export { isTauri, isWeb, getPlatform } from './platform';
+export { isDesktopBuild } from './platform';
 
 export {
 	setWindowPosition,

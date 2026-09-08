@@ -21,7 +21,6 @@ members = [
     "crates/tool-desktop",
     "crates/desktop-linux",
 ]
-exclude = ["src-tauri"]
 
 [workspace.package]
 edition = "2021"

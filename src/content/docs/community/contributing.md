@@ -99,9 +99,8 @@ src/
 │   ├── api/           # API routes
 │   ├── blog/          # Blog routes
 │   ├── docs/          # Documentation site routes
-│   └── overlay/       # Desktop overlay route
 └── app.css            # Global styles
-src-tauri/              # Tauri desktop app (Rust)
+crates/                 # Rust workspace: agent runtime, tools, plugins, native host
 ```
 
 ## License

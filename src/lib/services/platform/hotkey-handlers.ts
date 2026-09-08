@@ -1,6 +1,4 @@
-import { browser } from '$app/environment';
-import { isTauri } from './platform';
-import { registerHotkey, DEFAULT_HOTKEYS, type HotkeyConfig } from './hotkeys';
+import type { HotkeyConfig } from './hotkeys';
 
 // Event bus for hotkey actions (allows components to subscribe)
 type HotkeyEventHandler = () => void;
@@ -23,48 +21,14 @@ export function onHotkeyEvent(event: string, handler: HotkeyEventHandler): () =>
 /**
  * Emit a hotkey event
  */
-function emitHotkeyEvent(event: string): void {
+export function emitHotkeyEvent(event: string): void {
 	eventHandlers.get(event)?.forEach((handler) => handler());
 }
 
-// Push-to-talk state
-let isPTTActive = false;
-
-/**
- * Initialize all global hotkeys (Tauri only)
- */
-export async function initializeHotkeys(config?: Partial<HotkeyConfig>): Promise<void> {
-	if (!browser || !isTauri()) return;
-
-	const hotkeys = { ...DEFAULT_HOTKEYS, ...config };
-
-	// Push-to-talk: hold to record, release to send
-	await registerHotkey(
-		'pushToTalk',
-		hotkeys.pushToTalk,
-		() => {
-			// Key down - start recording
-			if (!isPTTActive) {
-				isPTTActive = true;
-				emitHotkeyEvent('ptt:start');
-			}
-		},
-		() => {
-			// Key up - stop recording and send
-			if (isPTTActive) {
-				isPTTActive = false;
-				emitHotkeyEvent('ptt:stop');
-			}
-		}
-	);
-
-	// Toggle overlay visibility
-	await registerHotkey('toggleOverlay', hotkeys.toggleOverlay, () => {
-		emitHotkeyEvent('overlay:toggle');
-	});
-
-	// Focus chat (expand chat input)
-	await registerHotkey('focusChat', hotkeys.focusChat, () => {
-		emitHotkeyEvent('chat:focus');
-	});
+// Global hotkeys used to go through the Tauri backend. That backend is
+// removed, so initialization is a documented no-op kept for call-site
+// compatibility. The local event bus above stays: in-app code can still
+// emit and subscribe without a global-shortcut backend.
+export async function initializeHotkeys(_config?: Partial<HotkeyConfig>): Promise<void> {
+	return;
 }

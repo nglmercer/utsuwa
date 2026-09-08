@@ -1,7 +1,7 @@
 import { browser } from '$app/environment';
 import type { VRM } from '@pixiv/three-vrm';
 import localforage from 'localforage';
-import { isTauri } from '$lib/services/platform/platform';
+
 import { createTempVrmStoreIntegration } from '$lib/utils/temp-vrm-store';
 import type { TouchZone } from '$lib/engine/photo-reactions';
 
@@ -168,38 +168,11 @@ function createVrmStore() {
 	const ready = new Promise<void>((resolve) => {
 		readyResolve = resolve;
 	});
-	// Prevents re-emitting sync events when handling incoming ones
-	let isSyncing = false;
-	// Held so the handler can be released (HMR re-runs this module in dev;
-	// without it each run would stack another duplicate listener)
-	let modelChangedUnlisten: Promise<(() => void) | undefined> | null = null;
-
-	// Initialize from storage (may override defaults with saved values)
+	// Initialize from storage (may override defaults with saved values).
+	// Cross-window model sync lived in the removed multi-window backend;
+	// the single native window reads storage directly.
 	if (browser) {
 		initFromStorage();
-
-		// Sync model changes from other Tauri windows
-		if (isTauri()) {
-			modelChangedUnlisten = import('@tauri-apps/api/event').then(({ listen }) =>
-				listen('vrm:model-changed', async () => {
-					// Drop events that arrive while a sync is already running
-					if (isSyncing) return;
-					isSyncing = true;
-					try {
-						await syncActiveModel();
-					} finally {
-						isSyncing = false;
-					}
-				})
-			);
-		}
-
-		if (import.meta.hot) {
-			import.meta.hot.dispose(() => {
-				modelChangedUnlisten?.then((unlisten) => unlisten?.());
-				modelChangedUnlisten = null;
-			});
-		}
 	}
 
 	async function initFromStorage() {
@@ -337,25 +310,9 @@ function createVrmStore() {
 	}
 
 	async function broadcastModelChange() {
-		if (!isTauri() || isSyncing) return;
-		const { emit } = await import('@tauri-apps/api/event');
-		emit('vrm:model-changed');
-	}
-
-	async function syncActiveModel() {
-		if (!storageReady || tempModelActive) return;
-		const savedActiveId = await vrmStorage?.getItem<string>('active-model-id');
-		if (!savedActiveId || savedActiveId === activeModelId) return;
-
-		// Check if model exists in our list already
-		const model = models.find((m) => m.id === savedActiveId);
-		if (model) {
-			activeModelId = savedActiveId;
-			modelUrl = model.url;
-		} else {
-			// New custom model added in another window — full re-init
-			await initFromStorage();
-		}
+		// No multi-window backend remains to notify; kept so model
+		// selection keeps one code path.
+		return;
 	}
 
 	// These run every frame from the render loop. Skip the reactive write when the

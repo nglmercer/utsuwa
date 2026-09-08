@@ -1,5 +1,3 @@
-import { isTauri } from './platform';
-
 export type HotkeyAction = 'pushToTalk' | 'toggleOverlay' | 'focusChat';
 
 export interface HotkeyConfig {
@@ -21,90 +19,36 @@ const handlers: Map<HotkeyAction, { onKeyDown: HotkeyHandler; onKeyUp?: KeyUpHan
 const registeredShortcuts: Map<HotkeyAction, string> = new Map();
 
 /**
- * Register a global hotkey handler (Tauri only, no-op on web)
- * For push-to-talk, provide both onKeyDown and onKeyUp handlers
+ * Register a global hotkey handler. No global-shortcut backend exists
+ * (the Tauri backend is removed), so this always reports failure and
+ * records nothing. Kept for call-site compatibility.
  */
 export async function registerHotkey(
-	action: HotkeyAction,
-	shortcut: string,
-	onKeyDown: HotkeyHandler,
-	onKeyUp?: KeyUpHandler
+	_action: HotkeyAction,
+	_shortcut: string,
+	_onKeyDown: HotkeyHandler,
+	_onKeyUp?: KeyUpHandler
 ): Promise<boolean> {
-	if (!isTauri()) return false;
-
-	try {
-		const { register } = await import('@tauri-apps/plugin-global-shortcut');
-
-		// Unregister existing shortcut for this action if any
-		await unregisterHotkey(action);
-
-		await register(shortcut, (event) => {
-			const handler = handlers.get(action);
-			if (!handler) return;
-
-			if (event.state === 'Pressed') {
-				handler.onKeyDown();
-			} else if (event.state === 'Released' && handler.onKeyUp) {
-				handler.onKeyUp();
-			}
-		});
-
-		handlers.set(action, { onKeyDown, onKeyUp });
-		registeredShortcuts.set(action, shortcut);
-		return true;
-	} catch (e) {
-		console.error(`Failed to register hotkey ${shortcut}:`, e);
-		return false;
-	}
+	return false;
 }
 
 /**
- * Unregister a global hotkey (Tauri only, no-op on web)
+ * Unregister a global hotkey (no backend: no-op).
  */
-export async function unregisterHotkey(action: HotkeyAction): Promise<void> {
-	if (!isTauri()) return;
-
-	const shortcut = registeredShortcuts.get(action);
-	if (!shortcut) {
-		handlers.delete(action);
-		return;
-	}
-
-	try {
-		const { unregister } = await import('@tauri-apps/plugin-global-shortcut');
-
-		try {
-			await unregister(shortcut);
-		} catch {
-			// Shortcut may not be registered
-		}
-
-		registeredShortcuts.delete(action);
-		handlers.delete(action);
-	} catch (e) {
-		console.error(`Failed to unregister hotkey:`, e);
-	}
+export async function unregisterHotkey(_action: HotkeyAction): Promise<void> {
+	return;
 }
 
 /**
- * Unregister all global hotkeys (Tauri only, no-op on web)
+ * Unregister all global hotkeys (no backend: no-op).
  */
 export async function unregisterAllHotkeys(): Promise<void> {
-	if (!isTauri()) return;
-
-	try {
-		const { unregisterAll } = await import('@tauri-apps/plugin-global-shortcut');
-		await unregisterAll();
-		handlers.clear();
-		registeredShortcuts.clear();
-	} catch (e) {
-		console.error('Failed to unregister all hotkeys:', e);
-	}
+	return;
 }
 
 /**
  * Check if global hotkeys are supported in the current environment
  */
 export function isHotkeysSupported(): boolean {
-	return isTauri();
+	return false;
 }

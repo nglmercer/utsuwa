@@ -2,12 +2,11 @@
 	import { Icon } from '$lib/components/ui';
 	import { characterStore } from '$lib/stores/character.svelte';
 	import { localPath } from '$lib/config/links';
-	import { isTauri } from '$lib/services/platform/platform';
 	import { ttsStore } from '$lib/stores/tts.svelte';
 	import { sttStore } from '$lib/stores/stt.svelte';
 	import { displayStore } from '$lib/stores/display.svelte';
 	import { chatHintStore } from '$lib/stores/chat-hint.svelte';
-	import { queueFiles, imageMimeFromPath } from './attach-files';
+	import { queueFiles } from './attach-files';
 	import { chatDraftStore } from '$lib/stores/chat-draft.svelte';
 	import { type PreparedImage } from '$lib/services/storage/keepsakes';
 	import ChatInput from './ChatInput.svelte';
@@ -103,47 +102,7 @@
 		if (!overlay) queueFiles(e.dataTransfer?.files ?? null, visionCapable);
 	}
 
-	// On desktop, Tauri's webview intercepts drag-and-drop so dataTransfer.files
-	// is empty (native drag-drop stays on for VRM upload). Read dropped image
-	// files via Tauri's own event + the fs plugin, mirroring VrmUploader.
-	$effect(() => {
-		if (!isTauri() || overlay) return;
-		let cancelled = false;
-		let unlisten: (() => void) | undefined;
-		(async () => {
-			const { getCurrentWindow } = await import('@tauri-apps/api/window');
-			if (cancelled) return;
-			unlisten = await getCurrentWindow().onDragDropEvent(async (event) => {
-				if (event.payload.type === 'over') {
-					chatDraftStore.setDropActive(true);
-				} else if (event.payload.type === 'leave') {
-					chatDraftStore.setDropActive(false);
-					dragDepth = 0;
-				} else if (event.payload.type === 'drop') {
-					chatDraftStore.setDropActive(false);
-					dragDepth = 0;
-					const imagePaths = event.payload.paths.filter((p) => imageMimeFromPath(p));
-					if (imagePaths.length === 0) return; // not images (VrmUploader etc. handle those)
-					const { readFile } = await import('@tauri-apps/plugin-fs');
-					const files: File[] = [];
-					for (const path of imagePaths) {
-						try {
-							const contents = await readFile(path);
-							const name = path.split(/[/\\]/).pop() || 'image';
-							files.push(new File([contents], name, { type: imageMimeFromPath(path)! }));
-						} catch {
-							chatHintStore.showHint("Couldn't read that image. Try a different one.");
-						}
-					}
-					if (files.length) await queueFiles(files, visionCapable);
-				}
-			});
-		})();
-		return () => {
-			cancelled = true;
-			unlisten?.();
-		};
-	});
+
 </script>
 
 {#if sttStore.error}

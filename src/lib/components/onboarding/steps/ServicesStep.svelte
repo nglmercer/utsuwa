@@ -11,16 +11,13 @@
 		type ModelInfo
 	} from '$lib/services/providers/use-model-fetch';
 	import { DOCS_URL } from '$lib/config/site';
-	import { isTauri } from '$lib/services/platform';
 
 	const LOCAL_LLM_DOCS_URL = `${DOCS_URL}/guides/local-llm-setup#allowing-utsuwa-to-reach-ollama`;
 
-	// Always open the docs subdomain; on desktop route it to the system browser.
+	// Always open the docs subdomain in the system browser.
 	function openLocalLlmDocs(e: MouseEvent) {
-		if (isTauri()) {
-			e.preventDefault();
-			import('@tauri-apps/plugin-opener').then(({ openUrl }) => openUrl(LOCAL_LLM_DOCS_URL));
-		}
+		e.preventDefault();
+		window.open(LOCAL_LLM_DOCS_URL, '_blank', 'noopener');
 	}
 
 	interface Props {

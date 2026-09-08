@@ -343,51 +343,32 @@ When relationship thresholds are crossed:
 4. UI displays event content (if any)
 5. Event ID is added to `completedEvents`
 
-## Desktop Application (Tauri)
+## Desktop Application (native host)
 
-The desktop app wraps the same SvelteKit application using Tauri v2.
+The desktop app runs the same SvelteKit application inside `crates/app-host`, a Rust host that embeds the WebView (GTK on Linux: Wayland and X11 from one binary) and additionally serves the agent runtime — model chat, tools, plugins, memory, policy — over a typed IPC bridge (`window.utsuwa.invoke`, `utsuwa-host-event`).
 
 ### Platform Layer
 
-A platform abstraction layer allows code to behave differently on web vs desktop:
+A small platform module marks desktop-only routing. It is build-time, never runtime-detected:
 
 **Key files:**
-- `src/lib/services/platform/platform.ts` — `isTauri()` / `isWeb()` detection
-- `src/lib/services/platform/window.ts` — Window management (position, drag, click-through)
-- `src/lib/services/platform/hotkeys.ts` — Global shortcut registration
+- `src/lib/services/platform/platform.ts` — `isDesktopBuild()` (baked in via `UTSUWA_NATIVE=1`)
+- `crates/app-host/src/dispatcher.rs` — typed IPC methods
+- `crates/app-host/src/protocol.rs` — `companion://app` custom scheme + navigation policy
 
 **Detection pattern:**
 ```typescript
-import { isTauri } from '$lib/services/platform';
+import { isDesktopBuild } from '$lib/services/platform';
 
-if (isTauri()) {
-  // Desktop-only code
-  await startDragging();
+if (isDesktopBuild()) {
+  // Native-host-only routing (no server routes exist there)
+  await fetchModelsDirect(providerId, apiKey, baseUrl);
 }
 ```
 
-### Multi-Window Architecture
+### Single-Window Architecture
 
-The desktop app uses two windows:
-
-| Window | Purpose |
-|--------|---------|
-| `main` | Full application with all features |
-| `overlay` | Transparent, always-on-top companion view |
-
-**Switching logic:**
-- Main → Overlay: Invoke `show_overlay` command, hide main window
-- Overlay → Main: Show main window, hide overlay
-
-### Overlay Rendering
-
-For transparent backgrounds in overlay mode:
-1. Tauri window configured with `transparent: true`, `decorations: false`
-2. HTML/body backgrounds set to transparent via CSS
-3. Three.js renderer uses `alpha: true` and `setClearColor(0x000000, 0)`
-4. Scene background set to `null` (no skybox)
-
-**Key file:** `src/routes/overlay/+page.svelte`
+The native host owns exactly one window. The previous multi-window overlay, global shortcuts, and in-app updater belonged to the removed Tauri shell and have no backend here; their shims are documented no-ops until host IPC grows equivalents.
 
 ## Technologies
 
@@ -398,7 +379,7 @@ For transparent backgrounds in overlay mode:
 | 3D Rendering | Three.js + Threlte |
 | VRM Support | @pixiv/three-vrm |
 | LLM Integration | xsAI SDK (web) / direct fetch (desktop) |
-| Desktop | Tauri v2 |
+| Desktop | app-host (Rust) + wry WebView |
 | Styling | Tailwind CSS 4 |
 | Database | IndexedDB (Dexie.js) |
 | Embeddings | Transformers.js |

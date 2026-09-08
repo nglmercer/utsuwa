@@ -3,7 +3,7 @@ import { webSpeechService } from '$lib/services/stt/web-speech';
 import { openAiSttService } from '$lib/services/stt/openai-stt';
 import { getSTTBaseUrl, getLocalSTTConnectionHint } from '$lib/services/providers/local-endpoints';
 import { getSTTProvider } from '$lib/services/providers/registry';
-import { isTauri } from '$lib/services/platform/platform';
+import { isDesktopBuild } from '$lib/services/platform/platform';
 import { settingsStore } from '$lib/stores/settings.svelte';
 
 function createSttStore() {
@@ -163,13 +163,14 @@ function createSttStore() {
 		if (!browser) return false;
 		// A local or Groq server works on any platform if a mic is available
 		if (useOpenAiStt && openAiSttService.isSupported()) return true;
-		// Web Speech only works in browsers (not Tauri's webview)
-		if (!isTauri() && webSpeechService.isSupported()) return true;
+		// Web Speech is feature-detected: present in Chrome/Edge, absent in
+		// the native webview and other browsers.
+		if (webSpeechService.isSupported()) return true;
 		return false;
 	}
 
 	function showUnsupportedError() {
-		if (isTauri()) {
+		if (isDesktopBuild()) {
 			setError('Add a Groq key or a local STT server in Settings → Persona for voice input on desktop.');
 		} else {
 			setError('Voice input is not supported in this browser. Add a Groq key or a local STT server in Settings → Persona, or try Chrome/Edge.');

@@ -3,7 +3,6 @@
 	import { getLLMProvider } from '$lib/services/providers/registry';
 	import { Icon, ProviderDropdown, ModelDropdown, ContextSizeSlider } from '$lib/components/ui';
 	import { DOCS_URL } from '$lib/config/site';
-	import { isTauri } from '$lib/services/platform';
 	import type { LlmSettingsState } from '$lib/stores/ai-services-settings.svelte';
 	import './ai-services-settings.css';
 
@@ -12,10 +11,8 @@
 	const LOCAL_LLM_DOCS_URL = `${DOCS_URL}/guides/local-llm-setup#allowing-utsuwa-to-reach-ollama`;
 
 	function openLocalLlmDocs(e: MouseEvent) {
-		if (isTauri()) {
-			e.preventDefault();
-			import('@tauri-apps/plugin-opener').then(({ openUrl }) => openUrl(LOCAL_LLM_DOCS_URL));
-		}
+		e.preventDefault();
+		window.open(LOCAL_LLM_DOCS_URL, '_blank', 'noopener');
 	}
 
 	function handleContextSizeChange(value: number | undefined) {

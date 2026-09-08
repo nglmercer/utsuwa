@@ -49,9 +49,7 @@
 			if (href && isWebOnly(href)) {
 				e.preventDefault();
 				e.stopPropagation();
-				import('@tauri-apps/plugin-opener').then(({ openUrl }) => {
-					openUrl(`${SITE_URL}${href}`);
-				});
+				window.open(`${SITE_URL}${href}`, '_blank', 'noopener');
 			}
 		}, true);
 	}

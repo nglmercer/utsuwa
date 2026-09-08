@@ -49,7 +49,6 @@
 	import { createReminderFiredHandler } from '$lib/services/chat/reminder-chat';
 	import { reminderStore } from '$lib/stores/reminders.svelte';
 	import { type PreparedImage } from '$lib/services/storage/keepsakes';
-	import { isTauri } from '$lib/services/platform';
 	import { browser } from '$app/environment';
 	import type { StateUpdates } from '$lib/types/character';
 	import type { EventDefinition } from '$lib/types/events';

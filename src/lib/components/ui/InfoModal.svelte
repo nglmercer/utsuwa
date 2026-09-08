@@ -3,8 +3,6 @@
 	import { onMount } from 'svelte';
 	import { pop, fadeFast } from '$lib/utils/motion';
 	import { DOCS_URL } from '$lib/config/site';
-	import { isTauri } from '$lib/services/platform/platform';
-	import { updaterStore } from '$lib/stores/updater.svelte';
 
 	interface Props {
 		onClose: () => void;
@@ -13,29 +11,6 @@
 	let { onClose }: Props = $props();
 
 	const version = `v${import.meta.env.VITE_APP_VERSION}`;
-
-	const updateStatusText = $derived.by(() => {
-		switch (updaterStore.status) {
-			case 'checking':
-				return 'Checking for updates…';
-			case 'uptodate':
-				return "You're on the latest version";
-			case 'available':
-				return `Update available: Utsuwa ${updaterStore.availableVersion}`;
-			case 'downloading':
-				return `Downloading… ${updaterStore.progress}%`;
-			case 'ready':
-				return 'Update installed — restarting…';
-			case 'error':
-				return updaterStore.errorMessage ?? 'Update check failed';
-			default:
-				return '';
-		}
-	});
-
-	const updateBusy = $derived(
-		updaterStore.status === 'checking' || updaterStore.status === 'downloading'
-	);
 
 	// System info
 	let sttSupport = $state('Checking...');
@@ -65,12 +40,10 @@
 		if (e.target === e.currentTarget) onClose();
 	}
 
-	// Always open the docs subdomain; on desktop route it to the system browser.
+	// Always open the docs subdomain in the system browser.
 	function handleDocsClick(e: MouseEvent) {
-		if (isTauri()) {
-			e.preventDefault();
-			import('@tauri-apps/plugin-opener').then(({ openUrl }) => openUrl(DOCS_URL));
-		}
+		e.preventDefault();
+		window.open(DOCS_URL, '_blank', 'noopener');
 	}
 </script>
 
@@ -89,21 +62,7 @@
 			<p id="modal-title" class="tagline">Open-source AI companion</p>
 			<div class="hero-meta">
 				<span class="version-chip">{version}</span>
-				{#if isTauri()}
-					<button
-						class="update-link"
-						onclick={() =>
-							updaterStore.status === 'available' ? updaterStore.install() : updaterStore.check()}
-						disabled={updateBusy}
-					>
-						<Icon name={updaterStore.status === 'available' ? 'download' : 'refresh-cw'} size={12} />
-						<span>{updaterStore.status === 'available' ? 'Install & restart' : 'Check for updates'}</span>
-					</button>
-				{/if}
 			</div>
-			{#if isTauri() && updateStatusText}
-				<span class="update-status">{updateStatusText}</span>
-			{/if}
 		</div>
 
 		<!-- Links -->
@@ -246,37 +205,6 @@
 		font-size: 0.72rem;
 		font-weight: 600;
 		color: var(--text-secondary);
-	}
-
-	.update-link {
-		display: inline-flex;
-		align-items: center;
-		gap: 0.35rem;
-		padding: 0.25rem 0.6rem;
-		border: none;
-		border-radius: var(--radius-full);
-		background: transparent;
-		font-size: 0.72rem;
-		font-weight: 500;
-		color: var(--accent);
-		cursor: pointer;
-		font-family: inherit;
-		transition: background 0.15s ease;
-	}
-
-	.update-link:hover:not(:disabled) {
-		background: var(--accent-muted);
-	}
-
-	.update-link:disabled {
-		opacity: 0.6;
-		cursor: default;
-		color: var(--text-tertiary);
-	}
-
-	.update-status {
-		font-size: 0.7rem;
-		color: var(--text-tertiary);
 	}
 
 	/* Link rows */

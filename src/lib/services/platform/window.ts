@@ -1,5 +1,3 @@
-import { isTauri } from './platform';
-
 export interface WindowPosition {
 	x: number;
 	y: number;
@@ -10,75 +8,50 @@ export interface WindowSize {
 	height: number;
 }
 
-/**
- * Set window position (Tauri only, no-op on web)
- */
-export async function setWindowPosition(position: WindowPosition): Promise<void> {
-	if (!isTauri()) return;
+// Window management used to go through the Tauri backend (multi-window
+// overlay, always-on-top, click-through). That backend is removed: the
+// native host (app-host) owns a single window, so these are documented
+// no-ops kept for call-site compatibility. Window behavior that needs a
+// host API should grow on the utsuwa IPC bridge instead.
 
-	const { getCurrentWindow, PhysicalPosition } = await import('@tauri-apps/api/window');
-	const window = getCurrentWindow();
-	await window.setPosition(new PhysicalPosition(position.x, position.y));
+/**
+ * Set window position (no backend: no-op).
+ */
+export async function setWindowPosition(_position: WindowPosition): Promise<void> {
+	return;
 }
 
 /**
- * Get current window position (Tauri only, returns null on web)
+ * Get current window position (no backend: always null).
  */
 export async function getWindowPosition(): Promise<WindowPosition | null> {
-	if (!isTauri()) return null;
-
-	const { getCurrentWindow } = await import('@tauri-apps/api/window');
-	const window = getCurrentWindow();
-	const position = await window.outerPosition();
-	return { x: position.x, y: position.y };
+	return null;
 }
 
 /**
- * Set whether the window should ignore cursor events (for click-through)
- * Tauri only, no-op on web
+ * Set whether the window should ignore cursor events (no backend: no-op).
  */
-export async function setIgnoreCursorEvents(ignore: boolean): Promise<void> {
-	if (!isTauri()) return;
-
-	const { getCurrentWindow } = await import('@tauri-apps/api/window');
-	const window = getCurrentWindow();
-	await window.setIgnoreCursorEvents(ignore);
+export async function setIgnoreCursorEvents(_ignore: boolean): Promise<void> {
+	return;
 }
 
 /**
- * Set window always on top state (Tauri only, no-op on web)
+ * Set window always on top state (no backend: no-op).
  */
-export async function setAlwaysOnTop(alwaysOnTop: boolean): Promise<void> {
-	if (!isTauri()) return;
-
-	const { getCurrentWindow } = await import('@tauri-apps/api/window');
-	const window = getCurrentWindow();
-	await window.setAlwaysOnTop(alwaysOnTop);
+export async function setAlwaysOnTop(_alwaysOnTop: boolean): Promise<void> {
+	return;
 }
 
 /**
- * Show/hide the window (Tauri only, no-op on web)
+ * Show/hide the window (no backend: no-op).
  */
-export async function setWindowVisible(visible: boolean): Promise<void> {
-	if (!isTauri()) return;
-
-	const { getCurrentWindow } = await import('@tauri-apps/api/window');
-	const window = getCurrentWindow();
-	if (visible) {
-		await window.show();
-	} else {
-		await window.hide();
-	}
+export async function setWindowVisible(_visible: boolean): Promise<void> {
+	return;
 }
 
 /**
- * Start dragging the window (Tauri only, no-op on web)
- * Call this on mousedown to enable window dragging
+ * Start dragging the window (no backend: no-op).
  */
 export async function startDragging(): Promise<void> {
-	if (!isTauri()) return;
-
-	const { getCurrentWindow } = await import('@tauri-apps/api/window');
-	const window = getCurrentWindow();
-	await window.startDragging();
+	return;
 }

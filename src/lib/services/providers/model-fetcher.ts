@@ -1,4 +1,4 @@
-import { isTauri } from '$lib/services/platform';
+import { isDesktopBuild } from '$lib/services/platform';
 import { fetchModelsDirect } from './client-models';
 import { isLocalLLMProvider } from './local-endpoints';
 
@@ -42,8 +42,8 @@ async function fetchProviderModelsUncached(
 	baseUrl?: string
 ): Promise<FetchModelsResult> {
 	// Local providers must be fetched from the user's device, not the deployed server.
-	// Tauri production builds also don't have server routes.
-	if (isTauri() || isLocalLLMProvider(providerId)) {
+	// Native desktop builds also don't have server routes.
+	if (isDesktopBuild() || isLocalLLMProvider(providerId)) {
 		return fetchModelsDirect(providerId, apiKey, baseUrl);
 	}
 

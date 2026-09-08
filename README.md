@@ -106,18 +106,7 @@ See the [Companion System Architecture](https://docs.utsuwa.ai/technology/compan
 
 ### Desktop Application (Beta)
 
-A native desktop app built with Tauri that includes all web features plus:
-
-- **Overlay Mode**: Your companion floats on your desktop with a transparent background
-- **Always-on-Top**: The overlay stays visible over all other windows
-- **Draggable Positioning**: Click and drag the character to reposition anywhere on screen, or lock her in place
-- **Resizable Overlay**: Hover to reveal a soft frame and drag the corner tab to resize; your size is remembered
-- **Overlay Camera**: A separate camera profile (zoom, height, FOV) tuned independently from the main app
-- **Floating Chat**: Expandable chat input that appears when you click the chat icon, with replies in a readable docked bubble
-- **Window Switching**: Seamlessly switch between the full app and overlay mode
-- **Global Hotkeys**: Push-to-talk, toggle overlay, and focus chat with keyboard shortcuts
-
-The desktop app uses the same codebase as the web version, and your save files are compatible between both.
+A native desktop app (`crates/app-host`, Rust + WebView) that runs the same SvelteKit frontend — your save files are compatible with the web version. It works on X11/XWayland and native Wayland, and additionally exposes the agent runtime (model chat, tools, plugins, memory) to the UI over a typed IPC bridge.
 
 ## Supported Providers
 
@@ -222,8 +211,11 @@ To run the desktop app from source, you'll need the [Rust toolchain](https://rus
 # Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Run the desktop app
-pnpm tauri dev
+# Run the desktop app (bundled frontend served by the host)
+cargo run
+
+# Or against the Svelte dev server (run `pnpm dev` alongside)
+cargo run -- --dev
 ```
 
 #### Configuration
@@ -283,9 +275,8 @@ utsuwa/
 │       ├── app/            # Main application routes
 │       ├── api/            # API routes
 │       ├── blog/           # Blog routes
-│       ├── docs/           # Documentation site routes
-│       └── overlay/        # Desktop overlay route
-├── src-tauri/               # Tauri desktop app (Rust)
+│       └── docs/           # Documentation site routes
+├── crates/                  # Rust workspace: agent runtime, tools, plugins, native host
 ├── static/
 │   └── models/             # Place default VRM models here
 ├── tools/                   # Optional helpers and self-hosted integrations
@@ -303,8 +294,8 @@ pnpm preview      # Preview production build
 pnpm lint         # Type-check the project (svelte-check)
 pnpm check        # Same as lint (alias)
 pnpm check:watch  # Type-check in watch mode
-pnpm tauri dev    # Run the desktop app in development mode
-pnpm tauri build  # Build desktop app installer
+cargo run         # Run the native desktop app (bundled frontend)
+cargo run -- --dev # Native app against the Svelte dev server
 ```
 
 ## Roadmap
@@ -373,7 +364,7 @@ Utsuwa is built on the shoulders of these excellent projects:
 - **[Three.js](https://github.com/mrdoob/three.js)** - 3D graphics engine
 - **[Threlte](https://github.com/threlte/threlte)** - Svelte components for Three.js
 - **[SvelteKit](https://github.com/sveltejs/kit)** - Web application framework
-- **[Tauri](https://github.com/tauri-apps/tauri)** - Desktop application framework
+- **[wry](https://github.com/tauri-apps/wry)** - Cross-platform WebView rendering for the native host
 - **[Tailwind CSS](https://github.com/tailwindlabs/tailwindcss)** - Utility-first CSS framework
 - **[Transformers.js](https://github.com/xenova/transformers.js)** - In-browser ML for semantic memory embeddings
 
