@@ -117,6 +117,16 @@ pub enum ToolError {
         message: String,
         recovery: serde_json::Value,
     },
+    /// A stable, structured filesystem validation result. `retryable` is an
+    /// argument-repair hint only; it never widens capability scope.
+    #[error("filesystem error for {tool}: {message}")]
+    Filesystem {
+        tool: String,
+        code: String,
+        retryable: bool,
+        message: String,
+        details: serde_json::Value,
+    },
     #[error("permission denied for {tool}: {reason}")]
     Denied { tool: String, reason: String },
     #[error("tool {tool} failed: {message}")]
@@ -140,6 +150,22 @@ impl ToolError {
                     serde_json::Value::String(message.clone()),
                 );
                 serde_json::Value::Object(object).to_string()
+            }
+            Self::Filesystem {
+                code,
+                retryable,
+                message,
+                details,
+                ..
+            } => {
+                let mut error = details.as_object().cloned().unwrap_or_default();
+                error.insert("code".to_string(), serde_json::Value::String(code.clone()));
+                error.insert("retryable".to_string(), serde_json::Value::Bool(*retryable));
+                error.insert(
+                    "message".to_string(),
+                    serde_json::Value::String(message.clone()),
+                );
+                serde_json::json!({ "error": serde_json::Value::Object(error) }).to_string()
             }
             other => other.to_string(),
         }

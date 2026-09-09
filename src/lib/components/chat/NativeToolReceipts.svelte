@@ -18,7 +18,10 @@
 
 	function outputPath(step: NativeToolStep): string | null {
 		if (typeof step.output !== 'object' || step.output === null) return null;
-		const path = (step.output as Record<string, unknown>).path;
+		const output = step.output as Record<string, unknown>;
+		const displayPath = output.display_path;
+		if (typeof displayPath === 'string') return displayPath;
+		const path = output.path;
 		return typeof path === 'string' ? path : null;
 	}
 

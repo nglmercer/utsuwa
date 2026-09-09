@@ -15,11 +15,12 @@
 //! `agent.turn_failed`, `agent.turn_cancelled`, `permission.requested`,
 //! `permission.dismissed`.
 
+use crate::file_target::{ConversationFileContext, FileRef, FileResolver, TargetPurpose};
 use crate::host_environment::HostEnvironment;
 use crate::user_directory_tools::{
     AppendFileTool, AppendUserFileTool, CreateUserFileTool, EditFileTool, EditTool,
-    EditUserFileTool, HostAwareWriteTool, ReplaceUserFileTool, ResolveUserDirectoryTool,
-    UserDirectoryWriteTool,
+    EditUserFileTool, HostAwarePathTool, HostAwareWriteTool, ReplaceUserFileTool,
+    ResolveUserDirectoryTool, UserDirectoryWriteTool,
 };
 use agent_core::{Agent, AgentEvent, AgentLimits, ToolAuthorizer, ToolReplayCache};
 use audit_core::AuditSink;
@@ -276,6 +277,7 @@ pub struct AgentRuntime {
     desktop: Mutex<tool_desktop::plugin::DesktopPlugin>,
     storage: Option<Arc<Mutex<Storage>>>,
     autonomous_full_access: Arc<AtomicBool>,
+    file_context: Arc<Mutex<ConversationFileContext>>,
     state: Arc<Mutex<State>>,
     executor: tokio::runtime::Runtime,
 }
@@ -353,6 +355,7 @@ impl AgentRuntime {
             desktop: Mutex::new(Self::desktop_plugin()),
             storage,
             autonomous_full_access,
+            file_context: Arc::new(Mutex::new(ConversationFileContext::default())),
             state: Arc::new(Mutex::new(State {
                 generation: 0,
                 transcript: Vec::new(),
@@ -373,6 +376,16 @@ impl AgentRuntime {
     /// authorization request without restarting the host.
     pub fn autonomous_full_access_enabled(&self) -> bool {
         self.autonomous_full_access.load(Ordering::SeqCst)
+    }
+
+    /// Snapshot the active conversational file identity. The returned
+    /// reference is only an identifier; callers must resolve and re-authorize
+    /// it before touching the filesystem.
+    pub fn active_file_ref(&self) -> Option<FileRef> {
+        self.file_context
+            .lock()
+            .ok()
+            .and_then(|context| context.active_file.clone())
     }
 
     /// Update the live mode after the native settings row has been written.
@@ -952,10 +965,11 @@ impl AgentRuntime {
             .filter(|message| message.role == model_core::ModelRole::System)
             .map(|message| message.content.as_str());
         let base_system_prompt = system_prompt.as_deref().or(history_system_prompt);
-        let host_system_prompt = compose_host_system_prompt_for(
+        let host_system_prompt = compose_host_system_prompt_for_context(
             base_system_prompt,
             autonomous_full_access,
             &host_environment,
+            Some(&self.file_context),
         );
         // `Agent` intentionally leaves an existing system message alone. A
         // native caller may supply one in history, so replace that message
@@ -984,23 +998,27 @@ impl AgentRuntime {
             }
         };
         let agent = agent.with_replay_cache(replay_cache.clone());
-        let mut registry =
-            match default_registry(&self.processes, host_environment.clone(), tool_profile) {
-                Ok(registry) => registry,
-                Err(err) => {
-                    if self.is_current(generation) {
-                        if let Ok(queue) = self.approvals.lock() {
-                            queue.end_task(&task_id);
-                        }
+        let mut registry = match default_registry(
+            &self.processes,
+            host_environment.clone(),
+            tool_profile,
+            Some(Arc::clone(&self.file_context)),
+        ) {
+            Ok(registry) => registry,
+            Err(err) => {
+                if self.is_current(generation) {
+                    if let Ok(queue) = self.approvals.lock() {
+                        queue.end_task(&task_id);
                     }
-                    self.emit_if_current(
-                        generation,
-                        "agent.turn_failed",
-                        serde_json::json!({ "error": err.to_string() }),
-                    );
-                    return;
                 }
-            };
+                self.emit_if_current(
+                    generation,
+                    "agent.turn_failed",
+                    serde_json::json!({ "error": err.to_string() }),
+                );
+                return;
+            }
+        };
         self.attach_mcp_tools(&mut registry).await;
         self.attach_plugin_tools(&mut registry);
         self.attach_memory_tools(&mut registry);
@@ -1039,6 +1057,7 @@ impl AgentRuntime {
                 );
             }
             Ok(outcome) => {
+                self.record_file_context(&outcome.executed, &host_environment);
                 if self.is_current(generation) {
                     if let Ok(mut state) = self.state.lock() {
                         state.transcript = outcome.messages.clone();
@@ -1132,6 +1151,44 @@ impl AgentRuntime {
             }
         }
     }
+
+    fn record_file_context(
+        &self,
+        executed: &[agent_core::ExecutedTool],
+        environment: &HostEnvironment,
+    ) {
+        let resolver = FileResolver::new(environment.clone());
+        let Ok(mut context) = self.file_context.lock() else {
+            return;
+        };
+        for step in executed {
+            if !step.name.starts_with("filesystem.") {
+                continue;
+            }
+            let Some(object) = step.output.content.as_object() else {
+                continue;
+            };
+            if let Some(file_ref) = object.get("file_ref").and_then(serde_json::Value::as_str) {
+                if let Ok(file_ref) = FileRef::parse(file_ref) {
+                    context.record_success(file_ref);
+                    continue;
+                }
+            }
+            let Some(path) = object.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if let Ok(resolved) = resolver.descriptor_for_absolute(
+                std::path::Path::new(path),
+                if step.name.contains("create") || step.name.contains("write") {
+                    TargetPurpose::Create
+                } else {
+                    TargetPurpose::Existing
+                },
+            ) {
+                context.record_success(resolved.file_ref);
+            }
+        }
+    }
 }
 
 fn serialize_tool_step(step: &agent_core::ToolStep) -> serde_json::Value {
@@ -1196,16 +1253,14 @@ fn host_environment_context_for(
     environment: &HostEnvironment,
     autonomous_full_access: bool,
 ) -> String {
-    let home_text = environment
-        .home
-        .as_deref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "not detected".to_string());
-    let cwd_text = environment
-        .cwd
-        .as_deref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "not detected".to_string());
+    host_environment_context_for_context(environment, autonomous_full_access, None)
+}
+
+fn host_environment_context_for_context(
+    environment: &HostEnvironment,
+    autonomous_full_access: bool,
+    file_context: Option<&Arc<Mutex<ConversationFileContext>>>,
+) -> String {
     let mode_text = if autonomous_full_access {
         "enabled; native Agent capability requests are automatically authorized"
     } else {
@@ -1219,36 +1274,55 @@ fn host_environment_context_for(
         "<host_environment>".to_string(),
         format!("OS: {}", host_os_label()),
         format!("Architecture: {}", environment.architecture),
-        format!("Home directory: {home_text}"),
+        format!(
+            "Available semantic user directories: {}",
+            environment
+                .user_dirs
+                .resolved()
+                .map(|(directory, _)| directory.json_key())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     ];
-    for (directory, path) in environment.user_dirs.resolved() {
-        lines.push(format!(
-            "{} directory: {}",
-            directory.prompt_label(),
-            path.display()
-        ));
-    }
     if environment.user_dirs.desktop.is_none() {
-        lines.push("Desktop directory: not available".to_string());
+        lines.push("desktop directory: not available".to_string());
     }
     lines.extend([
-        format!("Current working directory: {cwd_text}"),
         format!("Current local date: {current_local_date}"),
         format!("Current local datetime: {current_local_datetime}"),
         format!("Path separator: {}", environment.path_separator),
         format!("Path style: {}", environment.path_style),
-        "Filesystem tools require absolute host-native paths.".to_string(),
+        "Filesystem tools prefer file_ref or semantic directory ids with relative paths; absolute host-native paths are a compatibility fallback only. The exact native roots are host-owned and need not be reconstructed by the model.".to_string(),
         "Do not invent Windows drive-letter paths on a non-Windows host.".to_string(),
         "</host_environment>".to_string(),
     ]);
+    if let Some(context) = file_context
+        .and_then(|context| context.lock().ok())
+        .and_then(|context| context.active_file.clone())
+    {
+        let display_name = context
+            .as_str()
+            .rsplit(['/', '\\'])
+            .next()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("unknown");
+        lines.extend([
+            "<active_file>".to_string(),
+            format!("file_ref: {context}"),
+            format!("display_name: {display_name}"),
+            "Reuse this file_ref for follow-up filesystem operations about the same file."
+                .to_string(),
+            "</active_file>".to_string(),
+        ]);
+    }
     let runtime_lines = vec![
         "You are running inside the native Utsuwa desktop host.".to_string(),
         "Use the provided native tools when doing so is useful for completing the user's request."
             .to_string(),
-        "Filesystem tool paths must be absolute paths using the host operating system's native path format."
+        "Filesystem tools prefer file_ref from a previous successful operation, or target.directory plus target.relative_path. Directory values are semantic ids such as desktop and documents; never put a complete file path in a directory field."
             .to_string(),
         "Special filesystem directories are resolved by the operating system.".to_string(),
-        "Use the exact paths listed in the host environment block or returned by system.environment."
+        "The host owns path resolution, localization, canonicalization, and capability validation. Do not reconstruct localized filesystem roots from display_path."
             .to_string(),
         "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file with location and filename; do not first try filesystem.write or construct a special-directory path yourself. For existing files, use filesystem.edit."
             .to_string(),
@@ -1278,7 +1352,7 @@ fn host_environment_context_for(
         format!(
             "Autonomous Full Access is {mode_text}. When it is enabled, you may use available native tools without asking the user for additional permission; the native host has already received the user's consent."
         ),
-        "After a filesystem tool succeeds, use the exact path returned by the tool in the final response."
+        "After a filesystem tool succeeds, use file_ref for later tool calls and display_path only for the human-facing final response."
             .to_string(),
         "Never claim an operation succeeded until the tool confirms success.".to_string(),
         "Never report success after a failed tool call.".to_string(),
@@ -1300,12 +1374,23 @@ fn compose_host_system_prompt(user_prompt: Option<&str>, autonomous_full_access:
     )
 }
 
+#[cfg(test)]
 fn compose_host_system_prompt_for(
     user_prompt: Option<&str>,
     autonomous_full_access: bool,
     environment: &HostEnvironment,
 ) -> String {
-    let host_context = host_environment_context_for(environment, autonomous_full_access);
+    compose_host_system_prompt_for_context(user_prompt, autonomous_full_access, environment, None)
+}
+
+fn compose_host_system_prompt_for_context(
+    user_prompt: Option<&str>,
+    autonomous_full_access: bool,
+    environment: &HostEnvironment,
+    file_context: Option<&Arc<Mutex<ConversationFileContext>>>,
+) -> String {
+    let host_context =
+        host_environment_context_for_context(environment, autonomous_full_access, file_context);
     // A suspended native turn already contains the previous host context in
     // its system message. Rebuild from the original prompt portion so a mode
     // toggle updates the status without duplicating trusted runtime blocks.
@@ -1419,6 +1504,7 @@ fn default_registry(
     processes: &Arc<ProcessManager>,
     host_environment: HostEnvironment,
     tool_profile: ToolProfile,
+    file_context: Option<Arc<Mutex<ConversationFileContext>>>,
 ) -> Result<ToolRegistry, RuntimeError> {
     let mut registry = ToolRegistry::new();
     let mut fs_plugins = tool_filesystem::plugin::FsPluginRegistry::new();
@@ -1429,6 +1515,47 @@ fn default_registry(
         .map(tool_filesystem::plugin::tools_for_plugin)
         .unwrap_or_default();
     if let Some(plugin) = selected_fs {
+        if plugin.supports(tool_filesystem::plugin::FsCapability::Read) {
+            if let Some(index) = tools
+                .iter()
+                .position(|tool| tool.metadata().id.0 == "filesystem.read")
+            {
+                tools[index] = Arc::new(HostAwarePathTool::read(
+                    plugin.limits.clone(),
+                    host_environment.clone(),
+                ));
+            }
+        }
+        if plugin.supports(tool_filesystem::plugin::FsCapability::Stat) {
+            if let Some(index) = tools
+                .iter()
+                .position(|tool| tool.metadata().id.0 == "filesystem.stat")
+            {
+                tools[index] = Arc::new(HostAwarePathTool::stat(host_environment.clone()));
+            }
+        }
+        if plugin.supports(tool_filesystem::plugin::FsCapability::ReadRange) {
+            if let Some(index) = tools
+                .iter()
+                .position(|tool| tool.metadata().id.0 == "filesystem.read_range")
+            {
+                tools[index] = Arc::new(HostAwarePathTool::read_range(
+                    plugin.limits.clone(),
+                    host_environment.clone(),
+                ));
+            }
+        }
+        if plugin.supports(tool_filesystem::plugin::FsCapability::Patch) {
+            if let Some(index) = tools
+                .iter()
+                .position(|tool| tool.metadata().id.0 == "filesystem.patch")
+            {
+                tools[index] = Arc::new(HostAwarePathTool::patch(
+                    plugin.limits.clone(),
+                    host_environment.clone(),
+                ));
+            }
+        }
         if plugin.supports(tool_filesystem::plugin::FsCapability::Patch) {
             tools.push(Arc::new(EditUserFileTool::new(
                 plugin.limits.clone(),
@@ -1438,9 +1565,10 @@ fn default_registry(
                 plugin.limits.clone(),
                 host_environment.clone(),
             )));
-            tools.push(Arc::new(EditTool::new(
+            tools.push(Arc::new(EditTool::new_with_context(
                 plugin.limits.clone(),
                 host_environment.clone(),
+                file_context,
             )));
         }
         if plugin.supports(tool_filesystem::plugin::FsCapability::Write) {
@@ -1860,9 +1988,10 @@ mod tests {
             "Path style: {}",
             crate::host_environment::host_path_style()
         )));
-        assert!(context.contains("Current working directory:"));
-        assert!(context.contains("Home directory:"));
-        assert!(context.contains("Filesystem tools require absolute host-native paths."));
+        assert!(context.contains("Available semantic user directories:"));
+        assert!(context.contains(
+            "Filesystem tools prefer file_ref or semantic directory ids with relative paths"
+        ));
         assert!(context.contains(
             "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file"
         ));
@@ -1882,6 +2011,37 @@ mod tests {
             assert!(context.contains("Path style: POSIX"));
             assert!(!context.contains("C:\\Users\\"));
         }
+    }
+
+    #[test]
+    fn native_host_context_injects_the_active_file_reference() {
+        let context = Arc::new(Mutex::new(ConversationFileContext::default()));
+        context.lock().unwrap().record_success(
+            FileRef::parse("file:desktop:note.txt").expect("test file ref is valid"),
+        );
+        let environment = HostEnvironment {
+            os: "linux",
+            architecture: "x86_64",
+            home: Some(std::path::PathBuf::from("/tmp/home")),
+            cwd: Some(std::path::PathBuf::from("/tmp/home")),
+            user_dirs: crate::host_environment::UserDirectories {
+                desktop: Some(std::path::PathBuf::from("/tmp/home/Escritorio")),
+                ..Default::default()
+            },
+            xdg_config_source: None,
+            path_style: "POSIX",
+            path_separator: "/",
+        };
+        let prompt = compose_host_system_prompt_for_context(
+            Some("continue"),
+            false,
+            &environment,
+            Some(&context),
+        );
+        assert!(prompt.contains("<active_file>"));
+        assert!(prompt.contains("file_ref: file:desktop:note.txt"));
+        assert!(prompt.contains("Reuse this file_ref"));
+        assert!(!prompt.contains("/tmp/home/Escritorio/note.txt"));
     }
 
     #[tokio::test]
@@ -1945,15 +2105,14 @@ mod tests {
         let desktop_line = |prompt: &str| {
             prompt
                 .lines()
-                .find(|line| line.starts_with("Desktop directory:"))
+                .find(|line| line.starts_with("Available semantic user directories:"))
                 .expect("host context must report Desktop")
                 .to_string()
         };
         assert_eq!(desktop_line(&english), desktop_line(&spanish));
-        assert_eq!(
-            desktop_line(&english),
-            format!("Desktop directory: {}", desktop.display())
-        );
+        assert!(desktop_line(&english).contains("desktop"));
+        assert!(!english.contains(&desktop.display().to_string()));
+        assert!(!spanish.contains(&desktop.display().to_string()));
         assert!(english.contains("Never translate filesystem directory names"));
         assert!(spanish.contains("Never translate filesystem directory names"));
         std::fs::remove_dir_all(&home).unwrap();
@@ -2391,8 +2550,13 @@ mod tests {
     #[test]
     fn simple_profile_filters_redundant_builtin_tools_from_model_registry() {
         let processes = Arc::new(ProcessManager::new(ProcessLimits::default()));
-        let registry =
-            default_registry(&processes, HostEnvironment::snapshot(), ToolProfile::Simple).unwrap();
+        let registry = default_registry(
+            &processes,
+            HostEnvironment::snapshot(),
+            ToolProfile::Simple,
+            None,
+        )
+        .unwrap();
         let ids: Vec<String> = registry
             .list()
             .into_iter()

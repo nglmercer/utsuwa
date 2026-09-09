@@ -48,6 +48,18 @@ fn failed(message: impl Into<String>) -> ToolError {
     }
 }
 
+/// Compatibility identity for raw absolute-path tools. The host replaces
+/// this with a semantic `file:<directory>:<relative>` reference whenever the
+/// path belongs to a configured user directory. This fallback is still only
+/// an identifier: every reuse must pass through normal capability checks.
+fn file_metadata(path: &Path) -> serde_json::Value {
+    let display_path = path.to_string_lossy().into_owned();
+    serde_json::json!({
+        "file_ref": format!("file:path:{display_path}"),
+        "display_path": display_path,
+    })
+}
+
 /// Extract the `path` argument. Only absolute paths are accepted — relative
 /// paths would resolve against an ambient cwd, which is implicit authority.
 fn arg_path(args: &serde_json::Value) -> Result<PathBuf, ToolError> {
@@ -411,12 +423,18 @@ impl tool_core::Tool for StatTool {
     ) -> Result<ToolOutput, ToolError> {
         let path = authorized_path(&ctx, Capability::FilesystemRead, &arg_path(&args)?)?;
         let meta = std::fs::symlink_metadata(&path).map_err(|e| failed(e.to_string()))?;
-        Ok(ToolOutput::new(serde_json::json!({
+        let mut content = serde_json::json!({
             "path": path.to_string_lossy(),
             "kind": entry_kind(&meta.file_type()),
             "size": meta.len(),
             "readonly": meta.permissions().readonly(),
-        })))
+        });
+        if let Some(object) = content.as_object_mut() {
+            if let Some(metadata) = file_metadata(&path).as_object() {
+                object.extend(metadata.clone());
+            }
+        }
+        Ok(ToolOutput::new(content))
     }
 }
 
@@ -453,8 +471,14 @@ impl tool_core::Tool for ReadTool {
         let path = authorized_path(&ctx, Capability::FilesystemRead, &arg_path(&args)?)?;
         let bytes = read_capped(&path, 0, self.limits.max_read_bytes as u64)?;
         let text = String::from_utf8_lossy(&bytes.content).into_owned();
+        let mut content = serde_json::json!({ "path": path.to_string_lossy(), "content": text });
+        if let Some(object) = content.as_object_mut() {
+            if let Some(metadata) = file_metadata(&path).as_object() {
+                object.extend(metadata.clone());
+            }
+        }
         Ok(ToolOutput {
-            content: serde_json::json!({ "path": path.to_string_lossy(), "content": text }),
+            content,
             truncated: bytes.truncated,
             mutation: None,
         })
@@ -512,12 +536,18 @@ impl tool_core::Tool for ReadRangeTool {
         let length = length.min(self.limits.max_read_bytes as u64);
         let path = authorized_path(&ctx, Capability::FilesystemRead, &arg_path(&args)?)?;
         let bytes = read_capped(&path, offset, length)?;
+        let mut content = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "offset": offset,
+            "content": String::from_utf8_lossy(&bytes.content),
+        });
+        if let Some(object) = content.as_object_mut() {
+            if let Some(metadata) = file_metadata(&path).as_object() {
+                object.extend(metadata.clone());
+            }
+        }
         Ok(ToolOutput {
-            content: serde_json::json!({
-                "path": path.to_string_lossy(),
-                "offset": offset,
-                "content": String::from_utf8_lossy(&bytes.content),
-            }),
+            content,
             truncated: bytes.truncated,
             mutation: None,
         })
@@ -971,16 +1001,23 @@ impl tool_core::Tool for PatchTool {
             return Err(failed(err.to_string()));
         }
         let after_hash = sha256_hex(text.as_bytes());
-        Ok(ToolOutput::new(serde_json::json!({
+        let mut content = serde_json::json!({
             "path": path.to_string_lossy(),
             "replacements": replacements.len(),
             "hash": after_hash,
-        }))
-        .with_mutation(tool_core::MutationEvidence {
-            path: path.to_string_lossy().into_owned(),
-            before_sha256: Some(before_hash),
-            after_sha256: Some(after_hash),
-        }))
+        });
+        if let Some(object) = content.as_object_mut() {
+            if let Some(metadata) = file_metadata(&path).as_object() {
+                object.extend(metadata.clone());
+            }
+        }
+        Ok(
+            ToolOutput::new(content).with_mutation(tool_core::MutationEvidence {
+                path: path.to_string_lossy().into_owned(),
+                before_sha256: Some(before_hash),
+                after_sha256: Some(after_hash),
+            }),
+        )
     }
 }
 
@@ -1081,18 +1118,25 @@ impl tool_core::Tool for WriteTool {
         }
         std::fs::write(&path, content.as_bytes()).map_err(|e| failed(e.to_string()))?;
         let after_hash = sha256_hex(content.as_bytes());
-        Ok(ToolOutput::new(serde_json::json!({
+        let mut result = serde_json::json!({
             "path": path.to_string_lossy(),
             "created": created,
             "parent_created": parent_created,
             "bytes": content.len(),
             "hash": after_hash,
-        }))
-        .with_mutation(tool_core::MutationEvidence {
-            path: path.to_string_lossy().into_owned(),
-            before_sha256: before_hash,
-            after_sha256: Some(after_hash),
-        }))
+        });
+        if let Some(object) = result.as_object_mut() {
+            if let Some(metadata) = file_metadata(&path).as_object() {
+                object.extend(metadata.clone());
+            }
+        }
+        Ok(
+            ToolOutput::new(result).with_mutation(tool_core::MutationEvidence {
+                path: path.to_string_lossy().into_owned(),
+                before_sha256: before_hash,
+                after_sha256: Some(after_hash),
+            }),
+        )
     }
 }
 

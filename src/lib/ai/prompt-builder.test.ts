@@ -137,10 +137,10 @@ test('native prompts explain host-native tool behavior', () => {
 	const native = buildSystemPrompt(makeContext({ nativeRuntime: true }));
 	assert.ok(native.includes('<native_agent_tools>'));
 	assert.ok(native.includes('use the tools supplied with the current model request'));
-	assert.ok(native.includes('Filesystem tool paths must be absolute'));
+	assert.ok(native.includes('Filesystem tools prefer a file_ref'));
 	assert.ok(native.includes('Never invent a path'));
 	assert.ok(native.includes('write a placeholder such as "Updated date"'));
-	assert.ok(native.includes('call system.time first'));
+	assert.ok(native.includes('system.time remains available'));
 	assert.ok(native.includes('Never claim a tool operation succeeded'));
 	assert.ok(native.includes('filesystem.list'));
 

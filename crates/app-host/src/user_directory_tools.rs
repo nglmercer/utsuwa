@@ -5,12 +5,16 @@
 //! configured absolute path and delegates the actual write to the existing
 //! filesystem broker.
 
+use crate::file_target::{
+    ConversationFileContext, FileRef, FileResolver, FileTarget, FileTargetError,
+    FilesystemErrorCode, ResolvedFileTarget, TargetPurpose,
+};
 use crate::host_environment::{HostEnvironment, UserDirectory};
 use serde_json::{Map, Value};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tool_core::{CapabilityRequirement, Tool, ToolContext, ToolError, ToolMetadata, ToolOutput};
-use tool_filesystem::{PatchTool, WriteTool};
+use tool_filesystem::{PatchTool, ReadRangeTool, ReadTool, StatTool, WriteTool};
 
 const USER_DIRECTORY_ENUM: [&str; 8] = [
     "desktop",
@@ -47,6 +51,357 @@ fn failed(tool: &str, message: impl Into<String>) -> ToolError {
     }
 }
 
+fn filesystem_error(tool: &str, error: FileTargetError) -> ToolError {
+    let mut details = serde_json::Map::new();
+    if let Some(received) = error.received {
+        details.insert("received".to_string(), Value::String(received));
+    }
+    if let Some(target) = error.suggested_target {
+        details.insert(
+            "suggested_target".to_string(),
+            serde_json::to_value(target).unwrap_or(Value::Null),
+        );
+    }
+    ToolError::Filesystem {
+        tool: tool.to_string(),
+        code: serde_json::to_string(&error.code)
+            .unwrap_or_else(|_| "io_failure".to_string())
+            .trim_matches('"')
+            .to_string(),
+        retryable: error.retryable,
+        message: error.message,
+        details: Value::Object(details),
+    }
+}
+
+fn file_target_descriptor(resolved: &ResolvedFileTarget) -> Value {
+    let mut file = serde_json::Map::new();
+    file.insert(
+        "file_ref".to_string(),
+        Value::String(resolved.file_ref.to_string()),
+    );
+    if let Some(directory) = resolved.directory {
+        file.insert(
+            "directory".to_string(),
+            Value::String(directory.json_key().to_string()),
+        );
+    }
+    if let Some(relative_path) = &resolved.relative_path {
+        file.insert(
+            "relative_path".to_string(),
+            Value::String(relative_path.to_string_lossy().into_owned()),
+        );
+    }
+    file.insert(
+        "display_path".to_string(),
+        Value::String(resolved.display_path.clone()),
+    );
+    Value::Object(file)
+}
+
+fn tag_file_output(
+    output: &mut ToolOutput,
+    path: &Path,
+    environment: &HostEnvironment,
+    purpose: TargetPurpose,
+) {
+    let resolver = FileResolver::new(environment.clone());
+    let Ok(resolved) = resolver.descriptor_for_absolute(path, purpose) else {
+        return;
+    };
+    if let Some(object) = output.content.as_object_mut() {
+        object.insert(
+            "file_ref".to_string(),
+            Value::String(resolved.file_ref.to_string()),
+        );
+        object.insert(
+            "display_path".to_string(),
+            Value::String(resolved.display_path.clone()),
+        );
+        if let Some(directory) = resolved.directory {
+            object.insert(
+                "directory".to_string(),
+                Value::String(directory.json_key().to_string()),
+            );
+        }
+        if let Some(relative_path) = &resolved.relative_path {
+            object.insert(
+                "relative_path".to_string(),
+                Value::String(relative_path.to_string_lossy().into_owned()),
+            );
+        }
+        object.insert("file".to_string(), file_target_descriptor(&resolved));
+    }
+}
+
+fn host_file_metadata(mut metadata: ToolMetadata, target_required: &[&str]) -> ToolMetadata {
+    if let Some(schema) = metadata.input_schema.as_object_mut() {
+        if let Some(properties) = schema
+            .entry("properties")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+        {
+            properties.insert(
+                "file_ref".to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "Stable reference returned by a previous successful filesystem operation. Prefer this for follow-up requests."
+                }),
+            );
+            properties.insert(
+                "target".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "directory": { "type": "string", "enum": USER_DIRECTORY_ENUM },
+                        "relative_path": { "type": "string" }
+                    },
+                    "required": ["directory", "relative_path"]
+                }),
+            );
+        }
+        schema.insert(
+            "required".to_string(),
+            Value::Array(
+                target_required
+                    .iter()
+                    .map(|field| Value::String((*field).to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    metadata.description.push_str(
+        " Prefer file_ref or target.directory + target.relative_path; absolute path remains a compatibility fallback and is still capability-checked.",
+    );
+    metadata
+}
+
+fn normalize_host_file_args(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    purpose: TargetPurpose,
+    tool: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
+    let has_file_ref = object.contains_key("file_ref");
+    let has_target = object.contains_key("target");
+    let has_path = object.contains_key("path");
+    if (has_file_ref as u8 + has_target as u8 + has_path as u8) > 1 {
+        return Err(invalid_args(
+            tool,
+            "provide exactly one target: file_ref, target, or path",
+        ));
+    }
+    let resolver = FileResolver::new(environment.clone());
+    let mut normalized = object.clone();
+    if has_file_ref {
+        let raw = object
+            .get("file_ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_args(tool, "'file_ref' must be a string"))?;
+        let file_ref = FileRef::parse(raw).map_err(|error| filesystem_error(tool, error))?;
+        let resolved = resolver
+            .resolve_ref(&file_ref, purpose)
+            .map_err(|error| filesystem_error(tool, error))?;
+        normalized.remove("file_ref");
+        normalized.insert(
+            "path".to_string(),
+            Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
+        );
+    } else if has_target {
+        let target = object
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_args(tool, "'target' must be an object"))?;
+        let directory = target
+            .get("directory")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                invalid_args(tool, "target.directory must be a semantic directory id")
+            })?;
+        let directory = parse_directory_value(directory, environment, tool)?;
+        let relative_path = target
+            .get("relative_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_args(tool, "target.relative_path must be a string"))?;
+        let resolved = resolver
+            .resolve_target(
+                &FileTarget {
+                    directory,
+                    relative_path: PathBuf::from(relative_path),
+                },
+                purpose,
+            )
+            .map_err(|error| filesystem_error(tool, error))?;
+        normalized.remove("target");
+        normalized.insert(
+            "path".to_string(),
+            Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
+        );
+    } else if has_path {
+        let path = object
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_args(tool, "'path' must be a string"))?;
+        if !Path::new(path).is_absolute() {
+            return Err(invalid_args(tool, "path must be absolute"));
+        }
+        let normalized_special = normalize_special_user_path(
+            Path::new(path),
+            environment,
+            tool,
+            if matches!(purpose, TargetPurpose::Existing) {
+                SpecialPathPurpose::ExistingFile
+            } else {
+                SpecialPathPurpose::Write
+            },
+            "filesystem.create_user_file",
+        )?;
+        let candidate = normalized_special.path;
+        let candidate_is_in_configured_root = environment.user_dirs.resolved().any(|(_, root)| {
+            lexical_absolute_path(root)
+                .zip(lexical_absolute_path(&candidate))
+                .is_some_and(|(root, candidate)| candidate.starts_with(root))
+        });
+        if candidate_is_in_configured_root || candidate != Path::new(path) {
+            if let Some(resolved) = resolver
+                .normalize_absolute_path(&candidate, purpose)
+                .map_err(|error| filesystem_error(tool, error))?
+            {
+                normalized.insert(
+                    "path".to_string(),
+                    Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
+                );
+            } else if candidate != Path::new(path) {
+                normalized.insert(
+                    "path".to_string(),
+                    Value::String(candidate.to_string_lossy().into_owned()),
+                );
+            }
+        } else if candidate != Path::new(path) {
+            normalized.insert(
+                "path".to_string(),
+                Value::String(candidate.to_string_lossy().into_owned()),
+            );
+        }
+    } else {
+        return Err(invalid_args(
+            tool,
+            "missing file_ref, target, or absolute path target",
+        ));
+    }
+    Ok(Value::Object(normalized))
+}
+
+/// Host adapter for absolute-path filesystem tools. It accepts the canonical
+/// `file_ref`/`target` contract, normalizes compatible absolute paths, then
+/// delegates the capability-bearing operation to the original broker tool.
+pub(crate) struct HostAwarePathTool {
+    inner: Arc<dyn Tool>,
+    environment: HostEnvironment,
+    purpose: TargetPurpose,
+}
+
+impl HostAwarePathTool {
+    pub(crate) fn read(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ReadTool { limits }),
+            environment,
+            purpose: TargetPurpose::Existing,
+        }
+    }
+
+    pub(crate) fn stat(environment: HostEnvironment) -> Self {
+        Self {
+            inner: Arc::new(StatTool),
+            environment,
+            purpose: TargetPurpose::Existing,
+        }
+    }
+
+    pub(crate) fn read_range(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ReadRangeTool { limits }),
+            environment,
+            purpose: TargetPurpose::Existing,
+        }
+    }
+
+    pub(crate) fn patch(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
+        Self {
+            inner: Arc::new(PatchTool { limits }),
+            environment,
+            purpose: TargetPurpose::Existing,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for HostAwarePathTool {
+    fn metadata(&self) -> ToolMetadata {
+        let required = if self.inner.metadata().id.0 == "filesystem.read_range" {
+            &["offset", "length"][..]
+        } else if self.inner.metadata().id.0 == "filesystem.patch" {
+            &["replacements"][..]
+        } else {
+            &[][..]
+        };
+        host_file_metadata(self.inner.metadata(), required)
+    }
+
+    fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
+        let normalized = normalize_host_file_args(
+            args,
+            &self.environment,
+            self.purpose,
+            &self.inner.metadata().id.0,
+        )
+        .ok()?;
+        self.inner.required_capability(&normalized)
+    }
+
+    async fn invoke(
+        &self,
+        ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let normalized = normalize_host_file_args(
+            &args,
+            &self.environment,
+            self.purpose,
+            &self.inner.metadata().id.0,
+        )?;
+        let mut output = self.inner.invoke(ctx, normalized).await?;
+        let path = output
+            .content
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| args.get("path").and_then(Value::as_str))
+            .map(str::to_owned);
+        if let Some(path) = path {
+            tag_file_output(
+                &mut output,
+                Path::new(&path),
+                &self.environment,
+                self.purpose,
+            );
+        }
+        Ok(output)
+    }
+}
+
 fn invalid_user_directory(tool: &str, received: &str, environment: &HostEnvironment) -> ToolError {
     let mut available_directories = Map::new();
     for directory in UserDirectory::ALL {
@@ -57,13 +412,18 @@ fn invalid_user_directory(tool: &str, received: &str, environment: &HostEnvironm
             );
         }
     }
-    let detail = serde_json::json!({
-        "error": "invalid_user_directory",
-        "received": received,
-        "valid_directory_ids": USER_DIRECTORY_ENUM,
-        "available_directories": available_directories,
-    });
-    invalid_args(tool, format!("invalid_user_directory: {detail}"))
+    ToolError::Filesystem {
+        tool: tool.to_string(),
+        code: "invalid_directory".to_string(),
+        retryable: true,
+        message: "The directory must be a semantic allowed-directory id, not an arbitrary path."
+            .to_string(),
+        details: serde_json::json!({
+            "received": received,
+            "valid_directory_ids": USER_DIRECTORY_ENUM,
+            "available_directories": available_directories,
+        }),
+    }
 }
 
 fn configured_directory_for_path(
@@ -106,19 +466,10 @@ fn parse_directory_value(
     environment: &HostEnvironment,
     tool: &str,
 ) -> Result<UserDirectory, ToolError> {
-    match value.to_ascii_lowercase().as_str() {
-        "desktop" => Ok(UserDirectory::Desktop),
-        "documents" => Ok(UserDirectory::Documents),
-        "downloads" => Ok(UserDirectory::Downloads),
-        "pictures" => Ok(UserDirectory::Pictures),
-        "music" => Ok(UserDirectory::Music),
-        "videos" => Ok(UserDirectory::Videos),
-        "public_share" => Ok(UserDirectory::PublicShare),
-        "templates" => Ok(UserDirectory::Templates),
-        _ => configured_directory_for_path(value, environment)
-            .or_else(|| configured_directory_for_basename(value, environment))
-            .ok_or_else(|| invalid_user_directory(tool, value, environment)),
-    }
+    UserDirectory::from_json_key(value)
+        .or_else(|| configured_directory_for_path(value, environment))
+        .or_else(|| configured_directory_for_basename(value, environment))
+        .ok_or_else(|| invalid_user_directory(tool, value, environment))
 }
 
 fn parse_directory(
@@ -230,15 +581,102 @@ fn write_args_for_path(object: &Map<String, Value>, path: &Path) -> serde_json::
     write_args
 }
 
+fn normalize_user_target_args(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+    purpose: TargetPurpose,
+) -> Result<serde_json::Value, ToolError> {
+    let args = normalize_legacy_directory_shape(args, environment, tool)?;
+    let Some(object) = args.as_object() else {
+        return Ok(args);
+    };
+    let has_file_ref = object.contains_key("file_ref");
+    let has_target = object.contains_key("target");
+    if has_file_ref && has_target {
+        return Err(invalid_args(
+            tool,
+            "provide exactly one target: file_ref or target",
+        ));
+    }
+    if !has_file_ref && !has_target {
+        return Ok(args);
+    }
+    let resolver = FileResolver::new(environment.clone());
+    let mut normalized = object.clone();
+    let resolved = if has_file_ref {
+        let raw = object
+            .get("file_ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_args(tool, "'file_ref' must be a string"))?;
+        let file_ref = FileRef::parse(raw).map_err(|error| filesystem_error(tool, error))?;
+        resolver
+            .resolve_ref(&file_ref, purpose)
+            .map_err(|error| filesystem_error(tool, error))?
+    } else {
+        let target = object
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_args(tool, "'target' must be an object"))?;
+        let directory = target
+            .get("directory")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                invalid_args(tool, "target.directory must be a semantic directory id")
+            })?;
+        let directory = parse_directory_value(directory, environment, tool)?;
+        let relative_path = target
+            .get("relative_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_args(tool, "target.relative_path must be a string"))?;
+        resolver
+            .resolve_target(
+                &FileTarget {
+                    directory,
+                    relative_path: PathBuf::from(relative_path),
+                },
+                purpose,
+            )
+            .map_err(|error| filesystem_error(tool, error))?
+    };
+    let (Some(directory), Some(relative_path)) = (resolved.directory, resolved.relative_path)
+    else {
+        return Err(invalid_args(
+            tool,
+            "this user-directory tool requires a semantic file_ref or target",
+        ));
+    };
+    for field in [
+        "file_ref",
+        "target",
+        "location",
+        "directory_id",
+        "directory",
+        "user_directory",
+    ] {
+        normalized.remove(field);
+    }
+    normalized.insert(
+        "location".to_string(),
+        Value::String(directory.json_key().to_string()),
+    );
+    normalized.insert(
+        "filename".to_string(),
+        Value::String(relative_path.to_string_lossy().into_owned()),
+    );
+    Ok(Value::Object(normalized))
+}
+
 fn resolve_user_file_args(
     args: &serde_json::Value,
     environment: &HostEnvironment,
     tool: &str,
 ) -> Result<ResolvedUserFile, ToolError> {
+    let args = normalize_user_target_args(args, environment, tool, TargetPurpose::Create)?;
     let object = args
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
-    let directory = parse_directory(args, environment, tool)?;
+    let directory = parse_directory(&args, environment, tool)?;
     let relative = object
         .get("relative_path")
         .and_then(serde_json::Value::as_str)
@@ -262,8 +700,20 @@ fn resolve_user_file_args(
             ),
         )
     })?;
+    let resolved = FileResolver::new(environment.clone())
+        .resolve_target(
+            &FileTarget {
+                directory,
+                relative_path: relative_path.to_path_buf(),
+            },
+            TargetPurpose::Create,
+        )
+        .map_err(|error| filesystem_error(tool, error))?;
+    let relative_path = resolved
+        .relative_path
+        .unwrap_or(relative_path.to_path_buf());
     let resolved_directory = base.to_path_buf();
-    let path = base.join(relative_path);
+    let path = resolved.absolute_path;
 
     Ok(ResolvedUserFile {
         directory,
@@ -373,10 +823,11 @@ fn resolve_create_user_file_args(
     environment: &HostEnvironment,
     tool: &str,
 ) -> Result<ResolvedUserFile, ToolError> {
+    let args = normalize_user_target_args(args, environment, tool, TargetPurpose::Create)?;
     let object = args
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
-    let directory = parse_location(args, environment, tool)?;
+    let directory = parse_location(&args, environment, tool)?;
     let base = environment.user_dirs.get(directory).ok_or_else(|| {
         failed(
             tool,
@@ -387,7 +838,18 @@ fn resolve_create_user_file_args(
         )
     })?;
     let (filename, generated_filename) = optional_filename(object, tool)?;
-    let (relative_path, path) = normalize_filename(&filename, base, tool)?;
+    let (relative_path, _) = normalize_filename(&filename, base, tool)?;
+    let resolved = FileResolver::new(environment.clone())
+        .resolve_target(
+            &FileTarget {
+                directory,
+                relative_path: relative_path.clone(),
+            },
+            TargetPurpose::Create,
+        )
+        .map_err(|error| filesystem_error(tool, error))?;
+    let relative_path = resolved.relative_path.unwrap_or(relative_path);
+    let path = resolved.absolute_path;
     Ok(ResolvedUserFile {
         directory,
         resolved_directory: base.to_path_buf(),
@@ -416,21 +878,19 @@ impl HostAwareWriteTool {
         }
     }
 
-    /// Normalize a stale conventional special-directory path before the
-    /// ticket is minted, so the ticket always scopes the final path.
-    /// Normalization is conservative: an existing conventional parent
-    /// (or both directories) keeps the explicit path.
-    fn normalized_write_path(&self, args: &serde_json::Value) -> Option<NormalizedSpecialPath> {
-        args.get("path").and_then(Value::as_str).and_then(|path| {
-            normalize_special_user_path(
-                Path::new(path),
-                &self.environment,
-                "filesystem.write",
-                SpecialPathPurpose::Write,
-                CREATE_USER_FILE_TOOL,
-            )
-            .ok()
-        })
+    /// Normalize a compatible target before the ticket is minted, so the
+    /// ticket always scopes the final path. A file_ref or semantic target is
+    /// resolved by the same host resolver as all other filesystem tools.
+    fn normalized_write_args(
+        &self,
+        args: &serde_json::Value,
+    ) -> Result<serde_json::Value, ToolError> {
+        normalize_host_file_args(
+            args,
+            &self.environment,
+            TargetPurpose::Create,
+            "filesystem.write",
+        )
     }
 }
 
@@ -468,7 +928,8 @@ pub(crate) fn enrich_write_error(error: ToolError, environment: &HostEnvironment
 #[async_trait::async_trait]
 impl Tool for HostAwareWriteTool {
     fn metadata(&self) -> ToolMetadata {
-        let mut metadata = self.inner.metadata();
+        let metadata = host_file_metadata(self.inner.metadata(), &["content"]);
+        let mut metadata = metadata;
         metadata.description.push_str(
             " Prefer filesystem.create_user_file for OS-configured Desktop, Documents, Downloads, Pictures, Music, Videos, Public, or Templates directories; use filesystem.write only for arbitrary explicit paths.",
         );
@@ -476,16 +937,7 @@ impl Tool for HostAwareWriteTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let mut forwarded = args.clone();
-        if let (Some(object), Some(normalized)) = (
-            forwarded.as_object_mut(),
-            self.normalized_write_path(args).as_ref(),
-        ) {
-            object.insert(
-                "path".to_string(),
-                Value::String(normalized.path.to_string_lossy().into_owned()),
-            );
-        }
+        let forwarded = self.normalized_write_args(args).ok()?;
         self.inner.required_capability(&forwarded)
     }
 
@@ -494,21 +946,33 @@ impl Tool for HostAwareWriteTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let mut args = args;
-        let normalized = self.normalized_write_path(&args);
-        if let (Some(object), Some(normalized)) = (args.as_object_mut(), normalized.as_ref()) {
-            object.insert(
-                "path".to_string(),
-                Value::String(normalized.path.to_string_lossy().into_owned()),
-            );
-        }
+        let original_path = args.get("path").and_then(Value::as_str).map(str::to_owned);
+        let args = self.normalized_write_args(&args)?;
+        let normalized_path = args.get("path").and_then(Value::as_str).map(str::to_owned);
         let mut output = self
             .inner
             .invoke(ctx, args)
             .await
             .map_err(|error| enrich_write_error(error, &self.environment))?;
-        if let Some(normalized) = normalized {
-            tag_normalized_from(&mut output, &normalized);
+        if original_path.is_some() && original_path != normalized_path {
+            if let Some(object) = output.content.as_object_mut() {
+                if let Some(original_path) = original_path {
+                    object.insert("normalized_from".to_string(), Value::String(original_path));
+                }
+            }
+        }
+        if let Some(path) = output
+            .content
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            tag_file_output(
+                &mut output,
+                Path::new(&path),
+                &self.environment,
+                TargetPurpose::Create,
+            );
         }
         Ok(output)
     }
@@ -597,6 +1061,13 @@ impl Tool for UserDirectoryWriteTool {
         let resolved = resolve_user_file_args(&args, &self.environment, WRITE_USER_FILE_TOOL)?;
         let directory = resolved.directory.json_key();
         let mut output = self.inner.invoke(ctx, resolved.write_args).await?;
+        tag_user_file_output(
+            &mut output,
+            resolved.directory,
+            &resolved.resolved_directory,
+            &resolved.relative_path,
+            &self.environment,
+        );
         if let Some(object) = output.content.as_object_mut() {
             object.insert(
                 "directory_id".to_string(),
@@ -698,6 +1169,13 @@ impl Tool for CreateUserFileTool {
         let resolved_filename = resolved.relative_path.to_string_lossy().into_owned();
         let generated_filename = resolved.generated_filename;
         let mut output = self.inner.invoke(ctx, resolved.write_args).await?;
+        tag_user_file_output(
+            &mut output,
+            resolved.directory,
+            &resolved.resolved_directory,
+            &resolved.relative_path,
+            &self.environment,
+        );
         if let Some(object) = output.content.as_object_mut() {
             object.insert(
                 "location".to_string(),
@@ -730,6 +1208,7 @@ struct ResolvedEditTarget {
     resolved_directory: PathBuf,
     relative_path: PathBuf,
     path: PathBuf,
+    file_ref: FileRef,
 }
 
 #[derive(Debug, Clone)]
@@ -869,6 +1348,16 @@ fn resolve_edit_target(
     environment: &HostEnvironment,
     tool: &str,
 ) -> Result<ResolvedEditTarget, ToolError> {
+    resolve_edit_target_with_purpose(args, environment, tool, TargetPurpose::Existing)
+}
+
+fn resolve_edit_target_with_purpose(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+    purpose: TargetPurpose,
+) -> Result<ResolvedEditTarget, ToolError> {
+    let args = normalize_user_target_args(args, environment, tool, purpose)?;
     let object = args
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
@@ -876,7 +1365,7 @@ fn resolve_edit_target(
         || object.contains_key("directory_id")
         || object.contains_key("directory");
     let directory = if has_location {
-        parse_location(args, environment, tool)?
+        parse_location(&args, environment, tool)?
     } else {
         let filename = required_filename(object, tool)?;
         infer_edit_directory(&filename, environment, tool)?
@@ -897,12 +1386,24 @@ fn resolve_edit_target(
     } else {
         required_filename(object, tool)?
     };
-    let (relative_path, path) = normalize_filename(&filename, base, tool)?;
+    let relative_path = if Path::new(&filename).is_absolute() {
+        normalize_filename(&filename, base, tool)?.0
+    } else {
+        PathBuf::from(&filename)
+    };
+    let target = FileTarget {
+        directory,
+        relative_path: relative_path.clone(),
+    };
+    let resolved = FileResolver::new(environment.clone())
+        .resolve_target(&target, purpose)
+        .map_err(|error| filesystem_error(tool, error))?;
     Ok(ResolvedEditTarget {
         directory,
         resolved_directory: base.to_path_buf(),
         relative_path,
-        path,
+        path: resolved.absolute_path,
+        file_ref: resolved.file_ref,
     })
 }
 
@@ -947,7 +1448,13 @@ fn unchanged_special_path(path: &Path) -> NormalizedSpecialPath {
 
 /// Record a stale-path remap in the tool output so the model (and the
 /// receipt UI) can see which explicit path was normalized to the result.
-fn tag_normalized_from(output: &mut ToolOutput, normalized: &NormalizedSpecialPath) {
+fn tag_normalized_from(
+    output: &mut ToolOutput,
+    normalized: &NormalizedSpecialPath,
+    environment: &HostEnvironment,
+    purpose: TargetPurpose,
+) {
+    tag_file_output(output, &normalized.path, environment, purpose);
     if normalized.mapped {
         if let Some(object) = output.content.as_object_mut() {
             object.insert(
@@ -1013,15 +1520,12 @@ pub(crate) fn normalize_special_user_path(
                 return Err(failed(
                     tool,
                     format!(
-                        "file_not_found: '{}' does not exist. The host-configured {} directory is '{}'; the same file name was not found there either (checked '{}'). {}",
+                        "file_not_found: '{}' does not exist. The host-configured {} directory is '{}'; the same file name was not found there either (checked '{}'). Use {next_tool} with location='{}' after creating the file, or retry with the exact absolute path",
                         path.display(),
                         directory.prompt_label(),
                         configured.display(),
                         candidate.display(),
-                        format!(
-                            "Use {next_tool} with location='{}' after creating the file, or retry with the exact absolute path",
-                            directory.json_key(),
-                        ),
+                        directory.json_key(),
                     ),
                 ));
             }
@@ -1199,6 +1703,225 @@ fn resolve_new_text_source(
     Ok(Value::Object(normalized))
 }
 
+/// Repair the common model mistake of copying a displayed file path into a
+/// directory selector. The repair is performed only when the host can prove
+/// the path is an existing file inside one configured user directory.
+fn normalize_legacy_directory_shape(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let Some(object) = args.as_object() else {
+        return Ok(args.clone());
+    };
+    let mut normalized = object.clone();
+    let selector = ["location", "directory_id", "directory", "user_directory"]
+        .into_iter()
+        .find(|field| normalized.contains_key(*field));
+    let Some(selector) = selector else {
+        return Ok(args.clone());
+    };
+    let Some(value) = normalized
+        .get(selector)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(args.clone());
+    };
+    if selector == "user_directory" {
+        normalized.remove(selector);
+        normalized.insert("location".to_string(), Value::String(value.clone()));
+    }
+    if !Path::new(&value).is_absolute() {
+        return Ok(Value::Object(normalized));
+    }
+    let resolver = FileResolver::new(environment.clone());
+    let resolved =
+        match resolver.normalize_absolute_path(Path::new(&value), TargetPurpose::Existing) {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => return Ok(Value::Object(normalized)),
+            Err(error)
+                if matches!(
+                    error.code,
+                    FilesystemErrorCode::FileNotFound
+                        | FilesystemErrorCode::DirectoryNotFound
+                        | FilesystemErrorCode::TargetIsDirectory
+                ) =>
+            {
+                return Ok(Value::Object(normalized));
+            }
+            Err(error) => return Err(filesystem_error(tool, error)),
+        };
+    let Some(directory) = resolved.directory else {
+        return Ok(Value::Object(normalized));
+    };
+    let Some(relative_path) = resolved.relative_path else {
+        return Ok(Value::Object(normalized));
+    };
+    for field in ["location", "directory_id", "directory", "user_directory"] {
+        normalized.remove(field);
+    }
+    normalized.insert(
+        "location".to_string(),
+        Value::String(directory.json_key().to_string()),
+    );
+    normalized.insert(
+        "filename".to_string(),
+        Value::String(relative_path.to_string_lossy().into_owned()),
+    );
+    if normalized
+        .get("path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| path == relative_path.to_string_lossy())
+    {
+        normalized.remove("path");
+    }
+    Ok(Value::Object(normalized))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditOperationKind {
+    Replace,
+    Append,
+}
+
+fn normalize_structured_edit_args(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let args = normalize_legacy_directory_shape(args, environment, tool)?;
+    let Some(object) = args.as_object() else {
+        return Ok(args.clone());
+    };
+    let mut normalized = object.clone();
+    let has_file_ref = normalized.contains_key("file_ref");
+    let has_target = normalized.contains_key("target");
+    if has_file_ref && has_target {
+        return Err(invalid_args(
+            tool,
+            "provide exactly one target: file_ref or target",
+        ));
+    }
+
+    let operation = normalized.get("operation").cloned();
+    if operation.is_some() && operation.as_ref().and_then(Value::as_object).is_none() {
+        return Err(invalid_args(tool, "'operation' must be an object"));
+    }
+    let operation_kind = operation
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|operation| operation.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if operation.is_some() {
+                String::new()
+            } else {
+                "replace".to_string()
+            }
+        });
+    if !matches!(operation_kind.as_str(), "replace" | "append") {
+        return Err(invalid_args(
+            tool,
+            "operation.type must be one of: replace, append",
+        ));
+    }
+    let target_purpose = if operation_kind == "append" {
+        TargetPurpose::Create
+    } else {
+        TargetPurpose::Existing
+    };
+    normalized.insert(
+        "operation_type".to_string(),
+        Value::String(operation_kind.clone()),
+    );
+    if let Some(operation) = operation.and_then(|value| value.as_object().cloned()) {
+        match operation_kind.as_str() {
+            "replace" => {
+                for field in ["old_text", "new_text", "new_text_source"] {
+                    if let Some(value) = operation.get(field) {
+                        normalized.insert(field.to_string(), value.clone());
+                    }
+                }
+            }
+            "append" => {
+                let text = operation
+                    .get("text")
+                    .or_else(|| operation.get("content"))
+                    .cloned()
+                    .ok_or_else(|| invalid_args(tool, "append operation requires text"))?;
+                normalized.insert("content".to_string(), text);
+            }
+            _ => unreachable!("operation kind validated above"),
+        }
+    }
+    normalized.remove("operation");
+
+    if has_file_ref {
+        let raw = normalized
+            .get("file_ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_args(tool, "'file_ref' must be a string"))?;
+        let file_ref = FileRef::parse(raw).map_err(|error| filesystem_error(tool, error))?;
+        let resolved = FileResolver::new(environment.clone())
+            .resolve_ref(&file_ref, target_purpose)
+            .map_err(|error| filesystem_error(tool, error))?;
+        normalized.remove("file_ref");
+        if let (Some(directory), Some(relative_path)) = (resolved.directory, resolved.relative_path)
+        {
+            normalized.insert(
+                "location".to_string(),
+                Value::String(directory.json_key().to_string()),
+            );
+            normalized.insert(
+                "filename".to_string(),
+                Value::String(relative_path.to_string_lossy().into_owned()),
+            );
+        } else {
+            normalized.insert(
+                "path".to_string(),
+                Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
+            );
+        }
+    } else if has_target {
+        let target = normalized
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_args(tool, "'target' must be an object"))?;
+        let directory = target
+            .get("directory")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                invalid_args(tool, "target.directory must be a semantic directory id")
+            })?;
+        let directory = parse_directory_value(directory, environment, tool)?;
+        let relative_path = target
+            .get("relative_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| invalid_args(tool, "target.relative_path must be a string"))?;
+        normalized.remove("target");
+        normalized.insert(
+            "location".to_string(),
+            Value::String(directory.json_key().to_string()),
+        );
+        normalized.insert("filename".to_string(), Value::String(relative_path));
+    }
+    Ok(Value::Object(normalized))
+}
+
+fn edit_operation_kind(args: &serde_json::Value) -> EditOperationKind {
+    match args
+        .get("operation_type")
+        .and_then(Value::as_str)
+        .unwrap_or("replace")
+    {
+        "append" => EditOperationKind::Append,
+        _ => EditOperationKind::Replace,
+    }
+}
+
 fn missing_edit_argument(path: &Path, missing: Vec<&str>, preserved: Vec<&str>) -> ToolError {
     let mut recovery = serde_json::Map::new();
     recovery.insert(
@@ -1288,7 +2011,15 @@ fn tag_user_file_output(
     directory: UserDirectory,
     resolved_directory: &Path,
     relative_path: &Path,
+    environment: &HostEnvironment,
 ) {
+    let target = FileTarget {
+        directory,
+        relative_path: relative_path.to_path_buf(),
+    };
+    let resolved_target = FileResolver::new(environment.clone())
+        .resolve_target(&target, TargetPurpose::Existing)
+        .ok();
     if let Some(object) = output.content.as_object_mut() {
         object.insert(
             "location".to_string(),
@@ -1299,6 +2030,10 @@ fn tag_user_file_output(
             Value::String(directory.json_key().to_string()),
         );
         object.insert(
+            "directory".to_string(),
+            Value::String(directory.json_key().to_string()),
+        );
+        object.insert(
             "resolved_directory".to_string(),
             Value::String(resolved_directory.to_string_lossy().into_owned()),
         );
@@ -1306,6 +2041,21 @@ fn tag_user_file_output(
             "filename".to_string(),
             Value::String(relative_path.to_string_lossy().into_owned()),
         );
+        object.insert(
+            "relative_path".to_string(),
+            Value::String(relative_path.to_string_lossy().into_owned()),
+        );
+        if let Some(resolved_target) = resolved_target {
+            object.insert(
+                "file_ref".to_string(),
+                Value::String(resolved_target.file_ref.to_string()),
+            );
+            object.insert(
+                "display_path".to_string(),
+                Value::String(resolved_target.display_path.clone()),
+            );
+            object.insert("file".to_string(), file_target_descriptor(&resolved_target));
+        }
     }
 }
 
@@ -1391,6 +2141,7 @@ impl Tool for EditUserFileTool {
             resolved.directory,
             &resolved.resolved_directory,
             &resolved.relative_path,
+            &self.environment,
         );
         if let Some(object) = output.content.as_object_mut() {
             object.insert("updated".to_string(), Value::Bool(true));
@@ -1498,7 +2249,12 @@ impl Tool for EditFileTool {
             .invoke(ctx, patch_args_for(&normalized.path, &old_text, &new_text))
             .await
             .map_err(|error| with_read_retry_guidance(&normalized.path, error))?;
-        tag_normalized_from(&mut output, &normalized);
+        tag_normalized_from(
+            &mut output,
+            &normalized,
+            &self.environment,
+            TargetPurpose::Existing,
+        );
         if let Some(object) = output.content.as_object_mut() {
             object.insert("updated".to_string(), Value::Bool(true));
         }
@@ -1558,7 +2314,13 @@ impl Tool for ReplaceUserFileTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let resolved = resolve_edit_target(args, &self.environment, REPLACE_USER_FILE_TOOL).ok()?;
+        let resolved = resolve_edit_target_with_purpose(
+            args,
+            &self.environment,
+            REPLACE_USER_FILE_TOOL,
+            TargetPurpose::Create,
+        )
+        .ok()?;
         self.inner
             .required_capability(&path_only_args(&resolved.path))
     }
@@ -1568,7 +2330,12 @@ impl Tool for ReplaceUserFileTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let resolved = resolve_edit_target(&args, &self.environment, REPLACE_USER_FILE_TOOL)?;
+        let resolved = resolve_edit_target_with_purpose(
+            &args,
+            &self.environment,
+            REPLACE_USER_FILE_TOOL,
+            TargetPurpose::Create,
+        )?;
         let object = args
             .as_object()
             .ok_or_else(|| invalid_args(REPLACE_USER_FILE_TOOL, "args must be a JSON object"))?;
@@ -1597,6 +2364,7 @@ impl Tool for ReplaceUserFileTool {
             resolved.directory,
             &resolved.resolved_directory,
             &resolved.relative_path,
+            &self.environment,
         );
         if let Some(object) = output.content.as_object_mut() {
             object.insert("updated".to_string(), Value::Bool(true));
@@ -1705,7 +2473,13 @@ impl Tool for AppendUserFileTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let resolved = resolve_edit_target(args, &self.environment, APPEND_USER_FILE_TOOL).ok()?;
+        let resolved = resolve_edit_target_with_purpose(
+            args,
+            &self.environment,
+            APPEND_USER_FILE_TOOL,
+            TargetPurpose::Create,
+        )
+        .ok()?;
         self.inner
             .required_capability(&path_only_args(&resolved.path))
     }
@@ -1715,7 +2489,12 @@ impl Tool for AppendUserFileTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let resolved = resolve_edit_target(&args, &self.environment, APPEND_USER_FILE_TOOL)?;
+        let resolved = resolve_edit_target_with_purpose(
+            &args,
+            &self.environment,
+            APPEND_USER_FILE_TOOL,
+            TargetPurpose::Create,
+        )?;
         let object = args
             .as_object()
             .ok_or_else(|| invalid_args(APPEND_USER_FILE_TOOL, "args must be a JSON object"))?;
@@ -1741,6 +2520,7 @@ impl Tool for AppendUserFileTool {
             resolved.directory,
             &resolved.resolved_directory,
             &resolved.relative_path,
+            &self.environment,
         );
         if let Some(object) = output.content.as_object_mut() {
             object.insert("appended".to_string(), Value::Bool(true));
@@ -1867,7 +2647,12 @@ impl Tool for AppendFileTool {
                 }),
             )
             .await?;
-        tag_normalized_from(&mut output, &normalized);
+        tag_normalized_from(
+            &mut output,
+            &normalized,
+            &self.environment,
+            TargetPurpose::Create,
+        );
         if let Some(object) = output.content.as_object_mut() {
             object.insert("appended".to_string(), Value::Bool(true));
         }
@@ -1894,6 +2679,7 @@ fn normalize_unified_edit_args(
     args: &serde_json::Value,
     environment: &HostEnvironment,
     tool: &str,
+    purpose: TargetPurpose,
 ) -> Result<serde_json::Value, ToolError> {
     let Some(object) = args.as_object() else {
         return Ok(args.clone());
@@ -1908,7 +2694,8 @@ fn normalize_unified_edit_args(
         let mut semantic = object.clone();
         semantic.remove("path");
         let semantic_args = serde_json::Value::Object(semantic.clone());
-        let semantic_target = resolve_edit_target(&semantic_args, environment, tool)?;
+        let semantic_target =
+            resolve_edit_target_with_purpose(&semantic_args, environment, tool, purpose)?;
         let path_matches = if Path::new(&path).is_absolute() {
             let normalized = normalize_special_user_path(
                 Path::new(&path),
@@ -2000,18 +2787,33 @@ fn edit_target_style(args: &serde_json::Value, tool: &str) -> Result<EditTargetS
 pub(crate) struct EditTool {
     user_file: EditUserFileTool,
     file: EditFileTool,
+    append_user_file: AppendUserFileTool,
+    append_file: AppendFileTool,
     pending_edit: Arc<Mutex<Option<PendingEditState>>>,
+    active_context: Option<Arc<Mutex<ConversationFileContext>>>,
 }
 
 impl EditTool {
+    #[cfg(test)]
     pub(crate) fn new(
         limits: tool_filesystem::FilesystemLimits,
         environment: HostEnvironment,
     ) -> Self {
+        Self::new_with_context(limits, environment, None)
+    }
+
+    pub(crate) fn new_with_context(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+        active_context: Option<Arc<Mutex<ConversationFileContext>>>,
+    ) -> Self {
         Self {
             user_file: EditUserFileTool::new(limits.clone(), environment.clone()),
-            file: EditFileTool::new(limits, environment),
+            file: EditFileTool::new(limits.clone(), environment.clone()),
+            append_user_file: AppendUserFileTool::new(limits.clone(), environment.clone()),
+            append_file: AppendFileTool::new(limits, environment),
             pending_edit: Arc::new(Mutex::new(None)),
+            active_context,
         }
     }
 
@@ -2023,7 +2825,9 @@ impl EditTool {
     }
 
     fn merged_args(&self, args: &serde_json::Value) -> Result<MergedEditArgs, ToolError> {
-        let source_args = resolve_new_text_source(args, EDIT_TOOL)?;
+        let structured_args =
+            normalize_structured_edit_args(args, &self.user_file.environment, EDIT_TOOL)?;
+        let source_args = resolve_new_text_source(&structured_args, EDIT_TOOL)?;
         let supplied = supplied_edit_texts(&source_args, EDIT_TOOL)?;
         let pending = self.pending_snapshot();
         let object = source_args
@@ -2033,15 +2837,66 @@ impl EditTool {
             || object.contains_key("directory_id")
             || object.contains_key("directory")
             || object.contains_key("filename");
+        let target_purpose = if edit_operation_kind(&source_args) == EditOperationKind::Append {
+            TargetPurpose::Create
+        } else {
+            TargetPurpose::Existing
+        };
         let mut merged = object.clone();
         let target = if has_semantic_target {
-            Some(resolve_edit_target(
+            Some(resolve_edit_target_with_purpose(
                 &source_args,
                 &self.user_file.environment,
                 EDIT_TOOL,
+                target_purpose,
             )?)
         } else if !object.contains_key("path") {
-            let Some(pending) = pending.as_ref() else {
+            if let Some(pending) = pending.as_ref() {
+                merged.insert(
+                    "location".to_string(),
+                    Value::String(pending.target.directory.json_key().to_string()),
+                );
+                merged.insert(
+                    "filename".to_string(),
+                    Value::String(pending.target.relative_path.to_string_lossy().into_owned()),
+                );
+                Some(pending.target.clone())
+            } else if let Some(active) = self.active_file()? {
+                let resolved = FileResolver::new(self.user_file.environment.clone())
+                    .resolve_ref(&active, target_purpose)
+                    .map_err(|error| filesystem_error(EDIT_TOOL, error))?;
+                if let (Some(directory), Some(relative_path)) =
+                    (resolved.directory, resolved.relative_path)
+                {
+                    merged.insert(
+                        "location".to_string(),
+                        Value::String(directory.json_key().to_string()),
+                    );
+                    merged.insert(
+                        "filename".to_string(),
+                        Value::String(relative_path.to_string_lossy().into_owned()),
+                    );
+                    Some(ResolvedEditTarget {
+                        directory,
+                        resolved_directory: self
+                            .user_file
+                            .environment
+                            .user_dirs
+                            .get(directory)
+                            .map(Path::to_path_buf)
+                            .unwrap_or_default(),
+                        relative_path,
+                        path: resolved.absolute_path,
+                        file_ref: resolved.file_ref,
+                    })
+                } else {
+                    merged.insert(
+                        "path".to_string(),
+                        Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
+                    );
+                    None
+                }
+            } else {
                 return Ok(MergedEditArgs {
                     args: source_args,
                     target: None,
@@ -2049,16 +2904,7 @@ impl EditTool {
                     supplied_old_text: supplied.0,
                     supplied_new_text: supplied.1,
                 });
-            };
-            merged.insert(
-                "location".to_string(),
-                Value::String(pending.target.directory.json_key().to_string()),
-            );
-            merged.insert(
-                "filename".to_string(),
-                Value::String(pending.target.relative_path.to_string_lossy().into_owned()),
-            );
-            Some(pending.target.clone())
+            }
         } else {
             None
         };
@@ -2087,6 +2933,16 @@ impl EditTool {
             supplied_old_text: supplied.0,
             supplied_new_text: supplied.1,
         })
+    }
+
+    fn active_file(&self) -> Result<Option<FileRef>, ToolError> {
+        let Some(context) = &self.active_context else {
+            return Ok(None);
+        };
+        context
+            .lock()
+            .map(|context| context.active_file.clone())
+            .map_err(|_| failed(EDIT_TOOL, "active file context is unavailable"))
     }
 
     fn remember_edit_attempt(
@@ -2156,11 +3012,31 @@ impl Tool for EditTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(EDIT_TOOL),
-            description: "Edit one exact text block inside an existing file. Use location plus filename for Desktop/Documents/etc., or path for an explicit absolute path. Target, old_text, and new_text may be completed across same-turn retries; the host preserves valid pending values. A UTF-8 file with exactly one non-empty line can be edited without first reading it. For date/time replacements, new_text_source may be current_date, current_time, or current_datetime. Exact-match safety, capability tickets, symlink checks, and atomic mutation remain enforced by the filesystem broker.".to_string(),
+            description: "Edit or append to an existing file. Prefer file_ref from a previous successful filesystem result; otherwise use target.directory (a semantic id such as desktop) plus target.relative_path. The host also accepts legacy location+filename or an absolute path as a safe compatibility fallback. Use operation.type=replace with old_text/new_text, or operation.type=append with text. Target and edit values may be completed across same-turn retries; valid pending values are preserved. Exact-match safety, capability tickets, canonical path checks, symlink checks, and atomic mutation remain enforced by the filesystem broker.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
+                    "file_ref": {
+                        "type": "string",
+                        "description": "Stable reference returned by a previous successful filesystem operation. Prefer this for follow-up edits; do not reconstruct it from display_path."
+                    },
+                    "target": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "directory": {
+                                "type": "string",
+                                "enum": USER_DIRECTORY_ENUM,
+                                "description": "Semantic allowed-directory id such as desktop or documents. Never pass a complete file path here."
+                            },
+                            "relative_path": {
+                                "type": "string",
+                                "description": "Path to the file relative to directory, such as note.txt or projects/demo/config.toml."
+                            }
+                        },
+                        "required": ["directory", "relative_path"]
+                    },
                     "location": {
                         "type": "string",
                         "enum": USER_DIRECTORY_ENUM,
@@ -2186,6 +3062,24 @@ impl Tool for EditTool {
                         "type": "string",
                         "enum": ["current_date", "current_time", "current_datetime"],
                         "description": "Resolve replacement text from the native local clock. Use instead of new_text for basic date/time edits."
+                    },
+                    "operation": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": ["replace", "append"]
+                            },
+                            "old_text": { "type": "string" },
+                            "new_text": { "type": "string" },
+                            "new_text_source": {
+                                "type": "string",
+                                "enum": ["current_date", "current_time", "current_datetime"]
+                            },
+                            "text": { "type": "string" }
+                        },
+                        "required": ["type"]
                     }
                 }
             }),
@@ -2202,12 +3096,33 @@ impl Tool for EditTool {
             }
         };
         self.discard_if_explicit_target_changed(&merged);
-        let normalized =
-            normalize_unified_edit_args(&merged.args, &self.user_file.environment, EDIT_TOOL)
-                .ok()?;
-        match edit_target_style(&normalized, EDIT_TOOL).ok()? {
-            EditTargetStyle::UserFile => self.user_file.required_capability(&normalized),
-            EditTargetStyle::ExplicitPath => self.file.required_capability(&normalized),
+        let normalized = normalize_unified_edit_args(
+            &merged.args,
+            &self.user_file.environment,
+            EDIT_TOOL,
+            if edit_operation_kind(&merged.args) == EditOperationKind::Append {
+                TargetPurpose::Create
+            } else {
+                TargetPurpose::Existing
+            },
+        )
+        .ok()?;
+        match (
+            edit_operation_kind(&normalized),
+            edit_target_style(&normalized, EDIT_TOOL).ok()?,
+        ) {
+            (EditOperationKind::Replace, EditTargetStyle::UserFile) => {
+                self.user_file.required_capability(&normalized)
+            }
+            (EditOperationKind::Replace, EditTargetStyle::ExplicitPath) => {
+                self.file.required_capability(&normalized)
+            }
+            (EditOperationKind::Append, EditTargetStyle::UserFile) => {
+                self.append_user_file.required_capability(&normalized)
+            }
+            (EditOperationKind::Append, EditTargetStyle::ExplicitPath) => {
+                self.append_file.required_capability(&normalized)
+            }
         }
     }
 
@@ -2223,15 +3138,22 @@ impl Tool for EditTool {
                 return Err(error);
             }
         };
-        let normalized =
-            match normalize_unified_edit_args(&merged.args, &self.user_file.environment, EDIT_TOOL)
-            {
-                Ok(normalized) => normalized,
-                Err(error) => {
-                    self.clear_pending_edit();
-                    return Err(error);
-                }
-            };
+        let normalized = match normalize_unified_edit_args(
+            &merged.args,
+            &self.user_file.environment,
+            EDIT_TOOL,
+            if edit_operation_kind(&merged.args) == EditOperationKind::Append {
+                TargetPurpose::Create
+            } else {
+                TargetPurpose::Existing
+            },
+        ) {
+            Ok(normalized) => normalized,
+            Err(error) => {
+                self.clear_pending_edit();
+                return Err(error);
+            }
+        };
         let style = match edit_target_style(&normalized, EDIT_TOOL) {
             Ok(style) => style,
             Err(error) => {
@@ -2241,10 +3163,15 @@ impl Tool for EditTool {
         };
         match style {
             EditTargetStyle::UserFile => {
-                let target = match resolve_edit_target(
+                let target = match resolve_edit_target_with_purpose(
                     &normalized,
                     &self.user_file.environment,
                     EDIT_TOOL,
+                    if edit_operation_kind(&normalized) == EditOperationKind::Append {
+                        TargetPurpose::Create
+                    } else {
+                        TargetPurpose::Existing
+                    },
                 ) {
                     Ok(target) => target,
                     Err(error) => {
@@ -2257,6 +3184,27 @@ impl Tool for EditTool {
                     merged.supplied_old_text,
                     merged.supplied_new_text,
                 );
+                if edit_operation_kind(&normalized) == EditOperationKind::Append {
+                    let mut delegated = normalized;
+                    if let Some(object) = delegated.as_object_mut() {
+                        let content = object.remove("content").ok_or_else(|| {
+                            invalid_args(EDIT_TOOL, "append operation requires text")
+                        })?;
+                        object.insert("content".to_string(), content);
+                    }
+                    return match self.append_user_file.invoke(ctx, delegated).await {
+                        Ok(output) => {
+                            self.clear_pending_edit();
+                            Ok(output)
+                        }
+                        Err(error) => {
+                            if !Self::keep_pending_after_error(&error) {
+                                self.clear_pending_edit();
+                            }
+                            Err(error)
+                        }
+                    };
+                }
                 let (old_text, new_text) = match parse_unified_old_new(&normalized, &target.path) {
                     Ok(values) => values,
                     Err(error) => return Err(error),
@@ -2290,6 +3238,16 @@ impl Tool for EditTool {
                     Ok(target) => target,
                     Err(error) => return Err(error),
                 };
+                if edit_operation_kind(&normalized) == EditOperationKind::Append {
+                    let mut delegated = normalized;
+                    if let Some(object) = delegated.as_object_mut() {
+                        let content = object.remove("content").ok_or_else(|| {
+                            invalid_args(EDIT_TOOL, "append operation requires text")
+                        })?;
+                        object.insert("content".to_string(), content);
+                    }
+                    return self.append_file.invoke(ctx, delegated).await;
+                }
                 let (old_text, new_text) = parse_unified_old_new(&normalized, &target.path)?;
                 let mut delegated = normalized;
                 if let Some(object) = delegated.as_object_mut() {
@@ -2696,9 +3654,16 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, ToolError::InvalidArgs { .. }));
-        let message = error.to_string();
-        assert!(message.contains("invalid_user_directory"));
+        assert!(matches!(
+            &error,
+            ToolError::Filesystem {
+                code,
+                retryable: true,
+                ..
+            } if code == "invalid_directory"
+        ));
+        let message = error.model_message();
+        assert!(message.contains("invalid_directory"));
         assert!(message.contains("valid_directory_ids"));
         assert!(message.contains("Escritorio"));
         assert!(!arbitrary.exists());
@@ -3514,6 +4479,204 @@ mod tests {
         assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
         assert_eq!(output.content["updated"], true);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello world");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_repairs_a_displayed_file_path_in_the_directory_field() {
+        let (home, desktop) = stale_home("utsuwa-edit-directory-file-path");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "2026-09-08\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": target.to_string_lossy(),
+                    "new_text": "2026-09-09",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "2026-09-09\n");
+        assert_eq!(output.content["file_ref"], "file:desktop:note.txt");
+        assert_eq!(output.content["directory"], "desktop");
+        assert_eq!(output.content["relative_path"], "note.txt");
+        assert_eq!(
+            output.content["file"]["display_path"],
+            target.to_string_lossy().as_ref()
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_accepts_a_file_ref_for_follow_up_edits() {
+        let (home, desktop) = stale_home("utsuwa-edit-file-ref");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "Version 1\n").unwrap();
+        let host = environment(&home, &desktop);
+        let tool = EditTool::new(tool_filesystem::FilesystemLimits::default(), host);
+        let first = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "target": {
+                        "directory": "desktop",
+                        "relative_path": "note.txt"
+                    },
+                    "operation": {
+                        "type": "replace",
+                        "old_text": "Version 1",
+                        "new_text": "Version 2"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        let file_ref = first.content["file_ref"].as_str().unwrap().to_string();
+        assert_eq!(file_ref, "file:desktop:note.txt");
+
+        let second = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "file_ref": file_ref,
+                    "operation": {
+                        "type": "append",
+                        "text": "follow-up\n"
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.content["file_ref"], "file:desktop:note.txt");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "Version 2\nfollow-up\n"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_rejects_a_stale_file_ref_without_recreating_the_file() {
+        let (home, desktop) = stale_home("utsuwa-edit-stale-ref");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "Version 1").unwrap();
+        let file_ref = FileRef::from_target(&FileTarget {
+            directory: UserDirectory::Desktop,
+            relative_path: PathBuf::from("note.txt"),
+        })
+        .unwrap();
+        std::fs::remove_file(&target).unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let error = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "file_ref": file_ref,
+                    "old_text": "Version 1",
+                    "new_text": "Version 2"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolError::Filesystem {
+                code,
+                retryable: false,
+                ..
+            } if code == "stale_file_ref"
+        ));
+        assert!(!target.exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_uses_active_file_context_for_a_targetless_follow_up() {
+        let (home, desktop) = stale_home("utsuwa-edit-active-file");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "first\n").unwrap();
+        let context = Arc::new(Mutex::new(ConversationFileContext::default()));
+        context.lock().unwrap().record_success(
+            FileRef::from_target(&FileTarget {
+                directory: UserDirectory::Desktop,
+                relative_path: PathBuf::from("note.txt"),
+            })
+            .unwrap(),
+        );
+        let tool = EditTool::new_with_context(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+            Some(context),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "operation": { "type": "append", "text": "second\n" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["file_ref"], "file:desktop:note.txt");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "first\nsecond\n");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_explicit_target_does_not_replace_the_active_file() {
+        let (home, desktop) = stale_home("utsuwa-edit-active-failure");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "first\n").unwrap();
+        let context = Arc::new(Mutex::new(ConversationFileContext::default()));
+        context.lock().unwrap().record_success(
+            FileRef::from_target(&FileTarget {
+                directory: UserDirectory::Desktop,
+                relative_path: PathBuf::from("note.txt"),
+            })
+            .unwrap(),
+        );
+        let tool = EditTool::new_with_context(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+            Some(Arc::clone(&context)),
+        );
+        let failed = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "target": {
+                        "directory": "desktop",
+                        "relative_path": "../outside.txt"
+                    },
+                    "new_text": "bad"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(failed, ToolError::Filesystem { .. }));
+        assert_eq!(
+            context.lock().unwrap().active().unwrap().as_str(),
+            "file:desktop:note.txt"
+        );
+
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "old_text": "first",
+                "new_text": "updated"
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "updated\n");
         std::fs::remove_dir_all(&home).unwrap();
     }
 

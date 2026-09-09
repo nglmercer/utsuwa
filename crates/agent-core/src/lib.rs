@@ -935,6 +935,9 @@ fn truncate_json(value: &serde_json::Value, max_bytes: usize) -> String {
 fn tool_error_status(error: &tool_core::ToolError) -> ToolStepStatus {
     match error {
         tool_core::ToolError::RetryRequired { .. } => ToolStepStatus::Retry,
+        tool_core::ToolError::Filesystem {
+            retryable: true, ..
+        } => ToolStepStatus::Retry,
         tool_core::ToolError::Denied { .. } => ToolStepStatus::Denied,
         _ => ToolStepStatus::Failed,
     }

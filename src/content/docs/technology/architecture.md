@@ -137,6 +137,31 @@ User Input
 
 **State extraction (two paths):** The model replies in character and ends with a JSON block of state updates (mood, relationship deltas, `new_memory`). Capable models emit it inline; when a model skips or mangles it (common on small, local, and roleplay-tuned models), a second forced-JSON call re-derives the state so memory and relationship movement still land. See [Companion System](/docs/technology/companion-system) for the two-path model and the parser's robustness layers.
 
+### Native filesystem targeting
+
+In the desktop host, the model identifies a file while the filesystem broker
+owns localization, path resolution, and capability checks. Successful file
+operations return both a human-facing `display_path` and a machine-facing
+`file_ref`, such as `file:desktop:note.txt`.
+
+For a new target, use a semantic directory ID and a path relative to that
+directory:
+
+```json
+{
+  "target": {
+    "directory": "desktop",
+    "relative_path": "note.txt"
+  }
+}
+```
+
+Follow-up operations should reuse `file_ref` instead of reconstructing a
+localized absolute path. The host accepts safe absolute-path compatibility
+inputs when they are inside a configured directory, but rejects traversal,
+symlink escapes, and paths outside the capability policy. A failed edit does
+not replace the active conversation file; only a successful operation does.
+
 **Showing images:** A shown image (camera or drag-drop) is serialized per provider — OpenAI-style `image_url` data URLs or Anthropic base64 `source` blocks (`content.ts`) — and only reaches vision-capable models. Kept photos are stored locally (blob + thumbnail) via `src/lib/services/storage/keepsakes.ts`.
 
 ### TTS Pipeline

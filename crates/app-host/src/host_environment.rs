@@ -4,10 +4,12 @@
 //! translation table. The resolver only reports a configured directory after
 //! checking that it currently exists and is a directory.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UserDirectory {
     Desktop,
     Documents,
@@ -54,6 +56,20 @@ impl UserDirectory {
             Self::Videos => "videos",
             Self::PublicShare => "public_share",
             Self::Templates => "templates",
+        }
+    }
+
+    pub fn from_json_key(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "desktop" => Some(Self::Desktop),
+            "documents" => Some(Self::Documents),
+            "downloads" => Some(Self::Downloads),
+            "pictures" => Some(Self::Pictures),
+            "music" => Some(Self::Music),
+            "videos" => Some(Self::Videos),
+            "public_share" | "public" => Some(Self::PublicShare),
+            "templates" => Some(Self::Templates),
+            _ => None,
         }
     }
 
