@@ -237,6 +237,12 @@ pnpm dev:native
 
 # Then run the Rust host in another terminal
 cargo run -- --dev
+
+# Native host diagnostics (stderr plus a rolling log file)
+cargo run -p app-host -- --debug
+
+# More verbose per-module diagnostics
+cargo run -p app-host -- --trace
 ```
 
 Browser development uses `pnpm dev` and does not provide native filesystem or
@@ -245,7 +251,10 @@ process access. Native development uses `pnpm dev:native` together with
 owns the permission-controlled AgentRuntime tools. The native runtime also
 detects that bridge at runtime, so a native host started against a plain
 `pnpm dev` server still uses AgentRuntime rather than silently falling back to
-a tool-less web request.
+a tool-less web request. `--debug` and `--trace` keep the same structured logs
+on stderr and also write a daily `utsuwa.log` under the native Utsuwa state
+directory in `logs/`; filesystem target normalization and tool routing include
+safe diagnostics there without logging file contents or edit text.
 
 #### Configuration
 
@@ -327,6 +336,8 @@ pnpm check        # Same as lint (alias)
 pnpm check:watch  # Type-check in watch mode
 cargo run         # Run the native desktop app (bundled frontend)
 cargo run -- --dev # Native app against the Svelte dev server
+cargo run -p app-host -- --debug # Native host logs for tool/filesystem debugging
+cargo run -p app-host -- --trace # Very verbose native host logs
 ```
 
 ## Roadmap

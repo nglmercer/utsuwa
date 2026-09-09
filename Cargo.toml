@@ -63,6 +63,7 @@ tool-filesystem = { path = "crates/tool-filesystem" }
 tool-process = { path = "crates/tool-process" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+tracing-appender = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 url = "2"
 wat = "1"

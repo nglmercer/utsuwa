@@ -177,11 +177,63 @@ fn host_file_metadata(mut metadata: ToolMetadata, target_required: &[&str]) -> T
     metadata
 }
 
+/// A small model may copy the configured directory root into `path` while
+/// also sending a semantic target. Treat that exact root (or its conventional
+/// host-local alias) as redundant metadata, never as the file target. The
+/// selected semantic target remains the source of truth and still goes
+/// through the resolver and capability broker.
+fn is_configured_directory_alias(
+    path: &Path,
+    directory: Option<UserDirectory>,
+    environment: &HostEnvironment,
+) -> bool {
+    let Some(directory) = directory else {
+        return false;
+    };
+    let Some(configured) = environment.user_dirs.get(directory) else {
+        return false;
+    };
+    let same_canonical_root = path
+        .canonicalize()
+        .ok()
+        .zip(configured.canonicalize().ok())
+        .is_some_and(|(path, configured)| path == configured);
+    if same_canonical_root {
+        return true;
+    }
+    environment.home.as_deref().is_some_and(|home| {
+        lexical_absolute_path(path)
+            == lexical_absolute_path(&home.join(directory.conventional_name()))
+    })
+}
+
+fn active_file_from_context(
+    active_context: Option<&Arc<Mutex<ConversationFileContext>>>,
+) -> Option<FileRef> {
+    active_context
+        .and_then(|context| context.lock().ok())
+        .and_then(|context| context.active_file.clone())
+}
+
+fn retryable_target_args(tool: &str, message: impl Into<String>) -> ToolError {
+    ToolError::RetryRequired {
+        tool: tool.to_string(),
+        message: "Filesystem target needs correction".to_string(),
+        recovery: serde_json::json!({
+            "error": "invalid_file_target",
+            "reason": message.into(),
+            "target_fields": ["file_ref", "target", "path"],
+            "next_tool": tool,
+        }),
+    }
+}
+
 fn normalize_host_file_args(
     args: &serde_json::Value,
     environment: &HostEnvironment,
     purpose: TargetPurpose,
     tool: &str,
+    active_context: Option<&Arc<Mutex<ConversationFileContext>>>,
 ) -> Result<serde_json::Value, ToolError> {
     let object = args
         .as_object()
@@ -189,14 +241,46 @@ fn normalize_host_file_args(
     let has_file_ref = object.contains_key("file_ref");
     let has_target = object.contains_key("target");
     let has_path = object.contains_key("path");
-    if (has_file_ref as u8 + has_target as u8 + has_path as u8) > 1 {
-        return Err(invalid_args(
+    let selector_count = has_file_ref as u8 + has_target as u8 + has_path as u8;
+    tracing::debug!(
+        tool = %tool,
+        has_file_ref,
+        has_target,
+        has_path,
+        "filesystem target styles received"
+    );
+    if selector_count == 0 {
+        if let Some(file_ref) = active_file_from_context(active_context) {
+            let resolver = FileResolver::new(environment.clone());
+            let resolved = resolver
+                .resolve_ref(&file_ref, purpose)
+                .map_err(|error| filesystem_error(tool, error))?;
+            let mut normalized = object.clone();
+            normalized.insert(
+                "path".to_string(),
+                Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
+            );
+            tracing::debug!(
+                tool = %tool,
+                file_ref = %resolved.file_ref,
+                path = %resolved.absolute_path.display(),
+                "filesystem target resolved from active file context"
+            );
+            return Ok(Value::Object(normalized));
+        }
+        return Err(retryable_target_args(
             tool,
-            "provide exactly one target: file_ref, target, or path",
+            "missing file_ref, target, or absolute path target",
         ));
     }
     let resolver = FileResolver::new(environment.clone());
     let mut normalized = object.clone();
+
+    // Resolve every supplied selector before choosing the canonical path.
+    // Small models frequently echo both a stable reference and a display
+    // path; equivalent selectors are safe to collapse, while mismatches are
+    // still rejected.
+    let mut candidates = Vec::<(&str, ResolvedFileTarget)>::new();
     if has_file_ref {
         let raw = object
             .get("file_ref")
@@ -206,12 +290,9 @@ fn normalize_host_file_args(
         let resolved = resolver
             .resolve_ref(&file_ref, purpose)
             .map_err(|error| filesystem_error(tool, error))?;
-        normalized.remove("file_ref");
-        normalized.insert(
-            "path".to_string(),
-            Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
-        );
-    } else if has_target {
+        candidates.push(("file_ref", resolved));
+    }
+    if has_target {
         let target = object
             .get("target")
             .and_then(Value::as_object)
@@ -236,63 +317,80 @@ fn normalize_host_file_args(
                 purpose,
             )
             .map_err(|error| filesystem_error(tool, error))?;
-        normalized.remove("target");
-        normalized.insert(
-            "path".to_string(),
-            Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
-        );
-    } else if has_path {
+        candidates.push(("target", resolved));
+    }
+    if has_path {
         let path = object
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_args(tool, "'path' must be a string"))?;
         if !Path::new(path).is_absolute() {
-            return Err(invalid_args(tool, "path must be absolute"));
+            return Err(retryable_target_args(tool, "path must be absolute"));
         }
-        let normalized_special = normalize_special_user_path(
-            Path::new(path),
-            environment,
-            tool,
-            if matches!(purpose, TargetPurpose::Existing) {
-                SpecialPathPurpose::ExistingFile
-            } else {
-                SpecialPathPurpose::Write
-            },
-            "filesystem.create_user_file",
-        )?;
-        let candidate = normalized_special.path;
-        let candidate_is_in_configured_root = environment.user_dirs.resolved().any(|(_, root)| {
-            lexical_absolute_path(root)
-                .zip(lexical_absolute_path(&candidate))
-                .is_some_and(|(root, candidate)| candidate.starts_with(root))
+        let path = Path::new(path);
+        let is_directory_hint = candidates.first().is_some_and(|(_, target)| {
+            is_configured_directory_alias(path, target.directory, environment)
         });
-        if candidate_is_in_configured_root || candidate != Path::new(path) {
-            if let Some(resolved) = resolver
-                .normalize_absolute_path(&candidate, purpose)
-                .map_err(|error| filesystem_error(tool, error))?
-            {
-                normalized.insert(
-                    "path".to_string(),
-                    Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
-                );
-            } else if candidate != Path::new(path) {
-                normalized.insert(
-                    "path".to_string(),
-                    Value::String(candidate.to_string_lossy().into_owned()),
-                );
-            }
-        } else if candidate != Path::new(path) {
-            normalized.insert(
-                "path".to_string(),
-                Value::String(candidate.to_string_lossy().into_owned()),
+        if is_directory_hint {
+            tracing::debug!(
+                tool = %tool,
+                path = %path.display(),
+                "ignored redundant configured-directory path hint"
             );
+        } else {
+            let normalized_special = normalize_special_user_path(
+                path,
+                environment,
+                tool,
+                if matches!(purpose, TargetPurpose::Existing) {
+                    SpecialPathPurpose::ExistingFile
+                } else {
+                    SpecialPathPurpose::Write
+                },
+                "filesystem.create_user_file",
+            )?;
+            let resolved = resolver
+                .descriptor_for_absolute(&normalized_special.path, purpose)
+                .map_err(|error| filesystem_error(tool, error))?;
+            candidates.push(("path", resolved));
         }
-    } else {
-        return Err(invalid_args(
+    }
+
+    let Some((_, canonical)) = candidates.first() else {
+        return Err(retryable_target_args(
             tool,
             "missing file_ref, target, or absolute path target",
         ));
+    };
+    if candidates
+        .iter()
+        .any(|(_, candidate)| candidate.absolute_path != canonical.absolute_path)
+    {
+        tracing::debug!(
+            tool = %tool,
+            candidates = ?candidates
+                .iter()
+                .map(|(kind, candidate)| (*kind, candidate.absolute_path.display().to_string()))
+                .collect::<Vec<_>>(),
+            "filesystem target styles resolved to different paths"
+        );
+        return Err(retryable_target_args(
+            tool,
+            "target references identify different files; provide one target or equivalent file_ref, target, and path values",
+        ));
     }
+    normalized.remove("file_ref");
+    normalized.remove("target");
+    normalized.insert(
+        "path".to_string(),
+        Value::String(canonical.absolute_path.to_string_lossy().into_owned()),
+    );
+    tracing::debug!(
+        tool = %tool,
+        file_ref = %canonical.file_ref,
+        path = %canonical.absolute_path.display(),
+        "filesystem target normalized"
+    );
     Ok(Value::Object(normalized))
 }
 
@@ -303,6 +401,7 @@ pub(crate) struct HostAwarePathTool {
     inner: Arc<dyn Tool>,
     environment: HostEnvironment,
     purpose: TargetPurpose,
+    active_context: Option<Arc<Mutex<ConversationFileContext>>>,
 }
 
 impl HostAwarePathTool {
@@ -314,6 +413,7 @@ impl HostAwarePathTool {
             inner: Arc::new(ReadTool { limits }),
             environment,
             purpose: TargetPurpose::Existing,
+            active_context: None,
         }
     }
 
@@ -322,6 +422,7 @@ impl HostAwarePathTool {
             inner: Arc::new(StatTool),
             environment,
             purpose: TargetPurpose::Existing,
+            active_context: None,
         }
     }
 
@@ -333,6 +434,7 @@ impl HostAwarePathTool {
             inner: Arc::new(ReadRangeTool { limits }),
             environment,
             purpose: TargetPurpose::Existing,
+            active_context: None,
         }
     }
 
@@ -344,7 +446,16 @@ impl HostAwarePathTool {
             inner: Arc::new(PatchTool { limits }),
             environment,
             purpose: TargetPurpose::Existing,
+            active_context: None,
         }
+    }
+
+    pub(crate) fn with_active_context(
+        mut self,
+        active_context: Option<Arc<Mutex<ConversationFileContext>>>,
+    ) -> Self {
+        self.active_context = active_context;
+        self
     }
 }
 
@@ -367,6 +478,7 @@ impl Tool for HostAwarePathTool {
             &self.environment,
             self.purpose,
             &self.inner.metadata().id.0,
+            self.active_context.as_ref(),
         )
         .ok()?;
         self.inner.required_capability(&normalized)
@@ -382,6 +494,7 @@ impl Tool for HostAwarePathTool {
             &self.environment,
             self.purpose,
             &self.inner.metadata().id.0,
+            self.active_context.as_ref(),
         )?;
         let mut output = self.inner.invoke(ctx, normalized).await?;
         let path = output
@@ -890,6 +1003,7 @@ impl HostAwareWriteTool {
             &self.environment,
             TargetPurpose::Create,
             "filesystem.write",
+            None,
         )
     }
 }
@@ -2689,21 +2803,7 @@ fn is_selected_directory_alias(
     target: &ResolvedEditTarget,
     environment: &HostEnvironment,
 ) -> bool {
-    let Some(configured) = environment.user_dirs.get(target.directory) else {
-        return false;
-    };
-    let same_canonical_root = path
-        .canonicalize()
-        .ok()
-        .zip(configured.canonicalize().ok())
-        .is_some_and(|(path, configured)| path == configured);
-    if same_canonical_root {
-        return true;
-    }
-    environment.home.as_deref().is_some_and(|home| {
-        lexical_absolute_path(path)
-            == lexical_absolute_path(&home.join(target.directory.conventional_name()))
-    })
+    is_configured_directory_alias(path, Some(target.directory), environment)
 }
 
 /// Keep older callers that put a bare filename in `path` working, but never
@@ -3411,6 +3511,151 @@ mod tests {
             invocation_id: invocation,
             ticket: Some(ticket),
         }
+    }
+
+    fn read_ticketed_context(path: &Path) -> ToolContext {
+        let principal = Principal::Agent(AgentId::new("user-directory-read-test"));
+        let invocation = InvocationId::fresh();
+        let ticket = CapabilityTicket::mint(
+            principal.clone(),
+            Capability::FilesystemRead,
+            ResourceScope::new(vec![Resource::Path(path.to_path_buf())]),
+            invocation,
+            Duration::from_secs(60),
+        );
+        ToolContext {
+            principal,
+            invocation_id: invocation,
+            ticket: Some(ticket),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_read_accepts_equivalent_target_selectors() {
+        let (home, desktop) = stale_home("host-read-equivalent-targets");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "2026-09-08\n").unwrap();
+        let file_ref = FileRef::from_target(&FileTarget {
+            directory: UserDirectory::Desktop,
+            relative_path: PathBuf::from("note.txt"),
+        })
+        .unwrap();
+        let tool = HostAwarePathTool::read(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+
+        let output = tool
+            .invoke(
+                read_ticketed_context(&target),
+                serde_json::json!({
+                    "file_ref": file_ref,
+                    "target": {
+                        "directory": "desktop",
+                        "relative_path": "note.txt"
+                    },
+                    "path": target.to_string_lossy(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.content["content"], "2026-09-08\n");
+        assert_eq!(output.content["file_ref"], "file:desktop:note.txt");
+        assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_read_marks_mismatched_target_selectors_as_retryable() {
+        let (home, desktop) = stale_home("host-read-mismatched-targets");
+        let target = desktop.join("note.txt");
+        let other = desktop.join("other.txt");
+        std::fs::write(&target, "note\n").unwrap();
+        std::fs::write(&other, "other\n").unwrap();
+        let tool = HostAwarePathTool::read(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+
+        let error = tool
+            .invoke(
+                read_ticketed_context(&target),
+                serde_json::json!({
+                    "target": {
+                        "directory": "desktop",
+                        "relative_path": "note.txt"
+                    },
+                    "path": other.to_string_lossy(),
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ToolError::RetryRequired { .. }),
+            "{error:?}"
+        );
+        assert!(error.model_message().contains("invalid_file_target"));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_read_ignores_redundant_configured_directory_path_hint() {
+        let (home, desktop) = stale_home("host-read-directory-hint");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "line\n").unwrap();
+        let tool = HostAwarePathTool::read(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+
+        let output = tool
+            .invoke(
+                read_ticketed_context(&target),
+                serde_json::json!({
+                    "target": {
+                        "directory": "desktop",
+                        "relative_path": "note.txt"
+                    },
+                    "path": desktop.to_string_lossy(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.content["content"], "line\n");
+        assert_eq!(output.content["file_ref"], "file:desktop:note.txt");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_read_reuses_active_file_when_target_is_omitted() {
+        let (home, desktop) = stale_home("host-read-active-file");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "2026-09-08\n").unwrap();
+        let context = Arc::new(Mutex::new(ConversationFileContext::default()));
+        context.lock().unwrap().record_success(
+            FileRef::from_target(&FileTarget {
+                directory: UserDirectory::Desktop,
+                relative_path: PathBuf::from("note.txt"),
+            })
+            .unwrap(),
+        );
+        let tool = HostAwarePathTool::read(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        )
+        .with_active_context(Some(context));
+
+        let output = tool
+            .invoke(read_ticketed_context(&target), serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert_eq!(output.content["content"], "2026-09-08\n");
+        assert_eq!(output.content["file_ref"], "file:desktop:note.txt");
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[tokio::test]

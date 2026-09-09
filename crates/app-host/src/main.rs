@@ -6,6 +6,11 @@
 //! the winit window path. Dev mode (`--dev`) loads the Svelte dev
 //! server; otherwise bundled assets are served by Rust over the custom
 //! scheme (plan Phase 3).
+//!
+//! Pass `--debug` to enable structured diagnostics for the native host and
+//! write them to the rolling log under the Utsuwa state directory. `--trace`
+//! enables the more verbose per-module trace filter. `RUST_LOG` remains
+//! supported for normal runs.
 
 use app_host::{
     agent_runtime::EmitFn,
@@ -38,6 +43,105 @@ const BRIDGE_JS: &str = include_str!("bridge.js");
 /// path pings the event-loop proxy; the GTK path needs nothing — a
 /// timeout source drains the queue several times a second.
 type Waker = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct CliOptions {
+    dev: bool,
+    dev_grant_workspace: bool,
+    debug: bool,
+    trace: bool,
+}
+
+impl CliOptions {
+    fn from_env() -> Self {
+        let args = std::env::args().skip(1).collect::<Vec<_>>();
+        Self {
+            dev: args.iter().any(|arg| arg == "--dev"),
+            dev_grant_workspace: args.iter().any(|arg| arg == "--dev-grant-workspace"),
+            debug: args.iter().any(|arg| arg == "--debug"),
+            trace: args.iter().any(|arg| arg == "--trace"),
+        }
+    }
+}
+
+const DEBUG_LOG_MODULES: &[&str] = &[
+    "app_host",
+    "agent_core",
+    "tool_core",
+    "tool_filesystem",
+    "capability_core",
+    "policy_core",
+    "mcp_runtime",
+    "plugin_wasm",
+    "tool_process",
+    "tool_desktop",
+    "desktop_linux",
+    "memory",
+    "storage_core",
+    "secret_core",
+    "model_openai_compatible",
+];
+
+fn debug_filter(level: &str) -> String {
+    DEBUG_LOG_MODULES
+        .iter()
+        .map(|module| format!("{module}={level}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Initialize stderr logging for normal runs and stderr + a rolling file for
+/// `--debug`/`--trace`. The guard must remain alive until process shutdown so
+/// the non-blocking writer can flush its final records.
+fn init_logging(options: CliOptions) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let verbose = options.debug || options.trace;
+    if !verbose {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive("app_host=info".parse().expect("static directive")),
+            )
+            .init();
+        return None;
+    }
+
+    let level = if options.trace { "trace" } else { "debug" };
+    let filter = tracing_subscriber::EnvFilter::new(debug_filter(level));
+    let log_dir = storage_core::default_state_dir("utsuwa").join("logs");
+    let appender = match std::fs::create_dir_all(&log_dir) {
+        Ok(()) => tracing_appender::rolling::daily(&log_dir, "utsuwa.log"),
+        Err(error) => {
+            eprintln!("could not create native debug log directory {log_dir:?}: {error}");
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_file(options.trace)
+                .with_line_number(options.trace)
+                .init();
+            return None;
+        }
+    };
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
+    let (file_writer, guard) = tracing_appender::non_blocking(appender);
+    let writer = file_writer.and(std::io::stderr);
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_file(options.trace)
+        .with_line_number(options.trace)
+        .init();
+    tracing::info!(
+        debug = options.debug,
+        trace = options.trace,
+        log_dir = %log_dir.display(),
+        "native debug logging enabled"
+    );
+    Some(guard)
+}
 
 /// Shared WebView configuration: URL, navigation policy, custom scheme,
 /// bridge script, and the typed IPC handler. Replies queue on
@@ -415,15 +519,10 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("app_host=info".parse().expect("static directive")),
-        )
-        .init();
-
-    let dev = std::env::args().any(|arg| arg == "--dev");
-    let dev_grant_workspace = std::env::args().any(|arg| arg == "--dev-grant-workspace");
+    let options = CliOptions::from_env();
+    let _log_guard = init_logging(options);
+    let dev = options.dev;
+    let dev_grant_workspace = options.dev_grant_workspace;
     let config = if dev {
         AppHostConfig::dev(env!("CARGO_PKG_VERSION"))
     } else {

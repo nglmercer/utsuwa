@@ -1520,10 +1520,10 @@ fn default_registry(
                 .iter()
                 .position(|tool| tool.metadata().id.0 == "filesystem.read")
             {
-                tools[index] = Arc::new(HostAwarePathTool::read(
-                    plugin.limits.clone(),
-                    host_environment.clone(),
-                ));
+                tools[index] = Arc::new(
+                    HostAwarePathTool::read(plugin.limits.clone(), host_environment.clone())
+                        .with_active_context(file_context.clone()),
+                );
             }
         }
         if plugin.supports(tool_filesystem::plugin::FsCapability::Stat) {
@@ -1531,7 +1531,10 @@ fn default_registry(
                 .iter()
                 .position(|tool| tool.metadata().id.0 == "filesystem.stat")
             {
-                tools[index] = Arc::new(HostAwarePathTool::stat(host_environment.clone()));
+                tools[index] = Arc::new(
+                    HostAwarePathTool::stat(host_environment.clone())
+                        .with_active_context(file_context.clone()),
+                );
             }
         }
         if plugin.supports(tool_filesystem::plugin::FsCapability::ReadRange) {
@@ -1539,10 +1542,10 @@ fn default_registry(
                 .iter()
                 .position(|tool| tool.metadata().id.0 == "filesystem.read_range")
             {
-                tools[index] = Arc::new(HostAwarePathTool::read_range(
-                    plugin.limits.clone(),
-                    host_environment.clone(),
-                ));
+                tools[index] = Arc::new(
+                    HostAwarePathTool::read_range(plugin.limits.clone(), host_environment.clone())
+                        .with_active_context(file_context.clone()),
+                );
             }
         }
         if plugin.supports(tool_filesystem::plugin::FsCapability::Patch) {
@@ -1550,10 +1553,10 @@ fn default_registry(
                 .iter()
                 .position(|tool| tool.metadata().id.0 == "filesystem.patch")
             {
-                tools[index] = Arc::new(HostAwarePathTool::patch(
-                    plugin.limits.clone(),
-                    host_environment.clone(),
-                ));
+                tools[index] = Arc::new(
+                    HostAwarePathTool::patch(plugin.limits.clone(), host_environment.clone())
+                        .with_active_context(file_context.clone()),
+                );
             }
         }
         if plugin.supports(tool_filesystem::plugin::FsCapability::Patch) {
