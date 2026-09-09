@@ -23,6 +23,26 @@ export function ensureOpenAIPath(url: string): string {
 	return /\/v1$/i.test(cleanUrl) ? cleanUrl : `${cleanUrl}/v1`;
 }
 
+/**
+ * Bare hosts carry no path to preserve, so assume the OpenAI `/v1`
+ * convention (`https://api.example.com` → `https://api.example.com/v1`).
+ * Without this, model listing hits `{host}/models` and chat hits
+ * `{host}/chat/completions` — gateways answer those with HTML landing
+ * pages (HTTP 200), which surfaces as "invalid model metadata".
+ * Configured sub-paths are left intact: the operator placed the API there
+ * deliberately (gateways mounted below `/openai` or `/api`).
+ */
+function ensureVersionedRoot(url: string): string {
+	if (!url) return url;
+	try {
+		const parsed = new URL(url);
+		if (parsed.pathname === '/' || parsed.pathname === '') return ensureOpenAIPath(url);
+		return url;
+	} catch {
+		return url;
+	}
+}
+
 // A default local Ollama reached through the OpenAI-compatible provider: its
 // model list lives at /api/tags instead of /v1/models. Shared so the web and
 // desktop discovery paths can't drift.
@@ -106,7 +126,7 @@ export function getModelsBaseUrl(providerId: string, baseUrl?: string): string {
 		return ensureOpenAIPath(cleanUrl);
 	}
 
-	return cleanUrl;
+	return ensureVersionedRoot(cleanUrl);
 }
 
 export function getChatBaseUrl(providerId: string, baseUrl?: string): string {
@@ -116,7 +136,13 @@ export function getChatBaseUrl(providerId: string, baseUrl?: string): string {
 		return ensureOpenAIPath(cleanUrl);
 	}
 
-	return cleanUrl;
+	// Anthropic is header-versioned at the root (`{host}/messages`), so it
+	// must never gain a `/v1` path segment.
+	if (providerId === 'anthropic') {
+		return cleanUrl;
+	}
+
+	return ensureVersionedRoot(cleanUrl);
 }
 
 /** LM Studio's metadata API is rooted at the server origin, not `/v1`. */

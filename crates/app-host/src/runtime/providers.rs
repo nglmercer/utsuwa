@@ -241,7 +241,12 @@ impl Default for ProviderRegistry {
 
 /// Normalize only endpoint semantics known by the native provider factory.
 /// LM Studio and Ollama expose their OpenAI-compatible chat API below `/v1`;
-/// arbitrary OpenAI-compatible gateways keep their configured path intact.
+/// other providers gain `/v1` only when the configured URL is a bare host
+/// (`https://api.example.com` → `https://api.example.com/v1`) — otherwise a
+/// model list lands on `{host}/models` and chat on `{host}/chat/completions`,
+/// where gateways answer with HTML landing pages instead of the API.
+/// Arbitrary OpenAI-compatible gateways with a configured sub-path keep it
+/// intact, and Anthropic stays untouched (header-versioned at the root).
 pub fn normalize_provider_base_url(provider: &str, base_url: &str) -> String {
     let mut normalized = base_url.trim().trim_end_matches('/').to_string();
     const CHAT_SUFFIX: &str = "/chat/completions";
@@ -253,8 +258,19 @@ pub fn normalize_provider_base_url(provider: &str, base_url: &str) -> String {
         && !normalized.to_ascii_lowercase().ends_with("/v1")
     {
         normalized.push_str("/v1");
+    } else if provider != "anthropic" && is_bare_host_url(&normalized) {
+        normalized.push_str("/v1");
     }
     normalized
+}
+
+/// True when the URL carries no path beyond the root, so the OpenAI `/v1`
+/// convention can be assumed without overriding an operator's sub-path.
+/// Unparsable values are left alone rather than guessed.
+fn is_bare_host_url(url: &str) -> bool {
+    url::Url::parse(url)
+        .map(|parsed| parsed.path() == "/" || parsed.path().is_empty())
+        .unwrap_or(false)
 }
 
 fn sanitize_provider_url_for_log(base_url: &str) -> String {
