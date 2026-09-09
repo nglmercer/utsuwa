@@ -1590,6 +1590,17 @@ fn single_line_edit_text(path: &Path) -> Option<String> {
     Some(line.to_string())
 }
 
+fn is_date_placeholder(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "updated date" | "current date" | "today's date" | "today date"
+    )
+}
+
+fn current_local_date() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 fn parse_old_new(
     args: &serde_json::Value,
     tool: &str,
@@ -1625,12 +1636,11 @@ fn parse_old_new(
             ),
         )
     })?;
-    if new_text.trim().eq_ignore_ascii_case("updated date") {
-        return Err(invalid_args(
-            tool,
-            "'new_text' is a placeholder, not a date. Call system.time first, then retry with its exact 'date' value.",
-        ));
-    }
+    let new_text = if is_date_placeholder(&new_text) {
+        current_local_date()
+    } else {
+        new_text
+    };
     Ok((old_text, new_text))
 }
 
@@ -1660,15 +1670,6 @@ fn supplied_edit_texts(
         return Err(invalid_args(tool, "'old_text' must not be empty"));
     }
     let new_text = optional_edit_text(object, tool, "new_text")?;
-    if new_text
-        .as_deref()
-        .is_some_and(|text| text.trim().eq_ignore_ascii_case("updated date"))
-    {
-        return Err(invalid_args(
-            tool,
-            "'new_text' is a placeholder; use the host's current date or another concrete replacement",
-        ));
-    }
     Ok((old_text, new_text))
 }
 
@@ -1679,23 +1680,30 @@ fn resolve_new_text_source(
     let Some(object) = args.as_object() else {
         return Ok(args.clone());
     };
-    let Some(source) = object.get("new_text_source") else {
-        return Ok(args.clone());
-    };
-    let source = source
-        .as_str()
-        .ok_or_else(|| invalid_args(tool, "'new_text_source' must be a string when provided"))?;
-    let local = chrono::Local::now();
-    let new_text = match source {
-        "current_date" => local.format("%Y-%m-%d").to_string(),
-        "current_time" => local.format("%H:%M:%S").to_string(),
-        "current_datetime" => local.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        _ => {
-            return Err(invalid_args(
-                tool,
-                "'new_text_source' must be one of: current_date, current_time, current_datetime",
-            ));
+    let new_text = if let Some(source) = object.get("new_text_source") {
+        let source = source.as_str().ok_or_else(|| {
+            invalid_args(tool, "'new_text_source' must be a string when provided")
+        })?;
+        let local = chrono::Local::now();
+        match source {
+            "current_date" => local.format("%Y-%m-%d").to_string(),
+            "current_time" => local.format("%H:%M:%S").to_string(),
+            "current_datetime" => local.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            _ => {
+                return Err(invalid_args(
+                    tool,
+                    "'new_text_source' must be one of: current_date, current_time, current_datetime",
+                ));
+            }
         }
+    } else if let Some(new_text) = object.get("new_text").and_then(Value::as_str) {
+        if is_date_placeholder(new_text) {
+            current_local_date()
+        } else {
+            return Ok(args.clone());
+        }
+    } else {
+        return Ok(args.clone());
     };
     let mut normalized = object.clone();
     normalized.remove("new_text_source");
@@ -3790,7 +3798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_user_file_rejects_unknown_and_ambiguous_old_text() {
+    async fn edit_user_file_rejects_unknown_and_ambiguous_old_text_but_resolves_date_placeholder() {
         let home = std::env::temp_dir().join(format!(
             "utsuwa-edit-user-file-safety-{}",
             std::process::id()
@@ -3848,14 +3856,10 @@ mod tests {
                 }),
             )
             .await
-            .unwrap_err();
-        assert!(matches!(placeholder, ToolError::InvalidArgs { .. }));
-        assert!(placeholder.to_string().contains("system.time"));
-        // All failed attempts leave the file untouched.
-        assert_eq!(
-            std::fs::read_to_string(&target).unwrap(),
-            "alpha beta alpha"
-        );
+            .unwrap();
+        assert_eq!(placeholder.content["updated"], true);
+        let expected_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), expected_date);
         std::fs::remove_dir_all(&home).unwrap();
     }
 
@@ -5115,6 +5119,35 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_resolves_model_date_placeholder() {
+        let (home, desktop) = stale_home("utsuwa-edit-date-placeholder");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "2026-09-08\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let expected = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "new_text": "Updated date",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["updated"], true);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            format!("{expected}\n")
+        );
         std::fs::remove_dir_all(&home).unwrap();
     }
 
