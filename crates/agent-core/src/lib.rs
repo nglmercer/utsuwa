@@ -783,6 +783,23 @@ impl Agent {
             }
             Err(err) => {
                 let model_message = err.model_message();
+                let (error_kind, retryable, recovery_code) = match &err {
+                    tool_core::ToolError::RetryRequired { recovery, .. } => (
+                        "retry_required",
+                        true,
+                        recovery
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                    ),
+                    tool_core::ToolError::Filesystem {
+                        code, retryable, ..
+                    } => ("filesystem", *retryable, code.as_str()),
+                    tool_core::ToolError::InvalidArgs { .. } => ("invalid_args", false, ""),
+                    tool_core::ToolError::Denied { .. } => ("denied", false, ""),
+                    tool_core::ToolError::Failed { .. } => ("failed", false, ""),
+                    _ => ("other", false, ""),
+                };
                 let detail = match (authorizer.authorization_mode(), requirement.as_ref()) {
                     (Some(mode), Some(_)) => format!("{}; authorization_mode={mode}", err),
                     _ => err.to_string(),
@@ -798,6 +815,9 @@ impl Agent {
                 tracing::debug!(
                     tool_name = %call.name,
                     success = false,
+                    error_kind,
+                    retryable,
+                    recovery_code,
                     "native tool execution failed"
                 );
                 self.emit(AgentEvent::ToolFinished {

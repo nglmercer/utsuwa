@@ -222,7 +222,7 @@ fn retryable_target_args(tool: &str, message: impl Into<String>) -> ToolError {
         recovery: serde_json::json!({
             "error": "invalid_file_target",
             "reason": message.into(),
-            "target_fields": ["file_ref", "target", "path"],
+            "target_fields": ["file_ref", "target", "location", "filename", "path"],
             "next_tool": tool,
         }),
     }
@@ -1919,12 +1919,6 @@ fn normalize_structured_edit_args(
     let mut normalized = object.clone();
     let has_file_ref = normalized.contains_key("file_ref");
     let has_target = normalized.contains_key("target");
-    if has_file_ref && has_target {
-        return Err(invalid_args(
-            tool,
-            "provide exactly one target: file_ref or target",
-        ));
-    }
 
     let operation = normalized.get("operation").cloned();
     if operation.is_some() && operation.as_ref().and_then(Value::as_object).is_none() {
@@ -1954,6 +1948,103 @@ fn normalize_structured_edit_args(
     } else {
         TargetPurpose::Existing
     };
+
+    // Resolve all target selectors before collapsing them. Follow-up calls
+    // from small models often contain a stable file_ref plus copied target
+    // metadata (or legacy location/filename). Equivalent selectors are
+    // harmless; different selectors remain a retryable model-argument error.
+    let resolver = FileResolver::new(environment.clone());
+    let resolved_file_ref = if has_file_ref {
+        let raw = normalized
+            .get("file_ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_args(tool, "'file_ref' must be a string"))?;
+        let file_ref = FileRef::parse(raw).map_err(|error| filesystem_error(tool, error))?;
+        Some(
+            resolver
+                .resolve_ref(&file_ref, target_purpose)
+                .map_err(|error| filesystem_error(tool, error))?,
+        )
+    } else {
+        None
+    };
+    let resolved_target = if has_target {
+        let target = normalized
+            .get("target")
+            .and_then(Value::as_object)
+            .ok_or_else(|| invalid_args(tool, "'target' must be an object"))?;
+        let directory = target
+            .get("directory")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                invalid_args(tool, "target.directory must be a semantic directory id")
+            })?;
+        let directory = parse_directory_value(directory, environment, tool)?;
+        let relative_path = target
+            .get("relative_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| invalid_args(tool, "target.relative_path must be a string"))?;
+        Some(
+            resolver
+                .resolve_target(
+                    &FileTarget {
+                        directory,
+                        relative_path,
+                    },
+                    target_purpose,
+                )
+                .map_err(|error| filesystem_error(tool, error))?,
+        )
+    } else {
+        None
+    };
+    let has_legacy_target = normalized.contains_key("location")
+        || normalized.contains_key("directory_id")
+        || normalized.contains_key("directory")
+        || normalized.contains_key("filename");
+    let resolved_legacy_target = if has_legacy_target && (has_file_ref || has_target) {
+        let mut legacy = normalized.clone();
+        legacy.remove("file_ref");
+        legacy.remove("target");
+        Some(resolve_edit_target_with_purpose(
+            &Value::Object(legacy),
+            environment,
+            tool,
+            target_purpose,
+        )?)
+    } else {
+        None
+    };
+    let mut selector_paths = Vec::new();
+    if let Some(resolved) = &resolved_file_ref {
+        selector_paths.push(("file_ref", resolved.absolute_path.clone()));
+    }
+    if let Some(resolved) = &resolved_target {
+        selector_paths.push(("target", resolved.absolute_path.clone()));
+    }
+    if let Some(resolved) = &resolved_legacy_target {
+        selector_paths.push(("location+filename", resolved.path.clone()));
+    }
+    if let Some((_, canonical_path)) = selector_paths.first() {
+        if selector_paths
+            .iter()
+            .any(|(_, path)| path != canonical_path)
+        {
+            tracing::debug!(
+                tool = %tool,
+                selectors = ?selector_paths
+                    .iter()
+                    .map(|(kind, path)| (*kind, path.display().to_string()))
+                    .collect::<Vec<_>>(),
+                "filesystem edit selectors resolved to different paths"
+            );
+            return Err(retryable_target_args(
+                tool,
+                "target references identify different files; provide one target or equivalent selectors",
+            ));
+        }
+    }
     normalized.insert(
         "operation_type".to_string(),
         Value::String(operation_kind.clone()),
@@ -1980,16 +2071,9 @@ fn normalize_structured_edit_args(
     }
     normalized.remove("operation");
 
-    if has_file_ref {
-        let raw = normalized
-            .get("file_ref")
-            .and_then(Value::as_str)
-            .ok_or_else(|| invalid_args(tool, "'file_ref' must be a string"))?;
-        let file_ref = FileRef::parse(raw).map_err(|error| filesystem_error(tool, error))?;
-        let resolved = FileResolver::new(environment.clone())
-            .resolve_ref(&file_ref, target_purpose)
-            .map_err(|error| filesystem_error(tool, error))?;
-        normalized.remove("file_ref");
+    normalized.remove("file_ref");
+    normalized.remove("target");
+    if let Some(resolved) = resolved_file_ref {
         if let (Some(directory), Some(relative_path)) = (resolved.directory, resolved.relative_path)
         {
             normalized.insert(
@@ -2006,29 +2090,27 @@ fn normalize_structured_edit_args(
                 Value::String(resolved.absolute_path.to_string_lossy().into_owned()),
             );
         }
-    } else if has_target {
-        let target = normalized
-            .get("target")
-            .and_then(Value::as_object)
-            .ok_or_else(|| invalid_args(tool, "'target' must be an object"))?;
-        let directory = target
-            .get("directory")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                invalid_args(tool, "target.directory must be a semantic directory id")
-            })?;
-        let directory = parse_directory_value(directory, environment, tool)?;
-        let relative_path = target
-            .get("relative_path")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| invalid_args(tool, "target.relative_path must be a string"))?;
-        normalized.remove("target");
+    } else if let Some(resolved) = resolved_target {
         normalized.insert(
             "location".to_string(),
-            Value::String(directory.json_key().to_string()),
+            Value::String(
+                resolved
+                    .directory
+                    .expect("semantic target has a directory")
+                    .json_key()
+                    .to_string(),
+            ),
         );
-        normalized.insert("filename".to_string(), Value::String(relative_path));
+        normalized.insert(
+            "filename".to_string(),
+            Value::String(
+                resolved
+                    .relative_path
+                    .expect("semantic target has a relative path")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        );
     }
     Ok(Value::Object(normalized))
 }
@@ -2126,6 +2208,44 @@ fn parse_unified_old_new(
         return Err(missing_edit_argument(resolved_path, missing, preserved));
     }
     Ok((old_text.unwrap_or_default(), new_text.unwrap_or_default()))
+}
+
+/// Log only the shape of an edit call. Text values are intentionally omitted:
+/// they may contain private document contents or secrets.
+fn log_edit_argument_shape(args: &serde_json::Value) {
+    let Some(object) = args.as_object() else {
+        tracing::debug!(
+            tool = EDIT_TOOL,
+            "filesystem edit received non-object arguments"
+        );
+        return;
+    };
+    let operation = object
+        .get("operation")
+        .and_then(Value::as_object)
+        .and_then(|operation| operation.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            object
+                .get("operation_type")
+                .and_then(Value::as_str)
+                .unwrap_or("replace")
+        });
+    tracing::debug!(
+        tool = EDIT_TOOL,
+        operation,
+        has_file_ref = object.contains_key("file_ref"),
+        has_target = object.contains_key("target"),
+        has_path = object.contains_key("path"),
+        has_location = object.contains_key("location")
+            || object.contains_key("directory_id")
+            || object.contains_key("directory"),
+        has_filename = object.contains_key("filename"),
+        has_old_text = object.contains_key("old_text"),
+        has_new_text = object.contains_key("new_text"),
+        has_new_text_source = object.contains_key("new_text_source"),
+        "filesystem edit argument shape received"
+    );
 }
 
 fn tag_user_file_output(
@@ -2857,7 +2977,7 @@ fn normalize_unified_edit_args(
             lexical_absolute_path(&normalized) == lexical_absolute_path(&semantic_target.path)
         };
         if !path_matches {
-            return Err(invalid_args(
+            return Err(retryable_target_args(
                 tool,
                 "when both target styles are provided, path must identify the same file as location+filename; otherwise send only one target style",
             ));
@@ -2969,6 +3089,7 @@ impl EditTool {
     }
 
     fn merged_args(&self, args: &serde_json::Value) -> Result<MergedEditArgs, ToolError> {
+        log_edit_argument_shape(args);
         let structured_args =
             normalize_structured_edit_args(args, &self.user_file.environment, EDIT_TOOL)?;
         let source_args = resolve_new_text_source(&structured_args, EDIT_TOOL)?;
@@ -5375,6 +5496,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi");
         std::fs::write(&target, "hello").unwrap();
 
+        // A follow-up model call may include both the stable reference and
+        // the semantic target copied from the prior result. Equal selectors
+        // must be collapsed instead of rejected.
+        let file_ref = FileRef::from_target(&FileTarget {
+            directory: UserDirectory::Desktop,
+            relative_path: PathBuf::from("note.txt"),
+        })
+        .unwrap();
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "file_ref": file_ref,
+                "target": {
+                    "directory": "desktop",
+                    "relative_path": "note.txt"
+                },
+                "old_text": "hello",
+                "new_text": "hi",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi");
+        std::fs::write(&target, "hello").unwrap();
+
         let error = tool
             .invoke(
                 ticketed_context(&target),
@@ -5388,7 +5534,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+        assert!(
+            matches!(error, ToolError::RetryRequired { .. }),
+            "{error:?}"
+        );
         assert!(error.to_string().contains("same file"));
 
         // A location-only call can infer the sole direct file in the
