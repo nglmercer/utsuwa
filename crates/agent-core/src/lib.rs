@@ -353,10 +353,11 @@ impl Agent {
             .collect();
         let tool_ids: Vec<String> = tool_defs.iter().map(|tool| tool.name.clone()).collect();
         let invocation_id = InvocationId::fresh();
-        let mut executed = Vec::new();
+        let mut executed: Vec<ExecutedTool> = Vec::new();
         let mut tool_steps = Vec::new();
         let mut truncated = false;
         let mut final_text = String::new();
+        let mut read_only_follow_up_nudged = false;
 
         for _ in 0..self.limits.max_iterations {
             let mut request = ModelRequest::new(messages.clone());
@@ -372,6 +373,26 @@ impl Agent {
             truncated |= turn_truncated;
             final_text = text.clone();
             if calls.is_empty() {
+                let should_nudge = !read_only_follow_up_nudged
+                    && executed
+                        .last()
+                        .is_some_and(|step| Self::tool_may_need_follow_up(&step.name));
+                if should_nudge {
+                    let last_tool = executed
+                        .last()
+                        .map(|step| step.name.as_str())
+                        .unwrap_or("unknown");
+                    tracing::debug!(
+                        last_tool,
+                        "native read-only tool completed but model returned text; requesting one bounded continuation"
+                    );
+                    messages.push(ModelMessage::assistant(text, Vec::new()));
+                    messages.push(ModelMessage::user(
+                        "The previous native tool completed successfully. Continue the user's request now. If another native operation is needed, call the appropriate tool; do not claim a mutation succeeded without a successful mutation result.",
+                    ));
+                    read_only_follow_up_nudged = true;
+                    continue;
+                }
                 if !tool_defs.is_empty() {
                     // This is useful for distinguishing a missing Utsuwa
                     // registry from a provider/model that accepted `tools`
@@ -503,6 +524,23 @@ impl Agent {
             truncated,
             messages,
         })
+    }
+
+    fn tool_may_need_follow_up(name: &str) -> bool {
+        matches!(
+            name,
+            "system.time"
+                | "system.environment"
+                | "filesystem.read"
+                | "filesystem.read_range"
+                | "filesystem.stat"
+                | "filesystem.list"
+                | "filesystem.search_text"
+                | "filesystem.glob"
+                | "desktop.inspect"
+                | "desktop.status"
+                | "desktop.screenshot"
+        )
     }
 
     /// Refactored single-turn streaming shared by `turn` and the tool loop.
@@ -1216,6 +1254,96 @@ mod tests {
         let mut registry = tool_core::ToolRegistry::new();
         registry.register(Arc::new(tool_core::EchoTool)).unwrap();
         registry
+    }
+
+    struct TimeTool;
+
+    #[async_trait::async_trait]
+    impl tool_core::Tool for TimeTool {
+        fn metadata(&self) -> tool_core::ToolMetadata {
+            tool_core::ToolMetadata {
+                id: capability_core::ToolId::new("system.time"),
+                description: "current time (test double)".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                effects: vec![tool_core::ToolEffect::ReadOnly],
+            }
+        }
+
+        async fn invoke(
+            &self,
+            _ctx: tool_core::ToolContext,
+            _args: serde_json::Value,
+        ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+            Ok(tool_core::ToolOutput::new(
+                serde_json::json!({"local": "2026-09-09T17:00:00-05:00"}),
+            ))
+        }
+    }
+
+    fn registry_with_time_and_echo() -> tool_core::ToolRegistry {
+        let mut registry = tool_core::ToolRegistry::new();
+        registry.register(Arc::new(TimeTool)).unwrap();
+        registry.register(Arc::new(tool_core::EchoTool)).unwrap();
+        registry
+    }
+
+    fn time_call(id: &str) -> ModelStreamEvent {
+        ModelStreamEvent::ToolCall(ToolCall {
+            id: id.to_string(),
+            name: "system.time".to_string(),
+            arguments: "{}".to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn read_only_tool_text_gets_one_bounded_follow_up() {
+        let provider = Arc::new(QueueProvider::new(vec![
+            vec![
+                time_call("time-1"),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            text_turn("the current time is 17:00:00"),
+            vec![
+                echo_call("echo-1"),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            text_turn("done"),
+        ]));
+        let agent = Agent::new(provider.clone());
+        let outcome = agent
+            .turn_with_tools(
+                vec![ModelMessage::user("add the current time")],
+                &registry_with_time_and_echo(),
+                &AuthorizationContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "done");
+        assert_eq!(
+            outcome
+                .executed
+                .iter()
+                .map(|step| step.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["system.time", "system.echo"]
+        );
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        assert!(seen[2].messages.iter().any(|message| {
+            message.role == model_core::ModelRole::User
+                && message.content.contains("Continue the user's request now")
+        }));
+        assert!(seen[1].messages.iter().any(|message| {
+            message
+                .tool_result
+                .as_ref()
+                .is_some_and(|result| result.tool_call_id == "time-1" && !result.is_error)
+        }));
     }
 
     #[tokio::test]

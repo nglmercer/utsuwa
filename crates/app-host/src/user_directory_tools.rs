@@ -286,11 +286,39 @@ fn normalize_host_file_args(
             .get("file_ref")
             .and_then(Value::as_str)
             .ok_or_else(|| invalid_args(tool, "'file_ref' must be a string"))?;
-        let file_ref = FileRef::parse(raw).map_err(|error| filesystem_error(tool, error))?;
-        let resolved = resolver
-            .resolve_ref(&file_ref, purpose)
-            .map_err(|error| filesystem_error(tool, error))?;
-        candidates.push(("file_ref", resolved));
+        let resolved = FileRef::parse(raw).and_then(|file_ref| {
+            resolver
+                .resolve_ref(&file_ref, purpose)
+                .map_err(|error| error)
+        });
+        match resolved {
+            Ok(resolved) => candidates.push(("file_ref", resolved)),
+            Err(error)
+                if error.code == FilesystemErrorCode::InvalidFileRef
+                    && !has_target
+                    && !has_path
+                    && active_file_from_context(active_context).is_some() =>
+            {
+                // A tiny model can copy or truncate the active reference.
+                // The malformed value identifies no file, so the only safe
+                // recovery is the already successful active target. Resolve
+                // it again so current permissions and symlink checks still
+                // apply; never use this fallback for a stale or valid but
+                // mismatched reference.
+                let active = active_file_from_context(active_context)
+                    .expect("active context was checked above");
+                let resolved = resolver
+                    .resolve_ref(&active, purpose)
+                    .map_err(|error| filesystem_error(tool, error))?;
+                tracing::debug!(
+                    tool = %tool,
+                    active_file_ref = %resolved.file_ref,
+                    "recovered malformed file_ref from active file context"
+                );
+                candidates.push(("active_file", resolved));
+            }
+            Err(error) => return Err(filesystem_error(tool, error)),
+        }
     }
     if has_target {
         let target = object
