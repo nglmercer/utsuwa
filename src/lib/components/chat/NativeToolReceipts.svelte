@@ -36,6 +36,7 @@
 		}
 		if (
 			step.name === 'filesystem.patch' ||
+			step.name === 'filesystem.edit' ||
 			step.name === 'filesystem.edit_user_file' ||
 			step.name === 'filesystem.edit_file'
 		)

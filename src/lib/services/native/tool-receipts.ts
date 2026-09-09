@@ -4,7 +4,7 @@ export type NativeToolReceiptSummary = 'success' | 'recovered' | 'failed';
 
 /** Tool calls that can be shown as a deterministic native mutation receipt. */
 export function isNativeMutation(name: string): boolean {
-	return /^(filesystem\.(write|write_user_file|create_user_file|edit_user_file|edit_file|replace_user_file|append_user_file|append_file|patch|create|delete|move|mkdir)|process\.(spawn|kill)|desktop\.(click|invoke_element|type_text|set_value)|clipboard\.(write|set)|application\.launch|mcp\.|plugin\.)/.test(name);
+	return /^(filesystem\.(write|write_user_file|create_user_file|edit|edit_user_file|edit_file|replace_user_file|append_user_file|append_file|patch|create|delete|move|mkdir)|process\.(spawn|kill)|desktop\.(click|invoke_element|type_text|set_value)|clipboard\.(write|set)|application\.launch|mcp\.|plugin\.)/.test(name);
 }
 
 function mutationFamily(name: string): string | null {

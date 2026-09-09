@@ -157,6 +157,7 @@ test('send params target the native agent method', () => {
 
 test('edit and append tools count as native mutations', () => {
 	for (const name of [
+		'filesystem.edit',
 		'filesystem.edit_user_file',
 		'filesystem.edit_file',
 		'filesystem.replace_user_file',

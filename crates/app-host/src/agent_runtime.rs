@@ -17,8 +17,9 @@
 
 use crate::host_environment::HostEnvironment;
 use crate::user_directory_tools::{
-    AppendFileTool, AppendUserFileTool, CreateUserFileTool, EditFileTool, EditUserFileTool,
-    HostAwareWriteTool, ReplaceUserFileTool, ResolveUserDirectoryTool, UserDirectoryWriteTool,
+    AppendFileTool, AppendUserFileTool, CreateUserFileTool, EditFileTool, EditTool,
+    EditUserFileTool, HostAwareWriteTool, ReplaceUserFileTool, ResolveUserDirectoryTool,
+    UserDirectoryWriteTool,
 };
 use agent_core::{Agent, AgentEvent, AgentLimits, ToolAuthorizer, ToolReplayCache};
 use audit_core::AuditSink;
@@ -67,10 +68,10 @@ impl ToolProfile {
         match self {
             Self::Full => true,
             // The small-model profile hides redundant low-level variants
-            // (raw patch, range reads, search/glob, legacy aliases) while
-            // keeping the simple high-level file interfaces: create, edit,
-            // replace, and append — for user directories and arbitrary
-            // absolute paths alike.
+            // (raw patch, range reads, search/glob, legacy aliases) and the
+            // overlapping edit tools: small models get exactly one edit
+            // interface, filesystem.edit, which covers both the semantic
+            // location style and the explicit absolute path style.
             Self::Simple => !matches!(
                 tool_id,
                 "filesystem.stat"
@@ -78,6 +79,8 @@ impl ToolProfile {
                     | "filesystem.search_text"
                     | "filesystem.glob"
                     | "filesystem.patch"
+                    | "filesystem.edit_user_file"
+                    | "filesystem.edit_file"
                     | "filesystem.resolve_user_dir"
                     | "filesystem.write_user_file"
                     | "desktop.list_windows"
@@ -1242,13 +1245,15 @@ fn host_environment_context_for(
         "Special filesystem directories are resolved by the operating system.".to_string(),
         "Use the exact paths listed in the host environment block or returned by system.environment."
             .to_string(),
-        "For files in Desktop/Documents/etc., ALWAYS prefer filesystem.create_user_file with location and filename; do not first try filesystem.write or construct a special-directory path yourself."
+        "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file with location and filename; do not first try filesystem.write or construct a special-directory path yourself. For existing files, use filesystem.edit."
             .to_string(),
         "You can create, read, overwrite, and edit files using the native filesystem tools."
             .to_string(),
-        "For an existing file in Desktop/Documents/etc., use filesystem.edit_user_file for an exact old-text replacement, filesystem.replace_user_file for whole-file replacement, or filesystem.append_user_file to add text at the end. Read the file first with filesystem.read when the exact text is unknown."
+        "To edit an existing file, use filesystem.edit: pass location and filename for a file in Desktop/Documents/etc., or path for a file at an explicit absolute path; a unique existing filename may be resolved to its configured user directory when location is omitted. Never combine target styles. Always read the file first with filesystem.read for a partial edit, pass the exact old_text, and make new_text the actual replacement; never use a placeholder such as 'Updated date'. For a current/today date, call system.time first and use its date value. Use filesystem.replace_user_file for a complete replacement."
             .to_string(),
-        "For an existing file at an explicit absolute path, use filesystem.edit_file or filesystem.append_file."
+        "For whole-file replacement in Desktop/Documents/etc. use filesystem.replace_user_file; to add text at the end use filesystem.append_user_file, or filesystem.append_file for an explicit absolute path."
+            .to_string(),
+        "If an edit operation fails because a path or text match was wrong, correct the tool arguments and retry. A failed edit attempt does not mean editing is unsupported. Do not offer to create a replacement file unless the user actually asks for a new file."
             .to_string(),
         "Do not tell the user that file editing is unavailable unless the native tool actually returns an unavailable or denied result."
             .to_string(),
@@ -1424,7 +1429,14 @@ fn default_registry(
                 plugin.limits.clone(),
                 host_environment.clone(),
             )));
-            tools.push(Arc::new(EditFileTool::new(plugin.limits.clone())));
+            tools.push(Arc::new(EditFileTool::new(
+                plugin.limits.clone(),
+                host_environment.clone(),
+            )));
+            tools.push(Arc::new(EditTool::new(
+                plugin.limits.clone(),
+                host_environment.clone(),
+            )));
         }
         if plugin.supports(tool_filesystem::plugin::FsCapability::Write) {
             if let Some(index) = tools
@@ -1452,7 +1464,10 @@ fn default_registry(
                 plugin.limits.clone(),
                 host_environment.clone(),
             )));
-            tools.push(Arc::new(AppendFileTool::new(plugin.limits)));
+            tools.push(Arc::new(AppendFileTool::new(
+                plugin.limits.clone(),
+                host_environment.clone(),
+            )));
         }
     }
     for tool in [
@@ -1843,8 +1858,13 @@ mod tests {
         assert!(context.contains("Current working directory:"));
         assert!(context.contains("Home directory:"));
         assert!(context.contains("Filesystem tools require absolute host-native paths."));
-        assert!(context.contains("ALWAYS prefer filesystem.create_user_file"));
-        assert!(context.contains("filesystem.edit_user_file"));
+        assert!(context.contains(
+            "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file"
+        ));
+        assert!(context.contains("use filesystem.edit:"));
+        assert!(context.contains("call system.time first"));
+        assert!(context.contains("never use a placeholder such as 'Updated date'"));
+        assert!(context.contains("A failed edit attempt does not mean editing is unsupported"));
         assert!(context.contains(
             "Do not tell the user that file editing is unavailable unless the native tool actually returns an unavailable or denied result"
         ));
@@ -2272,6 +2292,7 @@ mod tests {
             "filesystem.create_user_file",
             "filesystem.edit_user_file",
             "filesystem.edit_file",
+            "filesystem.edit",
             "filesystem.replace_user_file",
             "filesystem.append_user_file",
             "filesystem.append_file",
@@ -2308,8 +2329,13 @@ mod tests {
         assert!(ToolProfile::Simple.allows_tool("system.environment"));
         assert!(ToolProfile::Simple.allows_tool("system.time"));
         assert!(ToolProfile::Simple.allows_tool("filesystem.create_user_file"));
-        assert!(ToolProfile::Simple.allows_tool("filesystem.edit_user_file"));
-        assert!(ToolProfile::Simple.allows_tool("filesystem.edit_file"));
+        // Small models get exactly one edit interface; the overlapping
+        // edit_user_file/edit_file tools stay available to Full.
+        assert!(ToolProfile::Simple.allows_tool("filesystem.edit"));
+        assert!(!ToolProfile::Simple.allows_tool("filesystem.edit_user_file"));
+        assert!(!ToolProfile::Simple.allows_tool("filesystem.edit_file"));
+        assert!(ToolProfile::Full.allows_tool("filesystem.edit_user_file"));
+        assert!(ToolProfile::Full.allows_tool("filesystem.edit_file"));
         assert!(ToolProfile::Simple.allows_tool("filesystem.replace_user_file"));
         assert!(ToolProfile::Simple.allows_tool("filesystem.append_user_file"));
         assert!(ToolProfile::Simple.allows_tool("filesystem.append_file"));
@@ -2369,8 +2395,7 @@ mod tests {
             "system.environment",
             "system.time",
             "filesystem.create_user_file",
-            "filesystem.edit_user_file",
-            "filesystem.edit_file",
+            "filesystem.edit",
             "filesystem.replace_user_file",
             "filesystem.append_user_file",
             "filesystem.append_file",
@@ -2387,6 +2412,8 @@ mod tests {
             "filesystem.search_text",
             "filesystem.glob",
             "filesystem.patch",
+            "filesystem.edit_user_file",
+            "filesystem.edit_file",
             "filesystem.resolve_user_dir",
             "filesystem.write_user_file",
             "desktop.list_windows",

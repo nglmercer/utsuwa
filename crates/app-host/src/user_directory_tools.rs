@@ -26,6 +26,7 @@ const CREATE_USER_FILE_TOOL: &str = "filesystem.create_user_file";
 const WRITE_USER_FILE_TOOL: &str = "filesystem.write_user_file";
 const EDIT_USER_FILE_TOOL: &str = "filesystem.edit_user_file";
 const EDIT_FILE_TOOL: &str = "filesystem.edit_file";
+const EDIT_TOOL: &str = "filesystem.edit";
 const REPLACE_USER_FILE_TOOL: &str = "filesystem.replace_user_file";
 const APPEND_USER_FILE_TOOL: &str = "filesystem.append_user_file";
 const APPEND_FILE_TOOL: &str = "filesystem.append_file";
@@ -413,6 +414,23 @@ impl HostAwareWriteTool {
             environment,
         }
     }
+
+    /// Normalize a stale conventional special-directory path before the
+    /// ticket is minted, so the ticket always scopes the final path.
+    /// Normalization is conservative: an existing conventional parent
+    /// (or both directories) keeps the explicit path.
+    fn normalized_write_path(&self, args: &serde_json::Value) -> Option<NormalizedSpecialPath> {
+        args.get("path").and_then(Value::as_str).and_then(|path| {
+            normalize_special_user_path(
+                Path::new(path),
+                &self.environment,
+                "filesystem.write",
+                SpecialPathPurpose::Write,
+                CREATE_USER_FILE_TOOL,
+            )
+            .ok()
+        })
+    }
 }
 
 pub(crate) fn enrich_write_error(error: ToolError, environment: &HostEnvironment) -> ToolError {
@@ -457,7 +475,17 @@ impl Tool for HostAwareWriteTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        self.inner.required_capability(args)
+        let mut forwarded = args.clone();
+        if let (Some(object), Some(normalized)) = (
+            forwarded.as_object_mut(),
+            self.normalized_write_path(args).as_ref(),
+        ) {
+            object.insert(
+                "path".to_string(),
+                Value::String(normalized.path.to_string_lossy().into_owned()),
+            );
+        }
+        self.inner.required_capability(&forwarded)
     }
 
     async fn invoke(
@@ -465,10 +493,23 @@ impl Tool for HostAwareWriteTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        self.inner
+        let mut args = args;
+        let normalized = self.normalized_write_path(&args);
+        if let (Some(object), Some(normalized)) = (args.as_object_mut(), normalized.as_ref()) {
+            object.insert(
+                "path".to_string(),
+                Value::String(normalized.path.to_string_lossy().into_owned()),
+            );
+        }
+        let mut output = self
+            .inner
             .invoke(ctx, args)
             .await
-            .map_err(|error| enrich_write_error(error, &self.environment))
+            .map_err(|error| enrich_write_error(error, &self.environment))?;
+        if let Some(normalized) = normalized {
+            tag_normalized_from(&mut output, &normalized);
+        }
+        Ok(output)
     }
 }
 
@@ -709,6 +750,56 @@ fn required_filename(object: &Map<String, Value>, tool: &str) -> Result<String, 
     Ok(filename)
 }
 
+/// Resolve a user-directory edit to one exact absolute target without ever
+/// asking the model to construct the host path. A missing location is
+/// accepted only when the relative filename identifies exactly one existing
+/// file among the host-configured user directories.
+fn infer_edit_directory(
+    filename: &str,
+    environment: &HostEnvironment,
+    tool: &str,
+) -> Result<UserDirectory, ToolError> {
+    if Path::new(filename).is_absolute() {
+        return Err(invalid_args(
+            tool,
+            "an absolute filename without 'location' is ambiguous; pass location+filename or use path",
+        ));
+    }
+
+    let mut matches = Vec::new();
+    for directory in UserDirectory::ALL {
+        let Some(base) = environment.user_dirs.get(directory) else {
+            continue;
+        };
+        let (_, path) = normalize_filename(filename, base, tool)?;
+        if path.is_file() {
+            matches.push(directory);
+        }
+    }
+    match matches.as_slice() {
+        [directory] => Ok(*directory),
+        [] => Err(invalid_args(
+            tool,
+            format!(
+                "could not resolve filename '{filename}' without a location; pass location='desktop' for a Desktop file or use an absolute path"
+            ),
+        )),
+        _ => {
+            let available = matches
+                .iter()
+                .map(|directory| format!("'{}'", directory.json_key()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(invalid_args(
+                tool,
+                format!(
+                    "filename '{filename}' exists in multiple configured user directories ({available}); pass the location explicitly"
+                ),
+            ))
+        }
+    }
+}
+
 /// Resolve `location` + `filename` to one exact absolute target without ever
 /// asking the model to construct the host path. Unlike creation, editing
 /// always names its file: no default filename is generated.
@@ -720,7 +811,15 @@ fn resolve_edit_target(
     let object = args
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
-    let directory = parse_location(args, environment, tool)?;
+    let directory = if object.contains_key("location")
+        || object.contains_key("directory_id")
+        || object.contains_key("directory")
+    {
+        parse_location(args, environment, tool)?
+    } else {
+        let filename = required_filename(object, tool)?;
+        infer_edit_directory(&filename, environment, tool)?
+    };
     let base = environment.user_dirs.get(directory).ok_or_else(|| {
         failed(
             tool,
@@ -747,6 +846,159 @@ fn patch_args_for(path: &Path, old_text: &str, new_text: &str) -> serde_json::Va
     })
 }
 
+/// How strictly a stale conventional-path compatibility remap must treat
+/// file existence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpecialPathPurpose {
+    /// Existing-file mutations (edit): remap only when the attempted path is
+    /// missing and the configured candidate exists. An existing attempted
+    /// path always wins (including the both-exist case); a missing candidate
+    /// is a structured error instead of a guess.
+    ExistingFile,
+    /// Writes and appends (which may create): remap when the attempted
+    /// conventional parent directory is missing and the configured directory
+    /// exists. Never remap when the conventional parent exists, even if the
+    /// configured directory exists too.
+    Write,
+}
+
+pub(crate) struct NormalizedSpecialPath {
+    pub path: PathBuf,
+    /// Whether the attempted path was remapped to the configured location.
+    /// Callers surface the original as `normalized_from` for transparency.
+    pub mapped: bool,
+    pub attempted: PathBuf,
+}
+
+fn unchanged_special_path(path: &Path) -> NormalizedSpecialPath {
+    NormalizedSpecialPath {
+        path: path.to_path_buf(),
+        mapped: false,
+        attempted: path.to_path_buf(),
+    }
+}
+
+/// Record a stale-path remap in the tool output so the model (and the
+/// receipt UI) can see which explicit path was normalized to the result.
+fn tag_normalized_from(output: &mut ToolOutput, normalized: &NormalizedSpecialPath) {
+    if normalized.mapped {
+        if let Some(object) = output.content.as_object_mut() {
+            object.insert(
+                "normalized_from".to_string(),
+                Value::String(normalized.attempted.to_string_lossy().into_owned()),
+            );
+        }
+    }
+}
+
+/// Map a stale conventional special-directory path (`$HOME/Desktop/...`)
+/// to the OS-configured location (`$HOME/Escritorio/...`) using only
+/// `HostEnvironment`/XDG data — never hardcoded translations.
+///
+/// Only a path directly below the conventional directory is eligible:
+/// nested lookalikes (`$HOME/projects/Desktop/x`), other roots
+/// (`/tmp/Desktop/x`), and relative paths are returned unchanged. The
+/// mapping consults the live filesystem for evidence (see
+/// [`SpecialPathPurpose`]) and runs before any capability ticket is minted,
+/// so the ticket always scopes the final resolved path.
+pub(crate) fn normalize_special_user_path(
+    path: &Path,
+    environment: &HostEnvironment,
+    tool: &str,
+    purpose: SpecialPathPurpose,
+    next_tool: &str,
+) -> Result<NormalizedSpecialPath, ToolError> {
+    let Some(home) = environment.home.as_deref() else {
+        return Ok(unchanged_special_path(path));
+    };
+    if !path.is_absolute() {
+        return Ok(unchanged_special_path(path));
+    }
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return Ok(unchanged_special_path(path));
+    };
+    for directory in UserDirectory::ALL {
+        let conventional = home.join(directory.conventional_name());
+        if parent != conventional.as_path() {
+            continue;
+        }
+        let Some(configured) = environment.user_dirs.get(directory) else {
+            return Ok(unchanged_special_path(path));
+        };
+        if configured == conventional {
+            // The conventional path is already the configured one.
+            return Ok(unchanged_special_path(path));
+        }
+        let candidate = configured.join(file_name);
+        match purpose {
+            SpecialPathPurpose::ExistingFile => {
+                if path.exists() {
+                    // The explicit path works (or both exist): never guess.
+                    return Ok(unchanged_special_path(path));
+                }
+                if candidate.exists() {
+                    return Ok(NormalizedSpecialPath {
+                        path: candidate,
+                        mapped: true,
+                        attempted: path.to_path_buf(),
+                    });
+                }
+                return Err(failed(
+                    tool,
+                    format!(
+                        "file_not_found: '{}' does not exist. The host-configured {} directory is '{}'; the same file name was not found there either (checked '{}'). {}",
+                        path.display(),
+                        directory.prompt_label(),
+                        configured.display(),
+                        candidate.display(),
+                        format!(
+                            "Use {next_tool} with location='{}' after creating the file, or retry with the exact absolute path",
+                            directory.json_key(),
+                        ),
+                    ),
+                ));
+            }
+            SpecialPathPurpose::Write => {
+                if conventional.is_dir() {
+                    // The explicit destination (or its parent) exists, or
+                    // both directories exist: the explicit path wins.
+                    return Ok(unchanged_special_path(path));
+                }
+                if configured.is_dir() {
+                    return Ok(NormalizedSpecialPath {
+                        path: candidate,
+                        mapped: true,
+                        attempted: path.to_path_buf(),
+                    });
+                }
+                return Ok(unchanged_special_path(path));
+            }
+        }
+    }
+    Ok(unchanged_special_path(path))
+}
+
+/// Append read-then-retry guidance when an edit fails only because the old
+/// text was not found. A wrong text match must never read as missing
+/// editing capability, and must never detour into creating another file.
+fn with_read_retry_guidance(path: &Path, error: ToolError) -> ToolError {
+    let ToolError::Failed { tool, message } = error else {
+        return error;
+    };
+    // Couples to PatchTool's exact diagnostic below; the match is
+    // deliberately narrow so only the not-found case is reworded.
+    if !message.contains("occurs 0 times") {
+        return ToolError::Failed { tool, message };
+    }
+    ToolError::Failed {
+        tool,
+        message: format!(
+            "{message}\nRead the exact current contents with filesystem.read first (next_tool: filesystem.read, path: '{}'), then retry the edit with the exact old text. A failed edit attempt does not mean editing is unsupported. Do not offer to create a replacement file unless the user actually asks for a new file.",
+            path.display(),
+        ),
+    }
+}
+
 fn path_only_args(path: &Path) -> serde_json::Value {
     serde_json::json!({ "path": path.to_string_lossy() })
 }
@@ -755,11 +1007,30 @@ fn parse_old_new(args: &serde_json::Value, tool: &str) -> Result<(String, String
     let object = args
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
-    let old_text = required_string_field(object, tool, "old_text")?;
+    let old_text = required_string_field(object, tool, "old_text").map_err(|_| {
+        invalid_args(
+            tool,
+            "missing 'old_text': read the file first with filesystem.read, then retry with the exact text to replace. Do not use a placeholder such as 'Updated date'. A single unique line is enough; the whole file is not needed.",
+        )
+    })?;
     if old_text.is_empty() {
-        return Err(invalid_args(tool, "'old_text' must not be empty"));
+        return Err(invalid_args(
+            tool,
+            "'old_text' must not be empty: use the exact current text from filesystem.read. A single unique line is enough.",
+        ));
     }
-    let new_text = required_string_field(object, tool, "new_text")?;
+    let new_text = required_string_field(object, tool, "new_text").map_err(|_| {
+        invalid_args(
+            tool,
+            "missing 'new_text': retry with the replacement text (pass an empty string to delete the old text).",
+        )
+    })?;
+    if new_text.trim().eq_ignore_ascii_case("updated date") {
+        return Err(invalid_args(
+            tool,
+            "'new_text' is a placeholder, not a date. Call system.time first, then retry with its exact 'date' value.",
+        ));
+    }
     Ok((old_text, new_text))
 }
 
@@ -791,9 +1062,9 @@ fn tag_user_file_output(
 
 /// Small-model partial-edit interface for files in OS-configured user
 /// directories. Resolves the semantic location in the native host, converts
-/// the simple arguments into `PatchTool` arguments, and delegates the actual
+/// the simple arguments into `PatchTool` arguments and delegates the actual
 /// mutation to the existing filesystem patch broker — ticket validation,
-/// exact-match safety, and atomic write all stay intact.
+/// exact-match safety, and atomic writes stay intact.
 pub(crate) struct EditUserFileTool {
     inner: PatchTool,
     environment: HostEnvironment,
@@ -816,7 +1087,7 @@ impl Tool for EditUserFileTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(EDIT_USER_FILE_TOOL),
-            description: "Replace one exact text block inside an existing file in an operating-system configured user directory such as Desktop or Documents. Use a semantic location such as desktop, never a constructed path. Read the file first with filesystem.read when the exact old text is unknown. The old text must occur exactly once.".to_string(),
+            description: "Edit one exact text block inside an existing file in an operating-system configured user directory such as Desktop or Documents. Use a semantic location such as desktop, never a constructed path. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -832,7 +1103,7 @@ impl Tool for EditUserFileTool {
                     },
                     "old_text": {
                         "type": "string",
-                        "description": "Exact text to replace. It must occur exactly once in the file."
+                        "description": "Exact current text to replace. It must occur exactly once in the file. Read the file first when unknown."
                     },
                     "new_text": {
                         "type": "string",
@@ -864,7 +1135,8 @@ impl Tool for EditUserFileTool {
         let mut output = self
             .inner
             .invoke(ctx, patch_args_for(&resolved.path, &old_text, &new_text))
-            .await?;
+            .await
+            .map_err(|error| with_read_retry_guidance(&resolved.path, error))?;
         tag_user_file_output(
             &mut output,
             resolved.directory,
@@ -879,17 +1151,48 @@ impl Tool for EditUserFileTool {
 }
 
 /// Partial-edit interface for an existing file at an explicit absolute path.
-/// Delegates the mutation to the existing filesystem patch broker.
+/// Host-aware: a stale conventional special-directory path
+/// (`$HOME/Desktop/...`) is normalized to the OS-configured location before
+/// any capability ticket is minted, so the ticket always scopes the final
+/// resolved path. Delegates the mutation to the existing filesystem patch
+/// broker.
 pub(crate) struct EditFileTool {
     inner: PatchTool,
+    environment: HostEnvironment,
 }
 
 impl EditFileTool {
-    pub(crate) fn new(limits: tool_filesystem::FilesystemLimits) -> Self {
+    pub(crate) fn new(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
         Self {
             inner: PatchTool { limits },
+            environment,
         }
     }
+}
+
+/// Resolve one explicit absolute path through stale conventional
+/// special-directory compatibility. The returned path is what the ticket
+/// must scope and what the broker must mutate.
+fn resolve_edit_file_path(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+    next_tool: &str,
+) -> Result<NormalizedSpecialPath, ToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
+    let path = required_string_field(object, tool, "path")?;
+    normalize_special_user_path(
+        Path::new(&path),
+        environment,
+        tool,
+        SpecialPathPurpose::ExistingFile,
+        next_tool,
+    )
 }
 
 #[async_trait::async_trait]
@@ -897,7 +1200,7 @@ impl Tool for EditFileTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(EDIT_FILE_TOOL),
-            description: "Replace one exact text block inside an existing file at an explicit absolute host-native path. Use this only for arbitrary paths; for Desktop/Documents/etc. prefer filesystem.edit_user_file. Read the file first with filesystem.read when the exact old text is unknown. The old text must occur exactly once.".to_string(),
+            description: "Edit one exact text block inside an existing file at an explicit absolute host-native path. Use this only for arbitrary paths; for Desktop/Documents/etc. prefer filesystem.edit or filesystem.edit_user_file. A stale conventional path such as $HOME/Desktop is normalized to the OS-configured directory when unambiguous. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -908,7 +1211,7 @@ impl Tool for EditFileTool {
                     },
                     "old_text": {
                         "type": "string",
-                        "description": "Exact text to replace. It must occur exactly once in the file."
+                        "description": "Exact current text to replace. It must occur exactly once in the file. Read the file first when unknown."
                     },
                     "new_text": {
                         "type": "string",
@@ -922,9 +1225,11 @@ impl Tool for EditFileTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let path = args.get("path")?.as_str()?;
+        let normalized =
+            resolve_edit_file_path(args, &self.environment, EDIT_FILE_TOOL, EDIT_USER_FILE_TOOL)
+                .ok()?;
         self.inner
-            .required_capability(&serde_json::json!({ "path": path }))
+            .required_capability(&path_only_args(&normalized.path))
     }
 
     async fn invoke(
@@ -932,15 +1237,19 @@ impl Tool for EditFileTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let object = args
-            .as_object()
-            .ok_or_else(|| invalid_args(EDIT_FILE_TOOL, "args must be a JSON object"))?;
-        let path = required_string_field(object, EDIT_FILE_TOOL, "path")?;
+        let normalized = resolve_edit_file_path(
+            &args,
+            &self.environment,
+            EDIT_FILE_TOOL,
+            EDIT_USER_FILE_TOOL,
+        )?;
         let (old_text, new_text) = parse_old_new(&args, EDIT_FILE_TOOL)?;
         let mut output = self
             .inner
-            .invoke(ctx, patch_args_for(Path::new(&path), &old_text, &new_text))
-            .await?;
+            .invoke(ctx, patch_args_for(&normalized.path, &old_text, &new_text))
+            .await
+            .map_err(|error| with_read_retry_guidance(&normalized.path, error))?;
+        tag_normalized_from(&mut output, &normalized);
         if let Some(object) = output.content.as_object_mut() {
             object.insert("updated".to_string(), Value::Bool(true));
         }
@@ -1192,21 +1501,51 @@ impl Tool for AppendUserFileTool {
 }
 
 /// Append-only interface for a file at an explicit absolute host-native
-/// path. Reads, appends, and delegates the write to the existing broker.
+/// path. Host-aware like [`EditFileTool`]: a stale conventional
+/// special-directory path is normalized before authorization. Reads,
+/// appends, and delegates the write to the existing broker.
 pub(crate) struct AppendFileTool {
     inner: WriteTool,
     limits: tool_filesystem::FilesystemLimits,
+    environment: HostEnvironment,
 }
 
 impl AppendFileTool {
-    pub(crate) fn new(limits: tool_filesystem::FilesystemLimits) -> Self {
+    pub(crate) fn new(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
         Self {
             inner: WriteTool {
                 limits: limits.clone(),
             },
             limits,
+            environment,
         }
     }
+}
+
+/// Resolve one explicit absolute append path through stale conventional
+/// special-directory compatibility. Appends may create, so the write
+/// evidence rules apply: an existing conventional parent (or both
+/// directories) keeps the explicit path.
+fn resolve_append_file_path(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+    next_tool: &str,
+) -> Result<NormalizedSpecialPath, ToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
+    let path = required_string_field(object, tool, "path")?;
+    normalize_special_user_path(
+        Path::new(&path),
+        environment,
+        tool,
+        SpecialPathPurpose::Write,
+        next_tool,
+    )
 }
 
 #[async_trait::async_trait]
@@ -1235,9 +1574,15 @@ impl Tool for AppendFileTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let path = args.get("path")?.as_str()?;
+        let normalized = resolve_append_file_path(
+            args,
+            &self.environment,
+            APPEND_FILE_TOOL,
+            APPEND_USER_FILE_TOOL,
+        )
+        .ok()?;
         self.inner
-            .required_capability(&serde_json::json!({ "path": path }))
+            .required_capability(&path_only_args(&normalized.path))
     }
 
     async fn invoke(
@@ -1245,30 +1590,204 @@ impl Tool for AppendFileTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
+        let normalized = resolve_append_file_path(
+            &args,
+            &self.environment,
+            APPEND_FILE_TOOL,
+            APPEND_USER_FILE_TOOL,
+        )?;
         let object = args
             .as_object()
             .ok_or_else(|| invalid_args(APPEND_FILE_TOOL, "args must be a JSON object"))?;
-        let path = required_string_field(object, APPEND_FILE_TOOL, "path")?;
         let content = required_string_field(object, APPEND_FILE_TOOL, "content")?;
-        if !Path::new(&path).is_absolute() {
+        if !normalized.path.is_absolute() {
             return Err(ToolError::InvalidArgs {
                 tool: "filesystem".to_string(),
                 message: "path must be absolute".to_string(),
             });
         }
         let appended =
-            append_content_for(APPEND_FILE_TOOL, Path::new(&path), &content, &self.limits)?;
+            append_content_for(APPEND_FILE_TOOL, &normalized.path, &content, &self.limits)?;
         let mut output = self
             .inner
             .invoke(
                 ctx,
-                serde_json::json!({ "path": path, "content": appended }),
+                serde_json::json!({
+                    "path": normalized.path.to_string_lossy(),
+                    "content": appended,
+                }),
             )
             .await?;
+        tag_normalized_from(&mut output, &normalized);
         if let Some(object) = output.content.as_object_mut() {
             object.insert("appended".to_string(), Value::Bool(true));
         }
         Ok(output)
+    }
+}
+
+/// Which target style a unified [`EditTool`] call uses. Exactly one style
+/// is allowed per call so the model never has to guess precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditTargetStyle {
+    /// `location` + `filename`: resolved through `HostEnvironment`.
+    UserFile,
+    /// `path`: explicit absolute path with stale conventional
+    /// special-directory compatibility.
+    ExplicitPath,
+}
+
+/// Keep older callers that put a bare filename in `path` working, but never
+/// reinterpret an arbitrary path. A relative value is converted to the
+/// semantic filename form and then resolved only if it uniquely identifies an
+/// existing configured user-directory file.
+fn normalize_unified_edit_args(args: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = args.as_object() else {
+        return args.clone();
+    };
+    let has_semantic_target = object.contains_key("location")
+        || object.contains_key("directory_id")
+        || object.contains_key("directory")
+        || object.contains_key("filename");
+    let Some(path) = object.get("path").and_then(Value::as_str) else {
+        return args.clone();
+    };
+    if has_semantic_target
+        || Path::new(path).is_absolute()
+        || looks_like_windows_absolute_path(path)
+    {
+        return args.clone();
+    }
+    let mut normalized = object.clone();
+    normalized.remove("path");
+    normalized.insert("filename".to_string(), Value::String(path.to_string()));
+    Value::Object(normalized)
+}
+
+fn edit_target_style(args: &serde_json::Value, tool: &str) -> Result<EditTargetStyle, ToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
+    let has_location = object.contains_key("location")
+        || object.contains_key("directory_id")
+        || object.contains_key("directory");
+    let has_filename = object.contains_key("filename");
+    let has_path = object.contains_key("path");
+    if has_path && (has_location || has_filename) {
+        return Err(invalid_args(
+            tool,
+            "provide either location+filename or path, not both",
+        ));
+    }
+    if has_path
+        && !has_location
+        && !has_filename
+        && object
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| {
+                !Path::new(path).is_absolute() && !looks_like_windows_absolute_path(path)
+            })
+    {
+        return Ok(EditTargetStyle::UserFile);
+    }
+    if has_location || has_filename {
+        if has_location && !has_filename {
+            return Err(invalid_args(
+                tool,
+                "a location-style edit requires 'filename'",
+            ));
+        }
+        return Ok(EditTargetStyle::UserFile);
+    }
+    if has_path {
+        return Ok(EditTargetStyle::ExplicitPath);
+    }
+    Err(invalid_args(
+        tool,
+        "an edit requires filename (with optional location) or path, plus old_text and new_text",
+    ))
+}
+
+/// The single model-facing edit tool: one interface for both the semantic
+/// user-directory style (`location` + `filename`) and the explicit absolute
+/// path style (`path`). It routes to [`EditUserFileTool`] or
+/// [`EditFileTool`], so stale-path normalization, read-retry guidance,
+/// ticket validation, exact-match safety, and atomic writes are all
+/// inherited rather than reimplemented.
+pub(crate) struct EditTool {
+    user_file: EditUserFileTool,
+    file: EditFileTool,
+}
+
+impl EditTool {
+    pub(crate) fn new(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
+        Self {
+            user_file: EditUserFileTool::new(limits.clone(), environment.clone()),
+            file: EditFileTool::new(limits, environment),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for EditTool {
+    fn metadata(&self) -> ToolMetadata {
+        ToolMetadata {
+            id: capability_core::ToolId::new(EDIT_TOOL),
+            description: "Edit one exact text block inside an existing file. For a file in Desktop/Documents/etc., pass location (desktop, documents, downloads, pictures, music, videos, public_share, or templates) and filename (note.txt); if location is omitted, a unique existing filename is resolved against the host's configured user directories. For a file at an explicit absolute path, pass path instead. For compatibility, a relative path is treated as a filename only when it uniquely identifies an existing configured user-directory file. Provide exactly one target style, never both. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "enum": USER_DIRECTORY_ENUM,
+                        "description": "Semantic operating-system user directory identifier. Use with filename; do not combine with path."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Existing file name such as note.txt, or a relative subpath such as notes/note.txt. Use with location, or alone only when it uniquely identifies an existing configured user-directory file; do not combine with path."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute host-native path of the existing file. Use instead of location+filename for arbitrary paths; do not combine with location or filename. A relative value is accepted only as a compatibility alias for a unique existing configured user-directory filename."
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact current text to replace. It must occur exactly once in the file. Read the file first when unknown."
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text."
+                    }
+                },
+                "required": ["old_text", "new_text"]
+            }),
+            effects: vec![tool_core::ToolEffect::FilesystemWrite],
+        }
+    }
+
+    fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
+        let normalized = normalize_unified_edit_args(args);
+        match edit_target_style(&normalized, EDIT_TOOL).ok()? {
+            EditTargetStyle::UserFile => self.user_file.required_capability(&normalized),
+            EditTargetStyle::ExplicitPath => self.file.required_capability(&normalized),
+        }
+    }
+
+    async fn invoke(
+        &self,
+        ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let normalized = normalize_unified_edit_args(&args);
+        match edit_target_style(&normalized, EDIT_TOOL)? {
+            EditTargetStyle::UserFile => self.user_file.invoke(ctx, normalized).await,
+            EditTargetStyle::ExplicitPath => self.file.invoke(ctx, normalized).await,
+        }
     }
 }
 
@@ -1764,6 +2283,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_user_file_rejects_missing_old_text_without_overwriting() {
+        let home = std::env::temp_dir().join(format!(
+            "utsuwa-edit-user-file-whole-{}",
+            std::process::id()
+        ));
+        let (_home, desktop) = edit_harness(&home);
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "old contents").unwrap();
+        let tool = EditUserFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let error = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "new_text": "complete replacement",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+        assert!(error.to_string().contains("filesystem.read"));
+        assert!(error.to_string().contains("Updated date"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old contents");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
     async fn edit_user_file_rejects_unknown_and_ambiguous_old_text() {
         let home = std::env::temp_dir().join(format!(
             "utsuwa-edit-user-file-safety-{}",
@@ -1807,7 +2357,21 @@ mod tests {
             "{ambiguous:?}"
         );
         assert!(ambiguous.to_string().contains("2 times"));
-        // Both failures leave the file untouched.
+        let placeholder = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "old_text": "alpha beta alpha",
+                    "new_text": "Updated date",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(placeholder, ToolError::InvalidArgs { .. }));
+        assert!(placeholder.to_string().contains("system.time"));
+        // All failed attempts leave the file untouched.
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "alpha beta alpha"
@@ -1822,7 +2386,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("arbitrary.txt");
         std::fs::write(&target, "old value here").unwrap();
-        let tool = EditFileTool::new(tool_filesystem::FilesystemLimits::default());
+        let tool = EditFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&dir, &dir.join("Escritorio")),
+        );
         let args = serde_json::json!({
             "path": target.to_string_lossy(),
             "old_text": "old",
@@ -1841,7 +2408,12 @@ mod tests {
 
     #[tokio::test]
     async fn edit_file_rejects_relative_paths_like_the_broker() {
-        let tool = EditFileTool::new(tool_filesystem::FilesystemLimits::default());
+        let home =
+            std::env::temp_dir().join(format!("utsuwa-edit-file-relative-{}", std::process::id()));
+        let tool = EditFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &home.join("Escritorio")),
+        );
         let error = tool
             .invoke(
                 ToolContext::new(Principal::Agent(AgentId::new("edit-relative"))),
@@ -1958,7 +2530,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("log.txt");
         std::fs::write(&target, "a").unwrap();
-        let tool = AppendFileTool::new(tool_filesystem::FilesystemLimits::default());
+        let tool = AppendFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&dir, &dir.join("Escritorio")),
+        );
         let output = tool
             .invoke(
                 ticketed_context(&target),
@@ -1972,6 +2547,595 @@ mod tests {
         assert_eq!(output.content["appended"], true);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "ab");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn stale_home(name: &str) -> (PathBuf, PathBuf) {
+        let home = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let desktop = home.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        (home, desktop)
+    }
+
+    #[tokio::test]
+    async fn edit_file_normalizes_a_stale_conventional_desktop_path() {
+        let (home, desktop) = stale_home("utsuwa-edit-remap");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "old content here").unwrap();
+        // The conventional directory is never created.
+        let stale = home.join("Desktop").join("note.txt");
+        let tool = EditFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let args = serde_json::json!({
+            "path": stale.to_string_lossy(),
+            "old_text": "old",
+            "new_text": "new",
+        });
+        // The ticket must scope the normalized target, not the stale path.
+        let requirement = tool
+            .required_capability(&args)
+            .expect("the normalized target needs filesystem write");
+        assert_eq!(requirement.capability, Capability::FilesystemWrite);
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(target.canonicalize().unwrap_or(target.clone()))
+        );
+        let output = tool.invoke(ticketed_context(&target), args).await.unwrap();
+        assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        assert_eq!(output.content["updated"], true);
+        assert_eq!(
+            output.content["normalized_from"],
+            stale.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "new content here"
+        );
+        assert!(!home.join("Desktop").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_file_keeps_an_explicit_path_when_both_locations_exist() {
+        let (home, desktop) = stale_home("utsuwa-edit-ambiguous");
+        let conventional_dir = home.join("Desktop");
+        std::fs::create_dir_all(&conventional_dir).unwrap();
+        let conventional = conventional_dir.join("note.txt");
+        std::fs::write(&conventional, "conventional old").unwrap();
+        let configured = desktop.join("note.txt");
+        std::fs::write(&configured, "configured old").unwrap();
+        let tool = EditFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&conventional),
+                serde_json::json!({
+                    "path": conventional.to_string_lossy(),
+                    "old_text": "old",
+                    "new_text": "new",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output.content["path"],
+            conventional.to_string_lossy().as_ref()
+        );
+        assert!(output.content.get("normalized_from").is_none());
+        assert_eq!(
+            std::fs::read_to_string(&conventional).unwrap(),
+            "conventional new"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&configured).unwrap(),
+            "configured old"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_file_reports_a_structured_error_when_nothing_exists() {
+        let (home, desktop) = stale_home("utsuwa-edit-missing");
+        let stale = home.join("Desktop").join("absent.txt");
+        let tool = EditFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let error = tool
+            .invoke(
+                ToolContext::new(Principal::Agent(AgentId::new("edit-missing"))),
+                serde_json::json!({
+                    "path": stale.to_string_lossy(),
+                    "old_text": "old",
+                    "new_text": "new",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::Failed { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("file_not_found"), "{message}");
+        assert!(
+            message.contains(&stale.to_string_lossy().into_owned()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&desktop.to_string_lossy().into_owned()),
+            "{message}"
+        );
+        assert!(message.contains("filesystem.edit_user_file"), "{message}");
+        // No capability is minted for a call that cannot resolve a target.
+        assert!(tool
+            .required_capability(&serde_json::json!({
+                "path": stale.to_string_lossy(),
+                "old_text": "old",
+                "new_text": "new",
+            }))
+            .is_none());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_reports_read_retry_guidance_for_unknown_old_text() {
+        let (home, desktop) = stale_home("utsuwa-edit-retry");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "exact current contents").unwrap();
+        let tool = EditFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let error = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "old_text": "guessed text",
+                    "new_text": "new",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::Failed { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("occurs 0 times"), "{message}");
+        assert!(message.contains("filesystem.read"), "{message}");
+        assert!(
+            message.contains("Do not offer to create a replacement file"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "exact current contents"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_missing_old_text_without_overwriting() {
+        let (home, desktop) = stale_home("utsuwa-edit-missing-old");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "exact current contents").unwrap();
+        let tool = EditFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let metadata = tool.metadata();
+        let required = metadata.input_schema["required"]
+            .as_array()
+            .expect("edit schema required must be an array");
+        assert!(required.iter().any(|field| field == "old_text"));
+
+        // Missing old_text must never turn a partial edit into a whole-file overwrite.
+        let missing = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "new_text": "new",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing, ToolError::InvalidArgs { .. }),
+            "{missing:?}"
+        );
+        assert!(missing.to_string().contains("filesystem.read"));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "exact current contents"
+        );
+
+        // Empty old_text would match everywhere, so it stays rejected with guidance.
+        let empty = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "old_text": "",
+                    "new_text": "new",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(empty, ToolError::InvalidArgs { .. }), "{empty:?}");
+        assert!(empty.to_string().contains("filesystem.read"), "{empty:?}");
+        // Missing new_text names the fix as well.
+        let no_new = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "old_text": "exact current contents",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(no_new, ToolError::InvalidArgs { .. }),
+            "{no_new:?}"
+        );
+        assert!(no_new.to_string().contains("new_text"), "{no_new:?}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "exact current contents"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_file_does_not_remap_nested_or_foreign_lookalikes() {
+        let (home, desktop) = stale_home("utsuwa-edit-lookalike");
+        // Nested lookalike: the parent is not directly $HOME/Desktop.
+        let nested_dir = home.join("projects").join("Desktop");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let nested = nested_dir.join("note.txt");
+        std::fs::write(&nested, "nested old").unwrap();
+        let tool = EditFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        tool.invoke(
+            ticketed_context(&nested),
+            serde_json::json!({
+                "path": nested.to_string_lossy(),
+                "old_text": "old",
+                "new_text": "new",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&nested).unwrap(), "nested new");
+
+        // Foreign root: an explicit path outside $HOME is never rewritten.
+        let foreign_root =
+            std::env::temp_dir().join(format!("utsuwa-edit-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&foreign_root);
+        let foreign_dir = foreign_root.join("Desktop");
+        std::fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join("note.txt");
+        std::fs::write(&foreign, "foreign old").unwrap();
+        tool.invoke(
+            ticketed_context(&foreign),
+            serde_json::json!({
+                "path": foreign.to_string_lossy(),
+                "old_text": "old",
+                "new_text": "new",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "foreign new");
+        std::fs::remove_dir_all(&home).unwrap();
+        std::fs::remove_dir_all(&foreign_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_file_normalizes_a_stale_conventional_path() {
+        let (home, desktop) = stale_home("utsuwa-append-remap");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "line one\n").unwrap();
+        let stale = home.join("Desktop").join("note.txt");
+        let tool = AppendFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let requirement = tool
+            .required_capability(&serde_json::json!({
+                "path": stale.to_string_lossy(),
+                "content": "line two\n",
+            }))
+            .expect("the normalized target needs filesystem write");
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(target.canonicalize().unwrap_or(target.clone()))
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "path": stale.to_string_lossy(),
+                    "content": "line two\n",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["appended"], true);
+        assert_eq!(
+            output.content["normalized_from"],
+            stale.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "line one\nline two\n"
+        );
+        assert!(!home.join("Desktop").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn append_file_keeps_explicit_path_when_conventional_parent_exists() {
+        let (home, desktop) = stale_home("utsuwa-append-ambiguous");
+        let conventional_dir = home.join("Desktop");
+        std::fs::create_dir_all(&conventional_dir).unwrap();
+        let conventional = conventional_dir.join("note.txt");
+        std::fs::write(&conventional, "conventional\n").unwrap();
+        let configured = desktop.join("note.txt");
+        std::fs::write(&configured, "configured\n").unwrap();
+        let tool = AppendFileTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        tool.invoke(
+            ticketed_context(&conventional),
+            serde_json::json!({
+                "path": conventional.to_string_lossy(),
+                "content": "more\n",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&conventional).unwrap(),
+            "conventional\nmore\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&configured).unwrap(),
+            "configured\n"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_aware_write_normalizes_a_stale_conventional_path() {
+        let (home, desktop) = stale_home("utsuwa-write-remap");
+        let stale = home.join("Desktop").join("fresh.txt");
+        let candidate = desktop.join("fresh.txt");
+        let tool = HostAwareWriteTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let requirement = tool
+            .required_capability(&serde_json::json!({
+                "path": stale.to_string_lossy(),
+                "content": "hello",
+            }))
+            .expect("the normalized target needs filesystem write");
+        // The missing file resolves against its nearest existing ancestor.
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(desktop.canonicalize().unwrap().join("fresh.txt"))
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&candidate),
+                serde_json::json!({
+                    "path": stale.to_string_lossy(),
+                    "content": "hello",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["path"], candidate.to_string_lossy().as_ref());
+        assert_eq!(
+            output.content["normalized_from"],
+            stale.to_string_lossy().as_ref()
+        );
+        assert_eq!(std::fs::read_to_string(&candidate).unwrap(), "hello");
+        assert!(!home.join("Desktop").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_aware_write_keeps_explicit_path_when_both_directories_exist() {
+        let (home, desktop) = stale_home("utsuwa-write-ambiguous");
+        let conventional_dir = home.join("Desktop");
+        std::fs::create_dir_all(&conventional_dir).unwrap();
+        let conventional = conventional_dir.join("fresh.txt");
+        let configured = desktop.join("fresh.txt");
+        let tool = HostAwareWriteTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        tool.invoke(
+            ticketed_context(&conventional),
+            serde_json::json!({
+                "path": conventional.to_string_lossy(),
+                "content": "explicit",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&conventional).unwrap(), "explicit");
+        assert!(!configured.exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_routes_location_style_to_the_configured_directory() {
+        let (home, desktop) = stale_home("utsuwa-edit-unified-location");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "hello").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "old_text": "hello",
+                    "new_text": "hello world",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        assert_eq!(output.content["updated"], true);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello world");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_resolves_a_unique_bare_filename_to_desktop() {
+        let (home, desktop) = stale_home("utsuwa-edit-bare-filename");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "old date").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "filename": "note.txt",
+                    "old_text": "old date",
+                    "new_text": "2026-09-09",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        assert_eq!(output.content["location"], "desktop");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "2026-09-09");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_resolves_a_relative_path_alias_to_desktop() {
+        let (home, desktop) = stale_home("utsuwa-edit-relative-path-alias");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "old date").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let requirement = tool
+            .required_capability(&serde_json::json!({
+                "path": "note.txt",
+                "old_text": "old date",
+                "new_text": "2026-09-09",
+            }))
+            .expect("the relative compatibility target needs filesystem write");
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(target.canonicalize().unwrap_or(target.clone()))
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "path": "note.txt",
+                    "old_text": "old date",
+                    "new_text": "2026-09-09",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        assert_eq!(output.content["location"], "desktop");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "2026-09-09");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_routes_path_style_through_normalization() {
+        let (home, desktop) = stale_home("utsuwa-edit-unified-path");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "old value").unwrap();
+        let stale = home.join("Desktop").join("note.txt");
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let requirement = tool
+            .required_capability(&serde_json::json!({
+                "path": stale.to_string_lossy(),
+                "old_text": "old",
+                "new_text": "new",
+            }))
+            .expect("the normalized target needs filesystem write");
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(target.canonicalize().unwrap_or(target.clone()))
+        );
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "path": stale.to_string_lossy(),
+                "old_text": "old",
+                "new_text": "new",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new value");
+        assert!(!home.join("Desktop").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_rejects_mixed_or_missing_target_styles() {
+        let (home, desktop) = stale_home("utsuwa-edit-unified-styles");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "hello").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        for args in [
+            serde_json::json!({
+                "location": "desktop",
+                "filename": "note.txt",
+                "path": target.to_string_lossy(),
+                "old_text": "hello",
+                "new_text": "hi",
+            }),
+            serde_json::json!({
+                "old_text": "hello",
+                "new_text": "hi",
+            }),
+            serde_json::json!({
+                "location": "desktop",
+                "old_text": "hello",
+                "new_text": "hi",
+            }),
+        ] {
+            let error = tool
+                .invoke(ticketed_context(&target), args)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
