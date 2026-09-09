@@ -10,6 +10,8 @@ export type LLMProvider =
 	| 'google'
 	| 'deepseek'
 	| 'xai'
+	// Optional-key / public OpenAI-compatible gateways
+	| 'kilo'
 	// Local
 	| 'ollama'
 	| 'lmstudio'

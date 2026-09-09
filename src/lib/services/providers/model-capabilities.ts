@@ -17,6 +17,8 @@ export interface ModelCapabilities {
 export interface ModelInfo {
 	id: string;
 	name: string;
+	/** Whether the model was classified as free from provider metadata/conventions. */
+	free?: boolean;
 	capabilities?: ModelCapabilities;
 }
 

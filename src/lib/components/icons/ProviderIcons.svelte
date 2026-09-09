@@ -46,6 +46,12 @@
 			color: '#000000'
 		},
 
+		// Kilo Gateway - public OpenAI-compatible gateway
+		kilo: {
+			body: '<path fill="currentColor" d="M13.4 1 4 13.2h6.9L9.6 23 20 9.5h-7.1L13.4 1z"/>',
+			color: '#F59E0B'
+		},
+
 		// Groq - custom icon (not in simple-icons)
 		groq: {
 			body: '<g fill="currentColor"><circle cx="12" cy="12" r="10" fill-opacity=".2"/><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="3" fill="var(--color-neutral-50, #fafafa)"/></g>',

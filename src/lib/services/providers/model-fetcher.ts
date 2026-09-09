@@ -2,6 +2,7 @@ import { isDesktopBuild } from '$lib/services/platform';
 import { fetchModelsDirect } from './client-models';
 import { isLocalLLMProvider } from './local-endpoints';
 import type { ModelInfo } from './model-capabilities';
+import { normalizeOptionalApiKey } from './openai-compatible';
 
 export type { ModelInfo } from './model-capabilities';
 
@@ -23,11 +24,12 @@ export function fetchProviderModels(
 	apiKey: string,
 	baseUrl?: string
 ): Promise<FetchModelsResult> {
-	const key = `${providerId}|${baseUrl ?? ''}|${apiKey}`;
+	const normalizedApiKey = normalizeOptionalApiKey(apiKey) ?? '';
+	const key = `${providerId}|${baseUrl ?? ''}|${normalizedApiKey}`;
 	const existing = inFlight.get(key);
 	if (existing) return existing;
 
-	const request = fetchProviderModelsUncached(providerId, apiKey, baseUrl).finally(() =>
+	const request = fetchProviderModelsUncached(providerId, normalizedApiKey, baseUrl).finally(() =>
 		inFlight.delete(key)
 	);
 	inFlight.set(key, request);

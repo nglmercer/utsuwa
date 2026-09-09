@@ -6,6 +6,7 @@
 	interface Model {
 		id: string;
 		name: string;
+		free?: boolean;
 		capabilities?: ModelCapabilities;
 	}
 
@@ -123,6 +124,9 @@
 						>
 							<span class="model-name">{model.name}</span>
 							<span class="model-badges">
+								{#if model.free}
+									<span class="model-badge free">Free</span>
+								{/if}
 								{#if model.capabilities?.vision}
 									<span class="model-badge">Vision</span>
 								{/if}
@@ -378,6 +382,10 @@
 		color: var(--text-tertiary);
 		font-size: 0.65rem;
 		white-space: nowrap;
+	}
+
+	.model-badge.free {
+		color: var(--color-success, #4ade80);
 	}
 
 	.check-icon {

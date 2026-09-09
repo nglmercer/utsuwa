@@ -8,6 +8,13 @@ import {
 } from './local-endpoints';
 import { DEFAULT_MODELS_BASE_URLS } from './provider-defaults.ts';
 import { parseLMStudioModelCapabilities, type ModelInfo } from './model-capabilities';
+import {
+	fetchOpenAICompatibleModels,
+	hasApiKey,
+	optionalBearerHeaders,
+	parseOpenAICompatibleModels
+} from './openai-compatible';
+import { getBridge } from '$lib/services/native/bridge';
 
 const MODEL_FILTERS: Record<string, RegExp> = {
 	openai: /^(gpt-|o1-|o3-|chatgpt-4o-)/,
@@ -103,7 +110,9 @@ export async function fetchModelsDirect(
 	const cleanBaseUrl =
 		providerId === 'ollama' || providerId === 'lmstudio' || providerId === 'openai-compatible'
 			? getModelsBaseUrl(providerId, baseUrl)
-			: (baseUrl || DEFAULT_MODELS_BASE_URLS[providerId] || '').replace(/\/+$/, '');
+			: providerId === 'kilo'
+				? getModelsBaseUrl(providerId, baseUrl || DEFAULT_MODELS_BASE_URLS.kilo)
+				: (baseUrl || DEFAULT_MODELS_BASE_URLS[providerId] || '').replace(/\/+$/, '');
 
 	try {
 		let models: ModelInfo[] = [];
@@ -124,11 +133,45 @@ export async function fetchModelsDirect(
 				}));
 				break;
 			}
+			case 'kilo': {
+				// Kilo's catalog is public. In anonymous mode only expose models the
+				// catalog explicitly marks as free, so a paid model is never selected
+				// silently. An optional key expands the catalog and keeps free models
+				// first. The native host performs the HTTP request because Kilo does
+				// not enable browser CORS for its public model endpoint.
+				const options = {
+					classifyFree: true,
+					onlyFree: !hasApiKey(apiKey),
+					includeCapabilities: true
+				};
+				const bridge = getBridge();
+				if (bridge) {
+					const params: Record<string, string> = {
+						provider: providerId,
+						base_url: cleanBaseUrl
+					};
+					if (hasApiKey(apiKey)) params.api_key = apiKey?.trim() ?? '';
+					const nativeResult = await bridge.invoke('providers.fetch_models', params);
+					const resultObject =
+						nativeResult && typeof nativeResult === 'object' && !Array.isArray(nativeResult)
+							? (nativeResult as Record<string, unknown>)
+							: undefined;
+					const catalog = resultObject?.catalog ?? nativeResult;
+					models = parseOpenAICompatibleModels(catalog, {
+						...options,
+						onlyFree: options.onlyFree && resultObject?.authenticated !== true
+					});
+				} else {
+					// Keep a direct-fetch fallback for older/non-native environments;
+					// normal packaged/native builds always use the bridge above.
+					models = await fetchOpenAICompatibleModels(apiKey, cleanBaseUrl, 'kilo', options);
+				}
+				break;
+			}
 			case 'openai-compatible': {
 				// OpenAI-compatible endpoints (OpenRouter, Together, vLLM, ...) may or
 				// may not require an API key. Keep all returned models as-is.
-				const headers: Record<string, string> = {};
-				if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+				const headers = optionalBearerHeaders(apiKey);
 
 				// Ollama exposes an OpenAI-compatible chat endpoint but its model list
 				// lives at /api/tags rather than /v1/models.
@@ -142,15 +185,20 @@ export async function fetchModelsDirect(
 						capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
 					}));
 				} else {
-					// Custom providers own their path semantics. Do not add `/v1`
-					// here; a custom gateway may use `/openai`, `/api`, or no prefix.
-					const res = await fetch(`${cleanBaseUrl}/models`, { headers });
-					if (!res.ok) throw new Error(`Failed to fetch models: ${res.statusText}`);
-					const data = await res.json();
-					models = (data.data || []).map((m: { id: string }) => ({
-						id: m.id,
-						name: m.id,
-						capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
+					// Custom providers own their path semantics. The shared parser does
+					// not add `/v1`; a gateway may use `/openai`, `/api`, or no prefix.
+					const fetchedModels = await fetchOpenAICompatibleModels(apiKey, cleanBaseUrl, providerId, {
+						includeCapabilities: true
+					});
+					// Preserve the existing generic-endpoint affordance: the protocol is
+					// OpenAI-compatible even when `/models` omits capability metadata.
+					models = fetchedModels.map((model) => ({
+						...model,
+						capabilities: {
+							...model.capabilities,
+							toolCalling: true,
+							toolCallingSupport: 'compatible' as const
+						}
 					}));
 				}
 				break;

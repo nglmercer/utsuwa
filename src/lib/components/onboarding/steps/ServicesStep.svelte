@@ -13,6 +13,7 @@
 	import { DOCS_URL } from '$lib/config/site';
 	import { syncNativeModelProvider } from '$lib/services/native/model-settings';
 	import { isDesktopBuild } from '$lib/services/platform';
+	import { hasApiKey } from '$lib/services/providers/openai-compatible';
 
 	const LOCAL_LLM_DOCS_URL = `${DOCS_URL}/guides/local-llm-setup#allowing-utsuwa-to-reach-ollama`;
 
@@ -96,7 +97,15 @@
 			const config = settingsStore.getProviderConfig(provider.id);
 			return !!config.baseUrl && !!(llmSettings.activeModel as string);
 		}
-		if (!provider.requiresApiKey) return true;
+		if (!provider.requiresApiKey) {
+			// Public/optional-key providers are configured once an anonymous
+			// model has been discovered and selected.
+			if (provider.authentication === 'optional') {
+				const activeModel = llmSettings.activeModel as string;
+				return !!activeModel && llmModels.some((model) => model.id === activeModel);
+			}
+			return true;
+		}
 		return settingsStore.isProviderConfigured(provider.id);
 	});
 
@@ -194,7 +203,7 @@
 	const debouncedFetchTTSModels = debounce(fetchTTSModels, 300);
 
 	$effect(() => {
-		if (!llmProvider?.isLocal) {
+		if (!llmProvider?.isLocal && llmProvider?.authentication !== 'optional') {
 			lastLocalLLMFetchKey = '';
 			return;
 		}
@@ -219,7 +228,9 @@
 		llmIsLoading = false;
 
 		// Check for cached models
-		const cached = getCachedModelsForProvider(providerId);
+		const cached = getCachedModelsForProvider(providerId, {
+			onlyFree: providerId === 'kilo' && !hasApiKey(settingsStore.getProviderConfig(providerId).apiKey)
+		});
 		if (cached) {
 			llmDynamicModels = cached;
 		}
@@ -241,6 +252,11 @@
 			void syncNativeModelProvider(providerId, initialModel).catch((error) => {
 				console.error('[Native model settings] sync failed:', error);
 			});
+		}
+		// Kilo has no static list; fetch its public catalog immediately after
+		// selection so onboarding can choose a free model without a key.
+		if (provider && !provider.isLocal && !provider.custom && !provider.requiresApiKey) {
+			void fetchLLMModels();
 		}
 	}
 
@@ -266,7 +282,9 @@
 
 	function handleLLMApiKeyBlur() {
 		const config = settingsStore.getProviderConfig(llmProvider?.id ?? '');
-		if (config.apiKey && llmProvider && !llmProvider.isLocal) {
+		if (llmProvider?.authentication === 'optional') {
+			void fetchLLMModels();
+		} else if (hasApiKey(config.apiKey) && llmProvider && !llmProvider.isLocal) {
 			debouncedFetchLLMModels();
 		}
 	}
@@ -391,12 +409,28 @@
 			placeholder="Select LLM provider..."
 		/>
 
-		{#if llmProvider?.requiresApiKey || llmProvider?.custom}
+		{#if llmProvider?.authentication === 'optional'}
+			<div class="provider-note provider-info">
+				<Icon name="info" size={14} />
+				<span>Anonymous access works with supported free models. Add a Kilo API key for additional models or account-based access.</span>
+			</div>
+			<p class="provider-note provider-warning">
+				Free gateway models may be served by third-party inference providers. Avoid sending secrets or sensitive information unless you trust the selected provider.
+			</p>
+			{#if llmFetchError}
+				<p class="provider-note error">
+					<Icon name="alert-circle" size={14} />
+					{llmFetchError}
+				</p>
+			{/if}
+		{/if}
+
+		{#if llmProvider?.requiresApiKey || llmProvider?.custom || llmProvider?.authentication === 'optional'}
 			<input
 				type="password"
 				class="api-key-input"
 				class:error={llmFetchError}
-				placeholder={llmProvider?.custom ? 'API Key (optional)' : 'Enter API Key...'}
+				placeholder={llmProvider?.custom || llmProvider?.authentication === 'optional' ? 'API Key (optional)' : 'Enter API Key...'}
 				value={settingsStore.getProviderConfig(llmProvider.id).apiKey ?? ''}
 				oninput={(e) => handleLLMApiKeyChange(e.currentTarget.value)}
 				onblur={llmProvider?.custom ? undefined : handleLLMApiKeyBlur}
@@ -806,6 +840,19 @@
 		align-items: flex-start;
 		line-height: 1.45;
 		color: var(--color-error);
+	}
+
+	.provider-info {
+		align-items: flex-start;
+		line-height: 1.45;
+		color: var(--text-secondary);
+	}
+
+	.provider-warning {
+		align-items: flex-start;
+		line-height: 1.45;
+		font-size: 0.7rem;
+		color: var(--text-tertiary);
 	}
 
 	.provider-error {

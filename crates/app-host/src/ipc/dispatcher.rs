@@ -95,28 +95,71 @@ impl Dispatcher {
         }
     }
 
+    /// Dispatch an IPC request and deliver its reply asynchronously.
+    ///
+    /// Model catalog requests perform network I/O through the native
+    /// OpenAI-compatible client because the embedded WebView cannot call
+    /// providers that do not enable CORS. Keeping that work off the UI/IPC
+    /// callback thread also prevents a slow provider from freezing the app.
+    pub fn handle_message_with_callback<F>(&self, raw: &str, callback: F)
+    where
+        F: FnOnce(String) + Send + 'static,
+    {
+        let body = raw_body(raw);
+        let request = match IpcRequest::parse(&body) {
+            Ok(request) => request,
+            Err(err) => {
+                tracing::warn!(%err, "dropping unparsable ipc message (no id to reply to)");
+                return;
+            }
+        };
+
+        if request.method == IpcMethod::ProvidersFetchModels {
+            let dispatcher = self.clone();
+            std::thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| IpcErrorBody {
+                        code: ipc_core::ErrorCode::Internal,
+                        message: format!("could not start native model fetch: {error}"),
+                    })
+                    .and_then(|runtime| {
+                        runtime.block_on(dispatcher.fetch_provider_models(&request))
+                    });
+                callback(dispatcher.reply_script_for(&request.id, result));
+            });
+        } else {
+            callback(self.reply_script(&request));
+        }
+    }
+
     fn reply_script(&self, request: &IpcRequest) -> String {
-        match self.dispatch(request) {
+        self.reply_script_for(&request.id, self.dispatch(request))
+    }
+
+    fn reply_script_for(&self, id: &str, result: Result<Value, IpcErrorBody>) -> String {
+        match result {
             Ok(result) => {
-                let response = IpcResponse::ok(request.id.clone(), result);
+                let response = IpcResponse::ok(id, result);
                 match serde_json::to_string(&response) {
-                    Ok(json) => resolve_script(&request.id, true, &json_payload(&json, true)),
+                    Ok(json) => resolve_script(id, true, &json_payload(&json, true)),
                     Err(err) => {
                         tracing::error!(%err, "failed to encode ipc response");
-                        internal_error_script(&request.id)
+                        internal_error_script(id)
                     }
                 }
             }
             Err(error) => {
                 let response = IpcErrorResponse {
-                    id: request.id.clone(),
+                    id: id.to_string(),
                     error,
                 };
                 match serde_json::to_string(&response) {
-                    Ok(json) => resolve_script(&request.id, false, &json_payload(&json, false)),
+                    Ok(json) => resolve_script(id, false, &json_payload(&json, false)),
                     Err(err) => {
                         tracing::error!(%err, "failed to encode ipc error");
-                        internal_error_script(&request.id)
+                        internal_error_script(id)
                     }
                 }
             }
@@ -142,6 +185,10 @@ impl Dispatcher {
             IpcMethod::SettingsSet => self.settings_set(request),
             IpcMethod::SettingsGetModelProvider => self.settings_get_model_provider(),
             IpcMethod::SettingsSetModelProvider => self.settings_set_model_provider(request),
+            IpcMethod::ProvidersFetchModels => Err(IpcErrorBody {
+                code: ipc_core::ErrorCode::Internal,
+                message: "providers.fetch_models must be dispatched asynchronously".to_string(),
+            }),
             IpcMethod::ActivityList => self.activity_list(request),
             IpcMethod::PluginList => self.plugin_list(),
             IpcMethod::PluginEnable => self.plugin_manage(request, PluginOp::Enable),

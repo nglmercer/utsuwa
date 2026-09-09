@@ -188,7 +188,7 @@ function createSettingsStore() {
 			...config
 		};
 		// Invalidate model cache if credentials or endpoint changed.
-		if ((config.apiKey && config.apiKey !== oldApiKey) || (config.baseUrl !== undefined && config.baseUrl !== oldBaseUrl)) {
+		if ((config.apiKey !== undefined && config.apiKey !== oldApiKey) || (config.baseUrl !== undefined && config.baseUrl !== oldBaseUrl)) {
 			delete providerConfigs[providerId].cachedModels;
 			delete providerConfigs[providerId].modelsFetchedAt;
 		}

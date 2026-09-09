@@ -38,6 +38,7 @@
 		{ id: 'cloud-commercial', label: 'Cloud Commercial', providers: ['openai', 'anthropic', 'google', 'deepseek', 'mistral', 'xai', 'groq', 'perplexity', 'moonshot', 'together'] },
 		{ id: 'cloud-additional', label: 'Cloud Additional', providers: ['cerebras', 'fireworks', 'novita', '302ai', 'comet'] },
 		{ id: 'aggregators', label: 'Aggregators', providers: ['openrouter', 'openai-compatible'] },
+		{ id: 'public-gateways', label: 'Public / Free', providers: ['kilo'] },
 		{ id: 'local', label: 'Local', providers: ['ollama', 'lmstudio', 'vllm', 'player2'] },
 		{ id: 'enterprise', label: 'Enterprise', providers: ['azure', 'cloudflare'] }
 	];

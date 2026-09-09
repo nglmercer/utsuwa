@@ -8,11 +8,12 @@
 
 	const state = createLlmSettingsState();
 
-	// Fetch local LLM models automatically when the endpoint changes.
+	// Fetch local and public/optional-key LLM models automatically when the
+	// provider or endpoint changes. Kilo has no static model list.
 	$effect(() => {
 		const providerId = state.consciousnessSettings.activeProvider as string;
 		const provider = providerId ? getLLMProvider(providerId) : null;
-		if (!provider?.isLocal) {
+		if (!provider?.isLocal && provider?.authentication !== 'optional') {
 			state.lastLocalLLMFetchKey = '';
 			return;
 		}

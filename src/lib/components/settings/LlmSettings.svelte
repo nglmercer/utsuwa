@@ -58,13 +58,29 @@
 		{#if state.consciousnessSettings.activeProvider}
 			{@const provider = getLLMProvider(state.consciousnessSettings.activeProvider as string)}
 
-			{#if provider?.requiresApiKey || provider?.custom}
+			{#if provider?.authentication === 'optional'}
+				<div class="provider-note provider-info">
+					<Icon name="info" size={14} />
+					<span>Anonymous access works with supported free models. Add a Kilo API key for additional models or account-based access.</span>
+				</div>
+				<p class="provider-note provider-warning">
+					Free gateway models may be served by third-party inference providers. Avoid sending secrets or sensitive information unless you trust the selected provider.
+				</p>
+				{#if state.llmFetchError}
+					<p class="provider-note error">
+						<Icon name="alert-circle" size={14} />
+						{state.llmFetchError}
+					</p>
+				{/if}
+			{/if}
+
+			{#if provider?.requiresApiKey || provider?.custom || provider?.authentication === 'optional'}
 				<div class="api-key-row">
 					<input
 						type="password"
 						class="api-key-input"
 						class:error={state.llmFetchError}
-						placeholder={provider?.custom ? 'API Key (optional)' : 'API Key'}
+						placeholder={provider?.custom || provider?.authentication === 'optional' ? 'API Key (optional)' : 'API Key'}
 						value={settingsStore.getProviderConfig(provider.id).apiKey ?? ''}
 						oninput={(e) => state.handleApiKeyChange(provider.id, e.currentTarget.value)}
 						onblur={provider?.custom ? undefined : state.handleLLMApiKeyBlur}
@@ -304,6 +320,17 @@
 		align-items: flex-start;
 		line-height: 1.45;
 		color: var(--color-error);
+	}
+
+	.provider-info {
+		align-items: flex-start;
+		line-height: 1.45;
+	}
+
+	.provider-warning {
+		align-items: flex-start;
+		line-height: 1.45;
+		font-size: 0.7rem;
 	}
 
 	.provider-error {

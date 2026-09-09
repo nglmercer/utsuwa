@@ -14,6 +14,7 @@ import { ttsStore } from '$lib/stores/tts.svelte';
 import { personaStore } from '$lib/stores/persona.svelte';
 import { vrmStore } from '$lib/stores/vrm.svelte';
 import { getLLMProvider, getTTSProvider } from '$lib/services/providers/registry';
+import { hasApiKey } from '$lib/services/providers/openai-compatible';
 import { streamChatDirect } from '$lib/services/chat/client-chat';
 import { processCompanionTurn } from '$lib/services/chat/companion-turn';
 import { retrieveRelevantContext } from '$lib/engine/memory';
@@ -229,7 +230,9 @@ export async function sendCompanionMessage(
 			systemEvent ? content : undefined,
 			nativeRuntime
 		);
-		if (!nativeRuntime && providerMeta?.requiresApiKey && !apiKey) {
+		const requiresApiKey =
+			providerMeta?.authentication === 'required' || providerMeta?.requiresApiKey === true;
+		if (!nativeRuntime && requiresApiKey && !hasApiKey(apiKey)) {
 			throw new Error(`Please configure API key for ${providerMeta.name} in Settings > Providers`);
 		}
 
@@ -312,7 +315,9 @@ export async function sendCompanionMessage(
 					messages: messages.map((m) => ({ role: m.role, content: toOpenAIContent(m.content) })),
 					provider,
 					model: selectedModel,
-					apiKey: apiKey || (providerMeta?.custom ? undefined : 'not-needed'),
+					// Keep anonymous/optional-key providers truly anonymous. The server
+					// route and xsai omit Authorization when this is undefined.
+					apiKey: apiKey || undefined,
 					baseURL,
 					systemPrompt,
 					...advancedParams

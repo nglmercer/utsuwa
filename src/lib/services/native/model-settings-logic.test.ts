@@ -27,6 +27,13 @@ test('native Ollama settings are idempotent and custom paths are preserved', () 
 	);
 });
 
+test('native Kilo settings preserve the gateway base without adding /v1', () => {
+	assert.equal(
+		normalizeNativeBaseUrl('kilo', 'https://api.kilo.ai/api/gateway/'),
+		'https://api.kilo.ai/api/gateway'
+	);
+});
+
 test('native settings payload sends the normalized provider base URL', () => {
 	assert.deepEqual(
 		buildNativeModelProviderParams({

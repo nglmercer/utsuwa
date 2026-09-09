@@ -3,6 +3,7 @@ import { buildNativeModelProviderParams, normalizeNativeBaseUrl } from './model-
 import { getLLMProvider } from '$lib/services/providers/registry';
 import { modulesStore } from '$lib/stores/modules.svelte';
 import { settingsStore } from '$lib/stores/settings.svelte';
+import { hasApiKey } from '$lib/services/providers/openai-compatible';
 
 /** Model configuration sent to the native host. The key is write-only: the
  * host stores it in the OS secret store and never returns it to the WebView. */
@@ -65,7 +66,14 @@ export async function syncNativeModelProvider(
 		// write will surface its own bridge error, and we avoid clearing a key
 		// based on an unavailable status read.
 	}
-	let apiKey = apiKeyOverride ?? (providerConfig.apiKey || undefined);
+	// Preserve an explicit empty override so the host can clear its key, while
+	// treating whitespace-only values as anonymous for optional-key providers.
+	let apiKey: string | undefined;
+	if (apiKeyOverride !== undefined) {
+		apiKey = hasApiKey(apiKeyOverride) ? apiKeyOverride.trim() : '';
+	} else {
+		apiKey = hasApiKey(providerConfig.apiKey) ? providerConfig.apiKey!.trim() : undefined;
+	}
 	if (apiKey === undefined && nativeProvider !== null && nativeProvider !== providerId) {
 		apiKey = '';
 	}

@@ -2,10 +2,16 @@ import { streamText } from '@xsai/stream-text';
 import { env } from '$env/dynamic/private';
 import type { RequestHandler } from './$types';
 import type { LLMProvider } from '$lib/types';
+import { getLLMProvider } from '$lib/services/providers/registry';
 import { getChatBaseUrl } from '$lib/services/providers/local-endpoints';
 import { assertSafeProviderUrl } from '$lib/services/providers/url-guard';
 import { sanitizeProviderError } from '$lib/services/providers/provider-errors';
 import { DEFAULT_CHAT_BASE_URLS } from '$lib/services/providers/provider-defaults';
+import {
+	describeOpenAICompatibleHttpError,
+	hasApiKey,
+	normalizeOptionalApiKey
+} from '$lib/services/providers/openai-compatible';
 
 // Providers that don't require API keys
 const LOCAL_PROVIDERS: LLMProvider[] = ['ollama', 'lmstudio'];
@@ -22,10 +28,13 @@ export const POST: RequestHandler = async ({ request }) => {
 
 	const typedProvider = provider as LLMProvider;
 
-	// Local providers and OpenAI-compatible endpoints don't require API keys.
+	const providerMeta = getLLMProvider(typedProvider);
+	// Local providers, custom endpoints, and providers with optional/none
+	// authentication may be used without a key. Required-key providers are
+	// rejected before a request is started.
 	const isLocalProvider = LOCAL_PROVIDERS.includes(typedProvider);
-	const isKeylessProvider = isLocalProvider || typedProvider === 'openai-compatible';
-	if (!apiKey && !isKeylessProvider) {
+	const requiresApiKey = providerMeta?.authentication === 'required' || providerMeta?.requiresApiKey === true;
+	if (!hasApiKey(apiKey) && requiresApiKey) {
 		return new Response(JSON.stringify({ error: 'API key required' }), {
 			status: 400,
 			headers: { 'Content-Type': 'application/json' }
@@ -80,10 +89,9 @@ export const POST: RequestHandler = async ({ request }) => {
 		let result;
 		try {
 			result = streamText({
-				// Keyless custom endpoints must not receive a fabricated bearer;
-				// strict gateways reject 'Bearer not-needed'. xsai omits the
-				// Authorization header entirely when apiKey is undefined.
-				apiKey: apiKey || (typedProvider === 'openai-compatible' ? undefined : 'not-needed'),
+				// xsai omits Authorization when apiKey is undefined. This is
+				// essential for anonymous Kilo/free-gateway requests.
+				apiKey: normalizeOptionalApiKey(apiKey),
 				baseURL: providerBaseURL,
 				model,
 				messages: messagesWithSystem,
@@ -95,10 +103,10 @@ export const POST: RequestHandler = async ({ request }) => {
 					...(presencePenalty !== undefined && { presence_penalty: presencePenalty }),
 					...(frequencyPenalty !== undefined && { frequency_penalty: frequencyPenalty })
 				})
-			});
+				});
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : 'Failed to connect to provider';
-			return new Response(JSON.stringify({ error: sanitizeProviderError(msg, providerBaseURL) }), {
+			const msg = describeChatError(err, typedProvider, providerBaseURL);
+			return new Response(JSON.stringify({ error: msg }), {
 				status: 502,
 				headers: { 'Content-Type': 'application/json' }
 			});
@@ -125,9 +133,9 @@ export const POST: RequestHandler = async ({ request }) => {
 				try {
 					reader = textStream.getReader();
 				} catch (err) {
-					const msg = err instanceof Error ? err.message : 'Failed to start stream';
+					const msg = describeChatError(err, typedProvider, providerBaseURL);
 					controller.enqueue(
-						encoder.encode(`e:${JSON.stringify({ error: sanitizeProviderError(msg, providerBaseURL) })}\n`)
+						encoder.encode(`e:${JSON.stringify({ error: msg })}\n`)
 					);
 					controller.close();
 					return;
@@ -143,10 +151,10 @@ export const POST: RequestHandler = async ({ request }) => {
 					controller.close();
 				} catch (error) {
 					console.error('Stream error:', error);
-					const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+					const errorMessage = describeChatError(error, typedProvider, providerBaseURL);
 					controller.enqueue(
 						encoder.encode(
-							`e:${JSON.stringify({ error: sanitizeProviderError(errorMessage, providerBaseURL) })}\n`
+							`e:${JSON.stringify({ error: errorMessage })}\n`
 						)
 					);
 					controller.close();
@@ -165,10 +173,38 @@ export const POST: RequestHandler = async ({ request }) => {
 		});
 	} catch (error) {
 		console.error('Chat API error:', error);
-		const msg = error instanceof Error ? error.message : 'Unknown error';
-		return new Response(JSON.stringify({ error: sanitizeProviderError(msg, baseURL) }), {
+		const msg = describeChatError(error, typedProvider, baseURL);
+		return new Response(JSON.stringify({ error: msg }), {
 			status: 500,
 			headers: { 'Content-Type': 'application/json' }
 		});
 	}
 };
+
+function describeChatError(error: unknown, providerId: string, baseUrl?: string): string {
+	const rawMessage = error instanceof Error ? error.message : 'Failed to connect to provider';
+	const remoteError = rawMessage.match(/Remote sent (\d{3}) response:\s*([\s\S]*)/i);
+	if (remoteError) {
+		const status = Number(remoteError[1]);
+		let detail = remoteError[2].trim();
+		try {
+			const parsed = JSON.parse(detail) as { error?: unknown; message?: unknown };
+			const nested = parsed.error;
+			detail =
+				typeof nested === 'string'
+					? nested
+					: nested && typeof nested === 'object' && typeof (nested as { message?: unknown }).message === 'string'
+						? (nested as { message: string }).message
+						: typeof parsed.message === 'string'
+							? parsed.message
+							: detail;
+		} catch {
+			// Keep the provider's short text diagnostic.
+		}
+		return sanitizeProviderError(
+			describeOpenAICompatibleHttpError(providerId, status, undefined, detail),
+			baseUrl
+		);
+	}
+	return sanitizeProviderError(rawMessage, baseUrl);
+}

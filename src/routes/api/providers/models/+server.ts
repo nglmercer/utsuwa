@@ -10,12 +10,15 @@ import {
 import { assertSafeProviderUrl } from '$lib/services/providers/url-guard';
 import { DEFAULT_MODELS_BASE_URLS } from '$lib/services/providers/provider-defaults';
 import { parseLMStudioModelCapabilities, type ModelInfo } from '$lib/services/providers/model-capabilities';
+import {
+	fetchOpenAICompatibleModels,
+	hasApiKey
+} from '$lib/services/providers/openai-compatible';
 
 interface FetchModelsResponse {
 	models: ModelInfo[];
 	error?: string;
 }
-
 
 // Model filter patterns - only keep chat-compatible models
 // Note: Google IDs have 'models/' prefix stripped before filtering
@@ -59,16 +62,14 @@ function normalizeModelName(id: string, providerId: string): string {
 	return name;
 }
 
-async function fetchOpenAIModels(apiKey: string | undefined, baseUrl: string): Promise<ModelInfo[]> {
-	const headers: Record<string, string> = {};
-	if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-	const response = await fetch(`${baseUrl}/models`, { headers });
-	if (!response.ok) throw new Error(`Failed to fetch models: ${response.statusText}`);
-	const data = await response.json();
-	return (data.data || []).map((m: { id: string }) => ({
-		id: m.id,
-		name: normalizeModelName(m.id, 'openai')
-	}));
+async function fetchOpenAIModels(
+	apiKey: string | undefined,
+	baseUrl: string,
+	providerId = 'openai'
+): Promise<ModelInfo[]> {
+	return fetchOpenAICompatibleModels(apiKey, baseUrl, providerId, {
+		normalizeName: (id) => normalizeModelName(id, providerId)
+	});
 }
 
 async function fetchAnthropicModels(apiKey: string, baseUrl: string): Promise<ModelInfo[]> {
@@ -223,7 +224,7 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		// Remove trailing slash for consistency
 		const cleanBaseUrl =
-			providerId === 'ollama' || providerId === 'lmstudio' || providerId === 'openai-compatible'
+			providerId === 'ollama' || providerId === 'lmstudio' || providerId === 'kilo' || providerId === 'openai-compatible'
 				? getModelsBaseUrl(providerId, effectiveBaseUrl)
 				: effectiveBaseUrl.replace(/\/+$/, '');
 
@@ -247,13 +248,20 @@ export const POST: RequestHandler = async ({ request }) => {
 				if (!apiKey) throw new Error('API key required for OpenAI');
 				models = await fetchOpenAIModels(apiKey, cleanBaseUrl);
 				break;
+			case 'kilo':
+				models = await fetchOpenAICompatibleModels(apiKey, cleanBaseUrl, 'kilo', {
+					classifyFree: true,
+					onlyFree: !hasApiKey(apiKey),
+					includeCapabilities: true
+				});
+				break;
 			case 'openai-compatible': {
 				// OpenAI-compatible endpoints may or may not require an API key.
 				if (looksLikeOllama(cleanBaseUrl)) {
 					models = await fetchOllamaModels(cleanBaseUrl);
 				} else {
 					// Custom endpoints own their path semantics; do not assume `/v1`.
-					models = (await fetchOpenAIModels(apiKey, cleanBaseUrl)).map((model) => ({
+					models = (await fetchOpenAIModels(apiKey, cleanBaseUrl, 'openai-compatible')).map((model) => ({
 						...model,
 						capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
 					}));

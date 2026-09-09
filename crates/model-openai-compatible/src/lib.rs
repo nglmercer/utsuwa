@@ -11,8 +11,10 @@ use model_core::{
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
+use std::time::Duration;
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+const MODELS_PATH: &str = "/models";
 const MAX_PROVIDER_ERROR_BODY: usize = 8 * 1024;
 
 #[derive(Debug, Clone)]
@@ -29,6 +31,10 @@ impl OpenAICompatibleClient {
         api_key: Option<String>,
         model: impl Into<String>,
     ) -> Self {
+        let api_key = api_key.and_then(|key| {
+            let key = key.trim();
+            (!key.is_empty()).then(|| key.to_string())
+        });
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -50,6 +56,49 @@ impl OpenAICompatibleClient {
     fn url(&self) -> String {
         format!("{}{}", self.base_url, CHAT_COMPLETIONS_PATH)
     }
+
+    fn models_url(&self) -> String {
+        format!("{}{}", self.base_url, MODELS_PATH)
+    }
+
+    /// Fetch the raw OpenAI-compatible model catalog.
+    ///
+    /// The native desktop host uses this method for providers whose public
+    /// model endpoint does not enable browser CORS (for example Kilo). The
+    /// frontend still owns model classification and presentation; this layer
+    /// only owns HTTP transport, optional Bearer authentication, and useful
+    /// provider errors.
+    pub async fn fetch_models(&self) -> Result<Value, ModelError> {
+        let endpoint = self.models_url();
+        let mut request = self.http.get(&endpoint);
+        request = request.timeout(Duration::from_secs(10));
+        if let Some(key) = self.api_key.as_deref() {
+            request = request.bearer_auth(key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = read_limited_provider_body(response).await;
+            return Err(ModelError::Provider {
+                status: status.as_u16(),
+                message: classify_provider_error(status.as_u16(), &body),
+            });
+        }
+
+        let data = response
+            .json::<Value>()
+            .await
+            .map_err(|e| ModelError::InvalidResponse(e.to_string()))?;
+        if !data.get("data").is_some_and(|models| models.is_array()) {
+            return Err(ModelError::InvalidResponse(
+                "model provider returned an invalid OpenAI-compatible catalog".to_string(),
+            ));
+        }
+        Ok(data)
+    }
 }
 
 #[async_trait::async_trait]
@@ -57,7 +106,7 @@ impl ModelProvider for OpenAICompatibleClient {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
         let body = request_body(&self.model, &request);
         let mut req = self.http.post(self.url()).json(&body);
-        if let Some(key) = &self.api_key {
+        if let Some(key) = self.api_key.as_deref() {
             req = req.bearer_auth(key);
         }
         let response = req
@@ -215,6 +264,7 @@ fn classify_provider_error(status: u16, body: &str) -> String {
     let detail = extract_provider_error(body).unwrap_or_else(|| sanitize_provider_error_body(body));
     let prefix = match status {
         401 | 403 => "authentication or authorization failed",
+        402 => "selected model requires payment or account credit",
         404 => "model or provider endpoint was not found",
         429 => "provider rate limit reached",
         500..=599 => "provider server error",
@@ -1093,6 +1143,134 @@ mod tests {
             ]
         );
         server.await.unwrap();
+    }
+
+    async fn captured_request(api_key: Option<&str>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            request_tx
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: [DONE]\n\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = OpenAICompatibleClient::new(
+            format!("http://{addr}"),
+            api_key.map(str::to_string),
+            "test-model",
+        );
+        let mut stream = client
+            .stream(ModelRequest::new(vec![ModelMessage::user("hi")]))
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+        let request = request_rx.await.unwrap();
+        server.await.unwrap();
+        request
+    }
+
+    async fn captured_models_request(api_key: Option<&str>) -> (String, Value) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 2048];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            request_tx
+                .send(String::from_utf8_lossy(&request).into_owned())
+                .unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 34\r\n\r\n{\"data\":[{\"id\":\"kilo-auto/free\"}]}",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = OpenAICompatibleClient::new(
+            format!("http://{addr}/api/gateway/"),
+            api_key.map(str::to_string),
+            "",
+        );
+        let data = client.fetch_models().await.unwrap();
+        let request = request_rx.await.unwrap();
+        server.await.unwrap();
+        (request, data)
+    }
+
+    #[test]
+    fn kilo_base_url_is_normalized_without_adding_v1() {
+        let client =
+            OpenAICompatibleClient::new("https://api.kilo.ai/api/gateway/", None, "test-model");
+        assert_eq!(client.base_url, "https://api.kilo.ai/api/gateway");
+        assert_eq!(
+            client.url(),
+            "https://api.kilo.ai/api/gateway/chat/completions"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_requests_omit_authorization_header() {
+        for api_key in [None, Some(""), Some("   ")] {
+            let request = captured_request(api_key).await;
+            assert!(!request
+                .lines()
+                .any(|line| { line.to_ascii_lowercase().starts_with("authorization:") }));
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_send_bearer_authorization() {
+        let request = captured_request(Some("  test-key  ")).await;
+        assert!(request.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.eq_ignore_ascii_case("authorization") && value.trim() == "Bearer test-key"
+        }));
+    }
+
+    #[tokio::test]
+    async fn model_catalog_uses_models_path_and_optional_auth() {
+        let (anonymous_request, anonymous_data) = captured_models_request(None).await;
+        assert!(anonymous_request.starts_with("GET /api/gateway/models HTTP/1.1"));
+        assert!(!anonymous_request
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("authorization:")));
+        assert_eq!(anonymous_data["data"][0]["id"], "kilo-auto/free");
+
+        let (authenticated_request, _) = captured_models_request(Some(" test-key ")).await;
+        assert!(authenticated_request.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.eq_ignore_ascii_case("authorization") && value.trim() == "Bearer test-key"
+        }));
     }
 
     #[tokio::test]

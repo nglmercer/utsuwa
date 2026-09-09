@@ -5,6 +5,7 @@
 import { fetchProviderModels, type ModelInfo } from './model-fetcher';
 import { getLLMProvider, getTTSProvider } from './registry';
 import { settingsStore } from '$lib/stores/settings.svelte';
+import { hasApiKey } from './openai-compatible';
 
 export type { ModelInfo };
 
@@ -60,8 +61,10 @@ export async function fetchModels(options: FetchModelsOptions): Promise<void> {
 	} = options;
 
 	const provider = getLLMProvider(providerId) || getTTSProvider(providerId);
-	// Custom OpenAI-compatible endpoints may not require an API key.
-	if (!providerId || (!isLocal && !apiKey && !provider?.custom)) return;
+	// Providers with optional/none authentication (including public gateways)
+	// can discover models anonymously. Required-key providers still wait until
+	// a usable key is present; custom endpoints remain configurable either way.
+	if (!providerId || (!isLocal && !hasApiKey(apiKey) && provider?.requiresApiKey && !provider?.custom)) return;
 
 	onStart();
 
@@ -86,7 +89,11 @@ export async function fetchModels(options: FetchModelsOptions): Promise<void> {
 /**
  * Checks for cached models and returns them if valid.
  */
-export function getCachedModelsForProvider(providerId: string): ModelInfo[] | null {
+export function getCachedModelsForProvider(
+	providerId: string,
+	options: { onlyFree?: boolean } = {}
+): ModelInfo[] | null {
 	const cached = settingsStore.getCachedModels(providerId);
-	return cached && cached.length > 0 ? cached : null;
+	const visible = options.onlyFree ? cached?.filter((model) => model.free === true) : cached;
+	return visible && visible.length > 0 ? visible : null;
 }

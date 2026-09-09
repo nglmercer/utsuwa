@@ -26,7 +26,7 @@ export function selectDefaultModel(
  * Determines whether a provider is ready to have its models fetched.
  * - Custom endpoints need a base URL.
  * - Local providers are always ready.
- * - Cloud providers need an API key.
+ * - Required-key cloud providers need an API key; public/optional gateways do not.
  */
 export function isProviderReadyForFetch(
 	provider: ProviderMetadata,
@@ -35,10 +35,10 @@ export function isProviderReadyForFetch(
 	if (provider.custom) {
 		return !!config.baseUrl;
 	}
-	if (provider.isLocal || !provider.requiresApiKey) {
+	if (provider.isLocal || provider.authentication === 'optional' || !provider.requiresApiKey) {
 		return true;
 	}
-	return !!config.apiKey;
+	return !!config.apiKey?.trim();
 }
 
 /**

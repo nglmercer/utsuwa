@@ -9,6 +9,7 @@ pub mod agent;
 pub mod dispatcher;
 pub mod permissions;
 pub mod plugins;
+pub mod providers;
 pub mod settings;
 
 pub use dispatcher::{emit_script, Dispatcher};

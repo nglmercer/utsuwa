@@ -17,6 +17,9 @@ export const DEFAULT_CHAT_BASE_URLS: Record<string, string> = {
 	google: 'https://generativelanguage.googleapis.com/v1beta/openai/',
 	deepseek: 'https://api.deepseek.com/',
 	xai: 'https://api.x.ai/v1/',
+	// Optional-key public gateway. No `/v1` suffix: the generic client appends
+	// `/chat/completions` and model discovery appends `/models`.
+	kilo: 'https://api.kilo.ai/api/gateway',
 	ollama: 'http://localhost:11434',
 	lmstudio: 'http://localhost:1234/v1/'
 };
@@ -29,6 +32,8 @@ export const DEFAULT_MODELS_BASE_URLS: Record<string, string> = {
 	google: 'https://generativelanguage.googleapis.com/v1beta',
 	deepseek: 'https://api.deepseek.com',
 	xai: 'https://api.x.ai/v1',
+	// Optional-key public gateway. No `/v1` suffix (see above).
+	kilo: 'https://api.kilo.ai/api/gateway',
 	ollama: 'http://localhost:11434',
 	lmstudio: 'http://localhost:1234/v1',
 	elevenlabs: 'https://api.elevenlabs.io/v1',

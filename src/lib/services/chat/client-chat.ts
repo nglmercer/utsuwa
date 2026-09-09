@@ -1,10 +1,16 @@
 import type { LLMProvider } from '$lib/types';
+import { getLLMProvider } from '$lib/services/providers/registry';
 import {
 	getChatBaseUrl,
 	getLocalProviderConnectionHint,
 	isLocalLLMProvider
 } from '$lib/services/providers/local-endpoints';
 import { DEFAULT_CHAT_BASE_URLS } from '$lib/services/providers/provider-defaults';
+import {
+	describeOpenAICompatibleHttpError,
+	hasApiKey,
+	optionalBearerHeaders
+} from '$lib/services/providers/openai-compatible';
 import {
 	htmlEndpointError,
 	looksLikeHtml,
@@ -72,8 +78,11 @@ export async function streamChatDirect(
 	const { messages, provider, model, apiKey, baseURL, systemPrompt } = options;
 
 	const isLocal = isLocalLLMProvider(provider);
-	// Custom OpenAI-compatible endpoints may or may not need a key, so don't force one.
-	if (!apiKey && !isLocal && provider !== 'openai-compatible') {
+	const providerMeta = getLLMProvider(provider);
+	const requiresApiKey = providerMeta?.authentication === 'required' || providerMeta?.requiresApiKey === true;
+	// Optional-key/public providers (including Kilo) and custom endpoints may
+	// be used anonymously; required-key providers still fail early.
+	if (!hasApiKey(apiKey) && requiresApiKey) {
 		onError('API key required');
 		return;
 	}
@@ -102,8 +111,8 @@ export async function streamChatDirect(
 		headers['x-api-key'] = apiKey || '';
 		headers['anthropic-version'] = '2023-06-01';
 		headers['anthropic-dangerous-direct-browser-access'] = 'true';
-	} else if (apiKey) {
-		headers['Authorization'] = `Bearer ${apiKey}`;
+	} else {
+		Object.assign(headers, optionalBearerHeaders(apiKey));
 	}
 
 	// Anthropic uses a different request format, and each provider wants images
@@ -147,9 +156,13 @@ export async function streamChatDirect(
 				msg = htmlEndpointError(providerBaseURL);
 			} else {
 				try {
-					msg = JSON.parse(bodyText)?.error?.message || msg;
+					const parsed = JSON.parse(bodyText);
+					const detail = typeof parsed?.error === 'string'
+						? parsed.error
+						: parsed?.error?.message || parsed?.message;
+					msg = describeOpenAICompatibleHttpError(provider, response.status, response.statusText, detail);
 				} catch {
-					// Not JSON — keep the status-based message
+					msg = describeOpenAICompatibleHttpError(provider, response.status, response.statusText);
 				}
 			}
 			msg = sanitizeProviderError(msg, providerBaseURL);
@@ -258,7 +271,9 @@ interface ExtractOptions {
 export async function extractStateUpdates(options: ExtractOptions): Promise<string | null> {
 	const { provider, model, apiKey, baseURL, system, userMessage, reply } = options;
 	const isLocal = isLocalLLMProvider(provider);
-	if (!apiKey && !isLocal && provider !== 'openai-compatible') return null;
+	const providerMeta = getLLMProvider(provider);
+	const requiresApiKey = providerMeta?.authentication === 'required' || providerMeta?.requiresApiKey === true;
+	if (!hasApiKey(apiKey) && requiresApiKey) return null;
 
 	const base = isLocal || provider === 'openai-compatible'
 		? getChatBaseUrl(provider, baseURL)
@@ -283,7 +298,7 @@ export async function extractStateUpdates(options: ExtractOptions): Promise<stri
 			messages: [{ role: 'user', content: userContent }]
 		});
 	} else {
-		if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+		Object.assign(headers, optionalBearerHeaders(apiKey));
 		url = `${trimmedBase}/chat/completions`;
 		body = JSON.stringify({
 			model,

@@ -2,6 +2,8 @@
 import { DEFAULT_CHAT_BASE_URLS } from './provider-defaults.ts';
 import type { ModelInfo } from './model-capabilities';
 
+export type ProviderAuthentication = 'required' | 'optional' | 'none';
+
 export interface ProviderMetadata {
 	id: string;
 	name: string;
@@ -10,6 +12,14 @@ export interface ProviderMetadata {
 	icon: string;
 	iconColor?: string;
 	requiresApiKey: boolean;
+	/**
+	 * Finer-grained auth model for OpenAI-compatible gateways. `requiresApiKey`
+	 * stays the source of truth for gating; this documents whether a keyless
+	 * provider also accepts an optional key (`'optional'`) or never uses one
+	 * (`'none'`). Future optional-key providers reuse this field instead of
+	 * adding parallel provider-specific code.
+	 */
+	authentication?: ProviderAuthentication;
 	defaultBaseUrl?: string;
 	isLocal?: boolean;
 	// A user-configured OpenAI-compatible endpoint (base URL + optional key +
@@ -25,7 +35,7 @@ export interface ProviderMetadata {
 }
 
 // ============================================
-// LLM PROVIDERS (8 total)
+// LLM PROVIDERS (9 total)
 // ============================================
 
 export const LLM_PROVIDERS: ProviderMetadata[] = [
@@ -77,8 +87,23 @@ export const LLM_PROVIDERS: ProviderMetadata[] = [
 		category: 'llm',
 		icon: '𝕏',
 		requiresApiKey: true,
+		authentication: 'required',
 		supportsVision: true,
 		defaultBaseUrl: DEFAULT_CHAT_BASE_URLS.xai
+	},
+	// Optional-key public gateway. Anonymous requests work with supported free
+	// models; a user-supplied key unlocks additional models/account access.
+	// Transport stays in the generic OpenAI-compatible client.
+	{
+		id: 'kilo',
+		name: 'Kilo Gateway',
+		description: 'Free models · No API key required',
+		category: 'llm',
+		icon: '⚡',
+		requiresApiKey: false,
+		authentication: 'optional',
+		defaultBaseUrl: DEFAULT_CHAT_BASE_URLS.kilo,
+		models: []
 	},
 	// Local LLMs discover installed models from the user's running local server.
 	{

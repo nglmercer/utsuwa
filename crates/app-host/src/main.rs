@@ -206,7 +206,9 @@ fn configure_builder(
         // operations can never arrive here (ipc-core has no such
         // variants). Replies go back through the bridge's
         // `__resolve`, keyed by request id.
-        if let Some(script) = ipc_dispatcher.handle_message(request.body()) {
+        let reply_tx = reply_tx.clone();
+        let waker = Arc::clone(&waker);
+        ipc_dispatcher.handle_message_with_callback(request.body(), move |script| {
             // Queue full / loop gone: log and drop; the bridge
             // promise stays pending rather than resolving wrongly.
             if reply_tx.send(script).is_err() {
@@ -214,7 +216,7 @@ fn configure_builder(
             } else {
                 waker();
             }
-        }
+        });
     }))
 }
 

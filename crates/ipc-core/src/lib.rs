@@ -44,6 +44,10 @@ pub enum IpcMethod {
     SettingsGetModelProvider,
     #[serde(rename = "settings.set_model_provider")]
     SettingsSetModelProvider,
+    /// Fetch an OpenAI-compatible model catalog through the native HTTP
+    /// client. This is needed when a provider does not enable WebView CORS.
+    #[serde(rename = "providers.fetch_models")]
+    ProvidersFetchModels,
     #[serde(rename = "activity.list")]
     ActivityList,
     #[serde(rename = "plugin.list")]

@@ -378,6 +378,10 @@ mod tests {
             ),
             "http://localhost:9000/custom"
         );
+        assert_eq!(
+            normalize_provider_base_url("kilo", "https://api.kilo.ai/api/gateway"),
+            "https://api.kilo.ai/api/gateway"
+        );
     }
 
     fn test_authorizer(enabled: bool) -> QueueAuthorizer {
@@ -2183,6 +2187,37 @@ mod tests {
             Arc::new(secret_core::MemoryStore::default());
         let factory = provider_factory_with_secrets(Some(storage), secrets);
         // Ollama-style keyless providers still construct.
+        factory().unwrap();
+    }
+
+    #[test]
+    fn kilo_provider_builds_without_an_api_key() {
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-runtime-kilo-nokey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Arc::new(Mutex::new(
+            storage_core::Storage::open(&dir.join("state.db")).unwrap(),
+        ));
+        {
+            let store = storage.lock().unwrap();
+            store
+                .set_setting(SETTING_PROVIDER, &serde_json::json!("kilo"))
+                .unwrap();
+            store
+                .set_setting(
+                    SETTING_BASE_URL,
+                    &serde_json::json!("https://api.kilo.ai/api/gateway"),
+                )
+                .unwrap();
+            store
+                .set_setting(SETTING_MODEL_NAME, &serde_json::json!("kilo-auto/free"))
+                .unwrap();
+        }
+        let secrets: Arc<dyn secret_core::SecretStore> =
+            Arc::new(secret_core::MemoryStore::default());
+        let factory = provider_factory_with_secrets(Some(storage), secrets);
+
+        // Kilo is routed through the generic OpenAI-compatible factory.
         factory().unwrap();
     }
 

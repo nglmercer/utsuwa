@@ -18,6 +18,7 @@ import {
 	isProviderReadyForFetch,
 	createFetchSignature
 } from './ai-services-settings-logic.ts';
+import { hasApiKey } from '$lib/services/providers/openai-compatible';
 
 /**
  * Shared helper: persists an API key and marks the provider as added when a key
@@ -63,8 +64,7 @@ export function createLlmSettingsState() {
 		return isProviderReadyForFetch(provider, settingsStore.getProviderConfig(providerId));
 	});
 
-	function activeLLMProviderForFetch() {
-		const providerId = consciousnessSettings.activeProvider as string;
+	function activeLLMProviderForFetch(providerId = consciousnessSettings.activeProvider as string) {
 		if (!providerId) return null;
 		const provider = getLLMProvider(providerId);
 		if (!provider) return null;
@@ -77,14 +77,21 @@ export function createLlmSettingsState() {
 		return { provider, config };
 	}
 
-	async function fetchLLMModels() {
-		const target = activeLLMProviderForFetch();
+	async function fetchLLMModels(
+		providerId?: string,
+		forceRefresh = false
+	) {
+		const target = activeLLMProviderForFetch(providerId);
 		if (!target) return;
 
-		const cached = getCachedModelsForProvider(target.provider.id);
-		if (cached) {
-			llmDynamicModels = cached;
-			return;
+		if (!forceRefresh) {
+			const cached = getCachedModelsForProvider(target.provider.id, {
+				onlyFree: target.provider.id === 'kilo' && !hasApiKey(target.config.apiKey)
+			});
+			if (cached) {
+				llmDynamicModels = cached;
+				return;
+			}
 		}
 
 		await fetchLLMModelsFromNetwork(target.provider, target.config);
@@ -165,7 +172,9 @@ export function createLlmSettingsState() {
 		llmIsLoading = false;
 		llmHealth = null;
 
-		const cached = getCachedModelsForProvider(providerId);
+		const cached = getCachedModelsForProvider(providerId, {
+			onlyFree: providerId === 'kilo' && !hasApiKey(settingsStore.getProviderConfig(providerId).apiKey)
+		});
 		if (cached) {
 			llmDynamicModels = cached;
 		}
@@ -186,6 +195,11 @@ export function createLlmSettingsState() {
 			void syncNativeModelProvider(providerId, initialModel).catch((error) => {
 				console.error('[Native model settings] sync failed:', error);
 			});
+		}
+		// Public/optional-key providers have no static model list and must load
+		// their anonymous catalog as soon as they are selected.
+		if (provider && !provider.isLocal && !provider.custom && !provider.requiresApiKey) {
+			void fetchLLMModels(providerId);
 		}
 		scheduleLLMHealthCheck();
 	}
@@ -229,7 +243,11 @@ export function createLlmSettingsState() {
 		if (!providerId) return;
 		const provider = getLLMProvider(providerId);
 		const config = settingsStore.getProviderConfig(providerId);
-		if (config.apiKey && provider && !provider.isLocal) {
+		if (provider?.authentication === 'optional') {
+			// The cache may have been populated anonymously. Always refresh on
+			// blur so adding or clearing a key changes the visible catalog.
+			void refreshLLMModels();
+		} else if (hasApiKey(config.apiKey) && provider && !provider.isLocal) {
 			debouncedFetchLLMModels();
 		}
 	}

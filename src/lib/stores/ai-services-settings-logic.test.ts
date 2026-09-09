@@ -39,6 +39,14 @@ const customProvider: ProviderMetadata = {
 	requiresApiKey: false
 } as ProviderMetadata;
 
+const optionalGatewayProvider: ProviderMetadata = {
+	id: 'kilo',
+	name: 'Kilo Gateway',
+	category: 'llm',
+	requiresApiKey: false,
+	authentication: 'optional'
+} as ProviderMetadata;
+
 test('selectDefaultModel preserves current selection when it exists', () => {
 	const models = [mockModel('a'), mockModel('b'), mockModel('c')];
 	assert.equal(selectDefaultModel(models, 'b'), 'b');
@@ -66,6 +74,11 @@ test('isProviderReadyForFetch requires API key for cloud providers', () => {
 test('isProviderReadyForFetch is always true for local providers', () => {
 	assert.equal(isProviderReadyForFetch(localProvider, {}), true);
 	assert.equal(isProviderReadyForFetch(localProvider, { apiKey: 'key' }), true);
+});
+
+test('isProviderReadyForFetch allows optional gateways without a key', () => {
+	assert.equal(isProviderReadyForFetch(optionalGatewayProvider, {}), true);
+	assert.equal(isProviderReadyForFetch(optionalGatewayProvider, { apiKey: '   ' }), true);
 });
 
 test('isProviderReadyForFetch requires base URL for custom endpoints', () => {

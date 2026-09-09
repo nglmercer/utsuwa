@@ -87,6 +87,17 @@ test('custom OpenAI-compatible base URLs preserve their configured path', () => 
 	);
 });
 
+test('Kilo gateway base URLs stay unversioned', () => {
+	assert.equal(
+		getChatBaseUrl('kilo', 'https://api.kilo.ai/api/gateway/'),
+		'https://api.kilo.ai/api/gateway'
+	);
+	assert.equal(
+		getModelsBaseUrl('kilo', 'https://api.kilo.ai/api/gateway'),
+		'https://api.kilo.ai/api/gateway'
+	);
+});
+
 test('provides local provider troubleshooting hints', () => {
 	assert.match(getLocalProviderConnectionHint('ollama', 'http://localhost:11434'), /ollama serve/);
 	assert.match(

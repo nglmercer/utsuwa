@@ -1,7 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { LLM_PROVIDERS, TTS_PROVIDERS, getTTSProvider, providerSupportsVision } from './registry.ts';
+import { LLM_PROVIDERS, TTS_PROVIDERS, getLLMProvider, getTTSProvider, providerSupportsVision } from './registry.ts';
+
+test('Kilo is a registered optional-key public gateway', () => {
+	const kilo = getLLMProvider('kilo');
+
+	assert.ok(kilo, 'Kilo should be registered');
+	assert.equal(kilo?.name, 'Kilo Gateway');
+	assert.equal(kilo?.requiresApiKey, false);
+	assert.equal(kilo?.authentication, 'optional');
+	assert.equal(kilo?.defaultBaseUrl, 'https://api.kilo.ai/api/gateway');
+	assert.deepEqual(kilo?.models ?? [], []);
+});
 
 test('local LLM providers rely on discovered installed models', () => {
 	const localProviders = LLM_PROVIDERS.filter((provider) => provider.isLocal);
