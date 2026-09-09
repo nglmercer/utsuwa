@@ -113,6 +113,16 @@ test('strips stray ChatML / Llama template tokens', () => {
 	assert.ok(dialogue.includes('Hey there.'));
 });
 
+test('preserves the contents of markdown bold dialogue', () => {
+	const { dialogue } = parseResponse('Hoy es **miércoles 9 de septiembre de 2026**.');
+	assert.equal(dialogue, 'Hoy es miércoles 9 de septiembre de 2026.');
+});
+
+test('removes single-asterisk stage directions without dropping dialogue', () => {
+	const { dialogue } = parseResponse('*smiles* That sounds lovely.');
+	assert.equal(dialogue, 'That sounds lovely.');
+});
+
 test('cuts at <|eot_id|> and keeps the dialogue before it', () => {
 	const raw = 'Take care of yourself tonight.<|eot_id|>garbage continuation here';
 	const { dialogue } = parseResponse(raw);

@@ -316,8 +316,13 @@ function cleanDialogue(text: string, companionName?: string): string {
 	// Remove any leftover (closed) JSON-like content
 	cleaned = cleaned.replace(/\{[^}]*"(?:mood|delta|emotion)[^}]*\}/gi, '');
 
-	// Remove action asterisks (we want dialogue only)
-	cleaned = cleaned.replace(/\*[^*]+\*/g, '');
+	// Remove markdown formatting without mistaking the inner pair of a bold
+	// span for an action. The old single-asterisk expression matched the
+	// middle of `**today**`, deleting the date and leaving `**` behind.
+	cleaned = cleaned.replace(/\*\*([^*\n]+)\*\*/g, '$1');
+	// Remove stage directions wrapped in single asterisks (we want dialogue
+	// only), while leaving any unmatched literal asterisks alone.
+	cleaned = cleaned.replace(/(?<!\*)\*[^*\n]+\*(?!\*)/g, '');
 
 	// Remove stage directions in parentheses
 	cleaned = cleaned.replace(/\([^)]*(?:smiles|laughs|sighs|blushes|looks|nods)[^)]*\)/gi, '');
