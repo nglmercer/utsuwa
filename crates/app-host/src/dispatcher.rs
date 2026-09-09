@@ -279,8 +279,9 @@ impl Dispatcher {
 
     /// Mint a standing grant from explicit user action (settings UI).
     /// Restricted to `FilesystemRead`: reads can be pre-approved, but
-    /// mutations and control always go through the per-request dialog —
-    /// there is deliberately no bulk path for them.
+    /// mutations and control in the normal policy go through the per-request
+    /// dialog. Autonomous Agent authorization is a separate runtime mode,
+    /// never a bulk grant through this endpoint.
     fn permission_grant(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
         if request.params.get("capability").and_then(|v| v.as_str()) != Some("FilesystemRead") {
             return Err(IpcErrorBody {
@@ -568,8 +569,8 @@ impl Dispatcher {
         Ok(serde_json::json!({ "ok": true }))
     }
 
-    /// Read a JSON setting from SQLite storage. Missing keys resolve to
-    /// `{"value": null}` rather than erroring.
+    /// Read a JSON setting from SQLite storage. Generic missing keys resolve
+    /// to `{"value": null}`; typed settings expose their declared default.
     fn settings_get(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
         let storage = self.storage.as_ref().ok_or_else(|| IpcErrorBody {
             code: ErrorCode::Internal,
@@ -597,6 +598,14 @@ impl Dispatcher {
             code: ErrorCode::Internal,
             message: err.to_string(),
         })?;
+        if key == crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS {
+            // Missing or legacy-malformed rows use the durable setting's
+            // declared default rather than leaking the generic null shape to
+            // the access UI.
+            return Ok(serde_json::json!({
+                "value": value.and_then(|value| value.as_bool()).unwrap_or(false)
+            }));
+        }
         Ok(serde_json::json!({ "value": value }))
     }
 
@@ -632,16 +641,36 @@ impl Dispatcher {
             });
         }
         let value = request.params.get("value").cloned().unwrap_or(Value::Null);
-        let storage = storage.lock().map_err(|_| IpcErrorBody {
-            code: ErrorCode::Internal,
-            message: "storage lock failed".to_string(),
-        })?;
-        storage
-            .set_setting(key, &value)
-            .map_err(|err| IpcErrorBody {
+        let autonomous_full_access = if key == crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS
+        {
+            Some(value.as_bool().ok_or_else(|| IpcErrorBody {
+                code: ErrorCode::InvalidParams,
+                message: format!("settings.set '{key}' requires a boolean value"),
+            })?)
+        } else {
+            None
+        };
+        {
+            let storage = storage.lock().map_err(|_| IpcErrorBody {
                 code: ErrorCode::Internal,
-                message: err.to_string(),
+                message: "storage lock failed".to_string(),
             })?;
+            storage
+                .set_setting(key, &value)
+                .map_err(|err| IpcErrorBody {
+                    code: ErrorCode::Internal,
+                    message: err.to_string(),
+                })?;
+        }
+        // Keep the live authorizer in sync with the durable row. This makes
+        // both enabling and disabling effective without a runtime restart;
+        // enabling also resumes a suspended Agent turn through its explicit
+        // autonomous-mode path.
+        if let Some(enabled) = autonomous_full_access {
+            if let Some(agent) = self.agent.as_ref() {
+                agent.set_autonomous_full_access(enabled);
+            }
+        }
         Ok(serde_json::json!({ "ok": true }))
     }
 
@@ -1174,6 +1203,75 @@ mod tests {
             .handle_message(r#"{"id":"32","method":"settings.get","params":{"key":"theme"}}"#)
             .unwrap();
         assert!(script.contains("\"value\":\"dark\""), "{script}");
+
+        // The autonomous setting is native-persisted and type-checked rather
+        // than being a frontend-only flag.
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"33","method":"settings.get","params":{{"key":"{}"}}}}"#,
+                crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS
+            ))
+            .unwrap();
+        assert!(script.contains("\"value\":false"), "{script}");
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"34","method":"settings.set","params":{{"key":"{}","value":true}}}}"#,
+                crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS
+            ))
+            .unwrap();
+        assert!(script.contains("\"ok\":true"), "{script}");
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"35","method":"settings.get","params":{{"key":"{}"}}}}"#,
+                crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS
+            ))
+            .unwrap();
+        assert!(script.contains("\"value\":true"), "{script}");
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"36","method":"settings.set","params":{{"key":"{}","value":"yes"}}}}"#,
+                crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS
+            ))
+            .unwrap();
+        assert!(script.contains("requires a boolean value"), "{script}");
+    }
+
+    #[test]
+    fn autonomous_setting_updates_the_live_agent_authorizer() {
+        let storage = temp_storage("autonomous-live");
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let emit: crate::agent_runtime::EmitFn = Arc::new(|_| {});
+        let agent = AgentRuntime::start_with_factory(
+            Arc::clone(&approvals),
+            Some(Arc::clone(&storage)),
+            None,
+            emit,
+            Arc::new(|| Err(crate::agent_runtime::RuntimeError::ModelNotConfigured)),
+        )
+        .unwrap();
+        assert!(!agent.autonomous_full_access_enabled());
+
+        let dispatcher = dispatcher()
+            .with_storage(storage)
+            .with_approvals(approvals)
+            .with_agent(Arc::clone(&agent));
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"60","method":"settings.set","params":{{"key":"{}","value":true}}}}"#,
+                crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS
+            ))
+            .unwrap();
+        assert!(script.contains("\"ok\":true"), "{script}");
+        assert!(agent.autonomous_full_access_enabled());
+
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"61","method":"settings.set","params":{{"key":"{}","value":false}}}}"#,
+                crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS
+            ))
+            .unwrap();
+        assert!(script.contains("\"ok\":true"), "{script}");
+        assert!(!agent.autonomous_full_access_enabled());
     }
 
     #[test]

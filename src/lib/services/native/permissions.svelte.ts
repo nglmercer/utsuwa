@@ -16,7 +16,15 @@ let attached = false;
 function onHostEvent(e: Event) {
 	if (!isHostEvent(e)) return;
 	const detail = (e as CustomEvent).detail;
-	if (!detail || detail.event !== 'permission.requested') return;
+	if (!detail) return;
+	if (detail.event === 'permission.dismissed') {
+		const id = (detail.data as Record<string, unknown> | null)?.id;
+		if (typeof id === 'string') {
+			requests = requests.filter((request) => request.id !== id);
+		}
+		return;
+	}
+	if (detail.event !== 'permission.requested') return;
 	const request = parsePermissionRequest(detail.data);
 	if (request && !requests.some((r) => r.id === request.id)) {
 		requests.push(request);

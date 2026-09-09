@@ -200,6 +200,13 @@ fn default_ttl(decision_allows_mutation: bool) -> Duration {
     }
 }
 
+/// Ticket lifetime for an already-authorized capability request. The host's
+/// autonomous Agent authorizer uses the same bounded lifetimes as ordinary
+/// policy decisions; autonomous mode never creates an unbounded ticket.
+pub fn ticket_ttl_for(capability: &Capability) -> Duration {
+    default_ttl(is_mutation_or_control(capability))
+}
+
 /// Evaluate one request. Pure function of (principal, request, context) —
 /// no I/O, no ambient authority, no panics. The span names the principal
 /// kind and capability only: concrete resources may contain user paths.
@@ -214,6 +221,16 @@ pub fn authorize(
         capability = ?request.capability
     )
     .entered();
+    // The caller-supplied principal and the request identity must agree.
+    // AgentRuntime constructs both values itself, but keeping this invariant
+    // in the policy boundary prevents a confused deputy if another native
+    // caller ever supplies mismatched values.
+    if principal != &request.principal {
+        return AuthorizationDecision::Deny {
+            reason: "capability request principal does not match its caller".to_string(),
+        };
+    }
+
     // The WebView never holds direct OS authority: a Frontend principal
     // asking for a privileged capability is denied outright rather than
     // prompted (prompting would train users to bless the wrong layer).
@@ -244,7 +261,7 @@ pub fn authorize(
             && (!requires_fresh || grant.lifetime == GrantLifetime::Once)
         {
             return AuthorizationDecision::Allow {
-                ticket_ttl: default_ttl(is_mutation_or_control(&request.capability)),
+                ticket_ttl: ticket_ttl_for(&request.capability),
             };
         }
     }
@@ -277,7 +294,7 @@ pub fn authorize(
     // The user themselves acting locally: allow, tickets still scope it.
     if *principal == Principal::User {
         return AuthorizationDecision::Allow {
-            ticket_ttl: default_ttl(is_mutation_or_control(&request.capability)),
+            ticket_ttl: ticket_ttl_for(&request.capability),
         };
     }
 
@@ -461,6 +478,40 @@ impl ApprovalQueue {
         let mut out: Vec<PendingRequest> = inner.pending.values().cloned().collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         out
+    }
+
+    /// Withdraw a pending request created for the trusted Agent runtime when
+    /// autonomous mode is enabled. This does not create a grant: the resumed
+    /// turn must still pass the live autonomous authorizer and receive a
+    /// normal invocation-bound capability ticket.
+    ///
+    /// The principal check is deliberate. A caller cannot use this helper to
+    /// silently remove or auto-approve a request belonging to the frontend,
+    /// a plugin, or another native principal.
+    pub fn withdraw_agent(&self, id: &str) -> Option<PendingRequest> {
+        let request = {
+            let mut inner = self.inner.lock().expect("approval queue lock");
+            let is_agent = inner
+                .pending
+                .get(id)
+                .is_some_and(|request| matches!(request.principal, Principal::Agent(_)));
+            if !is_agent {
+                return None;
+            }
+            inner.pending.remove(id)
+        }?;
+
+        if let Some(sink) = &self.sink {
+            sink.record(audit_core::AuditRecord::now(
+                request.principal.clone(),
+                Some(request.capability.clone()),
+                Some(request.resource.clone()),
+                audit_core::AuditOutcome::Authorized,
+                "authorization_mode=autonomous_full_access; pending Agent request resumed"
+                    .to_string(),
+            ));
+        }
+        Some(request)
     }
 
     /// Resolve a request. `Some(lifetime)` approves (records a grant scoped
@@ -938,6 +989,28 @@ mod tests {
             queue.decide("perm-999", Some(GrantLifetime::Once)),
             Err(QueueError::UnknownId("perm-999".to_string()))
         );
+    }
+
+    #[test]
+    fn withdraw_agent_only_removes_agent_requests_without_granting() {
+        let queue = ApprovalQueue::new();
+        let agent = queue.submit(
+            Principal::Agent(AgentId::new("a")),
+            Capability::FilesystemWrite,
+            Resource::Path(PathBuf::from("/work/file")),
+            "write".to_string(),
+        );
+        let frontend = queue.submit(
+            Principal::Frontend,
+            Capability::FilesystemWrite,
+            Resource::Path(PathBuf::from("/work/frontend-file")),
+            "frontend write".to_string(),
+        );
+
+        assert!(queue.withdraw_agent(&agent.id).is_some());
+        assert!(queue.withdraw_agent(&frontend.id).is_none());
+        assert_eq!(queue.list().len(), 1);
+        assert!(queue.grants_snapshot().is_empty());
     }
 
     #[test]

@@ -12,7 +12,8 @@
 //! manual dialog flow.
 //!
 //! Host events emitted: `agent.turn_done`, `agent.turn_suspended`,
-//! `agent.turn_failed`, `agent.turn_cancelled`, `permission.requested`.
+//! `agent.turn_failed`, `agent.turn_cancelled`, `permission.requested`,
+//! `permission.dismissed`.
 
 use agent_core::{Agent, AgentEvent, AgentLimits, ToolAuthorizer, ToolReplayCache};
 use audit_core::AuditSink;
@@ -22,7 +23,11 @@ use mcp_runtime::{McpManager, McpServerConfig};
 use model_core::{ModelMessage, ModelProvider};
 use model_openai_compatible::{AnthropicClient, OpenAICompatibleClient};
 use policy_core::{ApprovalQueue, AuthorizationDecision};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use storage_core::Storage;
 use tool_core::ToolRegistry;
 use tool_process::{ProcessLimits, ProcessManager};
@@ -40,6 +45,9 @@ pub const SETTING_MCP_SERVERS: &str = "mcp.servers";
 /// only `Enabled` plugins register tools, and every call stays behind
 /// policy + tickets.
 pub const SETTING_PLUGIN_DIR: &str = "plugin.dir";
+/// Native persistent setting for the explicit Agent-only autonomous mode.
+/// Missing or invalid values are treated as `false`.
+pub const SETTING_AUTONOMOUS_FULL_ACCESS: &str = "agent.autonomous_full_access";
 
 /// Transcript cap: oldest messages are dropped past this bound so a long
 /// session cannot grow memory (or model context) without limit.
@@ -96,6 +104,7 @@ struct QueueAuthorizer {
     approvals: Arc<Mutex<ApprovalQueue>>,
     task_id: String,
     turn_id: String,
+    autonomous_full_access: Arc<AtomicBool>,
 }
 
 impl ToolAuthorizer for QueueAuthorizer {
@@ -104,6 +113,15 @@ impl ToolAuthorizer for QueueAuthorizer {
         principal: &capability_core::Principal,
         request: &capability_core::CapabilityRequest,
     ) -> AuthorizationDecision {
+        // Autonomous mode is deliberately an AgentRuntime concern. It is
+        // checked before the ordinary queue policy so secret paths and
+        // shell/interpreter requests are included, but only when both the
+        // caller and the request carry the exact trusted Agent identity.
+        if self.autonomous_for(principal, request) {
+            return AuthorizationDecision::Allow {
+                ticket_ttl: policy_core::ticket_ttl_for(&request.capability),
+            };
+        }
         self.approvals
             .lock()
             .map(|queue| {
@@ -124,12 +142,36 @@ impl ToolAuthorizer for QueueAuthorizer {
         principal: &capability_core::Principal,
         request: &capability_core::CapabilityRequest,
     ) -> bool {
+        // `Agent::execute_prepared` commits immediately before minting the
+        // ticket. Autonomous mode must commit here too; it still mints the
+        // same invocation-bound ticket and the broker still validates it.
+        if self.autonomous_for(principal, request) {
+            return true;
+        }
         self.approvals
             .lock()
             .map(|queue| {
                 queue.consume_for(principal, request, Some(&self.task_id), Some(&self.turn_id))
             })
             .unwrap_or(false)
+    }
+
+    fn authorization_mode(&self) -> Option<&'static str> {
+        self.autonomous_full_access
+            .load(Ordering::SeqCst)
+            .then_some("autonomous_full_access")
+    }
+}
+
+impl QueueAuthorizer {
+    fn autonomous_for(
+        &self,
+        principal: &capability_core::Principal,
+        request: &capability_core::CapabilityRequest,
+    ) -> bool {
+        self.autonomous_full_access.load(Ordering::SeqCst)
+            && matches!(principal, capability_core::Principal::Agent(_))
+            && principal == &request.principal
     }
 }
 
@@ -147,6 +189,7 @@ pub struct AgentRuntime {
     memory: Mutex<Arc<memory::MemoryStore>>,
     desktop: Mutex<tool_desktop::plugin::DesktopPlugin>,
     storage: Option<Arc<Mutex<Storage>>>,
+    autonomous_full_access: Arc<AtomicBool>,
     state: Arc<Mutex<State>>,
     executor: tokio::runtime::Runtime,
 }
@@ -196,6 +239,9 @@ impl AgentRuntime {
             dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync,
         >,
     ) -> Result<Arc<Self>, RuntimeError> {
+        let autonomous_full_access = Arc::new(AtomicBool::new(
+            read_autonomous_full_access(storage.as_ref()).unwrap_or(false),
+        ));
         let executor = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("utsuwa-agent")
@@ -220,6 +266,7 @@ impl AgentRuntime {
             )),
             desktop: Mutex::new(Self::desktop_plugin()),
             storage,
+            autonomous_full_access,
             state: Arc::new(Mutex::new(State {
                 generation: 0,
                 transcript: Vec::new(),
@@ -232,6 +279,73 @@ impl AgentRuntime {
             })),
             executor,
         }))
+    }
+
+    /// Whether the explicit native setting is currently enabled in the live
+    /// runtime. The persisted value is refreshed when a turn is constructed;
+    /// this atomic mirror lets a settings change take effect for the next
+    /// authorization request without restarting the host.
+    pub fn autonomous_full_access_enabled(&self) -> bool {
+        self.autonomous_full_access.load(Ordering::SeqCst)
+    }
+
+    /// Update the live mode after the native settings row has been written.
+    /// Enabling it also wakes the one suspended Agent turn, if any, without
+    /// creating a broad grant or changing the behavior of other principals.
+    pub fn set_autonomous_full_access(self: &Arc<Self>, enabled: bool) {
+        self.autonomous_full_access.store(enabled, Ordering::SeqCst);
+        if enabled {
+            self.resume_suspended_for_autonomous_access();
+        }
+    }
+
+    fn refresh_autonomous_full_access(&self) -> bool {
+        // A native runtime always has storage. If that source cannot be read,
+        // fail closed instead of retaining a previously enabled high-impact
+        // mode; a later turn can re-read the durable value and re-enable it.
+        let enabled = if self.storage.is_some() {
+            read_autonomous_full_access(self.storage.as_ref()).unwrap_or(false)
+        } else {
+            // Headless/test runtimes without storage can still use the live
+            // setter, but they have no durable value to refresh.
+            self.autonomous_full_access_enabled()
+        };
+        self.autonomous_full_access.store(enabled, Ordering::SeqCst);
+        enabled
+    }
+
+    fn resume_suspended_for_autonomous_access(self: &Arc<Self>) {
+        let request_id = match self.lock_state() {
+            Ok(state) => state
+                .suspended
+                .as_ref()
+                .map(|suspended| suspended.request_id.clone()),
+            Err(_) => None,
+        };
+        let Some(request_id) = request_id else {
+            return;
+        };
+
+        // Only withdraw a pending request that the queue itself identifies as
+        // an Agent request. If another principal ever owns the id, it remains
+        // pending for its normal authorization path.
+        let withdrawn = self
+            .approvals
+            .lock()
+            .ok()
+            .and_then(|queue| queue.withdraw_agent(&request_id));
+        if withdrawn.is_none() {
+            return;
+        }
+
+        (self.emit)(HostEvent {
+            event: "permission.dismissed".to_string(),
+            data: serde_json::json!({
+                "id": request_id,
+                "reason": "autonomous_full_access",
+            }),
+        });
+        self.notify_decided(&request_id, true);
     }
 
     /// Desktop plugins installed on this host. The Linux X11 plugin
@@ -728,7 +842,28 @@ impl AgentRuntime {
         if let Some(note) = resume_note {
             transcript.push(ModelMessage::user(note));
         }
-        let agent = match self.build_agent(generation, system_prompt.clone()) {
+        // Refresh from native storage at the start of every turn. The atomic
+        // mirror is also updated by settings.set, so a toggle during an active
+        // turn is observed by the next authorization request immediately.
+        let autonomous_full_access = self.refresh_autonomous_full_access();
+        let history_system_prompt = transcript
+            .first()
+            .filter(|message| message.role == model_core::ModelRole::System)
+            .map(|message| message.content.as_str());
+        let base_system_prompt = system_prompt.as_deref().or(history_system_prompt);
+        let host_system_prompt =
+            compose_host_system_prompt(base_system_prompt, autonomous_full_access);
+        // `Agent` intentionally leaves an existing system message alone. A
+        // native caller may supply one in history, so replace that message
+        // here to guarantee the trusted host context is present in every
+        // native turn without discarding the user's character prompt.
+        if transcript
+            .first()
+            .is_some_and(|message| message.role == model_core::ModelRole::System)
+        {
+            transcript[0] = ModelMessage::system(host_system_prompt.clone());
+        }
+        let agent = match self.build_agent(generation, Some(host_system_prompt)) {
             Ok(agent) => agent,
             Err(err) => {
                 if self.is_current(generation) {
@@ -780,6 +915,7 @@ impl AgentRuntime {
             approvals: Arc::clone(&self.approvals),
             task_id: task_id.clone(),
             turn_id: turn_id.clone(),
+            autonomous_full_access: Arc::clone(&self.autonomous_full_access),
         };
         match agent
             .turn_with_tools_authorized(transcript, &registry, &authorizer)
@@ -886,6 +1022,143 @@ impl AgentRuntime {
                 }
             }
         }
+    }
+}
+
+/// Read the native persistent mode setting. A missing or malformed value is
+/// the safe default: autonomous access is disabled.
+fn read_autonomous_full_access(storage: Option<&Arc<Mutex<Storage>>>) -> Option<bool> {
+    let storage = storage?;
+    let storage = storage.lock().ok()?;
+    let value = storage.get_setting(SETTING_AUTONOMOUS_FULL_ACCESS).ok()?;
+    Some(value.and_then(|value| value.as_bool()).unwrap_or(false))
+}
+
+#[cfg(target_os = "windows")]
+fn host_home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            Some(PathBuf::from(drive).join(path))
+        })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn host_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+#[cfg(target_os = "linux")]
+fn configured_linux_desktop_dir(home: &Path) -> Option<PathBuf> {
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let config = std::fs::read_to_string(config_dir.join("user-dirs.dirs")).ok()?;
+    config.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "XDG_DESKTOP_DIR").then(|| desktop_path_from_raw(value, home))?
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn desktop_path_from_raw(raw: &str, home: &Path) -> Option<PathBuf> {
+    let raw = raw.trim().trim_matches('"').trim_matches('\'');
+    if raw.is_empty() {
+        return None;
+    }
+    let home = home.to_string_lossy();
+    let expanded = raw.replace("$HOME", home.as_ref());
+    let path = PathBuf::from(expanded);
+    path.is_absolute().then_some(path)
+}
+
+fn host_desktop_dir(home: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    if let Some(configured) = configured_linux_desktop_dir(home) {
+        return Some(configured);
+    }
+
+    let conventional = home.join("Desktop");
+    conventional.is_dir().then_some(conventional)
+}
+
+fn host_os_label() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "windows" => "Windows",
+        "macos" => "macOS",
+        other => other,
+    }
+}
+
+fn host_path_style() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "POSIX"
+    }
+}
+
+fn host_path_separator() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "\\"
+    } else {
+        "/"
+    }
+}
+
+/// Trusted native context appended to the user/character prompt. This is
+/// generated by the Rust host, so the model does not need to guess a username,
+/// operating system, or path syntax from its training data.
+pub fn host_environment_context(autonomous_full_access: bool) -> String {
+    let home = host_home_dir();
+    let home_text = home
+        .as_deref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not detected".to_string());
+    let desktop_text = home
+        .as_deref()
+        .and_then(host_desktop_dir)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not detected; inspect the home directory first".to_string());
+    let cwd_text = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "not detected".to_string());
+    let mode_text = if autonomous_full_access {
+        "enabled; native Agent capability requests are automatically authorized"
+    } else {
+        "disabled; normal Utsuwa permission policy applies"
+    };
+
+    format!(
+        "<host_environment>\nOS: {}\nArchitecture: {}\nHome directory: {}\nCurrent working directory: {}\nDesktop directory: {}\nPath separator: {}\nPath style: {}\nFilesystem tools require absolute host-native paths.\nDo not invent Windows drive-letter paths on a non-Windows host.\n</host_environment>\n\n<utsuwa_native_runtime>\nYou are running inside the native Utsuwa desktop host.\nUse the provided native tools when doing so is useful for completing the user's request.\nFilesystem tool paths must be absolute paths using the host operating system's native path format.\nNever invent a path when its location is unknown; inspect the filesystem with filesystem.list, filesystem.stat, or filesystem.glob first.\nIf a tool returns an error, use its error information to correct the call rather than pretending the operation succeeded.\nAutonomous Full Access is {mode_text}. When it is enabled, you may use available native tools without asking the user for additional permission; the native host has already received the user's consent.\nDo not claim an operation succeeded until the tool confirms success.\n</utsuwa_native_runtime>",
+        host_os_label(),
+        std::env::consts::ARCH,
+        home_text,
+        cwd_text,
+        desktop_text,
+        host_path_separator(),
+        host_path_style(),
+    )
+}
+
+fn compose_host_system_prompt(user_prompt: Option<&str>, autonomous_full_access: bool) -> String {
+    let host_context = host_environment_context(autonomous_full_access);
+    // A suspended native turn already contains the previous host context in
+    // its system message. Rebuild from the original prompt portion so a mode
+    // toggle updates the status without duplicating trusted runtime blocks.
+    let user_prompt = user_prompt
+        .map(|prompt| {
+            prompt
+                .split_once("\n\n<host_environment>")
+                .map_or(prompt, |(base, _)| base)
+        })
+        .filter(|prompt| !prompt.is_empty());
+    match user_prompt {
+        Some(prompt) => format!("{prompt}\n\n{host_context}"),
+        None => host_context,
     }
 }
 
@@ -1087,6 +1360,219 @@ mod tests {
         );
     }
 
+    fn test_authorizer(enabled: bool) -> QueueAuthorizer {
+        QueueAuthorizer {
+            approvals: Arc::new(Mutex::new(ApprovalQueue::new())),
+            task_id: "task-test".to_string(),
+            turn_id: "turn-test".to_string(),
+            autonomous_full_access: Arc::new(AtomicBool::new(enabled)),
+        }
+    }
+
+    #[test]
+    fn autonomous_authorizer_allows_every_agent_capability_but_not_frontend() {
+        let authorizer = test_authorizer(true);
+        let agent = capability_core::Principal::Agent(AgentId::new("agent-test"));
+        let requests = [
+            (
+                capability_core::Capability::FilesystemRead,
+                capability_core::Resource::Path("/home/u/.ssh/id_ed25519".into()),
+            ),
+            (
+                capability_core::Capability::FilesystemWrite,
+                capability_core::Resource::Path("/home/u/.aws/credentials".into()),
+            ),
+            (
+                capability_core::Capability::FilesystemCreate,
+                capability_core::Resource::Path("/home/u/new.txt".into()),
+            ),
+            (
+                capability_core::Capability::FilesystemDelete,
+                capability_core::Resource::Path("/home/u/old.txt".into()),
+            ),
+            (
+                capability_core::Capability::FilesystemMove,
+                capability_core::Resource::Path("/home/u/moved.txt".into()),
+            ),
+            (
+                capability_core::Capability::ProcessSpawn,
+                capability_core::Resource::Process {
+                    executable: "/bin/bash".into(),
+                    args: vec!["-lc".to_string(), "echo hello".to_string()],
+                    cwd: "/work".into(),
+                    env: vec![],
+                },
+            ),
+            (
+                capability_core::Capability::ProcessSignal,
+                capability_core::Resource::Process {
+                    executable: "/bin/echo".into(),
+                    args: vec![],
+                    cwd: "/work".into(),
+                    env: vec![],
+                },
+            ),
+            (
+                capability_core::Capability::NetworkConnect,
+                capability_core::Resource::HostPort {
+                    host: "example.test".to_string(),
+                    port: 443,
+                },
+            ),
+            (
+                capability_core::Capability::DesktopObserve,
+                capability_core::Resource::Window("window-1".to_string()),
+            ),
+            (
+                capability_core::Capability::DesktopControl,
+                capability_core::Resource::Window("window-1".to_string()),
+            ),
+            (
+                capability_core::Capability::ScreenCapture,
+                capability_core::Resource::Window("window-1".to_string()),
+            ),
+            (
+                capability_core::Capability::ClipboardRead,
+                capability_core::Resource::Application("clipboard".to_string()),
+            ),
+            (
+                capability_core::Capability::ClipboardWrite,
+                capability_core::Resource::Application("clipboard".to_string()),
+            ),
+            (
+                capability_core::Capability::ApplicationLaunch,
+                capability_core::Resource::Application("notes".to_string()),
+            ),
+            (
+                capability_core::Capability::McpInvoke,
+                capability_core::Resource::McpTool {
+                    server: "server".to_string(),
+                    tool: "tool".to_string(),
+                },
+            ),
+            (
+                capability_core::Capability::PluginInvoke,
+                capability_core::Resource::PluginTool {
+                    plugin: "plugin".to_string(),
+                    tool: "tool".to_string(),
+                },
+            ),
+        ];
+
+        for (capability, resource) in requests {
+            let request = capability_core::CapabilityRequest {
+                principal: agent.clone(),
+                capability,
+                resource,
+            };
+            assert!(matches!(
+                authorizer.authorize(&agent, &request),
+                AuthorizationDecision::Allow { .. }
+            ));
+            assert!(authorizer.commit(&agent, &request));
+        }
+        assert!(authorizer.authorization_mode().is_some());
+        assert!(authorizer
+            .approvals
+            .lock()
+            .unwrap()
+            .grants_snapshot()
+            .is_empty());
+
+        let frontend = capability_core::Principal::Frontend;
+        let frontend_request = capability_core::CapabilityRequest {
+            principal: frontend.clone(),
+            capability: capability_core::Capability::FilesystemWrite,
+            resource: capability_core::Resource::Path("/home/u/should-not-write".into()),
+        };
+        assert!(matches!(
+            authorizer.authorize(&frontend, &frontend_request),
+            AuthorizationDecision::Deny { .. }
+        ));
+        assert!(!authorizer.commit(&frontend, &frontend_request));
+
+        for principal in [
+            capability_core::Principal::NativePlugin(capability_core::PluginId::new("native")),
+            capability_core::Principal::WasmPlugin(capability_core::PluginId::new("wasm")),
+            capability_core::Principal::McpServer(capability_core::ServerId::new("mcp")),
+        ] {
+            let request = capability_core::CapabilityRequest {
+                principal: principal.clone(),
+                capability: capability_core::Capability::FilesystemWrite,
+                resource: capability_core::Resource::Path("/home/u/plugin-file".into()),
+            };
+            assert!(!matches!(
+                authorizer.authorize(&principal, &request),
+                AuthorizationDecision::Allow { .. }
+            ));
+            assert!(!authorizer.commit(&principal, &request));
+        }
+    }
+
+    #[test]
+    fn autonomous_authorizer_preserves_secret_and_interpreter_prompts_when_off() {
+        let authorizer = test_authorizer(false);
+        let agent = capability_core::Principal::Agent(AgentId::new("agent-test"));
+        let secret = capability_core::CapabilityRequest {
+            principal: agent.clone(),
+            capability: capability_core::Capability::FilesystemRead,
+            resource: capability_core::Resource::Path("/home/u/.ssh/id_ed25519".into()),
+        };
+        assert!(matches!(
+            authorizer.authorize(&agent, &secret),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+        let shell = capability_core::CapabilityRequest {
+            principal: agent.clone(),
+            capability: capability_core::Capability::ProcessSpawn,
+            resource: capability_core::Resource::Process {
+                executable: "/bin/bash".into(),
+                args: vec!["-lc".to_string(), "echo hello".to_string()],
+                cwd: "/work".into(),
+                env: vec![],
+            },
+        };
+        assert!(matches!(
+            authorizer.authorize(&agent, &shell),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn native_host_context_uses_host_native_path_style() {
+        let context = host_environment_context(false);
+        assert!(context.contains("<host_environment>"));
+        assert!(context.contains(&format!("Architecture: {}", std::env::consts::ARCH)));
+        assert!(context.contains(&format!("OS: {}", host_os_label())));
+        assert!(context.contains(&format!("Path style: {}", host_path_style())));
+        assert!(context.contains("Current working directory:"));
+        assert!(context.contains("Home directory:"));
+        assert!(context.contains("Filesystem tools require absolute host-native paths."));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(context.contains("OS: Linux"));
+            assert!(context.contains("Path style: POSIX"));
+            assert!(!context.contains("C:\\Users\\"));
+        }
+    }
+
+    #[test]
+    fn native_host_context_is_appended_without_replacing_character_prompt() {
+        let prompt = compose_host_system_prompt(Some("character voice"), true);
+        assert!(prompt.starts_with("character voice"));
+        assert!(prompt.contains("<host_environment>"));
+        assert!(prompt.contains("Autonomous Full Access is enabled"));
+    }
+
+    #[test]
+    fn native_host_context_rebuilds_existing_runtime_block_without_duplication() {
+        let first = compose_host_system_prompt(Some("character voice"), true);
+        let rebuilt = compose_host_system_prompt(Some(&first), false);
+        assert!(rebuilt.starts_with("character voice"));
+        assert_eq!(rebuilt.matches("<host_environment>").count(), 1);
+        assert!(rebuilt.contains("Autonomous Full Access is disabled"));
+    }
+
     /// Scripted multi-turn provider: pops one scripted turn per call.
     struct QueueProvider {
         turns: Mutex<Vec<Vec<ModelStreamEvent>>>,
@@ -1177,6 +1663,55 @@ mod tests {
         }
     }
 
+    fn harness_with_storage(provider: Arc<QueueProvider>, storage: Arc<Mutex<Storage>>) -> Harness {
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let runtime = AgentRuntime::start_with_factory(
+            Arc::clone(&approvals),
+            Some(storage),
+            None,
+            Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }),
+            Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+        )
+        .unwrap();
+        Harness {
+            runtime,
+            approvals,
+            events,
+        }
+    }
+
+    fn harness_with_storage_and_audit(
+        provider: Arc<QueueProvider>,
+        storage: Arc<Mutex<Storage>>,
+    ) -> (Harness, Arc<audit_core::InMemorySink>) {
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let audit = Arc::new(audit_core::InMemorySink::new());
+        let sink = events.clone();
+        let runtime = AgentRuntime::start_with_factory(
+            Arc::clone(&approvals),
+            Some(storage),
+            Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
+            Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }),
+            Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+        )
+        .unwrap();
+        (
+            Harness {
+                runtime,
+                approvals,
+                events,
+            },
+            audit,
+        )
+    }
+
     fn wait_for(harness: &Harness, event: &str) -> HostEvent {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
@@ -1203,6 +1738,46 @@ mod tests {
         let file = dir.join("notes.txt");
         std::fs::write(&file, "project notes alpha").unwrap();
         (dir, file.to_string_lossy().to_string())
+    }
+
+    fn write_turn(path: &str, content: &str) -> Vec<ModelStreamEvent> {
+        vec![
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: "w1".to_string(),
+                name: "filesystem.write".to_string(),
+                arguments: serde_json::json!({
+                    "path": path,
+                    "content": content,
+                })
+                .to_string(),
+            }),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ]
+    }
+
+    #[test]
+    fn native_turn_preserves_history_system_prompt_without_explicit_prompt() {
+        let provider = QueueProvider::new(vec![text_turn("ok")]);
+        let harness = harness(Arc::clone(&provider));
+        harness
+            .runtime
+            .send_request(AgentRequest {
+                text: "hello".to_string(),
+                history: vec![
+                    ModelMessage::system("character voice"),
+                    ModelMessage::user("earlier"),
+                ],
+                append_user_message: true,
+                ..AgentRequest::default()
+            })
+            .unwrap();
+        wait_for(&harness, "agent.turn_done");
+
+        let seen = provider.seen.lock().unwrap();
+        assert!(seen[0].messages[0].content.starts_with("character voice"));
+        assert!(seen[0].messages[0].content.contains("<host_environment>"));
     }
 
     #[test]
@@ -1233,6 +1808,151 @@ mod tests {
                 "native request is missing {tool_id}"
             );
         }
+    }
+
+    #[test]
+    fn autonomous_mode_executes_filesystem_write_without_permission_request() {
+        let (dir, _) = temp_project("autonomous-write");
+        let target = dir.join("hello.md");
+        let storage = Arc::new(Mutex::new(Storage::open(&dir.join("state.db")).unwrap()));
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(SETTING_AUTONOMOUS_FULL_ACCESS, &serde_json::json!(true))
+            .unwrap();
+
+        let provider = QueueProvider::new(vec![
+            write_turn(&target.to_string_lossy(), "Hello from Utsuwa"),
+            text_turn("created it"),
+        ]);
+        let (harness, audit) = harness_with_storage_and_audit(Arc::clone(&provider), storage);
+        assert!(harness.runtime.autonomous_full_access_enabled());
+        harness
+            .runtime
+            .send_message("Create hello.md".to_string())
+            .unwrap();
+
+        let done = wait_for(&harness, "agent.turn_done");
+        assert_eq!(done.data["text"], "created it");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "Hello from Utsuwa"
+        );
+        assert!(harness
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| event.event != "permission.requested"));
+        assert!(harness.approvals.lock().unwrap().list().is_empty());
+        let write_audit = audit
+            .records()
+            .into_iter()
+            .find(|record| {
+                record.outcome == audit_core::AuditOutcome::Executed
+                    && record.capability == Some(capability_core::Capability::FilesystemWrite)
+            })
+            .expect("autonomous write should be audit-logged");
+        assert!(write_audit
+            .detail
+            .contains("authorization_mode=autonomous_full_access"));
+        assert!(write_audit.mutation.is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn autonomous_mode_runs_bash_without_interpreter_permission_request() {
+        if !Path::new("/bin/bash").is_file() {
+            return;
+        }
+        let (dir, _) = temp_project("autonomous-bash");
+        let target = dir.join("hello.md");
+        let storage = Arc::new(Mutex::new(Storage::open(&dir.join("state.db")).unwrap()));
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(SETTING_AUTONOMOUS_FULL_ACCESS, &serde_json::json!(true))
+            .unwrap();
+
+        let command = format!("printf '%s' 'Hello from Utsuwa' > {}", target.display());
+        let spawn_turn = vec![
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: "p1".to_string(),
+                name: "process.spawn".to_string(),
+                arguments: serde_json::json!({
+                    "executable": "/bin/bash",
+                    "args": ["-lc", command],
+                    "cwd": dir.to_string_lossy(),
+                })
+                .to_string(),
+            }),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ];
+        let provider = QueueProvider::new(vec![spawn_turn, text_turn("ran it")]);
+        let harness = harness_with_storage(Arc::clone(&provider), storage);
+        harness
+            .runtime
+            .send_message("Run the command".to_string())
+            .unwrap();
+        let done = wait_for(&harness, "agent.turn_done");
+        assert_eq!(done.data["text"], "ran it");
+        let start = Instant::now();
+        while !target.exists() && start.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "Hello from Utsuwa"
+        );
+        assert!(harness
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| event.event != "permission.requested"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enabling_autonomous_mode_resumes_a_suspended_agent_turn() {
+        let (dir, path) = temp_project("autonomous-resume");
+        let provider = QueueProvider::new(vec![read_turn(&path), text_turn("read it")]);
+        let harness = harness(Arc::clone(&provider));
+        harness
+            .runtime
+            .send_message("Read my notes".to_string())
+            .unwrap();
+        let suspended = wait_for(&harness, "agent.turn_suspended");
+        let request_id = suspended.data["request_id"].as_str().unwrap();
+        assert_eq!(harness.approvals.lock().unwrap().list().len(), 1);
+
+        // This is the live half of the native settings.set path. The runtime
+        // withdraws only its Agent request and retries under the mode; no
+        // standing grant is created.
+        harness.runtime.set_autonomous_full_access(true);
+        let done = wait_for(&harness, "agent.turn_done");
+        assert_eq!(done.data["text"], "read it");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "project notes alpha"
+        );
+        assert!(harness.approvals.lock().unwrap().list().is_empty());
+        assert!(harness.events.lock().unwrap().iter().any(|event| {
+            event.event == "permission.dismissed" && event.data["id"] == request_id
+        }));
+        assert!(harness
+            .approvals
+            .lock()
+            .unwrap()
+            .grants_snapshot()
+            .is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

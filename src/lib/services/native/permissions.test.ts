@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+	AUTONOMOUS_FULL_ACCESS_SETTING,
 	formatCapability,
+	getAutonomousFullAccess,
 	grantHomeReadAccess,
 	headlineFor,
 	homeReadGranted,
@@ -10,7 +12,8 @@ import {
 	parsePermissionRequest,
 	replyParams,
 	revokeHomeReadAccess,
-	riskLevel
+	riskLevel,
+	setAutonomousFullAccess
 } from './permissions.ts';
 
 test('risk levels separate observation from mutation and control', () => {
@@ -109,4 +112,24 @@ test('home toggle stays off without a matching grant', () => {
 		}),
 		false
 	);
+});
+
+test('autonomous mode reads and writes the native setting', async () => {
+	const calls: Array<[string, Record<string, unknown> | undefined]> = [];
+	const invoke = async (method: string, params?: Record<string, unknown>) => {
+		calls.push([method, params]);
+		if (method === 'settings.get') return { value: true };
+		if (method === 'settings.set') return { ok: true };
+		throw new Error(`unexpected ${method}`);
+	};
+
+	assert.equal(await getAutonomousFullAccess(invoke), true);
+	await setAutonomousFullAccess(invoke, false);
+	assert.deepEqual(calls, [
+		['settings.get', { key: AUTONOMOUS_FULL_ACCESS_SETTING }],
+		[
+			'settings.set',
+			{ key: AUTONOMOUS_FULL_ACCESS_SETTING, value: false }
+		]
+	]);
 });

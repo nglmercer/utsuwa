@@ -140,6 +140,9 @@ export interface GrantsSnapshot {
 	home: string | null;
 }
 
+/** Native settings key for the explicit Agent-only autonomous mode. */
+export const AUTONOMOUS_FULL_ACCESS_SETTING = 'agent.autonomous_full_access';
+
 function parseGrant(item: unknown): StandingGrant | null {
 	if (typeof item !== 'object' || item === null) return null;
 	const g = item as Record<string, unknown>;
@@ -210,4 +213,33 @@ export async function revokeHomeReadAccess(
 		throw new Error('permission.revoke returned an unexpected payload');
 	}
 	return result.removed;
+}
+
+/** Read the persistent autonomous mode from native SQLite-backed settings. */
+export async function getAutonomousFullAccess(
+	invoke: (method: string, params?: Record<string, unknown>) => Promise<unknown>
+): Promise<boolean> {
+	const result = (await invoke('settings.get', {
+		key: AUTONOMOUS_FULL_ACCESS_SETTING
+	})) as Record<string, unknown> | null;
+	if (!result || !Object.prototype.hasOwnProperty.call(result, 'value')) {
+		throw new Error('settings.get returned an unexpected payload');
+	}
+	return result.value === true;
+}
+
+/** Persist the autonomous mode and let the native host update its live
+ * Agent authorizer. The UI only changes its displayed state after this
+ * succeeds, so it cannot drift from the native source of truth. */
+export async function setAutonomousFullAccess(
+	invoke: (method: string, params?: Record<string, unknown>) => Promise<unknown>,
+	enabled: boolean
+): Promise<void> {
+	const result = (await invoke('settings.set', {
+		key: AUTONOMOUS_FULL_ACCESS_SETTING,
+		value: enabled
+	})) as Record<string, unknown> | null;
+	if (!result || result.ok !== true) {
+		throw new Error('settings.set returned an unexpected payload');
+	}
 }

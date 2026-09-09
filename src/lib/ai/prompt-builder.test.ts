@@ -133,12 +133,14 @@ test('systemEvent renders an <event> layer in both modes', () => {
 	assert.ok(!plain.includes('<event>'));
 });
 
-test('native prompts explain tool behavior without hard-coding a tool list', () => {
+test('native prompts explain host-native tool behavior', () => {
 	const native = buildSystemPrompt(makeContext({ nativeRuntime: true }));
 	assert.ok(native.includes('<native_agent_tools>'));
 	assert.ok(native.includes('use the tools supplied with the current model request'));
+	assert.ok(native.includes('Filesystem tool paths must be absolute'));
+	assert.ok(native.includes('Never invent a path'));
 	assert.ok(native.includes('Never claim a tool operation succeeded'));
-	assert.ok(!native.includes('filesystem.list'));
+	assert.ok(native.includes('filesystem.list'));
 
 	const browser = buildSystemPrompt(makeContext());
 	assert.ok(!browser.includes('<native_agent_tools>'));

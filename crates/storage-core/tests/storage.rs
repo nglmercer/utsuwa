@@ -61,9 +61,25 @@ fn settings_survive_reopen() {
     {
         let store = Storage::open(&db).unwrap();
         store.set_setting("k", &json!([1, 2, 3])).unwrap();
+        store
+            .set_setting("agent.autonomous_full_access", &json!(true))
+            .unwrap();
     }
     let store = Storage::open(&db).unwrap();
     assert_eq!(store.get_setting("k").unwrap(), Some(json!([1, 2, 3])));
+    assert_eq!(
+        store.get_setting("agent.autonomous_full_access").unwrap(),
+        Some(json!(true))
+    );
+    store
+        .set_setting("agent.autonomous_full_access", &json!(false))
+        .unwrap();
+    drop(store);
+    let store = Storage::open(&db).unwrap();
+    assert_eq!(
+        store.get_setting("agent.autonomous_full_access").unwrap(),
+        Some(json!(false))
+    );
 }
 
 #[test]

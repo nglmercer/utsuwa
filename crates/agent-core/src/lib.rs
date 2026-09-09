@@ -178,6 +178,14 @@ pub trait ToolAuthorizer: Send + Sync {
     fn commit(&self, _principal: &Principal, _request: &CapabilityRequest) -> bool {
         true
     }
+
+    /// Optional audit label for the authorization mode that allowed a
+    /// capability-bearing call. Ordinary authorizers leave this unset;
+    /// host-specific modes can identify themselves without weakening the
+    /// ticket/broker boundary.
+    fn authorization_mode(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 struct ContextAuthorizer<'a> {
@@ -644,12 +652,13 @@ impl Agent {
                     id: call.id.clone(),
                     name: call.name.clone(),
                 });
-                self.audit(
-                    None,
-                    None,
-                    AuditOutcome::Executed,
-                    format!("{} replayed prior result; side effect skipped", call.name),
-                );
+                let detail = match (authorizer.authorization_mode(), requirement.as_ref()) {
+                    (Some(mode), Some(_)) => {
+                        format!("{} replayed prior result; side effect skipped; authorization_mode={mode}", call.name)
+                    }
+                    _ => format!("{} replayed prior result; side effect skipped", call.name),
+                };
+                self.audit(None, None, AuditOutcome::Executed, detail);
                 self.emit(AgentEvent::ToolFinished {
                     id: call.id,
                     name: call.name,
@@ -726,11 +735,15 @@ impl Agent {
                 // Mutation evidence (if the tool attached any) joins the
                 // audit record: path + before/after hashes, never contents.
                 let mutation = output.mutation.clone();
+                let detail = match (authorizer.authorization_mode(), requirement.as_ref()) {
+                    (Some(mode), Some(_)) => format!("{} ok; authorization_mode={mode}", call.name),
+                    _ => format!("{} ok", call.name),
+                };
                 self.audit_timed(
                     capability,
                     resource,
                     AuditOutcome::Executed,
-                    format!("{} ok", call.name),
+                    detail,
                     Some(elapsed_ms),
                     mutation,
                 );
@@ -747,11 +760,15 @@ impl Agent {
                 Ok(output)
             }
             Err(err) => {
+                let detail = match (authorizer.authorization_mode(), requirement.as_ref()) {
+                    (Some(mode), Some(_)) => format!("{}; authorization_mode={mode}", err),
+                    _ => err.to_string(),
+                };
                 self.audit_timed(
                     capability,
                     resource,
                     AuditOutcome::Failed,
-                    err.to_string(),
+                    detail,
                     Some(elapsed_ms),
                     None,
                 );

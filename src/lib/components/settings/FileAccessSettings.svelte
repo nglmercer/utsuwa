@@ -3,32 +3,45 @@
 	import { onMount } from 'svelte';
 	import { getBridge } from '$lib/services/native/bridge';
 	import {
+		getAutonomousFullAccess,
 		grantHomeReadAccess,
 		homeReadGranted,
 		listGrants,
-		revokeHomeReadAccess
+		revokeHomeReadAccess,
+		setAutonomousFullAccess
 	} from '$lib/services/native/permissions';
 
 	let enabled = $state(false);
+	let autonomousFullAccess = $state(false);
 	let home = $state<string | null>(null);
 	let busy = $state(false);
+	let autonomousBusy = $state(false);
+	let nativeAvailable = $state<boolean | null>(null);
 	let notice = $state<string | null>(null);
+	let autonomousNotice = $state<string | null>(null);
 	let error = $state<string | null>(null);
 
 	async function refresh() {
 		if (!browser) return;
 		const bridge = getBridge();
 		if (!bridge) {
-			error = 'native host is not attached';
+			nativeAvailable = false;
+			error = null;
 			return;
 		}
+		nativeAvailable = true;
 		try {
-			const snapshot = await listGrants((m, p) => bridge.invoke(m, p));
+			const invoke = (m: string, p?: Record<string, unknown>) => bridge.invoke(m, p);
+			const [snapshot, fullAccess] = await Promise.all([
+				listGrants(invoke),
+				getAutonomousFullAccess(invoke)
+			]);
 			enabled = homeReadGranted(snapshot);
 			home = snapshot.home;
+			autonomousFullAccess = fullAccess;
 			error = null;
 		} catch (e) {
-			error = e instanceof Error ? e.message : 'permission.grants failed';
+			error = e instanceof Error ? e.message : 'native access settings failed';
 		}
 	}
 
@@ -66,6 +79,37 @@
 			busy = false;
 		}
 	}
+
+	async function toggleAutonomousFullAccess() {
+		if (!browser || autonomousBusy || nativeAvailable !== true) return;
+		const bridge = getBridge();
+		if (!bridge) {
+			nativeAvailable = false;
+			error = null;
+			return;
+		}
+		const nextState = !autonomousFullAccess;
+		if (!autonomousFullAccess) {
+			const ok = window.confirm(
+				'Enable Autonomous Full Access?\n\nThe assistant will be able to read and modify files, execute programs, control supported desktop applications, and use other native tools without asking for permission each time.\n\nActions will run with the permissions of your current operating-system user.'
+			);
+			if (!ok) return;
+		}
+		autonomousBusy = true;
+		autonomousNotice = null;
+		error = null;
+		try {
+			await setAutonomousFullAccess((m, p) => bridge.invoke(m, p), nextState);
+			await refresh();
+			autonomousNotice = nextState
+				? 'Autonomous Full Access is on for the AI agent.'
+				: 'Autonomous Full Access is off. Normal Utsuwa permission policy restored.';
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'could not update Autonomous Full Access';
+		} finally {
+			autonomousBusy = false;
+		}
+	}
 </script>
 
 <div class="panel">
@@ -74,7 +118,7 @@
 			<h2>File access</h2>
 			<p class="sub">
 				Let the assistant read any file under your home folder without asking every time.
-				Writes, screenshots, and everything else still need per-request approval.
+				For broader native tools, use Autonomous Full Access below.
 			</p>
 		</div>
 	</div>
@@ -103,14 +147,61 @@
 			</button>
 		</div>
 		<p class="note">
-			Key directories (<code>.ssh</code>, <code>.aws</code>, <code>.gnupg</code>, …) are excluded:
-			the assistant must ask for those files individually, every time. Every granted read is
-			still audit-logged under Activity.
+			Key directories (<code>.ssh</code>, <code>.aws</code>, <code>.gnupg</code>, …) are excluded from
+			this broad read grant. In normal mode, the assistant asks for those files individually;
+			Autonomous Full Access can authorize the Agent's exact requests automatically. Every
+			granted read is still audit-logged under Activity.
 		</p>
 		{#if notice}
 			<p class="notice">{notice}</p>
 		{/if}
 		{#if busy}
+			<p class="busy">Working…</p>
+		{/if}
+	</div>
+
+	<div class="card autonomous-card">
+		<div class="card-head">
+			<div>
+				<p class="title">Autonomous Full Access</p>
+				<p class="meta">Native desktop only · persistent</p>
+			</div>
+			<button
+				class="service-toggle"
+				class:enabled={autonomousFullAccess}
+				onclick={toggleAutonomousFullAccess}
+				disabled={autonomousBusy || nativeAvailable !== true}
+				aria-label="Toggle Autonomous Full Access"
+				aria-pressed={autonomousFullAccess}
+			>
+				<span class="toggle-track">
+					<span class="toggle-thumb"></span>
+				</span>
+			</button>
+		</div>
+		<p class="note">
+			Allow the assistant to use filesystem, process, desktop, and other native tools without
+			individual permission prompts.
+		</p>
+		<p class="details">
+			<strong>Applies to the AI agent</strong><br />
+			Runs with the permissions of your operating-system user.
+		</p>
+		{#if autonomousFullAccess}
+			<p class="state-on">Agent tool requests are automatically authorized.</p>
+			<p class="warning" role="alert">
+				⚠ The assistant can modify files and execute programs using your operating-system account.
+			</p>
+		{:else}
+			<p class="state-off">Normal Utsuwa permission policy.</p>
+		{/if}
+		{#if nativeAvailable === false}
+			<p class="unavailable">Autonomous Full Access is available only in the native desktop app.</p>
+		{/if}
+		{#if autonomousNotice}
+			<p class="notice">{autonomousNotice}</p>
+		{/if}
+		{#if autonomousBusy}
 			<p class="busy">Working…</p>
 		{/if}
 	</div>
@@ -160,6 +251,32 @@
 		margin: 0.75rem 0 0;
 		font-size: 0.82rem;
 		opacity: 0.75;
+	}
+	.autonomous-card {
+		border-color: color-mix(in srgb, var(--accent) 35%, var(--border, #2a2a2e));
+	}
+	.details,
+	.state-on,
+	.state-off,
+	.warning,
+	.unavailable {
+		margin: 0.65rem 0 0;
+		font-size: 0.82rem;
+	}
+	.details {
+		opacity: 0.75;
+	}
+	.state-on {
+		color: var(--accent);
+	}
+	.state-off {
+		opacity: 0.7;
+	}
+	.warning {
+		color: #d49a45;
+	}
+	.unavailable {
+		opacity: 0.7;
 	}
 	.note code {
 		font-size: 0.78rem;
