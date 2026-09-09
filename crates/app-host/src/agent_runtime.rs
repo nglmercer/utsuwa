@@ -888,7 +888,7 @@ impl AgentRuntime {
             }
         };
         let agent = agent.with_replay_cache(replay_cache.clone());
-        let mut registry = match default_registry(&self.processes) {
+        let mut registry = match default_registry(&self.processes, host_environment.clone()) {
             Ok(registry) => registry,
             Err(err) => {
                 if self.is_current(generation) {
@@ -1147,7 +1147,7 @@ fn host_environment_context_for(
         "Special filesystem directories are resolved by the operating system.".to_string(),
         "Use the exact paths listed in the host environment block or returned by system.environment."
             .to_string(),
-        "For Desktop, Documents, Downloads, Pictures, Music, Videos, Public, or Templates, prefer filesystem.write_user_file with the matching directory enum and a relative_path instead of constructing an absolute path yourself."
+        "For files in Desktop/Documents/etc., use filesystem.write_user_file; set directory_id to a semantic identifier such as 'desktop', never put an absolute path in directory_id."
             .to_string(),
         "Never translate filesystem directory names according to the language of the conversation."
             .to_string(),
@@ -1209,7 +1209,9 @@ fn compose_host_system_prompt_for(
 /// Read-only host facts for models that need a small, explicit lookup instead
 /// of relying on the larger trusted system context. It has no capability
 /// requirement and never exposes a raw OS handle or mutation API.
-struct HostEnvironmentTool;
+struct HostEnvironmentTool {
+    environment: HostEnvironment,
+}
 
 #[async_trait::async_trait]
 impl tool_core::Tool for HostEnvironmentTool {
@@ -1237,9 +1239,7 @@ impl tool_core::Tool for HostEnvironmentTool {
                 message: "args must be a JSON object".to_string(),
             });
         }
-        Ok(tool_core::ToolOutput::new(
-            HostEnvironment::snapshot().json_value(),
-        ))
+        Ok(tool_core::ToolOutput::new(self.environment.json_value()))
     }
 }
 
@@ -1248,7 +1248,10 @@ impl tool_core::Tool for HostEnvironmentTool {
 /// search_text/glob/patch/write), host-resolved user-directory writes and
 /// lookup, structured process execution (spawn/status/kill, no shell), and
 /// the read-only system.environment lookup.
-fn default_registry(processes: &Arc<ProcessManager>) -> Result<ToolRegistry, RuntimeError> {
+fn default_registry(
+    processes: &Arc<ProcessManager>,
+    host_environment: HostEnvironment,
+) -> Result<ToolRegistry, RuntimeError> {
     let mut registry = ToolRegistry::new();
     let mut fs_plugins = tool_filesystem::plugin::FsPluginRegistry::new();
     fs_plugins.register(tool_filesystem::plugin::FsPlugin::local());
@@ -1263,9 +1266,15 @@ fn default_registry(processes: &Arc<ProcessManager>) -> Result<ToolRegistry, Run
                 .iter()
                 .position(|tool| tool.metadata().id.0 == "filesystem.write")
             {
-                tools[index] = Arc::new(HostAwareWriteTool::new(plugin.limits.clone()));
+                tools[index] = Arc::new(HostAwareWriteTool::new(
+                    plugin.limits.clone(),
+                    host_environment.clone(),
+                ));
             }
-            tools.push(Arc::new(UserDirectoryWriteTool::new(plugin.limits)));
+            tools.push(Arc::new(UserDirectoryWriteTool::new(
+                plugin.limits,
+                host_environment.clone(),
+            )));
         }
     }
     for tool in [
@@ -1282,8 +1291,12 @@ fn default_registry(processes: &Arc<ProcessManager>) -> Result<ToolRegistry, Run
     ] {
         tools.push(tool);
     }
-    tools.push(Arc::new(ResolveUserDirectoryTool::new()));
-    tools.push(Arc::new(HostEnvironmentTool));
+    tools.push(Arc::new(ResolveUserDirectoryTool::new(
+        host_environment.clone(),
+    )));
+    tools.push(Arc::new(HostEnvironmentTool {
+        environment: host_environment,
+    }));
     for tool in tools {
         registry
             .register(tool)

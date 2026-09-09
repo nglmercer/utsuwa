@@ -6,6 +6,7 @@
 //! filesystem broker.
 
 use crate::host_environment::{HostEnvironment, UserDirectory};
+use serde_json::{Map, Value};
 use std::path::{Component, Path, PathBuf};
 use tool_core::{CapabilityRequirement, Tool, ToolContext, ToolError, ToolMetadata, ToolOutput};
 use tool_filesystem::WriteTool;
@@ -35,15 +36,66 @@ fn failed(tool: &str, message: impl Into<String>) -> ToolError {
     }
 }
 
-fn parse_directory(args: &serde_json::Value, tool: &str) -> Result<UserDirectory, ToolError> {
-    let object = args
-        .as_object()
-        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
-    let value = object
-        .get("directory")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| invalid_args(tool, "missing string 'directory' argument"))?;
-    match value {
+fn invalid_user_directory(tool: &str, received: &str, environment: &HostEnvironment) -> ToolError {
+    let mut available_directories = Map::new();
+    for directory in UserDirectory::ALL {
+        if let Some(path) = environment.user_dirs.get(directory) {
+            available_directories.insert(
+                directory.json_key().to_string(),
+                Value::String(path.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    let detail = serde_json::json!({
+        "error": "invalid_user_directory",
+        "received": received,
+        "valid_directory_ids": USER_DIRECTORY_ENUM,
+        "available_directories": available_directories,
+    });
+    invalid_args(tool, format!("invalid_user_directory: {detail}"))
+}
+
+fn configured_directory_for_path(
+    value: &str,
+    environment: &HostEnvironment,
+) -> Option<UserDirectory> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut matches = UserDirectory::ALL
+        .into_iter()
+        .filter(|directory| environment.user_dirs.get(*directory) == Some(path));
+    let directory = matches.next()?;
+    matches.next().is_none().then_some(directory)
+}
+
+fn configured_directory_for_basename(
+    value: &str,
+    environment: &HostEnvironment,
+) -> Option<UserDirectory> {
+    let path = Path::new(value);
+    if path.components().count() != 1 {
+        return None;
+    }
+    let basename = path.file_name()?;
+    let mut matches = UserDirectory::ALL.into_iter().filter(|directory| {
+        environment
+            .user_dirs
+            .get(*directory)
+            .and_then(Path::file_name)
+            == Some(basename)
+    });
+    let directory = matches.next()?;
+    matches.next().is_none().then_some(directory)
+}
+
+fn parse_directory_value(
+    value: &str,
+    environment: &HostEnvironment,
+    tool: &str,
+) -> Result<UserDirectory, ToolError> {
+    match value.to_ascii_lowercase().as_str() {
         "desktop" => Ok(UserDirectory::Desktop),
         "documents" => Ok(UserDirectory::Documents),
         "downloads" => Ok(UserDirectory::Downloads),
@@ -52,14 +104,44 @@ fn parse_directory(args: &serde_json::Value, tool: &str) -> Result<UserDirectory
         "videos" => Ok(UserDirectory::Videos),
         "public_share" => Ok(UserDirectory::PublicShare),
         "templates" => Ok(UserDirectory::Templates),
-        _ => Err(invalid_args(
-            tool,
-            format!(
-                "'directory' must be one of: {}",
-                USER_DIRECTORY_ENUM.join(", ")
-            ),
-        )),
+        _ => configured_directory_for_path(value, environment)
+            .or_else(|| configured_directory_for_basename(value, environment))
+            .ok_or_else(|| invalid_user_directory(tool, value, environment)),
     }
+}
+
+fn parse_directory(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+) -> Result<UserDirectory, ToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
+    let (field, value) = if let Some(value) = object.get("directory_id") {
+        (
+            "directory_id",
+            value
+                .as_str()
+                .ok_or_else(|| invalid_args(tool, "'directory_id' must be a string"))?,
+        )
+    } else if let Some(value) = object.get("directory") {
+        (
+            "directory",
+            value
+                .as_str()
+                .ok_or_else(|| invalid_args(tool, "'directory' must be a string"))?,
+        )
+    } else {
+        return Err(invalid_args(
+            tool,
+            "missing string 'directory_id' argument (legacy 'directory' is also accepted)",
+        ));
+    };
+    parse_directory_value(value, environment, tool).map_err(|error| match error {
+        ToolError::InvalidArgs { message, .. } => invalid_args(tool, format!("{field}: {message}")),
+        error => error,
+    })
 }
 
 fn reject_unsafe_relative_path(relative_path: &Path) -> bool {
@@ -73,7 +155,7 @@ fn reject_unsafe_relative_path(relative_path: &Path) -> bool {
 
 struct ResolvedUserFile {
     directory: UserDirectory,
-    path: PathBuf,
+    resolved_directory: PathBuf,
     write_args: serde_json::Value,
 }
 
@@ -85,7 +167,7 @@ fn resolve_user_file_args(
     let object = args
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
-    let directory = parse_directory(args, tool)?;
+    let directory = parse_directory(args, environment, tool)?;
     let relative = object
         .get("relative_path")
         .and_then(serde_json::Value::as_str)
@@ -109,6 +191,7 @@ fn resolve_user_file_args(
             ),
         )
     })?;
+    let resolved_directory = base.to_path_buf();
     let path = base.join(relative_path);
 
     let mut write_args = serde_json::Value::Object(object.clone());
@@ -116,6 +199,7 @@ fn resolve_user_file_args(
         .as_object_mut()
         .expect("write args cloned from a JSON object");
     write_object.remove("directory");
+    write_object.remove("directory_id");
     write_object.remove("relative_path");
     write_object.insert(
         "path".to_string(),
@@ -124,7 +208,7 @@ fn resolve_user_file_args(
 
     Ok(ResolvedUserFile {
         directory,
-        path,
+        resolved_directory,
         write_args,
     })
 }
@@ -134,12 +218,17 @@ fn resolve_user_file_args(
 /// broker's normal `WriteTool` implementation.
 pub(crate) struct HostAwareWriteTool {
     inner: WriteTool,
+    environment: HostEnvironment,
 }
 
 impl HostAwareWriteTool {
-    pub(crate) fn new(limits: tool_filesystem::FilesystemLimits) -> Self {
+    pub(crate) fn new(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
         Self {
             inner: WriteTool { limits },
+            environment,
         }
     }
 }
@@ -167,7 +256,7 @@ pub(crate) fn enrich_write_error(error: ToolError, environment: &HostEnvironment
     ToolError::Failed {
         tool,
         message: format!(
-            "{message}. The host-configured {} directory is {}. Use filesystem.write_user_file with directory='{}', or retry using that exact resolved path",
+            "{message}. The host-configured {} directory is {}. Use filesystem.write_user_file with directory_id='{}', or retry using that exact resolved path",
             directory.prompt_label(),
             configured.display(),
             directory.json_key(),
@@ -194,11 +283,10 @@ impl Tool for HostAwareWriteTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let environment = HostEnvironment::snapshot();
         self.inner
             .invoke(ctx, args)
             .await
-            .map_err(|error| enrich_write_error(error, &environment))
+            .map_err(|error| enrich_write_error(error, &self.environment))
     }
 }
 
@@ -206,16 +294,17 @@ impl Tool for HostAwareWriteTool {
 /// the existing filesystem write broker and its exact capability scope.
 pub(crate) struct UserDirectoryWriteTool {
     inner: WriteTool,
-    /// Tests inject a deterministic environment. Production always snapshots
-    /// the native host at authorization and invocation time.
-    test_environment: Option<HostEnvironment>,
+    environment: HostEnvironment,
 }
 
 impl UserDirectoryWriteTool {
-    pub(crate) fn new(limits: tool_filesystem::FilesystemLimits) -> Self {
+    pub(crate) fn new(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
         Self {
             inner: WriteTool { limits },
-            test_environment: None,
+            environment,
         }
     }
 
@@ -224,16 +313,7 @@ impl UserDirectoryWriteTool {
         limits: tool_filesystem::FilesystemLimits,
         environment: HostEnvironment,
     ) -> Self {
-        Self {
-            inner: WriteTool { limits },
-            test_environment: Some(environment),
-        }
-    }
-
-    fn environment(&self) -> HostEnvironment {
-        self.test_environment
-            .clone()
-            .unwrap_or_else(HostEnvironment::snapshot)
+        Self::new(limits, environment)
     }
 }
 
@@ -242,15 +322,19 @@ impl Tool for UserDirectoryWriteTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new("filesystem.write_user_file"),
-            description: "Create or overwrite a UTF-8 file inside an operating-system configured user directory such as Desktop or Documents. Prefer this tool whenever the user refers to Desktop, Documents, Downloads, Pictures, Music, Videos, Public, or Templates. The host resolves the directory; do not manually construct those directory paths. The relative path must stay below the selected directory, and parent directories must already exist unless create_parents=true.".to_string(),
+            description: "Create or overwrite a UTF-8 file inside an operating-system configured user directory such as Desktop or Documents. Prefer this tool whenever the user refers to Desktop, Documents, Downloads, Pictures, Music, Videos, Public, or Templates. Set directory_id to a semantic identifier such as desktop; the host resolves it. For compatibility, an exact host-resolved directory path or the configured basename is also accepted. Never use an arbitrary absolute path or translate directory names. The relative path must stay below the selected directory, and parent directories must already exist unless create_parents=true.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "directory": {
+                    "directory_id": {
                         "type": "string",
                         "enum": USER_DIRECTORY_ENUM,
-                        "description": "Operating-system user directory identifier; use desktop, documents, downloads, pictures, music, videos, public_share, or templates."
+                        "description": "Semantic operating-system user directory identifier; use desktop, documents, downloads, pictures, music, videos, public_share, or templates. Do not put an absolute path here."
+                    },
+                    "directory": {
+                        "type": "string",
+                        "description": "Legacy alias for directory_id. An exact path is accepted only when it matches a validated host user directory."
                     },
                     "relative_path": {
                         "type": "string",
@@ -266,16 +350,15 @@ impl Tool for UserDirectoryWriteTool {
                         "description": "Explicitly create missing parent directories recursively. Omit or set false to require existing parents."
                     }
                 },
-                "required": ["directory", "relative_path", "content"]
+                "required": ["directory_id", "relative_path", "content"]
             }),
             effects: vec![tool_core::ToolEffect::FilesystemWrite],
         }
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let environment = self.environment();
         let resolved =
-            resolve_user_file_args(args, &environment, "filesystem.write_user_file").ok()?;
+            resolve_user_file_args(args, &self.environment, "filesystem.write_user_file").ok()?;
         // The inner tool computes the same canonical/lexical resource that it
         // will validate in `invoke`; no capability is minted for the symbolic
         // directory name supplied by the model.
@@ -287,30 +370,25 @@ impl Tool for UserDirectoryWriteTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let environment = self.environment();
-        let resolved = resolve_user_file_args(&args, &environment, "filesystem.write_user_file")?;
+        let resolved =
+            resolve_user_file_args(&args, &self.environment, "filesystem.write_user_file")?;
         let directory = resolved.directory.json_key();
-        let resolved_path = resolved.path.clone();
         let mut output = self.inner.invoke(ctx, resolved.write_args).await?;
         if let Some(object) = output.content.as_object_mut() {
             object.insert(
-                "directory".to_string(),
+                "directory_id".to_string(),
                 serde_json::Value::String(directory.to_string()),
             );
             object.insert(
                 "resolved_directory".to_string(),
                 serde_json::Value::String(
-                    environment
-                        .user_dirs
-                        .get(resolved.directory)
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| {
-                            resolved_path
-                                .parent()
-                                .map(|path| path.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        }),
+                    resolved.resolved_directory.to_string_lossy().into_owned(),
                 ),
+            );
+            // Keep the original output keys for older frontend consumers.
+            object.insert(
+                "directory".to_string(),
+                serde_json::Value::String(directory.to_string()),
             );
         }
         Ok(output)
@@ -320,27 +398,17 @@ impl Tool for UserDirectoryWriteTool {
 /// Resolve one validated special directory without exposing an OS mutation
 /// API or requiring a capability ticket.
 pub(crate) struct ResolveUserDirectoryTool {
-    test_environment: Option<HostEnvironment>,
+    environment: HostEnvironment,
 }
 
 impl ResolveUserDirectoryTool {
-    pub(crate) fn new() -> Self {
-        Self {
-            test_environment: None,
-        }
+    pub(crate) fn new(environment: HostEnvironment) -> Self {
+        Self { environment }
     }
 
     #[cfg(test)]
     fn with_environment(environment: HostEnvironment) -> Self {
-        Self {
-            test_environment: Some(environment),
-        }
-    }
-
-    fn environment(&self) -> HostEnvironment {
-        self.test_environment
-            .clone()
-            .unwrap_or_else(HostEnvironment::snapshot)
+        Self::new(environment)
     }
 }
 
@@ -354,13 +422,17 @@ impl Tool for ResolveUserDirectoryTool {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "directory": {
+                    "directory_id": {
                         "type": "string",
                         "enum": USER_DIRECTORY_ENUM,
-                        "description": "User directory identifier to resolve."
+                        "description": "Semantic user directory identifier; use desktop, documents, downloads, pictures, music, videos, public_share, or templates."
+                    },
+                    "directory": {
+                        "type": "string",
+                        "description": "Legacy alias for directory_id. An exact path or configured basename is accepted only when it matches a validated host user directory."
                     }
                 },
-                "required": ["directory"]
+                "required": ["directory_id"]
             }),
             effects: vec![tool_core::ToolEffect::ReadOnly],
         }
@@ -371,9 +443,8 @@ impl Tool for ResolveUserDirectoryTool {
         _ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let directory = parse_directory(&args, "filesystem.resolve_user_dir")?;
-        let environment = self.environment();
-        let path = environment.user_dirs.get(directory).ok_or_else(|| {
+        let directory = parse_directory(&args, &self.environment, "filesystem.resolve_user_dir")?;
+        let path = self.environment.user_dirs.get(directory).ok_or_else(|| {
             failed(
                 "filesystem.resolve_user_dir",
                 format!(
@@ -383,6 +454,9 @@ impl Tool for ResolveUserDirectoryTool {
             )
         })?;
         Ok(ToolOutput::new(serde_json::json!({
+            "directory_id": directory.json_key(),
+            "resolved_path": path.to_string_lossy(),
+            // Keep the original output keys for older model/tool consumers.
             "directory": directory.json_key(),
             "path": path.to_string_lossy(),
         })))
@@ -445,7 +519,7 @@ mod tests {
         );
 
         let args = serde_json::json!({
-            "directory": "desktop",
+            "directory_id": "desktop",
             "relative_path": "hello.txt",
             "content": "hello",
         });
@@ -459,9 +533,104 @@ mod tests {
         );
         let output = tool.invoke(ticketed_context(&target), args).await.unwrap();
         assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        assert_eq!(output.content["directory_id"], "desktop");
+        assert_eq!(
+            output.content["resolved_directory"],
+            desktop.to_string_lossy().as_ref()
+        );
         assert_eq!(output.content["directory"], "desktop");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
         assert!(!wrong.exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_user_file_normalizes_exact_path_and_configured_basename() {
+        let home = std::env::temp_dir().join(format!(
+            "utsuwa-user-directory-normalization-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let desktop = home.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let tool = UserDirectoryWriteTool::with_environment(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+
+        let exact_target = desktop.join("hello.txt");
+        let exact_path = desktop.to_string_lossy().into_owned();
+        let exact_args = serde_json::json!({
+            "directory": exact_path,
+            "relative_path": "hello.txt",
+            "content": "hello",
+        });
+        let exact_requirement = tool
+            .required_capability(&exact_args)
+            .expect("an exact configured directory path needs write capability");
+        assert_eq!(
+            exact_requirement.resource,
+            Resource::Path(exact_target.canonicalize().unwrap_or(exact_target.clone()))
+        );
+        let exact_output = tool
+            .invoke(ticketed_context(&exact_target), exact_args)
+            .await
+            .unwrap();
+        assert_eq!(exact_output.content["directory_id"], "desktop");
+        assert_eq!(
+            exact_output.content["resolved_directory"],
+            desktop.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            exact_output.content["path"],
+            exact_target.to_string_lossy().as_ref()
+        );
+
+        let basename_target = desktop.join("hello2.txt");
+        let basename_args = serde_json::json!({
+            "directory_id": "Escritorio",
+            "relative_path": "hello2.txt",
+            "content": "hello2",
+        });
+        tool.invoke(ticketed_context(&basename_target), basename_args)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&basename_target).unwrap(), "hello2");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_user_file_rejects_arbitrary_absolute_directory_path() {
+        let home = std::env::temp_dir().join(format!(
+            "utsuwa-user-directory-reject-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let desktop = home.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let arbitrary = home.join("random");
+        let target = arbitrary.join("hello.txt");
+        let tool = UserDirectoryWriteTool::with_environment(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let error = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "directory": arbitrary.to_string_lossy(),
+                    "relative_path": "hello.txt",
+                    "content": "hello",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs { .. }));
+        let message = error.to_string();
+        assert!(message.contains("invalid_user_directory"));
+        assert!(message.contains("valid_directory_ids"));
+        assert!(message.contains("Escritorio"));
+        assert!(!arbitrary.exists());
         std::fs::remove_dir_all(&home).unwrap();
     }
 
@@ -478,12 +647,30 @@ mod tests {
         let output = tool
             .invoke(
                 ToolContext::new(Principal::Agent(AgentId::new("resolve-test"))),
-                serde_json::json!({"directory": "desktop"}),
+                serde_json::json!({"directory_id": "desktop"}),
             )
             .await
             .unwrap();
+        assert_eq!(output.content["directory_id"], "desktop");
+        assert_eq!(
+            output.content["resolved_path"],
+            desktop.to_string_lossy().as_ref()
+        );
         assert_eq!(output.content["directory"], "desktop");
         assert_eq!(output.content["path"], desktop.to_string_lossy().as_ref());
+
+        let legacy_exact = tool
+            .invoke(
+                ToolContext::new(Principal::Agent(AgentId::new("resolve-test-legacy"))),
+                serde_json::json!({"directory": desktop.to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_exact.content["directory_id"], "desktop");
+        assert_eq!(
+            legacy_exact.content["resolved_path"],
+            desktop.to_string_lossy().as_ref()
+        );
         std::fs::remove_dir_all(&home).unwrap();
     }
 
