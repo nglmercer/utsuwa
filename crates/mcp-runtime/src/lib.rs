@@ -96,7 +96,9 @@ pub struct McpServerConfig {
 impl McpServerConfig {
     pub fn validate(&self) -> Result<(), McpError> {
         if self.id.0.is_empty() || self.id.0.len() > 128 {
-            return Err(McpError::Config("server id must be 1-128 chars".to_string()));
+            return Err(McpError::Config(
+                "server id must be 1-128 chars".to_string(),
+            ));
         }
         if !self
             .id
@@ -117,7 +119,9 @@ impl McpServerConfig {
             } => {
                 check_no_nul("command", command).map_err(McpError::Config)?;
                 if command.is_empty() || command.len() > 1024 {
-                    return Err(McpError::Config("'command' must be 1-1024 chars".to_string()));
+                    return Err(McpError::Config(
+                        "'command' must be 1-1024 chars".to_string(),
+                    ));
                 }
                 if args.len() > 128 {
                     return Err(McpError::Config("'args' exceeds 128 entries".to_string()));
@@ -125,11 +129,15 @@ impl McpServerConfig {
                 for arg in args {
                     check_no_nul("args[]", arg).map_err(McpError::Config)?;
                     if arg.len() > 4096 {
-                        return Err(McpError::Config("an 'args' entry exceeds 4096 chars".to_string()));
+                        return Err(McpError::Config(
+                            "an 'args' entry exceeds 4096 chars".to_string(),
+                        ));
                     }
                 }
                 if extra_env.len() > 64 {
-                    return Err(McpError::Config("'extra_env' exceeds 64 entries".to_string()));
+                    return Err(McpError::Config(
+                        "'extra_env' exceeds 64 entries".to_string(),
+                    ));
                 }
                 for (name, value) in extra_env {
                     check_no_nul("extra_env name", name).map_err(McpError::Config)?;
@@ -204,14 +212,14 @@ impl McpClient {
             DEFAULT_RPC_TIMEOUT,
             self.service.list_tools(None).instrument(span),
         )
-            .await
-            .map_err(|_| McpError::Timeout {
-                server: self.server.clone(),
-            })?
-            .map_err(|e| McpError::Protocol {
-                server: self.server.clone(),
-                message: format!("tools/list failed: {e}"),
-            })?;
+        .await
+        .map_err(|_| McpError::Timeout {
+            server: self.server.clone(),
+        })?
+        .map_err(|e| McpError::Protocol {
+            server: self.server.clone(),
+            message: format!("tools/list failed: {e}"),
+        })?;
         Ok(result.tools)
     }
 
@@ -231,14 +239,14 @@ impl McpClient {
             DEFAULT_RPC_TIMEOUT,
             self.service.call_tool(params).instrument(span),
         )
-            .await
-            .map_err(|_| McpError::Timeout {
-                server: self.server.clone(),
-            })?
-            .map_err(|e| McpError::Protocol {
-                server: self.server.clone(),
-                message: format!("tools/call failed: {e}"),
-            })
+        .await
+        .map_err(|_| McpError::Timeout {
+            server: self.server.clone(),
+        })?
+        .map_err(|e| McpError::Protocol {
+            server: self.server.clone(),
+            message: format!("tools/call failed: {e}"),
+        })
     }
 }
 
@@ -312,7 +320,9 @@ impl McpToolBridge {
     /// The bridge ticket must cover `McpInvoke` on this exact server tool.
     fn authorize(&self, ctx: &ToolContext) -> Result<(), ToolError> {
         let ticket = ctx.ticket.as_ref().ok_or_else(|| {
-            Self::denied("no capability ticket: MCP tools authorize through the agent + policy engine")
+            Self::denied(
+                "no capability ticket: MCP tools authorize through the agent + policy engine",
+            )
         })?;
         let request = CapabilityRequest {
             principal: ctx.principal.clone(),
@@ -379,18 +389,22 @@ impl Tool for McpToolBridge {
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
         self.authorize(&ctx)?;
-        let map = args.as_object().cloned().ok_or_else(|| ToolError::InvalidArgs {
-            tool: "mcp".to_string(),
-            message: "MCP tool arguments must be a JSON object".to_string(),
-        })?;
-        let client = self.client.lock().await;
-        let result = client
-            .call_tool(&self.tool, Some(map))
-            .await
-            .map_err(|e| ToolError::Failed {
+        let map = args
+            .as_object()
+            .cloned()
+            .ok_or_else(|| ToolError::InvalidArgs {
                 tool: "mcp".to_string(),
-                message: e.to_string(),
+                message: "MCP tool arguments must be a JSON object".to_string(),
             })?;
+        let client = self.client.lock().await;
+        let result =
+            client
+                .call_tool(&self.tool, Some(map))
+                .await
+                .map_err(|e| ToolError::Failed {
+                    tool: "mcp".to_string(),
+                    message: e.to_string(),
+                })?;
         Ok(ToolOutput::new(mcp_result_to_json(&result)))
     }
 }
@@ -618,13 +632,20 @@ impl McpManager {
         server_id: &str,
     ) -> Result<Arc<tokio::sync::Mutex<McpClient>>, McpError> {
         // Fast path without holding the lock across the handshake.
-        if let Some(client) = self.inner.lock().await.servers.get(server_id).and_then(|managed| {
-            if managed.config.enabled {
-                managed.client.clone()
-            } else {
-                None
-            }
-        }) {
+        if let Some(client) = self
+            .inner
+            .lock()
+            .await
+            .servers
+            .get(server_id)
+            .and_then(|managed| {
+                if managed.config.enabled {
+                    managed.client.clone()
+                } else {
+                    None
+                }
+            })
+        {
             return Ok(client);
         }
         let config = self
@@ -639,12 +660,15 @@ impl McpManager {
         if !config.enabled {
             return Err(McpError::Disabled(server_id.to_string()));
         }
-        let client = Arc::new(tokio::sync::Mutex::new(
-            McpClient::connect(&config).await?,
-        ));
-        self.inner.lock().await.servers.get_mut(server_id).map(|managed| {
-            managed.client = Some(Arc::clone(&client));
-        });
+        let client = Arc::new(tokio::sync::Mutex::new(McpClient::connect(&config).await?));
+        self.inner
+            .lock()
+            .await
+            .servers
+            .get_mut(server_id)
+            .map(|managed| {
+                managed.client = Some(Arc::clone(&client));
+            });
         Ok(client)
     }
 }
@@ -662,4 +686,39 @@ pub struct McpServerStatus {
     pub enabled: bool,
     pub connected: bool,
     pub tools: usize,
+}
+
+/// Dynamic MCP tool collection: every configured server's discovered
+/// tools, bridged into the runtime ABI. Best-effort per server — a down
+/// server logs and skips, never fails the turn. Server-set
+/// synchronization from settings stays the composition root's job
+/// ([`McpManager::sync_configs`]); this source only collects.
+pub struct McpToolSource {
+    pub manager: Arc<McpManager>,
+}
+
+impl McpToolSource {
+    pub fn new(manager: Arc<McpManager>) -> Self {
+        Self { manager }
+    }
+}
+
+#[async_trait::async_trait]
+impl tool_sdk::ToolSource for McpToolSource {
+    fn id(&self) -> &'static str {
+        "mcp"
+    }
+
+    async fn load(
+        &self,
+        _ctx: &tool_sdk::ToolLoadContext,
+    ) -> Result<Vec<Arc<dyn tool_core::Tool>>, tool_sdk::ToolSourceError> {
+        let mut registry = tool_core::ToolRegistry::new();
+        for id in self.manager.server_ids().await {
+            if let Err(e) = self.manager.register_into(&id, &mut registry).await {
+                tracing::warn!(server = %id, error = %e, "mcp server unavailable this turn");
+            }
+        }
+        Ok(tool_sdk::collect_tools(&registry))
+    }
 }

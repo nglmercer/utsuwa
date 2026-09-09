@@ -6,7 +6,7 @@
 //! the host environment instead of letting individual tools grow their own
 //! variants.
 
-use crate::host_environment::{HostEnvironment, UserDirectory};
+use host_core::{HostEnvironment, UserDirectory};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
@@ -599,7 +599,7 @@ impl ConversationFileContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_environment::UserDirectories;
+    use host_core::UserDirectories;
 
     fn environment(root: &Path) -> HostEnvironment {
         HostEnvironment {

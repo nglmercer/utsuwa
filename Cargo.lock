@@ -138,8 +138,10 @@ dependencies = [
  "capability-core",
  "chrono",
  "desktop-linux",
+ "file-target",
  "futures-util",
  "gtk",
+ "host-core",
  "iana-time-zone",
  "ipc-core",
  "mcp-runtime",
@@ -157,7 +159,9 @@ dependencies = [
  "tool-core",
  "tool-desktop",
  "tool-filesystem",
+ "tool-filesystem-host",
  "tool-process",
+ "tool-sdk",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1190,6 +1194,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "file-target"
+version = "0.1.0"
+dependencies = [
+ "host-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1745,6 +1758,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
 dependencies = [
  "digest 0.11.3",
+]
+
+[[package]]
+name = "host-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2368,6 +2389,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tool-core",
+ "tool-sdk",
  "tracing",
 ]
 
@@ -2416,6 +2438,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tool-core",
+ "tool-sdk",
 ]
 
 [[package]]
@@ -3139,6 +3162,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tool-core",
+ "tool-sdk",
  "tracing",
  "wasmtime",
  "wat",
@@ -4610,6 +4634,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tool-core",
+ "tool-sdk",
 ]
 
 [[package]]
@@ -4627,7 +4652,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "tool-filesystem-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-core",
+ "chrono",
+ "file-target",
+ "host-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tool-core",
+ "tool-filesystem",
+ "tool-sdk",
+ "tracing",
+]
+
+[[package]]
 name = "tool-process"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tool-core",
+ "tracing",
+]
+
+[[package]]
+name = "tool-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -4835,6 +4892,17 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "utsuwa-sdk"
+version = "0.1.0"
+dependencies = [
+ "capability-core",
+ "file-target",
+ "host-core",
+ "tool-core",
+ "tool-sdk",
+]
 
 [[package]]
 name = "uuid"

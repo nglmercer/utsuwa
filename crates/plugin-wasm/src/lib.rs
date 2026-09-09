@@ -185,7 +185,11 @@ impl PluginRuntime {
             if !matches!(state, plugin_core::PluginState::Validated) {
                 registry.validate(id)?;
             }
-            registry.get(id).ok_or_else(|| WasmError::Unknown(id.to_string()))?.module_bytes.clone()
+            registry
+                .get(id)
+                .ok_or_else(|| WasmError::Unknown(id.to_string()))?
+                .module_bytes
+                .clone()
         };
         let manifest = self
             .lock_registry()?
@@ -194,7 +198,10 @@ impl PluginRuntime {
             .manifest
             .clone();
         let loaded = self.instantiate(&manifest, &bytes)?;
-        self.instances.lock().map_err(|_| WasmError::Engine("instance lock failed".to_string()))?.insert(id.to_string(), Mutex::new(loaded));
+        self.instances
+            .lock()
+            .map_err(|_| WasmError::Engine("instance lock failed".to_string()))?
+            .insert(id.to_string(), Mutex::new(loaded));
         self.lock_registry()?.mark_loaded(id)?;
         Ok(())
     }
@@ -220,7 +227,9 @@ impl PluginRuntime {
     pub fn reload(&self, id: &str) -> Result<(), WasmError> {
         let was_enabled = {
             let registry = self.lock_registry()?;
-            let record = registry.get(id).ok_or_else(|| WasmError::Unknown(id.to_string()))?;
+            let record = registry
+                .get(id)
+                .ok_or_else(|| WasmError::Unknown(id.to_string()))?;
             record.state == plugin_core::PluginState::Enabled
         };
         if was_enabled {
@@ -260,7 +269,9 @@ impl PluginRuntime {
             .ok_or_else(|| WasmError::Unknown(id.to_string()))?;
         let was_enabled = {
             let registry = self.lock_registry()?;
-            let record = registry.get(id).ok_or_else(|| WasmError::Unknown(id.to_string()))?;
+            let record = registry
+                .get(id)
+                .ok_or_else(|| WasmError::Unknown(id.to_string()))?;
             record.state == plugin_core::PluginState::Enabled
         };
         self.instances
@@ -298,7 +309,11 @@ impl PluginRuntime {
         let runtime_arc = Arc::clone(self);
         let ids: Vec<String> = {
             let registry = self.lock_registry()?;
-            registry.enabled().iter().map(|r| r.manifest.id.0.clone()).collect()
+            registry
+                .enabled()
+                .iter()
+                .map(|r| r.manifest.id.0.clone())
+                .collect()
         };
         let mut added = Vec::new();
         for id in ids {
@@ -314,7 +329,9 @@ impl PluginRuntime {
                 }
             }
             let manifests = self.lock_registry()?;
-            let record = manifests.get(&id).ok_or_else(|| WasmError::Unknown(id.clone()))?;
+            let record = manifests
+                .get(&id)
+                .ok_or_else(|| WasmError::Unknown(id.clone()))?;
             for tool in &record.manifest.tools {
                 let bridge = PluginToolBridge {
                     plugin: record.manifest.id.clone(),
@@ -341,11 +358,21 @@ impl PluginRuntime {
     /// Manifests of enabled plugins (for UIs and diagnostics).
     pub fn enabled_manifests(&self) -> Vec<PluginManifest> {
         self.lock_registry()
-            .map(|registry| registry.enabled().iter().map(|r| r.manifest.clone()).collect())
+            .map(|registry| {
+                registry
+                    .enabled()
+                    .iter()
+                    .map(|r| r.manifest.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
-    fn instantiate(&self, manifest: &PluginManifest, bytes: &[u8]) -> Result<LoadedPlugin, WasmError> {
+    fn instantiate(
+        &self,
+        manifest: &PluginManifest,
+        bytes: &[u8],
+    ) -> Result<LoadedPlugin, WasmError> {
         // `Module::new` accepts binary or text (wat feature): text is a
         // development convenience, real plugins ship bytes.
         let module =
@@ -382,9 +409,10 @@ impl PluginRuntime {
         let alloc: TypedFunc<i32, i32> = instance
             .get_typed_func(&mut store, "alloc")
             .map_err(|_| WasmError::Abi("guest must export `alloc(i32) -> i32`".to_string()))?;
-        let invoke: TypedFunc<(i32, i32), i64> = instance
-            .get_typed_func(&mut store, "invoke")
-            .map_err(|_| WasmError::Abi("guest must export `invoke(i32, i32) -> i64`".to_string()))?;
+        let invoke: TypedFunc<(i32, i32), i64> =
+            instance.get_typed_func(&mut store, "invoke").map_err(|_| {
+                WasmError::Abi("guest must export `invoke(i32, i32) -> i64`".to_string())
+            })?;
         Ok(LoadedPlugin {
             store,
             memory,
@@ -405,7 +433,9 @@ impl PluginRuntime {
             .instances
             .lock()
             .map_err(|_| WasmError::Engine("instance lock failed".to_string()))?;
-        let instance = instances.get(id).ok_or_else(|| WasmError::Unknown(id.to_string()))?;
+        let instance = instances
+            .get(id)
+            .ok_or_else(|| WasmError::Unknown(id.to_string()))?;
         let mut plugin = instance
             .lock()
             .map_err(|_| WasmError::Engine("plugin lock failed".to_string()))?;
@@ -416,7 +446,9 @@ impl PluginRuntime {
             alloc,
             invoke,
         } = &mut *plugin;
-        store.set_fuel(FUEL_PER_CALL).map_err(|e| WasmError::Engine(e.to_string()))?;
+        store
+            .set_fuel(FUEL_PER_CALL)
+            .map_err(|e| WasmError::Engine(e.to_string()))?;
         let arg_ptr = alloc
             .call(&mut *store, args_json.len() as i32)
             .map_err(|e| WasmError::Trap(format!("guest alloc failed: {e}")))?;
@@ -445,16 +477,16 @@ impl PluginRuntime {
         }
         let mem_len = memory.data_size(&mut *store);
         if ret_ptr.saturating_add(ret_len) > mem_len {
-            return Err(WasmError::Abi("tool result points outside guest memory".to_string()));
+            return Err(WasmError::Abi(
+                "tool result points outside guest memory".to_string(),
+            ));
         }
         let mut out = vec![0u8; ret_len];
         memory
             .read(&mut *store, ret_ptr, &mut out)
             .map_err(|e| WasmError::Abi(format!("cannot read guest result: {e}")))?;
         let call = store.data_mut().call.take();
-        let (logs, mutations) = call
-            .map(|c| (c.logs, c.mutations))
-            .unwrap_or_default();
+        let (logs, mutations) = call.map(|c| (c.logs, c.mutations)).unwrap_or_default();
         Ok((out, logs, mutations))
     }
 
@@ -491,8 +523,7 @@ impl PluginRuntime {
         let principal = Principal::WasmPlugin(manifest.id.clone());
         let ttl = std::time::Duration::from_secs(60);
         let scope_of = |paths: &[String]| {
-            let resources: Vec<Resource> =
-                paths.iter().map(|p| Resource::Path(p.into())).collect();
+            let resources: Vec<Resource> = paths.iter().map(|p| Resource::Path(p.into())).collect();
             (!resources.is_empty()).then(|| capability_core::ResourceScope::new(resources))
         };
         let mint = |capability: Capability, scope: Option<capability_core::ResourceScope>| {
@@ -507,8 +538,14 @@ impl PluginRuntime {
             })
         };
         let call = ActiveCall {
-            read_ticket: mint(Capability::FilesystemRead, scope_of(&manifest.filesystem.read)),
-            write_ticket: mint(Capability::FilesystemWrite, scope_of(&manifest.filesystem.write)),
+            read_ticket: mint(
+                Capability::FilesystemRead,
+                scope_of(&manifest.filesystem.read),
+            ),
+            write_ticket: mint(
+                Capability::FilesystemWrite,
+                scope_of(&manifest.filesystem.write),
+            ),
             invocation,
             logs: Vec::new(),
             mutations: Vec::new(),
@@ -517,7 +554,9 @@ impl PluginRuntime {
             .instances
             .lock()
             .map_err(|_| WasmError::Engine("instance lock failed".to_string()))?;
-        let instance = instances.get(id).ok_or_else(|| WasmError::Unknown(id.to_string()))?;
+        let instance = instances
+            .get(id)
+            .ok_or_else(|| WasmError::Unknown(id.to_string()))?;
         let mut plugin = instance
             .lock()
             .map_err(|_| WasmError::Engine("plugin lock failed".to_string()))?;
@@ -572,7 +611,9 @@ fn witness_before(path: &str) -> Option<String> {
     use std::io::Read;
     let file = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();
-    file.take(MAX_WITNESS_BYTES + 1).read_to_end(&mut buf).ok()?;
+    file.take(MAX_WITNESS_BYTES + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
     if buf.len() as u64 > MAX_WITNESS_BYTES {
         return None;
     }
@@ -627,7 +668,10 @@ fn ticket_check(
     resource: Resource,
 ) -> Result<(), String> {
     let data = caller.data();
-    let call = data.call.as_ref().ok_or_else(|| "no active call".to_string())?;
+    let call = data
+        .call
+        .as_ref()
+        .ok_or_else(|| "no active call".to_string())?;
     let ticket = match capability {
         Capability::FilesystemRead => call.read_ticket.as_ref(),
         Capability::FilesystemWrite => call.write_ticket.as_ref(),
@@ -642,21 +686,23 @@ fn ticket_check(
         capability: capability.clone(),
         resource,
     };
-    ticket.check(&principal, &request, &call.invocation).map_err(|e| {
-        format!(
-            "ticket does not authorize this plugin call: {}",
-            match e {
-                capability_core::TicketError::Expired => "capability ticket expired",
-                capability_core::TicketError::PrincipalMismatch =>
-                    "ticket bound to a different principal",
-                capability_core::TicketError::InvocationMismatch =>
-                    "ticket bound to a different invocation",
-                capability_core::TicketError::CapabilityMismatch
-                | capability_core::TicketError::ScopeMismatch =>
-                    "ticket does not cover this resource",
-            }
-        )
-    })
+    ticket
+        .check(&principal, &request, &call.invocation)
+        .map_err(|e| {
+            format!(
+                "ticket does not authorize this plugin call: {}",
+                match e {
+                    capability_core::TicketError::Expired => "capability ticket expired",
+                    capability_core::TicketError::PrincipalMismatch =>
+                        "ticket bound to a different principal",
+                    capability_core::TicketError::InvocationMismatch =>
+                        "ticket bound to a different invocation",
+                    capability_core::TicketError::CapabilityMismatch
+                    | capability_core::TicketError::ScopeMismatch =>
+                        "ticket does not cover this resource",
+                }
+            )
+        })
 }
 
 /// `host.fs.read(path_ptr, path_len) -> i64`: file read through the
@@ -774,8 +820,9 @@ impl PluginToolBridge {
     fn authorize(&self, ctx: &ToolContext) -> Result<(), ToolError> {
         let ticket = ctx.ticket.as_ref().ok_or_else(|| ToolError::Denied {
             tool: "plugin".to_string(),
-            reason: "no capability ticket: plugin tools authorize through the agent + policy engine"
-                .to_string(),
+            reason:
+                "no capability ticket: plugin tools authorize through the agent + policy engine"
+                    .to_string(),
         })?;
         let request = CapabilityRequest {
             principal: ctx.principal.clone(),
@@ -828,7 +875,10 @@ impl Tool for PluginToolBridge {
             message,
         };
         let args_json = serde_json::to_vec(&args).map_err(|e| failed(e.to_string()))?;
-        let ticket = ctx.ticket.clone().ok_or_else(|| failed("missing capability ticket".to_string()))?;
+        let ticket = ctx
+            .ticket
+            .clone()
+            .ok_or_else(|| failed("missing capability ticket".to_string()))?;
         self.runtime
             .begin_call(
                 &self.id,
@@ -896,8 +946,52 @@ impl PluginRuntime {
                 trust: record.manifest.trust.as_str().to_string(),
                 runtime: record.manifest.runtime.as_str().to_string(),
                 state: record.state.as_str().to_string(),
-                tools: record.manifest.tools.iter().map(|t| t.name.clone()).collect(),
+                tools: record
+                    .manifest
+                    .tools
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .collect(),
             })
             .collect()
+    }
+}
+
+/// Dynamic WASM-plugin tool collection: every enabled plugin's tools,
+/// bridged into the runtime ABI. Best-effort like MCP: a broken plugin
+/// logs and skips, never fails the turn. Directory discovery from
+/// settings stays the composition root's job
+/// ([`PluginRuntime::discover_dir`]); this source only collects.
+/// Enabling loads code — calls still need a policy ticket per invocation.
+pub struct PluginToolSource {
+    pub runtime: Arc<PluginRuntime>,
+}
+
+impl PluginToolSource {
+    pub fn new(runtime: Arc<PluginRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[async_trait::async_trait]
+impl tool_sdk::ToolSource for PluginToolSource {
+    fn id(&self) -> &'static str {
+        "plugin"
+    }
+
+    async fn load(
+        &self,
+        _ctx: &tool_sdk::ToolLoadContext,
+    ) -> Result<Vec<Arc<dyn tool_core::Tool>>, tool_sdk::ToolSourceError> {
+        let mut registry = tool_core::ToolRegistry::new();
+        match self.runtime.register_enabled(&mut registry) {
+            Ok(added) => {
+                if !added.is_empty() {
+                    tracing::debug!(tools = ?added, "plugin tools registered for turn");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "plugin registration failed"),
+        }
+        Ok(tool_sdk::collect_tools(&registry))
     }
 }

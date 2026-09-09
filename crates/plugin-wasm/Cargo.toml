@@ -13,6 +13,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tool-core.workspace = true
+tool-sdk.workspace = true
 tracing.workspace = true
 wasmtime.workspace = true
 async-trait.workspace = true

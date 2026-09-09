@@ -1,6 +1,7 @@
 // Pure native-agent chat logic for the host-driven turn loop.
 // Framework-free so it runs under `node --test`. The reactive store lives
-// in `agent.svelte.ts`; the Rust side is `crates/app-host/src/agent_runtime.rs`.
+// in `agent.svelte.ts`; the Rust side is `crates/app-host/src/runtime.rs`
+// (+ `runtime/` for session/turn/authorization/prompts/providers).
 //
 // Turn lifecycle over the bridge:
 //   invoke('agent.send_message', { text }) -> { accepted: true }

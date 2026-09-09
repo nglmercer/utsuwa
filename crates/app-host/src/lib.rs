@@ -7,12 +7,10 @@
 
 use ipc_core::HostEvent;
 
-pub mod agent_runtime;
-pub mod dispatcher;
-pub mod file_target;
-pub mod host_environment;
+pub mod ipc;
 pub mod protocol;
-mod user_directory_tools;
+pub mod runtime;
+pub mod tooling;
 pub use winit;
 
 /// Errors surfaced by the host. No panics cross this boundary.

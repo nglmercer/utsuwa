@@ -112,7 +112,9 @@ impl MemoryStore {
     fn check_text(text: &str) -> Result<String, MemoryError> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            return Err(MemoryError::Invalid("memory text must not be empty".to_string()));
+            return Err(MemoryError::Invalid(
+                "memory text must not be empty".to_string(),
+            ));
         }
         if trimmed.chars().count() > MAX_ENTRY_CHARS {
             return Err(MemoryError::Invalid(format!(
@@ -159,7 +161,12 @@ impl MemoryStore {
         conn.execute(
             "INSERT INTO memory_entries (text, tags, importance, created_ms, updated_ms)
              VALUES (?1, ?2, ?3, ?4, ?4)",
-            params![text, serde_json::to_string(&tags).unwrap_or_default(), importance, now],
+            params![
+                text,
+                serde_json::to_string(&tags).unwrap_or_default(),
+                importance,
+                now
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -185,7 +192,9 @@ impl MemoryStore {
             sql.push_str(" WHERE ");
             let clauses: Vec<String> = terms
                 .iter()
-                .map(|_| "(LOWER(text) LIKE ? ESCAPE '\\' OR LOWER(tags) LIKE ? ESCAPE '\\')".to_string())
+                .map(|_| {
+                    "(LOWER(text) LIKE ? ESCAPE '\\' OR LOWER(tags) LIKE ? ESCAPE '\\')".to_string()
+                })
                 .collect();
             sql.push_str(&clauses.join(" AND "));
             for term in &terms {
@@ -334,10 +343,7 @@ pub mod tools {
                 })
                 .transpose()?
                 .unwrap_or_default();
-            let importance = args
-                .get("importance")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
+            let importance = args.get("importance").and_then(|v| v.as_i64()).unwrap_or(0);
             let id = self
                 .store
                 .remember(text, &tags, importance)
@@ -359,7 +365,9 @@ pub mod tools {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: capability_core::ToolId::new("memory.recall"),
-                description: "Recall remembered facts by keyword. Empty query lists recent entries.".to_string(),
+                description:
+                    "Recall remembered facts by keyword. Empty query lists recent entries."
+                        .to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -376,10 +384,7 @@ pub mod tools {
             _ctx: ToolContext,
             args: serde_json::Value,
         ) -> Result<ToolOutput, ToolError> {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             if query.chars().count() > MAX_ENTRY_CHARS {
                 return Err(invalid("query is too long".to_string()));
             }
@@ -433,7 +438,42 @@ pub mod tools {
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| invalid("missing integer 'id'".to_string()))?;
             let forgotten = self.store.forget(id).map_err(store_error)?;
-            Ok(ToolOutput::new(serde_json::json!({ "forgotten": forgotten })))
+            Ok(ToolOutput::new(
+                serde_json::json!({ "forgotten": forgotten }),
+            ))
+        }
+    }
+
+    /// Static memory tool group (`memory.remember` / `memory.recall` /
+    /// `memory.forget`) served from one store. Pure tools: no capability
+    /// requirement, so collection is infallible and synchronous.
+    pub struct MemoryToolPack {
+        pub store: Arc<MemoryStore>,
+    }
+
+    impl MemoryToolPack {
+        pub fn new(store: Arc<MemoryStore>) -> Self {
+            Self { store }
+        }
+    }
+
+    impl tool_sdk::ToolPack for MemoryToolPack {
+        fn id(&self) -> &'static str {
+            "memory"
+        }
+
+        fn tools(&self, _ctx: &tool_sdk::ToolLoadContext) -> Vec<Arc<dyn tool_core::Tool>> {
+            vec![
+                Arc::new(RememberTool {
+                    store: Arc::clone(&self.store),
+                }) as Arc<dyn tool_core::Tool>,
+                Arc::new(RecallTool {
+                    store: Arc::clone(&self.store),
+                }),
+                Arc::new(ForgetTool {
+                    store: Arc::clone(&self.store),
+                }),
+            ]
         }
     }
 
@@ -453,7 +493,9 @@ pub mod tools {
         #[tokio::test]
         async fn remember_recall_forget_roundtrip() {
             let store = store();
-            let remember = RememberTool { store: store.clone() };
+            let remember = RememberTool {
+                store: store.clone(),
+            };
             let out = remember
                 .invoke(
                     ctx(),
@@ -464,7 +506,9 @@ pub mod tools {
             // Text is trimmed before storing.
             assert_eq!(out.content["id"].as_i64().unwrap(), 1);
 
-            let recall = RecallTool { store: store.clone() };
+            let recall = RecallTool {
+                store: store.clone(),
+            };
             let out = recall
                 .invoke(ctx(), serde_json::json!({"query": "dark"}))
                 .await
@@ -475,7 +519,9 @@ pub mod tools {
             assert_eq!(entries[0]["importance"], 6);
 
             // Pure tools: no ticket required.
-            assert!(remember.required_capability(&serde_json::json!({})).is_none());
+            assert!(remember
+                .required_capability(&serde_json::json!({}))
+                .is_none());
 
             let forget = ForgetTool { store };
             let out = forget
@@ -534,11 +580,19 @@ mod tests {
     fn remember_and_recall_by_keyword() {
         let db = store();
         let id = db
-            .remember("Hana prefers concise summaries", &tags(&["user", "style"]), 5)
+            .remember(
+                "Hana prefers concise summaries",
+                &tags(&["user", "style"]),
+                5,
+            )
             .unwrap();
         assert!(id > 0);
-        db.remember("Deploy checklist lives in /ops/runbook.md", &tags(&["ops"]), 3)
-            .unwrap();
+        db.remember(
+            "Deploy checklist lives in /ops/runbook.md",
+            &tags(&["ops"]),
+            3,
+        )
+        .unwrap();
 
         // Case-insensitive substring over text and tags.
         let hits = db.recall("HANA", 10).unwrap();
@@ -585,7 +639,9 @@ mod tests {
     fn validation_rejects_empty_oversize_and_bad_tags() {
         let db = store();
         assert!(db.remember("   ", &[], 0).is_err());
-        assert!(db.remember(&"x".repeat(MAX_ENTRY_CHARS + 1), &[], 0).is_err());
+        assert!(db
+            .remember(&"x".repeat(MAX_ENTRY_CHARS + 1), &[], 0)
+            .is_err());
         assert!(db.remember("ok", &["".to_string()], 0).is_err());
         assert!(db
             .remember("ok", &vec!["t".to_string(); MAX_TAGS + 1], 0)

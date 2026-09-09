@@ -20,6 +20,11 @@ members = [
     "crates/memory",
     "crates/tool-desktop",
     "crates/desktop-linux",
+    "crates/tool-sdk",
+    "crates/host-core",
+    "crates/file-target",
+    "crates/tool-filesystem-host",
+    "crates/utsuwa-sdk",
 ]
 
 [workspace.package]
@@ -36,6 +41,8 @@ capability-core = { path = "crates/capability-core" }
 chrono = { version = "0.4", default-features = true }
 futures-core = "0.3"
 futures-util = "0.3"
+file-target = { path = "crates/file-target" }
+host-core = { path = "crates/host-core" }
 iana-time-zone = "0.1"
 ipc-core = { path = "crates/ipc-core" }
 keyring = { version = "4" }
@@ -60,7 +67,10 @@ plugin-wasm = { path = "crates/plugin-wasm" }
 tool-core = { path = "crates/tool-core" }
 tool-desktop = { path = "crates/tool-desktop" }
 tool-filesystem = { path = "crates/tool-filesystem" }
+tool-filesystem-host = { path = "crates/tool-filesystem-host" }
 tool-process = { path = "crates/tool-process" }
+tool-sdk = { path = "crates/tool-sdk" }
+utsuwa-sdk = { path = "crates/utsuwa-sdk" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-appender = "0.2"

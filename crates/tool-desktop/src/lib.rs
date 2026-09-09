@@ -984,6 +984,35 @@ pub mod tools {
     }
 }
 
+/// Static desktop tool group for the active plugin's declared
+/// capabilities. Status/inspect stay available as honest read-only facts
+/// even with the stub; actions the platform lacks stay invisible.
+/// Collection is synchronous; model-facing profile filtering happens
+/// centrally in the catalog snapshot.
+pub struct DesktopToolPack {
+    pub plugin: plugin::DesktopPlugin,
+    pub filesystem_desktop: Option<String>,
+}
+
+impl DesktopToolPack {
+    pub fn new(plugin: plugin::DesktopPlugin, filesystem_desktop: Option<String>) -> Self {
+        Self {
+            plugin,
+            filesystem_desktop,
+        }
+    }
+}
+
+impl tool_sdk::ToolPack for DesktopToolPack {
+    fn id(&self) -> &'static str {
+        "desktop"
+    }
+
+    fn tools(&self, _ctx: &tool_sdk::ToolLoadContext) -> Vec<Arc<dyn tool_core::Tool>> {
+        tools::for_plugin_with_filesystem_desktop(&self.plugin, self.filesystem_desktop.clone())
+    }
+}
+
 /// Placeholder backend: honest failure instead of fake control.
 pub struct StubBackend;
 

@@ -14,131 +14,56 @@
 //! Host events emitted: `agent.turn_done`, `agent.turn_suspended`,
 //! `agent.turn_failed`, `agent.turn_cancelled`, `permission.requested`,
 //! `permission.dismissed`.
+//!
+//! The runtime is a thin facade: session lifecycle, turn execution,
+//! authorization, prompts, and provider configuration live in the
+//! child modules. Tool composition lives in `crate::tooling`.
 
-use crate::file_target::{ConversationFileContext, FileRef, FileResolver, TargetPurpose};
-use crate::host_environment::HostEnvironment;
-use crate::user_directory_tools::{
-    AppendFileTool, AppendUserFileTool, CreateUserFileTool, EditFileTool, EditTool,
-    EditUserFileTool, HostAwarePathTool, HostAwareWriteTool, ReplaceUserFileTool,
-    ResolveUserDirectoryTool, UserDirectoryWriteTool,
+pub mod authorization;
+pub mod events;
+pub mod prompts;
+pub mod providers;
+pub mod session;
+pub mod turn;
+
+#[cfg(test)]
+pub(crate) use self::authorization::QueueAuthorizer;
+#[cfg(test)]
+pub(crate) use self::prompts::compose_host_system_prompt_for_context;
+pub use self::prompts::host_environment_context;
+#[cfg(test)]
+pub(crate) use self::prompts::host_os_label;
+#[cfg(test)]
+pub(crate) use self::prompts::{compose_host_system_prompt, compose_host_system_prompt_for};
+#[cfg(test)]
+pub(crate) use self::providers::configured_tool_profile;
+pub use self::providers::{
+    normalize_provider_base_url, tool_profile_for_provider, ToolProfile, SETTING_API_KEY,
+    SETTING_AUTONOMOUS_FULL_ACCESS, SETTING_BASE_URL, SETTING_MCP_SERVERS, SETTING_MODEL_NAME,
+    SETTING_PLUGIN_DIR, SETTING_PROVIDER, SETTING_TOOL_PROFILE,
 };
-use agent_core::{Agent, AgentEvent, AgentLimits, ToolAuthorizer, ToolReplayCache};
+pub(crate) use self::providers::{provider_factory_with_secrets, read_autonomous_full_access};
+pub use self::session::AgentRequest;
+pub(crate) use self::session::State;
+pub(crate) use file_target::{ConversationFileContext, FileRef};
+pub(crate) use host_core::HostEnvironment;
+pub(crate) use tool_process::{ProcessLimits, ProcessManager};
+
+use crate::tooling::{
+    discover_plugins_from_settings, sync_mcp_from_settings, ProcessToolPack, SystemToolPack,
+};
 use audit_core::AuditSink;
 use capability_core::AgentId;
 use ipc_core::HostEvent;
-use mcp_runtime::{McpManager, McpServerConfig};
-use model_core::{ModelMessage, ModelProvider};
-use model_openai_compatible::{AnthropicClient, OpenAICompatibleClient};
-use policy_core::{ApprovalQueue, AuthorizationDecision};
+use mcp_runtime::McpManager;
+use model_core::ModelProvider;
+use policy_core::ApprovalQueue;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use storage_core::Storage;
-use tool_core::ToolRegistry;
-use tool_process::{ProcessLimits, ProcessManager};
-use tracing::Instrument as _;
-
-/// Setting keys the provider factory reads. Values are JSON strings.
-pub const SETTING_PROVIDER: &str = "model.provider";
-pub const SETTING_BASE_URL: &str = "model.base_url";
-pub const SETTING_API_KEY: &str = "model.api_key";
-pub const SETTING_MODEL_NAME: &str = "model.name";
-/// Settings key holding the MCP server set (JSON array of server configs).
-pub const SETTING_MCP_SERVERS: &str = "mcp.servers";
-/// Settings key holding the WASM plugin directory (JSON string path).
-/// Discovered every turn so installs take effect without a restart;
-/// only `Enabled` plugins register tools, and every call stays behind
-/// policy + tickets.
-pub const SETTING_PLUGIN_DIR: &str = "plugin.dir";
-/// Native persistent setting for the explicit Agent-only autonomous mode.
-/// Missing or invalid values are treated as `false`.
-pub const SETTING_AUTONOMOUS_FULL_ACCESS: &str = "agent.autonomous_full_access";
-/// Optional native model-facing tool profile. When absent, local providers
-/// use the small-model profile and other providers use the complete profile.
-pub const SETTING_TOOL_PROFILE: &str = "agent.tool_profile";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolProfile {
-    Simple,
-    Full,
-}
-
-impl ToolProfile {
-    fn allows_tool(self, tool_id: &str) -> bool {
-        match self {
-            Self::Full => true,
-            // The small-model profile hides redundant low-level variants
-            // (raw patch, range reads, search/glob, legacy aliases) and the
-            // overlapping edit tools: small models get exactly one edit
-            // interface, filesystem.edit, which covers both the semantic
-            // location style and the explicit absolute path style.
-            Self::Simple => !matches!(
-                tool_id,
-                "filesystem.stat"
-                    | "filesystem.read_range"
-                    | "filesystem.search_text"
-                    | "filesystem.glob"
-                    | "filesystem.patch"
-                    | "filesystem.edit_user_file"
-                    | "filesystem.edit_file"
-                    | "filesystem.resolve_user_dir"
-                    | "filesystem.write_user_file"
-                    | "desktop.list_windows"
-                    | "desktop.accessibility_tree"
-                    | "desktop.invoke_element"
-                    | "desktop.set_value"
-            ),
-        }
-    }
-}
-
-pub fn tool_profile_for_provider(provider: Option<&str>) -> ToolProfile {
-    match provider
-        .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-    {
-        Some(provider)
-            if provider.eq_ignore_ascii_case("lmstudio")
-                || provider.eq_ignore_ascii_case("ollama") =>
-        {
-            ToolProfile::Simple
-        }
-        _ => ToolProfile::Full,
-    }
-}
-
-fn configured_tool_profile(storage: Option<&Arc<Mutex<Storage>>>) -> ToolProfile {
-    let Some(storage) = storage else {
-        return ToolProfile::Full;
-    };
-    let Ok(storage) = storage.lock() else {
-        tracing::warn!("tool profile storage lock failed; using full profile");
-        return ToolProfile::Full;
-    };
-    if let Ok(Some(value)) = storage.get_setting(SETTING_TOOL_PROFILE) {
-        if let Some(profile) = value.as_str() {
-            match profile.trim().to_ascii_lowercase().as_str() {
-                "simple" => return ToolProfile::Simple,
-                "full" => return ToolProfile::Full,
-                _ => tracing::warn!(
-                    profile = %profile,
-                    "unknown agent.tool_profile value; inferring from provider"
-                ),
-            }
-        }
-    }
-    let provider = storage
-        .get_setting(SETTING_PROVIDER)
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(str::to_owned));
-    tool_profile_for_provider(provider.as_deref())
-}
-
-/// Transcript cap: oldest messages are dropped past this bound so a long
-/// session cannot grow memory (or model context) without limit.
-const MAX_TRANSCRIPT_MESSAGES: usize = 100;
+use tool_sdk::ToolCatalog;
 
 /// Callback the runtime uses to reach the frontend (reply queue + wake).
 pub type EmitFn = Arc<dyn Fn(HostEvent) + Send + Sync>;
@@ -153,113 +78,6 @@ pub enum RuntimeError {
     Settings(String),
     #[error("tool registry failed: {0}")]
     Tools(String),
-}
-
-/// A turn paused for the user, kept until the request is resolved.
-struct Suspended {
-    transcript: Vec<model_core::ModelMessage>,
-    request_id: String,
-    task_id: String,
-    turn_id: String,
-    system_prompt: Option<String>,
-    replay_cache: Arc<ToolReplayCache>,
-}
-
-struct State {
-    generation: u64,
-    transcript: Vec<ModelMessage>,
-    suspended: Option<Suspended>,
-    running: Option<tokio::task::JoinHandle<()>>,
-    task_id: Option<String>,
-    turn_id: Option<String>,
-    system_prompt: Option<String>,
-    replay_cache: Option<Arc<ToolReplayCache>>,
-}
-
-/// Input accepted from the native bridge. The frontend can send its current
-/// text history and prompt context on the first native turn; subsequent
-/// approval resumes use the host-owned transcript stored in `State`.
-#[derive(Debug, Clone, Default)]
-pub struct AgentRequest {
-    pub text: String,
-    pub history: Vec<ModelMessage>,
-    pub system_prompt: Option<String>,
-    pub append_user_message: bool,
-}
-
-struct QueueAuthorizer {
-    approvals: Arc<Mutex<ApprovalQueue>>,
-    task_id: String,
-    turn_id: String,
-    autonomous_full_access: Arc<AtomicBool>,
-}
-
-impl ToolAuthorizer for QueueAuthorizer {
-    fn authorize(
-        &self,
-        principal: &capability_core::Principal,
-        request: &capability_core::CapabilityRequest,
-    ) -> AuthorizationDecision {
-        // Autonomous mode is deliberately an AgentRuntime concern. It is
-        // checked before the ordinary queue policy so secret paths and
-        // shell/interpreter requests are included, but only when both the
-        // caller and the request carry the exact trusted Agent identity.
-        if self.autonomous_for(principal, request) {
-            return AuthorizationDecision::Allow {
-                ticket_ttl: policy_core::ticket_ttl_for(&request.capability),
-            };
-        }
-        self.approvals
-            .lock()
-            .map(|queue| {
-                queue.authorize_for(
-                    principal,
-                    request,
-                    Some(self.task_id.clone()),
-                    Some(self.turn_id.clone()),
-                )
-            })
-            .unwrap_or_else(|_| AuthorizationDecision::Deny {
-                reason: "approval queue lock failed".to_string(),
-            })
-    }
-
-    fn commit(
-        &self,
-        principal: &capability_core::Principal,
-        request: &capability_core::CapabilityRequest,
-    ) -> bool {
-        // `Agent::execute_prepared` commits immediately before minting the
-        // ticket. Autonomous mode must commit here too; it still mints the
-        // same invocation-bound ticket and the broker still validates it.
-        if self.autonomous_for(principal, request) {
-            return true;
-        }
-        self.approvals
-            .lock()
-            .map(|queue| {
-                queue.consume_for(principal, request, Some(&self.task_id), Some(&self.turn_id))
-            })
-            .unwrap_or(false)
-    }
-
-    fn authorization_mode(&self) -> Option<&'static str> {
-        self.autonomous_full_access
-            .load(Ordering::SeqCst)
-            .then_some("autonomous_full_access")
-    }
-}
-
-impl QueueAuthorizer {
-    fn autonomous_for(
-        &self,
-        principal: &capability_core::Principal,
-        request: &capability_core::CapabilityRequest,
-    ) -> bool {
-        self.autonomous_full_access.load(Ordering::SeqCst)
-            && matches!(principal, capability_core::Principal::Agent(_))
-            && principal == &request.principal
-    }
 }
 
 /// Host-owned agent loop. Construct with [`AgentRuntime::start`], which
@@ -298,7 +116,6 @@ impl AgentRuntime {
             secret_core::system("utsuwa"),
         )
     }
-
     /// Start with the host's shared secret store so settings writes and
     /// provider reads use the same keychain/memory fallback instance.
     pub fn start_with_secrets(
@@ -316,7 +133,6 @@ impl AgentRuntime {
             provider_factory_with_secrets(storage, secrets),
         )
     }
-
     /// Start with an explicit provider factory (tests inject stubs).
     pub fn start_with_factory(
         approvals: Arc<Mutex<ApprovalQueue>>,
@@ -369,7 +185,6 @@ impl AgentRuntime {
             executor,
         }))
     }
-
     /// Whether the explicit native setting is currently enabled in the live
     /// runtime. The persisted value is refreshed when a turn is constructed;
     /// this atomic mirror lets a settings change take effect for the next
@@ -377,7 +192,6 @@ impl AgentRuntime {
     pub fn autonomous_full_access_enabled(&self) -> bool {
         self.autonomous_full_access.load(Ordering::SeqCst)
     }
-
     /// Snapshot the active conversational file identity. The returned
     /// reference is only an identifier; callers must resolve and re-authorize
     /// it before touching the filesystem.
@@ -387,7 +201,6 @@ impl AgentRuntime {
             .ok()
             .and_then(|context| context.active_file.clone())
     }
-
     /// Update the live mode after the native settings row has been written.
     /// Enabling it also wakes the one suspended Agent turn, if any, without
     /// creating a broad grant or changing the behavior of other principals.
@@ -397,56 +210,6 @@ impl AgentRuntime {
             self.resume_suspended_for_autonomous_access();
         }
     }
-
-    fn refresh_autonomous_full_access(&self) -> bool {
-        // A native runtime always has storage. If that source cannot be read,
-        // fail closed instead of retaining a previously enabled high-impact
-        // mode; a later turn can re-read the durable value and re-enable it.
-        let enabled = if self.storage.is_some() {
-            read_autonomous_full_access(self.storage.as_ref()).unwrap_or(false)
-        } else {
-            // Headless/test runtimes without storage can still use the live
-            // setter, but they have no durable value to refresh.
-            self.autonomous_full_access_enabled()
-        };
-        self.autonomous_full_access.store(enabled, Ordering::SeqCst);
-        enabled
-    }
-
-    fn resume_suspended_for_autonomous_access(self: &Arc<Self>) {
-        let request_id = match self.lock_state() {
-            Ok(state) => state
-                .suspended
-                .as_ref()
-                .map(|suspended| suspended.request_id.clone()),
-            Err(_) => None,
-        };
-        let Some(request_id) = request_id else {
-            return;
-        };
-
-        // Only withdraw a pending request that the queue itself identifies as
-        // an Agent request. If another principal ever owns the id, it remains
-        // pending for its normal authorization path.
-        let withdrawn = self
-            .approvals
-            .lock()
-            .ok()
-            .and_then(|queue| queue.withdraw_agent(&request_id));
-        if withdrawn.is_none() {
-            return;
-        }
-
-        (self.emit)(HostEvent {
-            event: "permission.dismissed".to_string(),
-            data: serde_json::json!({
-                "id": request_id,
-                "reason": "autonomous_full_access",
-            }),
-        });
-        self.notify_decided(&request_id, true);
-    }
-
     /// Desktop plugins installed on this host. The Linux X11 plugin
     /// joins when a display answers; Windows UI Automation and macOS
     /// AX are declared so their future crates drop in behind the same
@@ -473,47 +236,22 @@ impl AgentRuntime {
         ));
         registry.select().unwrap_or_else(DesktopPlugin::stub)
     }
-
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, State>, RuntimeError> {
-        self.state
-            .lock()
-            .map_err(|_| RuntimeError::Executor("runtime state lock failed".to_string()))
-    }
-
-    fn is_current(&self, generation: u64) -> bool {
-        self.lock_state()
-            .map(|state| state.generation == generation)
-            .unwrap_or(false)
-    }
-
-    fn emit_if_current(&self, generation: u64, event: &str, data: serde_json::Value) {
-        if self.is_current(generation) {
-            (self.emit)(HostEvent {
-                event: event.to_string(),
-                data,
-            });
-        }
-    }
-
     /// The MCP server manager: configure servers here (or via the
     /// `mcp.servers` settings key, which syncs every turn) and their
     /// tools join the next turn's registry through host policy.
     pub fn mcp_manager(&self) -> &Arc<McpManager> {
         &self.mcp
     }
-
     /// Synchronous MCP status snapshot (blocks on the worker executor).
     pub fn mcp_status_blocking(&self) -> Vec<mcp_runtime::McpServerStatus> {
         self.executor.block_on(self.mcp.status())
     }
-
     /// The WASM plugin manager: lifecycle calls here (`plugin.enable` /
     /// `plugin.disable` / …) take effect on the next turn's registry,
     /// which is rebuilt per turn through [`PluginRuntime::register_enabled`].
     pub fn plugin_manager(&self) -> &Arc<plugin_wasm::PluginRuntime> {
         &self.plugins
     }
-
     /// Install the durable memory store (boot only; last call wins). Each
     /// turn's registry serves `memory.remember` / `memory.recall` /
     /// `memory.forget` from the current store. Without this call the
@@ -523,7 +261,6 @@ impl AgentRuntime {
             *slot = store;
         }
     }
-
     /// The current memory store (tests and diagnostics).
     pub fn memory_store(&self) -> Arc<memory::MemoryStore> {
         self.memory
@@ -536,7 +273,6 @@ impl AgentRuntime {
                 )
             })
     }
-
     /// Install the desktop plugin (boot only, or tests with a fake).
     /// The turn registers `desktop.*` tools only for the active
     /// plugin's declared capabilities — with the stub plugin the model
@@ -546,110 +282,26 @@ impl AgentRuntime {
             *slot = plugin;
         }
     }
-
-    /// Sync the MCP server set from settings and register every enabled
-    /// server's tools into the turn registry. Best-effort per server: a
-    /// down server logs and skips, never fails the turn.
-    async fn attach_mcp_tools(&self, registry: &mut ToolRegistry) {
-        if let Some(storage) = &self.storage {
-            let configs: Option<Vec<McpServerConfig>> = storage
-                .lock()
-                .ok()
-                .and_then(|store| store.get_setting(SETTING_MCP_SERVERS).ok())
-                .flatten()
-                .and_then(|value| {
-                    serde_json::from_value(value).map_err(|e| {
-                        tracing::warn!(%e, "mcp.servers setting is not a server array; ignoring");
-                    }).ok()
-                });
-            if let Some(configs) = configs {
-                if let Err(e) = self.mcp.sync_configs(configs).await {
-                    tracing::warn!(%e, "mcp settings sync failed");
-                }
-            }
-        }
-        for id in self.mcp.server_ids().await {
-            if let Err(e) = self.mcp.register_into(&id, registry).await {
-                tracing::warn!(server = %id, error = %e, "mcp server unavailable this turn");
-            }
-        }
-    }
-
-    /// Discover the configured plugin directory and register every
-    /// enabled plugin's tools into the turn registry. Best-effort like
-    /// MCP: a broken plugin logs and skips, never fails the turn.
-    /// Enabling (user action via `plugin.enable`) only loads code —
-    /// calls still need a policy ticket per invocation.
-    fn attach_plugin_tools(&self, registry: &mut ToolRegistry) {
-        if let Some(storage) = &self.storage {
-            let dir: Option<String> = storage
-                .lock()
-                .ok()
-                .and_then(|store| store.get_setting(SETTING_PLUGIN_DIR).ok())
-                .flatten()
-                .and_then(|value| {
-                    serde_json::from_value(value)
-                        .map_err(|e| {
-                            tracing::warn!(%e, "plugin.dir setting is not a path string; ignoring");
-                        })
-                        .ok()
-                });
-            if let Some(dir) = dir {
-                if let Err(e) = self.plugins.discover_dir(std::path::Path::new(&dir)) {
-                    tracing::warn!(dir = %dir, error = %e, "plugin discovery failed");
-                }
-            }
-        }
-        match self.plugins.register_enabled(registry) {
-            Ok(added) => {
-                if !added.is_empty() {
-                    tracing::debug!(tools = ?added, "plugin tools registered for turn");
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "plugin registration failed"),
-        }
-    }
-
-    /// Register the memory tools from the current store. Best-effort:
-    /// a poisoned slot logs and skips, never fails the turn.
-    fn attach_memory_tools(&self, registry: &mut ToolRegistry) {
-        let store = match self.memory.lock() {
-            Ok(store) => Arc::clone(&store),
+    /// Build the per-turn [`ToolCatalog`]: static packs (system facts,
+    /// process tools) plus best-effort sources (MCP, plugins, memory,
+    /// desktop) and the required builtin filesystem surface. Snapshot
+    /// once per turn; leaf crates own their tool construction, so this
+    /// method only clones handles and reads settings into managers.
+    async fn tool_catalog(&self, host_environment: &HostEnvironment) -> ToolCatalog {
+        sync_mcp_from_settings(&self.mcp, self.storage.as_ref()).await;
+        discover_plugins_from_settings(&self.plugins, self.storage.as_ref());
+        let memory_store = match self.memory.lock() {
+            Ok(store) => Some(Arc::clone(&store)),
             Err(_) => {
                 tracing::warn!("memory store lock failed; skipping memory tools this turn");
-                return;
+                None
             }
         };
-        for tool in [
-            Arc::new(memory::tools::RememberTool {
-                store: store.clone(),
-            }) as Arc<dyn tool_core::Tool>,
-            Arc::new(memory::tools::RecallTool {
-                store: store.clone(),
-            }),
-            Arc::new(memory::tools::ForgetTool { store }),
-        ] {
-            if let Err(e) = registry.register(tool) {
-                tracing::warn!(error = %e, "memory tool registration failed");
-            }
-        }
-    }
-
-    /// Register `desktop.*` tools for the active plugin's declared
-    /// capabilities. Status/inspect remain available as honest read-only
-    /// facts even with the stub; actions the platform lacks (e.g.
-    /// `set_value` on X11) stay invisible.
-    fn attach_desktop_tools(
-        &self,
-        registry: &mut ToolRegistry,
-        host_environment: &HostEnvironment,
-        tool_profile: ToolProfile,
-    ) {
-        let plugin = match self.desktop.lock() {
-            Ok(plugin) => plugin.clone(),
+        let desktop = match self.desktop.lock() {
+            Ok(plugin) => Some(plugin.clone()),
             Err(_) => {
                 tracing::warn!("desktop plugin lock failed; skipping desktop tools this turn");
-                return;
+                None
             }
         };
         let filesystem_desktop = host_environment
@@ -657,1120 +309,45 @@ impl AgentRuntime {
             .desktop
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
-        for tool in
-            tool_desktop::tools::for_plugin_with_filesystem_desktop(&plugin, filesystem_desktop)
-        {
-            if !tool_profile.allows_tool(&tool.metadata().id.0) {
-                continue;
-            }
-            if let Err(e) = registry.register(tool) {
-                tracing::warn!(error = %e, "desktop tool registration failed");
-            }
-        }
-    }
+        let processes = Arc::clone(&self.processes);
+        let environment = host_environment.clone();
+        let file_context = Some(Arc::clone(&self.file_context));
 
-    fn build_agent(
-        &self,
-        generation: u64,
-        system_prompt: Option<String>,
-    ) -> Result<Agent, RuntimeError> {
-        let provider = (self.provider_factory)()?;
-        let mut agent = Agent::new(provider)
-            .with_agent_id(self.agent_id.clone())
-            .with_limits(AgentLimits::default());
-        if let Some(prompt) = system_prompt {
-            agent = agent.with_system_prompt(prompt);
-        }
-        if let Some(sink) = &self.audit {
-            agent = agent.with_audit_sink(sink.clone());
-        }
-        let state = Arc::clone(&self.state);
-        let emit = Arc::clone(&self.emit);
-        agent = agent.with_event_sink(Arc::new(move |event| {
-            let current = state
-                .lock()
-                .map(|state| state.generation == generation)
-                .unwrap_or(false);
-            if !current {
-                return;
-            }
-            let (name, data) = match event {
-                AgentEvent::TextDelta(delta) => {
-                    ("agent.text_delta", serde_json::json!({ "delta": delta }))
-                }
-                AgentEvent::ToolStarted { id, name } => (
-                    "agent.tool_started",
-                    serde_json::json!({ "id": id, "name": name }),
-                ),
-                AgentEvent::ToolFinished { id, name, ok } => (
-                    "agent.tool_finished",
-                    serde_json::json!({ "id": id, "name": name, "ok": ok }),
-                ),
-            };
-            emit(HostEvent {
-                event: name.to_string(),
-                data,
-            });
-        }));
-        Ok(agent)
-    }
-
-    /// Queue a user message and run the turn in the background. Supersedes
-    /// any in-flight or suspended turn (their late events are dropped).
-    pub fn send_message(self: &Arc<Self>, text: String) -> Result<(), RuntimeError> {
-        self.send_request(AgentRequest {
-            text,
-            append_user_message: true,
-            ..AgentRequest::default()
-        })
-    }
-
-    /// Start a turn with optional frontend history and prompt context. The
-    /// host becomes the owner of the transcript as soon as this request is
-    /// accepted; history is only an initial synchronization payload.
-    pub fn send_request(self: &Arc<Self>, request: AgentRequest) -> Result<(), RuntimeError> {
-        let (transcript, generation, task_id, turn_id, system_prompt, replay_cache, old_task) = {
-            let mut state = self.lock_state()?;
-            state.generation += 1;
-            if let Some(handle) = state.running.take() {
-                handle.abort();
-            }
-            let old_task = state.task_id.take();
-            state.suspended = None;
-            let task_id = uuid::Uuid::new_v4().to_string();
-            let turn_id = uuid::Uuid::new_v4().to_string();
-            let replay_cache = Arc::new(ToolReplayCache::new());
-            let mut transcript = if state.transcript.is_empty() && !request.history.is_empty() {
-                request.history
-            } else {
-                state.transcript.clone()
-            };
-            if let Some(prompt) = &request.system_prompt {
-                if transcript
-                    .first()
-                    .is_some_and(|message| message.role == model_core::ModelRole::System)
-                {
-                    transcript[0] = ModelMessage::system(prompt.clone());
-                }
-            }
-            let already_contains_text = transcript.last().is_some_and(|message| {
-                message.role == model_core::ModelRole::User && message.content == request.text
-            });
-            if request.append_user_message && !already_contains_text {
-                transcript.push(ModelMessage::user(request.text));
-            }
-            state.transcript = transcript.clone();
-            state.task_id = Some(task_id.clone());
-            state.turn_id = Some(turn_id.clone());
-            state.system_prompt = request.system_prompt.clone();
-            state.replay_cache = Some(Arc::clone(&replay_cache));
-            while state.transcript.len() > MAX_TRANSCRIPT_MESSAGES {
-                let remove_at = if state
-                    .transcript
-                    .first()
-                    .is_some_and(|message| message.role == model_core::ModelRole::System)
-                {
-                    1
-                } else {
-                    0
-                };
-                state.transcript.remove(remove_at);
-            }
-            (
-                state.transcript.clone(),
-                state.generation,
-                task_id,
-                turn_id,
-                request.system_prompt,
-                replay_cache,
-                old_task,
-            )
-        };
-        if let Some(old_task) = old_task {
-            if let Ok(queue) = self.approvals.lock() {
-                queue.end_task(&old_task);
-            }
-        }
-        self.spawn_turn(
-            transcript,
-            generation,
-            task_id,
-            turn_id,
-            system_prompt,
-            replay_cache,
-            None,
-        )
-    }
-
-    /// Resume a suspended turn after its permission request was resolved.
-    /// Approving re-runs the turn so the call executes under the new
-    /// grant; denying notes the refusal so the model works around it.
-    /// Resolving an unknown or already-superseded request is a no-op.
-    pub fn notify_decided(self: &Arc<Self>, request_id: &str, approved: bool) {
-        let (transcript, generation, task_id, turn_id, system_prompt, replay_cache) =
-            match self.lock_state() {
-                Ok(mut state) => {
-                    let Some(suspended) = state.suspended.take() else {
-                        return;
-                    };
-                    if suspended.request_id != request_id {
-                        state.suspended = Some(suspended);
-                        return;
-                    }
-                    state.generation += 1;
-                    if let Some(handle) = state.running.take() {
-                        handle.abort();
-                    }
-                    state.transcript = suspended.transcript.clone();
-                    state.task_id = Some(suspended.task_id.clone());
-                    state.turn_id = Some(suspended.turn_id.clone());
-                    state.system_prompt = suspended.system_prompt.clone();
-                    (
-                        suspended.transcript,
-                        state.generation,
-                        suspended.task_id,
-                        suspended.turn_id,
-                        suspended.system_prompt,
-                        suspended.replay_cache,
-                    )
-                }
-                Err(_) => return,
-            };
-        let note = if approved {
-            format!(
-                "The user approved permission request {request_id}. Continue the task; \
-                 re-issue the tool call if it is still needed."
-            )
-        } else {
-            format!(
-                "The user denied permission request {request_id}. Do not retry that \
-                 exact call; work around it or explain what you need."
-            )
-        };
-        // Resume failures are terminal for this turn: the failure event
-        // already tells the frontend what happened.
-        let _ = self.spawn_turn(
-            transcript,
-            generation,
-            task_id,
-            turn_id,
-            system_prompt,
-            replay_cache,
-            Some(note),
-        );
-    }
-
-    /// Abort the in-flight turn and drop any suspended one. Late worker
-    /// events are suppressed by the generation bump.
-    pub fn cancel(self: &Arc<Self>) {
-        let (generation, task_id) = match self.lock_state() {
-            Ok(mut state) => {
-                state.generation += 1;
-                if let Some(handle) = state.running.take() {
-                    handle.abort();
-                }
-                state.suspended = None;
-                state.replay_cache = None;
-                (state.generation, state.task_id.take())
-            }
-            Err(_) => return,
-        };
-        if let Some(task_id) = task_id {
-            if let Ok(queue) = self.approvals.lock() {
-                queue.end_task(&task_id);
-            }
-        }
-        // The cancelling generation is current by construction.
-        (self.emit)(HostEvent {
-            event: "agent.turn_cancelled".to_string(),
-            data: serde_json::json!({}),
-        });
-        let _ = generation;
-    }
-
-    fn spawn_turn(
-        self: &Arc<Self>,
-        transcript: Vec<ModelMessage>,
-        generation: u64,
-        task_id: String,
-        turn_id: String,
-        system_prompt: Option<String>,
-        replay_cache: Arc<ToolReplayCache>,
-        resume_note: Option<String>,
-    ) -> Result<(), RuntimeError> {
-        let this = Arc::clone(self);
-        let executor_handle = this.executor.handle().clone();
-        let handle = executor_handle.spawn(async move {
-            this.run_turn(
-                transcript,
-                generation,
-                task_id,
-                turn_id,
-                system_prompt,
-                replay_cache,
-                resume_note,
-            )
-            .await;
-        });
-        self.lock_state()?.running = Some(handle);
-        Ok(())
-    }
-
-    async fn run_turn(
-        &self,
-        transcript: Vec<ModelMessage>,
-        generation: u64,
-        task_id: String,
-        turn_id: String,
-        system_prompt: Option<String>,
-        replay_cache: Arc<ToolReplayCache>,
-        resume_note: Option<String>,
-    ) {
-        let span = tracing::info_span!("host.turn", generation, resumed = resume_note.is_some());
-        self.run_turn_inner(
-            transcript,
-            generation,
-            task_id,
-            turn_id,
-            system_prompt,
-            replay_cache,
-            resume_note,
-        )
-        .instrument(span)
-        .await
-    }
-
-    async fn run_turn_inner(
-        &self,
-        mut transcript: Vec<ModelMessage>,
-        generation: u64,
-        task_id: String,
-        turn_id: String,
-        system_prompt: Option<String>,
-        replay_cache: Arc<ToolReplayCache>,
-        resume_note: Option<String>,
-    ) {
-        if let Some(note) = resume_note {
-            transcript.push(ModelMessage::user(note));
-        }
-        // Refresh from native storage at the start of every turn. The atomic
-        // mirror is also updated by settings.set, so a toggle during an active
-        // turn is observed by the next authorization request immediately.
-        let autonomous_full_access = self.refresh_autonomous_full_access();
-        let tool_profile = configured_tool_profile(self.storage.as_ref());
-        let host_environment = HostEnvironment::snapshot();
-        log_host_environment(&host_environment, tool_profile);
-        let history_system_prompt = transcript
-            .first()
-            .filter(|message| message.role == model_core::ModelRole::System)
-            .map(|message| message.content.as_str());
-        let base_system_prompt = system_prompt.as_deref().or(history_system_prompt);
-        let host_system_prompt = compose_host_system_prompt_for_context(
-            base_system_prompt,
-            autonomous_full_access,
-            &host_environment,
-            Some(&self.file_context),
-        );
-        // `Agent` intentionally leaves an existing system message alone. A
-        // native caller may supply one in history, so replace that message
-        // here to guarantee the trusted host context is present in every
-        // native turn without discarding the user's character prompt.
-        if transcript
-            .first()
-            .is_some_and(|message| message.role == model_core::ModelRole::System)
-        {
-            transcript[0] = ModelMessage::system(host_system_prompt.clone());
-        }
-        let agent = match self.build_agent(generation, Some(host_system_prompt)) {
-            Ok(agent) => agent,
-            Err(err) => {
-                if self.is_current(generation) {
-                    if let Ok(queue) = self.approvals.lock() {
-                        queue.end_task(&task_id);
-                    }
-                }
-                self.emit_if_current(
-                    generation,
-                    "agent.turn_failed",
-                    serde_json::json!({ "error": err.to_string() }),
-                );
-                return;
-            }
-        };
-        let agent = agent.with_replay_cache(replay_cache.clone());
-        let mut registry = match default_registry(
-            &self.processes,
-            host_environment.clone(),
-            tool_profile,
-            Some(Arc::clone(&self.file_context)),
-        ) {
-            Ok(registry) => registry,
-            Err(err) => {
-                if self.is_current(generation) {
-                    if let Ok(queue) = self.approvals.lock() {
-                        queue.end_task(&task_id);
-                    }
-                }
-                self.emit_if_current(
-                    generation,
-                    "agent.turn_failed",
-                    serde_json::json!({ "error": err.to_string() }),
-                );
-                return;
-            }
-        };
-        self.attach_mcp_tools(&mut registry).await;
-        self.attach_plugin_tools(&mut registry);
-        self.attach_memory_tools(&mut registry);
-        self.attach_desktop_tools(&mut registry, &host_environment, tool_profile);
-        let tool_ids: Vec<String> = registry
-            .list()
-            .into_iter()
-            .map(|metadata| metadata.id.0)
-            .collect();
-        tracing::debug!(
-            native_bridge = true,
-            registered_tool_count = tool_ids.len(),
-            registered_tool_ids = ?tool_ids,
-            "native agent tool registry ready"
-        );
-        let authorizer = QueueAuthorizer {
-            approvals: Arc::clone(&self.approvals),
-            task_id: task_id.clone(),
-            turn_id: turn_id.clone(),
-            autonomous_full_access: Arc::clone(&self.autonomous_full_access),
-        };
-        match agent
-            .turn_with_tools_authorized(transcript, &registry, &authorizer)
-            .await
-        {
-            Err(err) => {
-                if self.is_current(generation) {
-                    if let Ok(queue) = self.approvals.lock() {
-                        queue.end_task(&task_id);
-                    }
-                }
-                self.emit_if_current(
-                    generation,
-                    "agent.turn_failed",
-                    serde_json::json!({ "error": err.to_string() }),
-                );
-            }
-            Ok(outcome) => {
-                self.record_file_context(&outcome.executed, &host_environment);
-                if self.is_current(generation) {
-                    if let Ok(mut state) = self.state.lock() {
-                        state.transcript = outcome.messages.clone();
-                    }
-                }
-                match outcome.pending_approval {
-                    Some(pending) => {
-                        if !self.is_current(generation) {
-                            return;
-                        }
-                        let request = match self.approvals.lock() {
-                            Ok(queue) => queue.submit_for_task(
-                                agent.principal(),
-                                pending.capability.clone(),
-                                pending.resource.clone(),
-                                pending.reason.clone(),
-                                Some(task_id.clone()),
-                                Some(turn_id.clone()),
-                            ),
-                            Err(_) => {
-                                if let Ok(queue) = self.approvals.lock() {
-                                    queue.end_task(&task_id);
-                                }
-                                self.emit_if_current(
-                                    generation,
-                                    "agent.turn_failed",
-                                    serde_json::json!({ "error": "approval queue lock failed" }),
-                                );
-                                return;
-                            }
-                        };
-                        if let Ok(mut state) = self.state.lock() {
-                            if state.generation == generation {
-                                state.suspended = Some(Suspended {
-                                    transcript: outcome.messages.clone(),
-                                    request_id: request.id.clone(),
-                                    task_id: task_id.clone(),
-                                    turn_id: turn_id.clone(),
-                                    system_prompt: system_prompt.clone(),
-                                    replay_cache: replay_cache.clone(),
-                                });
-                            }
-                        }
-                        match serde_json::to_value(&request) {
-                            Ok(data) => {
-                                self.emit_if_current(generation, "permission.requested", data)
-                            }
-                            Err(err) => tracing::warn!(%err, "cannot serialize permission request"),
-                        }
-                        self.emit_if_current(
-                            generation,
-                            "agent.turn_suspended",
-                            serde_json::json!({
-                                "text": outcome.text,
-                                "request_id": request.id,
-                                "tool_steps": outcome.tool_steps.iter().map(serialize_tool_step).collect::<Vec<_>>(),
-                            }),
-                        );
-                    }
-                    None => {
-                        if self.is_current(generation) {
-                            if let Ok(queue) = self.approvals.lock() {
-                                queue.end_task(&task_id);
-                            }
-                        }
-                        let executed: Vec<serde_json::Value> = outcome
-                            .executed
-                            .iter()
-                            .map(|step| {
-                                serde_json::json!({
-                                    "id": step.id,
-                                    "name": step.name,
-                                    "output": step.output.content,
-                                })
-                            })
-                            .collect();
-                        let tool_steps: Vec<serde_json::Value> =
-                            outcome.tool_steps.iter().map(serialize_tool_step).collect();
-                        self.emit_if_current(
-                            generation,
-                            "agent.turn_done",
-                            serde_json::json!({
-                                "text": outcome.text,
-                                "executed": executed,
-                                "tool_steps": tool_steps,
-                                "truncated": outcome.truncated,
-                            }),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn record_file_context(
-        &self,
-        executed: &[agent_core::ExecutedTool],
-        environment: &HostEnvironment,
-    ) {
-        let resolver = FileResolver::new(environment.clone());
-        let Ok(mut context) = self.file_context.lock() else {
-            return;
-        };
-        for step in executed {
-            if !step.name.starts_with("filesystem.") {
-                continue;
-            }
-            let Some(object) = step.output.content.as_object() else {
-                continue;
-            };
-            if let Some(file_ref) = object.get("file_ref").and_then(serde_json::Value::as_str) {
-                if let Ok(file_ref) = FileRef::parse(file_ref) {
-                    context.record_success(file_ref);
-                    continue;
-                }
-            }
-            let Some(path) = object.get("path").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            if let Ok(resolved) = resolver.descriptor_for_absolute(
-                std::path::Path::new(path),
-                if step.name.contains("create") || step.name.contains("write") {
-                    TargetPurpose::Create
-                } else {
-                    TargetPurpose::Existing
-                },
-            ) {
-                context.record_success(resolved.file_ref);
-            }
-        }
-    }
-}
-
-fn serialize_tool_step(step: &agent_core::ToolStep) -> serde_json::Value {
-    serde_json::json!({
-        "id": step.id.clone(),
-        "name": step.name.clone(),
-        "status": step.status.as_str(),
-        "ok": step.ok,
-        "output": step.output.clone(),
-        "error": step.error.clone(),
-    })
-}
-
-/// Read the native persistent mode setting. A missing or malformed value is
-/// the safe default: autonomous access is disabled.
-fn read_autonomous_full_access(storage: Option<&Arc<Mutex<Storage>>>) -> Option<bool> {
-    let storage = storage?;
-    let storage = storage.lock().ok()?;
-    let value = storage.get_setting(SETTING_AUTONOMOUS_FULL_ACCESS).ok()?;
-    Some(value.and_then(|value| value.as_bool()).unwrap_or(false))
-}
-
-fn host_os_label() -> &'static str {
-    crate::host_environment::host_os_label()
-}
-
-fn log_host_environment(environment: &HostEnvironment, tool_profile: ToolProfile) {
-    let path_for_log = |path: Option<&std::path::Path>| {
-        path.map(|path| path.display().to_string())
-            .unwrap_or_else(|| "not_available".to_string())
-    };
-    let desktop_source = if environment.user_dirs.desktop.is_some() {
-        if environment.xdg_config_source.is_some() {
-            "xdg_user_dirs"
-        } else {
-            "platform"
-        }
-    } else {
-        "unavailable"
-    };
-    tracing::debug!(
-        host_os = %environment.os,
-        home = %path_for_log(environment.home.as_deref()),
-        desktop = %path_for_log(environment.user_dirs.desktop.as_deref()),
-        documents = %path_for_log(environment.user_dirs.documents.as_deref()),
-        downloads = %path_for_log(environment.user_dirs.downloads.as_deref()),
-        desktop_source = %desktop_source,
-        xdg_config_source = %path_for_log(environment.xdg_config_source.as_deref()),
-        tool_profile = ?tool_profile,
-        "native host environment resolved"
-    );
-}
-
-/// Trusted native context appended to the user/character prompt. This is
-/// generated by the Rust host, so the model does not need to guess a username,
-/// operating system, or path syntax from its training data.
-pub fn host_environment_context(autonomous_full_access: bool) -> String {
-    host_environment_context_for(&HostEnvironment::snapshot(), autonomous_full_access)
-}
-
-fn host_environment_context_for(
-    environment: &HostEnvironment,
-    autonomous_full_access: bool,
-) -> String {
-    host_environment_context_for_context(environment, autonomous_full_access, None)
-}
-
-fn host_environment_context_for_context(
-    environment: &HostEnvironment,
-    autonomous_full_access: bool,
-    file_context: Option<&Arc<Mutex<ConversationFileContext>>>,
-) -> String {
-    let mode_text = if autonomous_full_access {
-        "enabled; native Agent capability requests are automatically authorized"
-    } else {
-        "disabled; normal Utsuwa permission policy applies"
-    };
-    let local_now = chrono::Local::now();
-    let current_local_date = local_now.format("%Y-%m-%d").to_string();
-    let current_local_datetime = local_now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    let mut lines = vec![
-        "<host_environment>".to_string(),
-        format!("OS: {}", host_os_label()),
-        format!("Architecture: {}", environment.architecture),
-        format!(
-            "Available semantic user directories: {}",
-            environment
-                .user_dirs
-                .resolved()
-                .map(|(directory, _)| directory.json_key())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    ];
-    if environment.user_dirs.desktop.is_none() {
-        lines.push("desktop directory: not available".to_string());
-    }
-    lines.extend([
-        format!("Current local date: {current_local_date}"),
-        format!("Current local datetime: {current_local_datetime}"),
-        format!("Path separator: {}", environment.path_separator),
-        format!("Path style: {}", environment.path_style),
-        "Filesystem tools prefer file_ref or semantic directory ids with relative paths; absolute host-native paths are a compatibility fallback only. The exact native roots are host-owned and need not be reconstructed by the model.".to_string(),
-        "Do not invent Windows drive-letter paths on a non-Windows host.".to_string(),
-        "</host_environment>".to_string(),
-    ]);
-    if let Some(context) = file_context
-        .and_then(|context| context.lock().ok())
-        .and_then(|context| context.active_file.clone())
-    {
-        let display_name = context
-            .as_str()
-            .rsplit(['/', '\\'])
-            .next()
-            .filter(|name| !name.is_empty())
-            .unwrap_or("unknown");
-        lines.extend([
-            "<active_file>".to_string(),
-            format!("file_ref: {context}"),
-            format!("display_name: {display_name}"),
-            "Reuse this file_ref for follow-up filesystem operations about the same file."
-                .to_string(),
-            "</active_file>".to_string(),
-        ]);
-    }
-    let runtime_lines = vec![
-        "You are running inside the native Utsuwa desktop host.".to_string(),
-        "Use the provided native tools when doing so is useful for completing the user's request."
-            .to_string(),
-        "Filesystem tools prefer file_ref from a previous successful operation, or target.directory plus target.relative_path. Directory values are semantic ids such as desktop and documents; never put a complete file path in a directory field."
-            .to_string(),
-        "Special filesystem directories are resolved by the operating system.".to_string(),
-        "The host owns path resolution, localization, canonicalization, and capability validation. Do not reconstruct localized filesystem roots from display_path."
-            .to_string(),
-        "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file with location and filename; do not first try filesystem.write or construct a special-directory path yourself. For existing files, use filesystem.edit."
-            .to_string(),
-        "You can create, read, overwrite, and edit files using the native filesystem tools."
-            .to_string(),
-        "To edit an existing file, use filesystem.edit: pass location and filename for a file in Desktop/Documents/etc., or path for an explicit absolute path; a unique existing filename may be resolved to its configured user directory when location is omitted. Never combine target styles unless both values identify the same file. The host preserves valid target, old_text, and new_text values across same-turn retries. For a UTF-8 file with exactly one non-empty line, the host can infer old_text when new_text is present; for multi-line files, call filesystem.read and use the exact old_text. For basic date/time replacements, new_text_source may be current_date, current_time, or current_datetime. Use system.time when exact fresh clock or timezone details are needed. Never use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement."
-            .to_string(),
-        "For whole-file replacement in Desktop/Documents/etc. use filesystem.replace_user_file; to add text at the end use filesystem.append_user_file, or filesystem.append_file for an explicit absolute path."
-            .to_string(),
-        "If an edit operation fails because a path or text match was wrong, correct the tool arguments and retry. A failed edit attempt does not mean editing is unsupported. Do not offer to create a replacement file unless the user actually asks for a new file."
-            .to_string(),
-        "Do not tell the user that file editing is unavailable unless the native tool actually returns an unavailable or denied result."
-            .to_string(),
-        "For desktop capability questions use desktop.status; to see open windows use desktop.inspect. Filesystem Desktop and the graphical desktop backend are different."
-            .to_string(),
-        "Never translate filesystem directory names according to the language of the conversation."
-            .to_string(),
-        "\"Desktop\", \"escritorio\", \"bureau\", and similar words refer to the Desktop directory reported by the host; they do not mean a literal directory with that translated name."
-            .to_string(),
-        "Never guess /Desktop, /Escritorio, /Documents, C:\\Users, or another special directory."
-            .to_string(),
-        "If the host does not know a directory, inspect the filesystem with filesystem.list, filesystem.stat, or filesystem.glob before performing a mutation."
-            .to_string(),
-        "Never invent a path when its location is unknown.".to_string(),
-        "If a tool returns an error, use its error information to correct the call rather than pretending the operation succeeded."
-            .to_string(),
-        format!(
-            "Autonomous Full Access is {mode_text}. When it is enabled, you may use available native tools without asking the user for additional permission; the native host has already received the user's consent."
-        ),
-        "After a filesystem tool succeeds, use file_ref for later tool calls and display_path only for the human-facing final response."
-            .to_string(),
-        "Never claim an operation succeeded until the tool confirms success.".to_string(),
-        "Never report success after a failed tool call.".to_string(),
-        "For the current date or current time, call system.time. Never infer the current date or time from model knowledge.".to_string(),
-    ];
-    format!(
-        "{}\n\n<utsuwa_native_runtime>\n{}\n</utsuwa_native_runtime>",
-        lines.join("\n"),
-        runtime_lines.join("\n")
-    )
-}
-
-#[cfg(test)]
-fn compose_host_system_prompt(user_prompt: Option<&str>, autonomous_full_access: bool) -> String {
-    compose_host_system_prompt_for(
-        user_prompt,
-        autonomous_full_access,
-        &HostEnvironment::snapshot(),
-    )
-}
-
-#[cfg(test)]
-fn compose_host_system_prompt_for(
-    user_prompt: Option<&str>,
-    autonomous_full_access: bool,
-    environment: &HostEnvironment,
-) -> String {
-    compose_host_system_prompt_for_context(user_prompt, autonomous_full_access, environment, None)
-}
-
-fn compose_host_system_prompt_for_context(
-    user_prompt: Option<&str>,
-    autonomous_full_access: bool,
-    environment: &HostEnvironment,
-    file_context: Option<&Arc<Mutex<ConversationFileContext>>>,
-) -> String {
-    let host_context =
-        host_environment_context_for_context(environment, autonomous_full_access, file_context);
-    // A suspended native turn already contains the previous host context in
-    // its system message. Rebuild from the original prompt portion so a mode
-    // toggle updates the status without duplicating trusted runtime blocks.
-    let user_prompt = user_prompt
-        .map(|prompt| {
-            prompt
-                .split_once("\n\n<host_environment>")
-                .map_or(prompt, |(base, _)| base)
-        })
-        .filter(|prompt| !prompt.is_empty());
-    match user_prompt {
-        Some(prompt) => format!("{prompt}\n\n{host_context}"),
-        None => host_context,
-    }
-}
-
-/// Read-only host facts for models that need a small, explicit lookup instead
-/// of relying on the larger trusted system context. It has no capability
-/// requirement and never exposes a raw OS handle or mutation API.
-struct HostEnvironmentTool {
-    environment: HostEnvironment,
-}
-
-#[async_trait::async_trait]
-impl tool_core::Tool for HostEnvironmentTool {
-    fn metadata(&self) -> tool_core::ToolMetadata {
-        tool_core::ToolMetadata {
-            id: capability_core::ToolId::new("system.environment"),
-            description: "Return the native operating system, home directory, current working directory, path style, and validated special user directories. Read-only; use these exact paths instead of guessing or translating directory names.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {},
-            }),
-            effects: vec![tool_core::ToolEffect::ReadOnly],
-        }
-    }
-
-    async fn invoke(
-        &self,
-        _ctx: tool_core::ToolContext,
-        args: serde_json::Value,
-    ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
-        if !args.is_object() {
-            return Err(tool_core::ToolError::InvalidArgs {
-                tool: "system.environment".to_string(),
-                message: "args must be a JSON object".to_string(),
-            });
-        }
-        Ok(tool_core::ToolOutput::new(self.environment.json_value()))
-    }
-}
-
-/// Read-only clock facts for models that must use the host's actual current
-/// time instead of inferring it from training data or a conversation date.
-/// It deliberately snapshots the clock on every invocation.
-struct SystemTimeTool;
-
-#[async_trait::async_trait]
-impl tool_core::Tool for SystemTimeTool {
-    fn metadata(&self) -> tool_core::ToolMetadata {
-        tool_core::ToolMetadata {
-            id: capability_core::ToolId::new("system.time"),
-            description: "Return the current local and UTC time from the native host. Read-only, fresh on every call; use this instead of guessing the date or time.".to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {},
-            }),
-            effects: vec![tool_core::ToolEffect::ReadOnly],
-        }
-    }
-
-    async fn invoke(
-        &self,
-        _ctx: tool_core::ToolContext,
-        args: serde_json::Value,
-    ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
-        if !args.is_object() {
-            return Err(tool_core::ToolError::InvalidArgs {
-                tool: "system.time".to_string(),
-                message: "args must be a JSON object".to_string(),
-            });
-        }
-
-        let utc = chrono::Utc::now();
-        let local = utc.with_timezone(&chrono::Local);
-        let mut content = serde_json::json!({
-            "local": local.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "utc": utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-            "date": local.format("%Y-%m-%d").to_string(),
-            "time": local.format("%H:%M:%S").to_string(),
-            "utc_offset": local.format("%:z").to_string(),
-            "unix_timestamp": utc.timestamp(),
-        });
-        if let Ok(timezone) = iana_time_zone::get_timezone() {
-            if let Some(object) = content.as_object_mut() {
-                object.insert("timezone".to_string(), serde_json::Value::String(timezone));
-            }
-        }
-        Ok(tool_core::ToolOutput::new(content))
-    }
-}
-
-/// Tools the agent may call, all behind policy + tickets: the filesystem
-/// plugin's declared capabilities, host-resolved user-directory writes and
-/// lookup, structured process execution, desktop tools, and read-only
-/// system.environment/system.time lookups. The model-facing profile may hide
-/// redundant low-level variants without removing their implementations.
-fn default_registry(
-    processes: &Arc<ProcessManager>,
-    host_environment: HostEnvironment,
-    tool_profile: ToolProfile,
-    file_context: Option<Arc<Mutex<ConversationFileContext>>>,
-) -> Result<ToolRegistry, RuntimeError> {
-    let mut registry = ToolRegistry::new();
-    let mut fs_plugins = tool_filesystem::plugin::FsPluginRegistry::new();
-    fs_plugins.register(tool_filesystem::plugin::FsPlugin::local());
-    let selected_fs = fs_plugins.select();
-    let mut tools: Vec<Arc<dyn tool_core::Tool>> = selected_fs
-        .as_ref()
-        .map(tool_filesystem::plugin::tools_for_plugin)
-        .unwrap_or_default();
-    if let Some(plugin) = selected_fs {
-        if plugin.supports(tool_filesystem::plugin::FsCapability::Read) {
-            if let Some(index) = tools
-                .iter()
-                .position(|tool| tool.metadata().id.0 == "filesystem.read")
-            {
-                tools[index] = Arc::new(
-                    HostAwarePathTool::read(plugin.limits.clone(), host_environment.clone())
-                        .with_active_context(file_context.clone()),
-                );
-            }
-        }
-        if plugin.supports(tool_filesystem::plugin::FsCapability::Stat) {
-            if let Some(index) = tools
-                .iter()
-                .position(|tool| tool.metadata().id.0 == "filesystem.stat")
-            {
-                tools[index] = Arc::new(
-                    HostAwarePathTool::stat(host_environment.clone())
-                        .with_active_context(file_context.clone()),
-                );
-            }
-        }
-        if plugin.supports(tool_filesystem::plugin::FsCapability::ReadRange) {
-            if let Some(index) = tools
-                .iter()
-                .position(|tool| tool.metadata().id.0 == "filesystem.read_range")
-            {
-                tools[index] = Arc::new(
-                    HostAwarePathTool::read_range(plugin.limits.clone(), host_environment.clone())
-                        .with_active_context(file_context.clone()),
-                );
-            }
-        }
-        if plugin.supports(tool_filesystem::plugin::FsCapability::Patch) {
-            if let Some(index) = tools
-                .iter()
-                .position(|tool| tool.metadata().id.0 == "filesystem.patch")
-            {
-                tools[index] = Arc::new(
-                    HostAwarePathTool::patch(plugin.limits.clone(), host_environment.clone())
-                        .with_active_context(file_context.clone()),
-                );
-            }
-        }
-        if plugin.supports(tool_filesystem::plugin::FsCapability::Patch) {
-            tools.push(Arc::new(EditUserFileTool::new(
-                plugin.limits.clone(),
-                host_environment.clone(),
-            )));
-            tools.push(Arc::new(EditFileTool::new(
-                plugin.limits.clone(),
-                host_environment.clone(),
-            )));
-            tools.push(Arc::new(EditTool::new_with_context(
-                plugin.limits.clone(),
+        let catalog = ToolCatalog::new()
+            .with_pack(SystemToolPack::new(environment))
+            .with_pack(ProcessToolPack::new(processes))
+            .with_required_pack(tool_filesystem_host::HostFilesystemPack::new(
                 host_environment.clone(),
                 file_context,
+            ))
+            .with_source(mcp_runtime::McpToolSource::new(Arc::clone(&self.mcp)))
+            .with_source(plugin_wasm::PluginToolSource::new(Arc::clone(
+                &self.plugins,
             )));
-        }
-        if plugin.supports(tool_filesystem::plugin::FsCapability::Write) {
-            if let Some(index) = tools
-                .iter()
-                .position(|tool| tool.metadata().id.0 == "filesystem.write")
-            {
-                tools[index] = Arc::new(HostAwareWriteTool::new(
-                    plugin.limits.clone(),
-                    host_environment.clone(),
-                ));
-            }
-            tools.push(Arc::new(CreateUserFileTool::new(
-                plugin.limits.clone(),
-                host_environment.clone(),
-            )));
-            tools.push(Arc::new(UserDirectoryWriteTool::new(
-                plugin.limits.clone(),
-                host_environment.clone(),
-            )));
-            tools.push(Arc::new(ReplaceUserFileTool::new(
-                plugin.limits.clone(),
-                host_environment.clone(),
-            )));
-            tools.push(Arc::new(AppendUserFileTool::new(
-                plugin.limits.clone(),
-                host_environment.clone(),
-            )));
-            tools.push(Arc::new(AppendFileTool::new(
-                plugin.limits.clone(),
-                host_environment.clone(),
-            )));
-        }
-    }
-    for tool in [
-        Arc::new(tool_process::SpawnTool {
-            manager: Arc::clone(processes),
-            limits: ProcessLimits::default(),
-        }) as Arc<dyn tool_core::Tool>,
-        Arc::new(tool_process::StatusTool {
-            manager: Arc::clone(processes),
-        }),
-        Arc::new(tool_process::KillTool {
-            manager: Arc::clone(processes),
-        }),
-    ] {
-        tools.push(tool);
-    }
-    tools.push(Arc::new(ResolveUserDirectoryTool::new(
-        host_environment.clone(),
-    )));
-    tools.push(Arc::new(HostEnvironmentTool {
-        environment: host_environment,
-    }));
-    tools.push(Arc::new(SystemTimeTool));
-    for tool in tools {
-        if !tool_profile.allows_tool(&tool.metadata().id.0) {
-            continue;
-        }
-        registry
-            .register(tool)
-            .map_err(|e| RuntimeError::Tools(e.to_string()))?;
-    }
-    Ok(registry)
-}
-
-fn provider_factory_with_secrets(
-    storage: Option<Arc<Mutex<Storage>>>,
-    secrets: Arc<dyn secret_core::SecretStore>,
-) -> Arc<dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync> {
-    Arc::new(move || {
-        let storage = storage.as_ref().ok_or(RuntimeError::ModelNotConfigured)?;
-        let storage = storage
-            .lock()
-            .map_err(|_| RuntimeError::Settings("storage lock failed".to_string()))?;
-        let get = |key: &str| -> Result<Option<String>, RuntimeError> {
-            storage
-                .get_setting(key)
-                .map_err(|e| RuntimeError::Settings(e.to_string()))
-                .map(|v| v.and_then(|v| v.as_str().map(str::to_string)))
+        let catalog = match memory_store {
+            Some(store) => catalog.with_pack(memory::tools::MemoryToolPack::new(store)),
+            None => catalog,
         };
-        let raw_base_url = get(SETTING_BASE_URL)?
-            .filter(|s| !s.is_empty())
-            .ok_or(RuntimeError::ModelNotConfigured)?;
-        let name = get(SETTING_MODEL_NAME)?
-            .filter(|s| !s.is_empty())
-            .ok_or(RuntimeError::ModelNotConfigured)?;
-        // Older databases may lack the provider id, so retain compatibility
-        // by treating them as generic OpenAI-compatible endpoints.
-        let provider = get(SETTING_PROVIDER)?.unwrap_or_else(|| "openai-compatible".to_string());
-        // Frontend synchronization normalizes this already, but older native
-        // databases can contain a bare LM Studio/Ollama host or a pasted full
-        // endpoint. Normalize at the provider boundary as a defense in depth.
-        let base_url = if provider == "anthropic" {
-            raw_base_url.trim_end_matches('/').to_string()
-        } else {
-            normalize_provider_base_url(&provider, &raw_base_url)
-        };
-        let api_key = resolve_api_key(&storage, secrets.as_ref())?;
-        tracing::debug!(
-            provider = %provider,
-            model = %name,
-            normalized_base_url = %sanitize_provider_url_for_log(&base_url),
-            "native agent provider selected"
-        );
-        if provider == "anthropic" {
-            let api_key = api_key.ok_or(RuntimeError::ModelNotConfigured)?;
-            Ok(Arc::new(AnthropicClient::new(base_url, api_key, name)) as Arc<dyn ModelProvider>)
-        } else {
-            if provider_requires_api_key(&provider) && api_key.is_none() {
-                return Err(RuntimeError::ModelNotConfigured);
-            }
-            Ok(
-                Arc::new(OpenAICompatibleClient::new(base_url, api_key, name))
-                    as Arc<dyn ModelProvider>,
-            )
+        match desktop {
+            Some(plugin) => catalog.with_pack(tool_desktop::DesktopToolPack::new(
+                plugin,
+                filesystem_desktop,
+            )),
+            None => catalog,
         }
-    })
-}
-
-/// Normalize only endpoint semantics known by the native provider factory.
-/// LM Studio and Ollama expose their OpenAI-compatible chat API below `/v1`;
-/// arbitrary OpenAI-compatible gateways keep their configured path intact.
-pub fn normalize_provider_base_url(provider: &str, base_url: &str) -> String {
-    let mut normalized = base_url.trim().trim_end_matches('/').to_string();
-    const CHAT_SUFFIX: &str = "/chat/completions";
-    if normalized.to_ascii_lowercase().ends_with(CHAT_SUFFIX) {
-        normalized.truncate(normalized.len() - CHAT_SUFFIX.len());
     }
-
-    if matches!(provider, "lmstudio" | "ollama")
-        && !normalized.to_ascii_lowercase().ends_with("/v1")
-    {
-        normalized.push_str("/v1");
-    }
-    normalized
-}
-
-fn sanitize_provider_url_for_log(base_url: &str) -> String {
-    base_url
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(base_url)
-        .to_string()
-}
-
-fn provider_requires_api_key(provider: &str) -> bool {
-    matches!(
-        provider,
-        "openai" | "google" | "deepseek" | "xai" | "groq" | "mistral"
-    )
-}
-
-/// API key resolution order: OS keychain first; then a one-time migration
-/// of the legacy plaintext `model.api_key` settings value into the
-/// keychain (the settings row is deleted afterwards). The key is never
-/// logged, never exposed to the model context, and never forwarded except
-/// to the configured provider.
-fn resolve_api_key(
-    storage: &Storage,
-    secrets: &dyn secret_core::SecretStore,
-) -> Result<Option<String>, RuntimeError> {
-    match secrets.get(secret_core::ACCOUNT_MODEL_API_KEY) {
-        Ok(Some(key)) if !key.is_empty() => return Ok(Some(key)),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(%e, "secret store unreadable; checking legacy settings"),
-    }
-    let legacy = storage
-        .get_setting(SETTING_API_KEY)
-        .map_err(|e| RuntimeError::Settings(e.to_string()))?
-        .and_then(|v| v.as_str().map(str::to_string))
-        .filter(|s| !s.is_empty());
-    if let Some(key) = legacy {
-        match secrets.set(secret_core::ACCOUNT_MODEL_API_KEY, &key) {
-            Ok(()) => {
-                storage
-                    .delete_setting(SETTING_API_KEY)
-                    .map_err(|e| RuntimeError::Settings(format!(
-                        "migrated model API key but could not delete its plaintext settings row: {e}"
-                    )))?;
-                tracing::info!("migrated model.api_key from settings to the OS keychain");
-            }
-            Err(e) => {
-                return Err(RuntimeError::Settings(format!(
-                    "cannot move the legacy model API key into native secret storage: {e}"
-                )));
-            }
-        }
-        return Ok(Some(key));
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model_core::{FinishReason, ModelError, ModelRequest, ModelStreamEvent, ToolCall};
+    use agent_core::ToolAuthorizer;
+    use model_core::{
+        FinishReason, ModelError, ModelMessage, ModelRequest, ModelStreamEvent, ToolCall,
+    };
+    use policy_core::{ApprovalQueue, AuthorizationDecision};
     use std::time::{Duration, Instant};
-    use tool_core::Tool;
+    use tool_sdk::ToolLoadContext;
 
     #[test]
     fn provider_base_url_normalization_is_provider_aware() {
@@ -1987,10 +564,7 @@ mod tests {
         assert!(context.contains("<host_environment>"));
         assert!(context.contains(&format!("Architecture: {}", std::env::consts::ARCH)));
         assert!(context.contains(&format!("OS: {}", host_os_label())));
-        assert!(context.contains(&format!(
-            "Path style: {}",
-            crate::host_environment::host_path_style()
-        )));
+        assert!(context.contains(&format!("Path style: {}", host_core::host_path_style())));
         assert!(context.contains("Available semantic user directories:"));
         assert!(context.contains(
             "Filesystem tools prefer file_ref or semantic directory ids with relative paths"
@@ -2027,7 +601,7 @@ mod tests {
             architecture: "x86_64",
             home: Some(std::path::PathBuf::from("/tmp/home")),
             cwd: Some(std::path::PathBuf::from("/tmp/home")),
-            user_dirs: crate::host_environment::UserDirectories {
+            user_dirs: host_core::UserDirectories {
                 desktop: Some(std::path::PathBuf::from("/tmp/home/Escritorio")),
                 ..Default::default()
             },
@@ -2049,7 +623,15 @@ mod tests {
 
     #[tokio::test]
     async fn system_time_returns_fresh_parseable_native_clock_facts() {
-        let tool = SystemTimeTool;
+        // Resolved through the pack (the runtime's composition seam),
+        // not by constructing the tool directly.
+        use tool_sdk::ToolPack as _;
+        let pack = SystemToolPack::new(HostEnvironment::snapshot());
+        let tool = pack
+            .tools(&ToolLoadContext::new(ToolProfile::Full))
+            .into_iter()
+            .find(|tool| tool.metadata().id.0 == "system.time")
+            .expect("system pack must provide system.time");
         assert!(tool.required_capability(&serde_json::json!({})).is_none());
         let before = chrono::Utc::now().timestamp();
         let output = tool
@@ -2087,7 +669,7 @@ mod tests {
             architecture: std::env::consts::ARCH,
             home: Some(home.clone()),
             cwd: Some(home.clone()),
-            user_dirs: crate::host_environment::UserDirectories {
+            user_dirs: host_core::UserDirectories {
                 desktop: Some(desktop.clone()),
                 ..Default::default()
             },
@@ -2550,16 +1132,23 @@ mod tests {
         std::fs::remove_dir_all(&storage_dir).ok();
     }
 
-    #[test]
-    fn simple_profile_filters_redundant_builtin_tools_from_model_registry() {
-        let processes = Arc::new(ProcessManager::new(ProcessLimits::default()));
-        let registry = default_registry(
-            &processes,
-            HostEnvironment::snapshot(),
-            ToolProfile::Simple,
-            None,
-        )
-        .unwrap();
+    #[tokio::test]
+    async fn simple_profile_filters_redundant_builtin_tools_from_model_registry() {
+        // Same composition the runtime snapshots per turn: static packs
+        // plus the required filesystem surface, filtered centrally.
+        let processes = ProcessManager::new(ProcessLimits::default());
+        let environment = HostEnvironment::snapshot();
+        let catalog = ToolCatalog::new()
+            .with_pack(SystemToolPack::new(environment.clone()))
+            .with_pack(ProcessToolPack::new(processes))
+            .with_required_pack(tool_filesystem_host::HostFilesystemPack::new(
+                environment,
+                None,
+            ));
+        let registry = catalog
+            .snapshot(&ToolLoadContext::new(ToolProfile::Simple))
+            .await
+            .expect("builtin catalog snapshot must succeed");
         let ids: Vec<String> = registry
             .list()
             .into_iter()
@@ -3393,7 +1982,7 @@ mod tests {
             .lock()
             .unwrap()
             .set_setting(
-                crate::agent_runtime::SETTING_MCP_SERVERS,
+                crate::runtime::SETTING_MCP_SERVERS,
                 &serde_json::to_value(vec![config]).unwrap(),
             )
             .unwrap();

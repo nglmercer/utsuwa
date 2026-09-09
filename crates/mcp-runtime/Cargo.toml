@@ -12,5 +12,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tool-core.workspace = true
+tool-sdk.workspace = true
 tracing.workspace = true
 async-trait.workspace = true

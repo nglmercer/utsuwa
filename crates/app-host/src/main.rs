@@ -13,9 +13,9 @@
 //! supported for normal runs.
 
 use app_host::{
-    agent_runtime::EmitFn,
-    dispatcher::{emit_script, Dispatcher},
+    ipc::{emit_script, Dispatcher},
     protocol::{self, AssetServer},
+    runtime::EmitFn,
     AppHostConfig, FrontendSource,
 };
 use ipc_core::HostEvent;
@@ -494,7 +494,7 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
     if let Some(store) = &storage {
         dispatcher = dispatcher.with_storage(Arc::clone(store));
     }
-    match app_host::agent_runtime::AgentRuntime::start_with_secrets(
+    match app_host::runtime::AgentRuntime::start_with_secrets(
         approvals,
         storage,
         Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),

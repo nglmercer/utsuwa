@@ -1,4 +1,4 @@
-//! Host-owned environment facts exposed to the native agent.
+//! OS and user-directory facts owned by the host, shared by tools and prompts.
 //!
 //! In particular, Linux XDG user directories are configuration, not a
 //! translation table. The resolver only reports a configured directory after
