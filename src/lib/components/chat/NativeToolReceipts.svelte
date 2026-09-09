@@ -29,11 +29,19 @@
 		if (
 			step.name === 'filesystem.write' ||
 			step.name === 'filesystem.write_user_file' ||
-			step.name === 'filesystem.create_user_file'
+			step.name === 'filesystem.create_user_file' ||
+			step.name === 'filesystem.replace_user_file'
 		) {
 			return output?.created === true ? 'Created' : 'Updated';
 		}
-		if (step.name === 'filesystem.patch') return 'Updated';
+		if (
+			step.name === 'filesystem.patch' ||
+			step.name === 'filesystem.edit_user_file' ||
+			step.name === 'filesystem.edit_file'
+		)
+			return 'Updated';
+		if (step.name === 'filesystem.append_user_file' || step.name === 'filesystem.append_file')
+			return 'Appended';
 		if (step.name === 'process.spawn') return 'Started process';
 		if (step.name === 'process.kill') return 'Stopped process';
 		return `${step.name} succeeded`;

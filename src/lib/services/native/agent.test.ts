@@ -9,7 +9,7 @@ import {
 	sendParams,
 	statusFor
 } from './agent.ts';
-import { summarizeNativeToolSteps } from './tool-receipts.ts';
+import { isNativeMutation, summarizeNativeToolSteps } from './tool-receipts.ts';
 
 test('turn_done parses text, steps, and truncation', () => {
 	const event = parseAgentTurnEvent('agent.turn_done', {
@@ -153,4 +153,45 @@ test('send params target the native agent method', () => {
 		method: 'agent.send_message',
 		params: { text: 'hello' }
 	});
+});
+
+test('edit and append tools count as native mutations', () => {
+	for (const name of [
+		'filesystem.edit_user_file',
+		'filesystem.edit_file',
+		'filesystem.replace_user_file',
+		'filesystem.append_user_file',
+		'filesystem.append_file',
+		'filesystem.create_user_file',
+		'filesystem.patch'
+	]) {
+		assert.equal(isNativeMutation(name), true, name);
+	}
+	assert.equal(isNativeMutation('filesystem.read'), false);
+	assert.equal(isNativeMutation('system.time'), false);
+});
+
+test('native receipt summary treats an edit retry as recovered', () => {
+	const event = parseAgentTurnEvent('agent.turn_done', {
+		text: 'updated',
+		tool_steps: [
+			{
+				id: 'wrong',
+				name: 'filesystem.create_user_file',
+				status: 'failed',
+				ok: false,
+				error: 'replacement block occurs 0 times'
+			},
+			{
+				id: 'right',
+				name: 'filesystem.edit_user_file',
+				status: 'success',
+				ok: true,
+				output: { path: '/tmp/home/Escritorio/note.txt', updated: true }
+			}
+		]
+	});
+	assert.equal(event?.kind, 'done');
+	if (event?.kind !== 'done') throw new Error('unreachable');
+	assert.equal(summarizeNativeToolSteps(event.done.toolSteps), 'recovered');
 });
