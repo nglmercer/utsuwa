@@ -1850,6 +1850,13 @@ fn is_date_placeholder(text: &str) -> bool {
     )
 }
 
+fn is_time_placeholder(text: &str) -> bool {
+    matches!(
+        text.trim().to_ascii_lowercase().as_str(),
+        "current time" | "current hour" | "the current time" | "the current hour" | "now"
+    )
+}
+
 fn current_local_date() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
@@ -1952,6 +1959,8 @@ fn resolve_new_text_source(
     } else if let Some(new_text) = object.get("new_text").and_then(Value::as_str) {
         if is_date_placeholder(new_text) {
             current_local_date()
+        } else if is_time_placeholder(new_text) {
+            chrono::Local::now().format("%H:%M:%S").to_string()
         } else {
             return Ok(args.clone());
         }
@@ -5651,6 +5660,33 @@ mod tests {
         let lines = contents.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0], "2026-09-09");
+        assert!(looks_like_clock_text(lines[1]), "{contents:?}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_resolves_current_hour_placeholder_before_appending() {
+        let (home, desktop) = stale_home("utsuwa-edit-clock-placeholder");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "header\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "location": "desktop",
+                "filename": "note.txt",
+                "new_text": "current hour",
+            }),
+        )
+        .await
+        .unwrap();
+        let contents = std::fs::read_to_string(&target).unwrap();
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "header");
         assert!(looks_like_clock_text(lines[1]), "{contents:?}");
         std::fs::remove_dir_all(&home).unwrap();
     }
