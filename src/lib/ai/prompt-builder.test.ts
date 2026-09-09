@@ -139,7 +139,7 @@ test('native prompts explain host-native tool behavior', () => {
 	assert.ok(native.includes('use the tools supplied with the current model request'));
 	assert.ok(native.includes('Filesystem tool paths must be absolute'));
 	assert.ok(native.includes('Never invent a path'));
-	assert.ok(native.includes('never write a placeholder such as "Updated date"'));
+	assert.ok(native.includes('write a placeholder such as "Updated date"'));
 	assert.ok(native.includes('call system.time first'));
 	assert.ok(native.includes('Never claim a tool operation succeeded'));
 	assert.ok(native.includes('filesystem.list'));

@@ -1249,7 +1249,7 @@ fn host_environment_context_for(
             .to_string(),
         "You can create, read, overwrite, and edit files using the native filesystem tools."
             .to_string(),
-        "To edit an existing file, use filesystem.edit: pass location and filename for a file in Desktop/Documents/etc., or path for a file at an explicit absolute path; a unique existing filename may be resolved to its configured user directory when location is omitted. Never combine target styles. Always read the file first with filesystem.read for a partial edit, pass the exact old_text, and make new_text the actual replacement; never use a placeholder such as 'Updated date'. For a current/today date, call system.time first and use its date value. Use filesystem.replace_user_file for a complete replacement."
+        "To edit an existing file, use filesystem.edit: pass location and filename for a file in Desktop/Documents/etc., or path for a file at an explicit absolute path; a unique existing filename may be resolved to its configured user directory when location is omitted. Never combine target styles unless both values identify the same file. For a date edit, follow this exact order: call system.time, call filesystem.read for the resolved file, then call filesystem.edit with the exact old_text copied from the read result and the actual new_text date from system.time. Never guess old_text, omit either edit field, or use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement."
             .to_string(),
         "For whole-file replacement in Desktop/Documents/etc. use filesystem.replace_user_file; to add text at the end use filesystem.append_user_file, or filesystem.append_file for an explicit absolute path."
             .to_string(),
@@ -1862,8 +1862,8 @@ mod tests {
             "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file"
         ));
         assert!(context.contains("use filesystem.edit:"));
-        assert!(context.contains("call system.time first"));
-        assert!(context.contains("never use a placeholder such as 'Updated date'"));
+        assert!(context.contains("For a date edit, follow this exact order: call system.time"));
+        assert!(context.contains("use a placeholder such as 'Updated date'"));
         assert!(context.contains("A failed edit attempt does not mean editing is unsupported"));
         assert!(context.contains(
             "Do not tell the user that file editing is unavailable unless the native tool actually returns an unavailable or denied result"

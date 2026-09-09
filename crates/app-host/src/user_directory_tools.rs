@@ -8,6 +8,7 @@
 use crate::host_environment::{HostEnvironment, UserDirectory};
 use serde_json::{Map, Value};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tool_core::{CapabilityRequirement, Tool, ToolContext, ToolError, ToolMetadata, ToolOutput};
 use tool_filesystem::{PatchTool, WriteTool};
 
@@ -723,6 +724,7 @@ impl Tool for CreateUserFileTool {
 /// One validated edit target inside an OS-configured user directory: the
 /// semantic directory, its resolved host path, the relative filename, and
 /// the exact absolute target the broker will mutate.
+#[derive(Clone)]
 struct ResolvedEditTarget {
     directory: UserDirectory,
     resolved_directory: PathBuf,
@@ -748,6 +750,50 @@ fn required_filename(object: &Map<String, Value>, tool: &str) -> Result<String, 
         return Err(invalid_args(tool, "'filename' must name a file"));
     }
     Ok(filename)
+}
+
+/// If a location is supplied without a filename, infer it only when that
+/// configured directory contains exactly one direct regular file. This keeps
+/// malformed small-model calls useful without guessing among multiple files.
+fn infer_single_edit_filename(base: &Path, tool: &str) -> Result<String, ToolError> {
+    let entries = std::fs::read_dir(base).map_err(|error| {
+        failed(
+            tool,
+            format!(
+                "cannot inspect the host-configured edit directory '{}': {error}",
+                base.display()
+            ),
+        )
+    })?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| failed(tool, error.to_string()))?;
+        if entry
+            .file_type()
+            .map_err(|error| failed(tool, error.to_string()))?
+            .is_file()
+        {
+            files.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    match files.as_slice() {
+        [filename] => Ok(filename.clone()),
+        [] => Err(invalid_args(
+            tool,
+            format!(
+                "missing 'filename': no existing direct file was found in '{}'; call filesystem.list or pass filename explicitly",
+                base.display()
+            ),
+        )),
+        _ => Err(invalid_args(
+            tool,
+            format!(
+                "missing 'filename': multiple existing files were found in '{}': {}; pass the requested filename explicitly",
+                base.display(),
+                files.iter().map(|file| format!("'{file}'")).collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
 }
 
 /// Resolve a user-directory edit to one exact absolute target without ever
@@ -811,10 +857,10 @@ fn resolve_edit_target(
     let object = args
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
-    let directory = if object.contains_key("location")
+    let has_location = object.contains_key("location")
         || object.contains_key("directory_id")
-        || object.contains_key("directory")
-    {
+        || object.contains_key("directory");
+    let directory = if has_location {
         parse_location(args, environment, tool)?
     } else {
         let filename = required_filename(object, tool)?;
@@ -829,7 +875,13 @@ fn resolve_edit_target(
             ),
         )
     })?;
-    let filename = required_filename(object, tool)?;
+    let filename = if object.contains_key("filename") {
+        required_filename(object, tool)?
+    } else if has_location {
+        infer_single_edit_filename(base, tool)?
+    } else {
+        required_filename(object, tool)?
+    };
     let (relative_path, path) = normalize_filename(&filename, base, tool)?;
     Ok(ResolvedEditTarget {
         directory,
@@ -1003,26 +1055,56 @@ fn path_only_args(path: &Path) -> serde_json::Value {
     serde_json::json!({ "path": path.to_string_lossy() })
 }
 
-fn parse_old_new(args: &serde_json::Value, tool: &str) -> Result<(String, String), ToolError> {
+/// Return the exact text when an edit target is a small single-line file.
+/// This gives a weak model a safe retry hint without exposing multi-line file
+/// contents through an argument-validation error.
+fn single_line_edit_hint(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+    let line = lines.next()?;
+    if line.is_empty() || lines.next().is_some() || line.len() > 1024 {
+        return None;
+    }
+    Some(line.to_string())
+}
+
+fn parse_old_new(
+    args: &serde_json::Value,
+    tool: &str,
+    resolved_path: &Path,
+) -> Result<(String, String), ToolError> {
     let object = args
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
     let old_text = required_string_field(object, tool, "old_text").map_err(|_| {
+        let single_line_hint = single_line_edit_hint(resolved_path)
+            .map(|line| format!(" The file is one line; use old_text={line:?}."))
+            .unwrap_or_default();
         invalid_args(
             tool,
-            "missing 'old_text': read the file first with filesystem.read, then retry with the exact text to replace. Do not use a placeholder such as 'Updated date'. A single unique line is enough; the whole file is not needed.",
+            format!(
+                "missing 'old_text': first call filesystem.read with path '{}', copy one exact current line, then retry filesystem.edit with both old_text and new_text. Do not guess old_text or use a placeholder such as 'Updated date'; a single unique line is enough, the whole file is not needed.{}",
+                resolved_path.display(),
+                single_line_hint
+            ),
         )
     })?;
     if old_text.is_empty() {
         return Err(invalid_args(
             tool,
-            "'old_text' must not be empty: use the exact current text from filesystem.read. A single unique line is enough.",
+            format!(
+                "'old_text' must not be empty: call filesystem.read with path '{}' and copy one exact current line before retrying.",
+                resolved_path.display()
+            ),
         ));
     }
     let new_text = required_string_field(object, tool, "new_text").map_err(|_| {
         invalid_args(
             tool,
-            "missing 'new_text': retry with the replacement text (pass an empty string to delete the old text).",
+            format!(
+                "missing 'new_text': retry filesystem.edit only after both old_text and new_text are present. For the current date, call system.time first and use its returned date; pass an empty string only when deleting the old text. Target: '{}'.",
+                resolved_path.display()
+            ),
         )
     })?;
     if new_text.trim().eq_ignore_ascii_case("updated date") {
@@ -1099,7 +1181,7 @@ impl Tool for EditUserFileTool {
                     },
                     "filename": {
                         "type": "string",
-                        "description": "Existing file name such as note.txt, or a relative subpath such as notes/note.txt. An absolute path is accepted only when it is inside the selected configured directory."
+                        "description": "Existing file name such as note.txt, or a relative subpath such as notes/note.txt. If omitted, it is inferred only when the selected directory contains exactly one direct file. An absolute path is accepted only when it is inside the selected configured directory."
                     },
                     "old_text": {
                         "type": "string",
@@ -1110,7 +1192,7 @@ impl Tool for EditUserFileTool {
                         "description": "Replacement text."
                     }
                 },
-                "required": ["location", "filename", "old_text", "new_text"]
+                "required": ["location", "old_text", "new_text"]
             }),
             effects: vec![tool_core::ToolEffect::FilesystemWrite],
         }
@@ -1131,7 +1213,7 @@ impl Tool for EditUserFileTool {
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
         let resolved = resolve_edit_target(&args, &self.environment, EDIT_USER_FILE_TOOL)?;
-        let (old_text, new_text) = parse_old_new(&args, EDIT_USER_FILE_TOOL)?;
+        let (old_text, new_text) = parse_old_new(&args, EDIT_USER_FILE_TOOL, &resolved.path)?;
         let mut output = self
             .inner
             .invoke(ctx, patch_args_for(&resolved.path, &old_text, &new_text))
@@ -1243,7 +1325,7 @@ impl Tool for EditFileTool {
             EDIT_FILE_TOOL,
             EDIT_USER_FILE_TOOL,
         )?;
-        let (old_text, new_text) = parse_old_new(&args, EDIT_FILE_TOOL)?;
+        let (old_text, new_text) = parse_old_new(&args, EDIT_FILE_TOOL, &normalized.path)?;
         let mut output = self
             .inner
             .invoke(ctx, patch_args_for(&normalized.path, &old_text, &new_text))
@@ -1641,27 +1723,66 @@ enum EditTargetStyle {
 /// reinterpret an arbitrary path. A relative value is converted to the
 /// semantic filename form and then resolved only if it uniquely identifies an
 /// existing configured user-directory file.
-fn normalize_unified_edit_args(args: &serde_json::Value) -> serde_json::Value {
+fn normalize_unified_edit_args(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+) -> Result<serde_json::Value, ToolError> {
     let Some(object) = args.as_object() else {
-        return args.clone();
+        return Ok(args.clone());
     };
+    let has_location = object.contains_key("location")
+        || object.contains_key("directory_id")
+        || object.contains_key("directory");
+    let has_filename = object.contains_key("filename");
+    let has_path = object.contains_key("path");
+    if has_path && (has_location || has_filename) {
+        let path = required_string_field(object, tool, "path")?;
+        let mut semantic = object.clone();
+        semantic.remove("path");
+        let semantic_args = serde_json::Value::Object(semantic.clone());
+        let semantic_target = resolve_edit_target(&semantic_args, environment, tool)?;
+        let path_matches = if Path::new(&path).is_absolute() {
+            let normalized = normalize_special_user_path(
+                Path::new(&path),
+                environment,
+                tool,
+                SpecialPathPurpose::ExistingFile,
+                EDIT_USER_FILE_TOOL,
+            )?;
+            lexical_absolute_path(&normalized.path) == lexical_absolute_path(&semantic_target.path)
+        } else if looks_like_windows_absolute_path(&path) {
+            false
+        } else {
+            let (_, normalized) =
+                normalize_filename(&path, &semantic_target.resolved_directory, tool)?;
+            lexical_absolute_path(&normalized) == lexical_absolute_path(&semantic_target.path)
+        };
+        if !path_matches {
+            return Err(invalid_args(
+                tool,
+                "when both target styles are provided, path must identify the same file as location+filename; otherwise send only one target style",
+            ));
+        }
+        return Ok(semantic_args);
+    }
     let has_semantic_target = object.contains_key("location")
         || object.contains_key("directory_id")
         || object.contains_key("directory")
         || object.contains_key("filename");
     let Some(path) = object.get("path").and_then(Value::as_str) else {
-        return args.clone();
+        return Ok(args.clone());
     };
     if has_semantic_target
         || Path::new(path).is_absolute()
         || looks_like_windows_absolute_path(path)
     {
-        return args.clone();
+        return Ok(args.clone());
     }
     let mut normalized = object.clone();
     normalized.remove("path");
     normalized.insert("filename".to_string(), Value::String(path.to_string()));
-    Value::Object(normalized)
+    Ok(Value::Object(normalized))
 }
 
 fn edit_target_style(args: &serde_json::Value, tool: &str) -> Result<EditTargetStyle, ToolError> {
@@ -1692,12 +1813,6 @@ fn edit_target_style(args: &serde_json::Value, tool: &str) -> Result<EditTargetS
         return Ok(EditTargetStyle::UserFile);
     }
     if has_location || has_filename {
-        if has_location && !has_filename {
-            return Err(invalid_args(
-                tool,
-                "a location-style edit requires 'filename'",
-            ));
-        }
         return Ok(EditTargetStyle::UserFile);
     }
     if has_path {
@@ -1718,6 +1833,7 @@ fn edit_target_style(args: &serde_json::Value, tool: &str) -> Result<EditTargetS
 pub(crate) struct EditTool {
     user_file: EditUserFileTool,
     file: EditFileTool,
+    retry_target: Arc<Mutex<Option<ResolvedEditTarget>>>,
 }
 
 impl EditTool {
@@ -1728,6 +1844,54 @@ impl EditTool {
         Self {
             user_file: EditUserFileTool::new(limits.clone(), environment.clone()),
             file: EditFileTool::new(limits, environment),
+            retry_target: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Reuse a target only for a target-less retry in this same tool instance.
+    /// The registry is created per agent turn, so this cannot carry a file
+    /// target into a later user request.
+    fn retry_args(&self, args: &serde_json::Value) -> serde_json::Value {
+        let Some(object) = args.as_object() else {
+            return args.clone();
+        };
+        let has_target = object.contains_key("location")
+            || object.contains_key("directory_id")
+            || object.contains_key("directory")
+            || object.contains_key("filename")
+            || object.contains_key("path");
+        if has_target {
+            return args.clone();
+        }
+        let Ok(guard) = self.retry_target.lock() else {
+            return args.clone();
+        };
+        let Some(target) = guard.as_ref() else {
+            return args.clone();
+        };
+        let mut retry = object.clone();
+        retry.insert(
+            "location".to_string(),
+            Value::String(target.directory.json_key().to_string()),
+        );
+        retry.insert(
+            "filename".to_string(),
+            Value::String(target.relative_path.to_string_lossy().into_owned()),
+        );
+        Value::Object(retry)
+    }
+
+    fn remember_retry_target(&self, target: Option<ResolvedEditTarget>) {
+        if let Some(target) = target {
+            if let Ok(mut guard) = self.retry_target.lock() {
+                *guard = Some(target);
+            }
+        }
+    }
+
+    fn clear_retry_target(&self) {
+        if let Ok(mut guard) = self.retry_target.lock() {
+            *guard = None;
         }
     }
 }
@@ -1737,7 +1901,7 @@ impl Tool for EditTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(EDIT_TOOL),
-            description: "Edit one exact text block inside an existing file. For a file in Desktop/Documents/etc., pass location (desktop, documents, downloads, pictures, music, videos, public_share, or templates) and filename (note.txt); if location is omitted, a unique existing filename is resolved against the host's configured user directories. For a file at an explicit absolute path, pass path instead. For compatibility, a relative path is treated as a filename only when it uniquely identifies an existing configured user-directory file. Provide exactly one target style, never both. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
+            description: "Edit one exact text block inside an existing file. For a file in Desktop/Documents/etc., pass location (desktop, documents, downloads, pictures, music, videos, public_share, or templates) and filename (note.txt); if filename is omitted, a unique existing direct file in that location is inferred. If location is omitted, a unique existing filename is resolved against the host's configured user directories. For a file at an explicit absolute path, pass path instead. For compatibility, a relative path is treated as a filename only when it uniquely identifies an existing configured user-directory file. Prefer one target style; if both are supplied, they must identify the same file. After a validation error, a same-turn retry may reuse the previously resolved target when it supplies old_text and new_text. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1745,11 +1909,11 @@ impl Tool for EditTool {
                     "location": {
                         "type": "string",
                         "enum": USER_DIRECTORY_ENUM,
-                        "description": "Semantic operating-system user directory identifier. Use with filename; do not combine with path."
+                        "description": "Semantic operating-system user directory identifier. Use with filename, or omit filename only when the location contains exactly one direct file; do not combine with path."
                     },
                     "filename": {
                         "type": "string",
-                        "description": "Existing file name such as note.txt, or a relative subpath such as notes/note.txt. Use with location, or alone only when it uniquely identifies an existing configured user-directory file; do not combine with path."
+                        "description": "Existing file name such as note.txt, or a relative subpath such as notes/note.txt. Use with location, or omit only when that location contains exactly one direct file; do not combine with path."
                     },
                     "path": {
                         "type": "string",
@@ -1771,7 +1935,9 @@ impl Tool for EditTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let normalized = normalize_unified_edit_args(args);
+        let args = self.retry_args(args);
+        let normalized =
+            normalize_unified_edit_args(&args, &self.user_file.environment, EDIT_TOOL).ok()?;
         match edit_target_style(&normalized, EDIT_TOOL).ok()? {
             EditTargetStyle::UserFile => self.user_file.required_capability(&normalized),
             EditTargetStyle::ExplicitPath => self.file.required_capability(&normalized),
@@ -1783,10 +1949,32 @@ impl Tool for EditTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let normalized = normalize_unified_edit_args(&args);
+        let args = self.retry_args(&args);
+        let normalized =
+            normalize_unified_edit_args(&args, &self.user_file.environment, EDIT_TOOL)?;
         match edit_target_style(&normalized, EDIT_TOOL)? {
-            EditTargetStyle::UserFile => self.user_file.invoke(ctx, normalized).await,
-            EditTargetStyle::ExplicitPath => self.file.invoke(ctx, normalized).await,
+            EditTargetStyle::UserFile => {
+                let target =
+                    resolve_edit_target(&normalized, &self.user_file.environment, EDIT_TOOL).ok();
+                match self.user_file.invoke(ctx, normalized).await {
+                    Ok(output) => {
+                        self.clear_retry_target();
+                        Ok(output)
+                    }
+                    Err(error) => {
+                        self.remember_retry_target(target);
+                        Err(error)
+                    }
+                }
+            }
+            EditTargetStyle::ExplicitPath => {
+                self.clear_retry_target();
+                let result = self.file.invoke(ctx, normalized).await;
+                if result.is_ok() {
+                    self.clear_retry_target();
+                }
+                result
+            }
         }
     }
 }
@@ -2745,6 +2933,7 @@ mod tests {
             "{missing:?}"
         );
         assert!(missing.to_string().contains("filesystem.read"));
+        assert!(missing.to_string().contains("exact current contents"));
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "exact current contents"
@@ -3066,6 +3255,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unified_edit_reuses_the_last_target_for_a_targetless_retry() {
+        let (home, desktop) = stale_home("utsuwa-edit-targetless-retry");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "Updated date").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let first = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "new_text": "2026-09-09",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(first, ToolError::InvalidArgs { .. }), "{first:?}");
+
+        let retry_args = serde_json::json!({
+            "old_text": "Updated date",
+            "new_text": "2026-09-09",
+        });
+        let requirement = tool
+            .required_capability(&retry_args)
+            .expect("the remembered target needs filesystem write");
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(target.canonicalize().unwrap_or(target.clone()))
+        );
+        let output = tool
+            .invoke(ticketed_context(&target), retry_args)
+            .await
+            .unwrap();
+        assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "2026-09-09");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
     async fn unified_edit_routes_path_style_through_normalization() {
         let (home, desktop) = stale_home("utsuwa-edit-unified-path");
         let target = desktop.join("note.txt");
@@ -3110,7 +3341,10 @@ mod tests {
             tool_filesystem::FilesystemLimits::default(),
             environment(&home, &desktop),
         );
-        for args in [
+        // A redundant matching path is safe and keeps older/model-generated
+        // calls from failing before the edit reaches the filesystem broker.
+        tool.invoke(
+            ticketed_context(&target),
             serde_json::json!({
                 "location": "desktop",
                 "filename": "note.txt",
@@ -3118,22 +3352,69 @@ mod tests {
                 "old_text": "hello",
                 "new_text": "hi",
             }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi");
+        std::fs::write(&target, "hello").unwrap();
+
+        tool.invoke(
+            ticketed_context(&target),
             serde_json::json!({
+                "location": "desktop",
+                "filename": "note.txt",
+                "path": "note.txt",
                 "old_text": "hello",
                 "new_text": "hi",
             }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi");
+        std::fs::write(&target, "hello").unwrap();
+
+        let error = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "path": home.join("other.txt").to_string_lossy(),
+                    "old_text": "hello",
+                    "new_text": "hi",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+        assert!(error.to_string().contains("same file"));
+
+        // A location-only call can infer the sole direct file in the
+        // configured directory, which is useful for small-model retries.
+        tool.invoke(
+            ticketed_context(&target),
             serde_json::json!({
                 "location": "desktop",
                 "old_text": "hello",
                 "new_text": "hi",
             }),
-        ] {
-            let error = tool
-                .invoke(ticketed_context(&target), args)
-                .await
-                .unwrap_err();
-            assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
-        }
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi");
+        std::fs::write(&target, "hello").unwrap();
+
+        let error = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "old_text": "hello",
+                    "new_text": "hi",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
         std::fs::remove_dir_all(&home).unwrap();
     }
