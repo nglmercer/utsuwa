@@ -9,8 +9,10 @@
 	import { wrapWordsInHtml } from './reveal-markup';
 	import { phaseLabel, type ThinkingPhase } from '$lib/services/chat/chat-phase';
 	import { type PreparedImage } from '$lib/services/storage/keepsakes';
+	import type { NativeToolStep } from '$lib/services/native/agent';
 	import { chatDraftStore } from '$lib/stores/chat-draft.svelte';
 	import ChatInput from './ChatInput.svelte';
+	import NativeToolReceipts from './NativeToolReceipts.svelte';
 
 	interface Props {
 		open: boolean;
@@ -18,6 +20,7 @@
 		isTyping?: boolean;
 		phase?: ThinkingPhase;
 		onSend: (content: string, images?: PreparedImage[]) => void;
+		nativeToolSteps?: NativeToolStep[];
 		disabled?: boolean;
 		visionCapable?: boolean;
 	}
@@ -28,6 +31,7 @@
 		isTyping = false,
 		phase = 'thinking',
 		onSend,
+		nativeToolSteps = [],
 		disabled = false,
 		visionCapable = true
 	}: Props = $props();
@@ -344,8 +348,9 @@
 					</div>
 				</div>
 			{/if}
-		{/if}
-	</div>
+			{/if}
+			<NativeToolReceipts steps={nativeToolSteps} />
+		</div>
 
 	<div class="input-dock">
 		<ChatInput {onSend} {disabled} {visionCapable} docked />

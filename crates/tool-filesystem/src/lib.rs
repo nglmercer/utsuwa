@@ -120,6 +120,7 @@ fn authorized_write_path(
     ctx: &ToolContext,
     capability: Capability,
     path: &Path,
+    create_parents: bool,
 ) -> Result<(PathBuf, bool), ToolError> {
     let ticket = ctx.ticket.as_ref().ok_or_else(|| {
         denied("no capability ticket: route filesystem access through the agent + policy engine")
@@ -174,6 +175,28 @@ fn authorized_write_path(
             "'{}' is outside the granted scope",
             path.display()
         )));
+    }
+    if create && create_parents {
+        let parent = target.parent().ok_or_else(|| {
+            failed(format!(
+                "parent directory does not exist: {}",
+                target.display()
+            ))
+        })?;
+        if !parent.is_dir() {
+            let resolved_parent = resolve_target(parent).ok_or_else(|| {
+                failed(format!(
+                    "parent directory does not exist: {}",
+                    parent.display()
+                ))
+            })?;
+            if !in_scope(&resolved_parent) {
+                return Err(denied(format!(
+                    "parent directory '{}' is outside the granted scope",
+                    parent.display()
+                )));
+            }
+        }
     }
     if !create && target.is_dir() {
         return Err(failed(format!("'{}' is a directory", path.display())));
@@ -259,6 +282,37 @@ fn requirement(capability: Capability, path: &Path) -> CapabilityRequirement {
         capability,
         resource: Resource::Path(resolved),
     }
+}
+
+/// Scope an explicit recursive-parent write to the nearest existing
+/// directory. Creating a missing parent is itself a filesystem mutation, so
+/// a ticket for only the eventual file must not silently authorize it.
+fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
+    let mut cursor = path.parent()?;
+    loop {
+        if cursor.is_dir() {
+            return cursor.canonicalize().ok();
+        }
+        cursor = cursor.parent()?;
+    }
+}
+
+fn write_requirement(args: &serde_json::Value) -> Option<CapabilityRequirement> {
+    let path = arg_path(args).ok()?;
+    let create_parents = args
+        .get("create_parents")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if create_parents {
+        if let Some(parent) = path.parent() {
+            if !parent.is_dir() {
+                if let Some(scope) = nearest_existing_directory(&path) {
+                    return Some(requirement(Capability::FilesystemWrite, &scope));
+                }
+            }
+        }
+    }
+    Some(requirement(Capability::FilesystemWrite, &path))
 }
 
 fn entry_kind(file_type: &std::fs::FileType) -> &'static str {
@@ -934,17 +988,38 @@ pub struct WriteTool {
     pub limits: FilesystemLimits,
 }
 
+fn create_parents_arg(args: &serde_json::Value) -> Result<bool, ToolError> {
+    match args.get("create_parents") {
+        None => Ok(false),
+        Some(value) => value.as_bool().ok_or_else(|| ToolError::InvalidArgs {
+            tool: "filesystem.write".to_string(),
+            message: "'create_parents' must be a boolean when provided".to_string(),
+        }),
+    }
+}
+
 #[async_trait::async_trait]
 impl tool_core::Tool for WriteTool {
     fn metadata(&self) -> tool_core::ToolMetadata {
         tool_core::ToolMetadata {
             id: capability_core::ToolId::new("filesystem.write"),
-            description: "Create a new file or overwrite an existing one inside the granted scope (capped). Missing parents are created; symlinks are never followed.".to_string(),
+            description: "Write a UTF-8 file to an absolute host-native path inside the granted scope (capped). The parent directory must already exist unless create_parents=true. For Desktop, Documents, Downloads, and other special directories, use the exact paths supplied by system.environment or host_environment; never guess or translate those directory names. Symlinks are never followed for the target.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" },
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute host-native file path. Use the exact special-directory path reported by system.environment or host_environment."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "UTF-8 file contents."
+                    },
+                    "create_parents": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Explicitly create missing parent directories recursively. Omit or set false to require an existing parent directory."
+                    },
                 },
                 "required": ["path", "content"],
             }),
@@ -953,9 +1028,7 @@ impl tool_core::Tool for WriteTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        arg_path(args)
-            .ok()
-            .map(|path| requirement(Capability::FilesystemWrite, &path))
+        write_requirement(args)
     }
 
     async fn invoke(
@@ -979,12 +1052,31 @@ impl tool_core::Tool for WriteTool {
                 ),
             });
         }
-        let (path, created) =
-            authorized_write_path(&ctx, Capability::FilesystemWrite, &arg_path(&args)?)?;
+        let create_parents = create_parents_arg(&args)?;
+        let (path, created) = authorized_write_path(
+            &ctx,
+            Capability::FilesystemWrite,
+            &arg_path(&args)?,
+            create_parents,
+        )?;
         let before_hash = std::fs::read(&path).ok().map(|bytes| sha256_hex(&bytes));
+        let mut parent_created = false;
         if created {
-            if let Some(parent) = path.parent() {
+            let parent = path.parent().ok_or_else(|| {
+                failed(format!(
+                    "parent directory does not exist: {}",
+                    path.display()
+                ))
+            })?;
+            if !parent.is_dir() {
+                if !create_parents {
+                    return Err(failed(format!(
+                        "parent directory does not exist: {}",
+                        parent.display()
+                    )));
+                }
                 std::fs::create_dir_all(parent).map_err(|e| failed(e.to_string()))?;
+                parent_created = true;
             }
         }
         std::fs::write(&path, content.as_bytes()).map_err(|e| failed(e.to_string()))?;
@@ -992,6 +1084,7 @@ impl tool_core::Tool for WriteTool {
         Ok(ToolOutput::new(serde_json::json!({
             "path": path.to_string_lossy(),
             "created": created,
+            "parent_created": parent_created,
             "bytes": content.len(),
             "hash": after_hash,
         }))
@@ -1497,12 +1590,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_creates_new_files_with_parents() {
+    async fn write_creates_new_files_in_existing_parent() {
         let dir = TestDir::create();
         let write = WriteTool {
             limits: FilesystemLimits::default(),
         };
-        let target = dir.0.join("new").join("note.txt");
+        let target = dir.0.join("note.txt");
         let out = write
             .invoke(
                 write_ctx(&dir.0),
@@ -1519,6 +1612,83 @@ mod tests {
             evidence.after_sha256.as_deref(),
             Some(sha256_hex(b"hello").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn write_does_not_create_missing_parent_by_default() {
+        let dir = TestDir::create();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+        };
+        let missing_parent = dir.0.join("Desktop");
+        let target = missing_parent.join("hello.txt");
+        let err = write
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": target.to_string_lossy(), "content": "hello"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ToolError::Failed {
+                tool: "filesystem".to_string(),
+                message: format!(
+                    "parent directory does not exist: {}",
+                    missing_parent.display()
+                ),
+            }
+        );
+        assert!(!missing_parent.exists());
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn write_can_create_parents_only_when_explicitly_requested() {
+        let dir = TestDir::create();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+        };
+        let parent = dir.0.join("new").join("nested");
+        let target = parent.join("note.txt");
+        let out = write
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "hello",
+                    "create_parents": true,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["created"], true);
+        assert_eq!(out.content["parent_created"], true);
+        assert!(parent.is_dir());
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn explicit_parent_creation_needs_a_directory_scoped_ticket() {
+        let dir = TestDir::create();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+        };
+        let parent = dir.0.join("new").join("nested");
+        let target = parent.join("note.txt");
+        let err = write
+            .invoke(
+                write_ctx(&target),
+                serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "hello",
+                    "create_parents": true,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied { .. }), "{err:?}");
+        assert!(!parent.exists());
     }
 
     #[tokio::test]

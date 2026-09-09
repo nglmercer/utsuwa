@@ -25,6 +25,7 @@ import { getWorkingMemory, ensureSession } from '$lib/engine/memory';
 import { toOpenAIContent, type ContentPart } from '$lib/services/chat/content';
 import { isDesktopBuildExpected, isNativeRuntimeAvailable } from '$lib/services/platform';
 import { sendAgentMessage } from '$lib/services/native/agent.svelte';
+import type { NativeToolStep } from '$lib/services/native/agent';
 import { syncNativeModelProvider } from '$lib/services/native/model-settings';
 import { selectCompanionTransport } from './transport';
 import { filterEmptyAssistantPlaceholders } from './history';
@@ -46,6 +47,8 @@ export interface CompanionChatHooks {
 	beforeStream?: () => void;
 	/** What she is doing right now (remembering, seeing, thinking). */
 	setPhase?: (phase: ThinkingPhase) => void;
+	/** Authoritative native tool receipts for the current turn. */
+	onNativeToolSteps?: (steps: NativeToolStep[]) => void;
 }
 
 async function buildCompanionPrompt(
@@ -179,6 +182,7 @@ export async function sendCompanionMessage(
 
 	chatStore.setLoading(true);
 	chatStore.setError(null);
+	hooks.onNativeToolSteps?.([]);
 	hooks.setTyping(true);
 	hooks.setLatestResponse('');
 	hooks.setPhase?.('remembering');
@@ -265,20 +269,20 @@ export async function sendCompanionMessage(
 			if (!nativeSettingsReady) {
 				throw new Error('Native model settings are unavailable or incomplete');
 			}
-			fullContent = (
-				await sendAgentMessage(
-					content,
-					{
-						history: messages.map((message) => ({
-							role: message.role,
-							content: toOpenAIContent(message.content)
-						})),
-						systemPrompt,
-						appendUserMessage: !systemEvent
-					},
-					onDelta
-				)
-			).text;
+			const nativeTurn = await sendAgentMessage(
+				content,
+				{
+					history: messages.map((message) => ({
+						role: message.role,
+						content: toOpenAIContent(message.content)
+					})),
+					systemPrompt,
+					appendUserMessage: !systemEvent
+				},
+				onDelta
+			);
+			hooks.onNativeToolSteps?.(nativeTurn.toolSteps);
+			fullContent = nativeTurn.text;
 		} else if (transport === 'direct') {
 			// Local providers still use the existing direct browser transport on
 			// web builds, where there is no native host.

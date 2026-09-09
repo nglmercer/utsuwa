@@ -27,6 +27,7 @@
 	});
 	import SpeechBubble from '$lib/components/chat/SpeechBubble.svelte';
 	import ChatWindow from '$lib/components/chat/ChatWindow.svelte';
+	import NativeToolReceipts from '$lib/components/chat/NativeToolReceipts.svelte';
 	import { type ThinkingPhase } from '$lib/services/chat/chat-phase';
 	import ThinkingImages from '$lib/components/chat/ThinkingImages.svelte';
 	import Photoboard from '$lib/components/chat/Photoboard.svelte';
@@ -47,6 +48,7 @@
 	import { settingsStore } from '$lib/stores/settings.svelte';
 	import { onDestroy } from 'svelte';
 	import { sendCompanionMessage, type SendCompanionMessageOptions } from '$lib/services/chat/companion-chat';
+	import type { NativeToolStep } from '$lib/services/native/agent';
 	import { createReminderFiredHandler } from '$lib/services/chat/reminder-chat';
 	import { reminderStore } from '$lib/stores/reminders.svelte';
 	import { type PreparedImage } from '$lib/services/storage/keepsakes';
@@ -88,6 +90,9 @@
 	let isTyping = $state(false);
 	// What she's doing this turn, for the shimmer label
 	let thinkingPhase = $state<ThinkingPhase>('thinking');
+	// Native tool receipts are kept separate from model prose so a failed
+	// mutation cannot be hidden by an optimistic assistant response.
+	let nativeToolSteps = $state<NativeToolStep[]>([]);
 	// Chat sidebar state — start open when sidebar mode is enabled
 	let sidebarOpen = $state(
 		displayStore.chatDisplayMode === 'sidebar' || displayStore.chatDisplayMode === 'both'
@@ -242,7 +247,8 @@
 			setActiveEvent: (e) => (activeEvent = e),
 			setPhase: (p) => (thinkingPhase = p),
 			onShownImages: (shown) => (thinkingImages = shown),
-			onNewMemory: (m) => (lastNewMemory = m)
+			onNewMemory: (m) => (lastNewMemory = m),
+			onNativeToolSteps: (steps) => (nativeToolSteps = steps)
 		}, options);
 	}
 
@@ -398,9 +404,13 @@
 				isTyping={isTyping && typingDotsVisible}
 				phase={thinkingPhase}
 				onSend={handleSend}
+				nativeToolSteps={nativeToolSteps}
 				disabled={chatStore.isLoading}
 				{visionCapable}
 			/>
+			{#if !sidebarOpen || !showSidebarTrigger}
+				<NativeToolReceipts steps={nativeToolSteps} floating />
+			{/if}
 
 			<!-- The image she's being shown, floated above her head while she considers it -->
 			<ThinkingImages images={thinkingImages} show={isTyping} />

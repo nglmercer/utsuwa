@@ -354,6 +354,7 @@ impl Agent {
         let tool_ids: Vec<String> = tool_defs.iter().map(|tool| tool.name.clone()).collect();
         let invocation_id = InvocationId::fresh();
         let mut executed = Vec::new();
+        let mut tool_steps = Vec::new();
         let mut truncated = false;
         let mut final_text = String::new();
 
@@ -385,6 +386,7 @@ impl Agent {
                     invocation_id,
                     text,
                     executed,
+                    tool_steps,
                     pending_approval: None,
                     truncated,
                     messages: messages.clone(),
@@ -408,6 +410,7 @@ impl Agent {
                         name: call.name.clone(),
                         output: output.clone(),
                     });
+                    tool_steps.push(ToolStep::success(call, &output));
                     results.push(ModelMessage::tool_result(ToolResult {
                         tool_call_id: call.id.clone(),
                         content: truncate_json(&output.content, self.limits.max_tool_output_bytes),
@@ -422,12 +425,14 @@ impl Agent {
                             invocation_id,
                             text,
                             executed,
+                            tool_steps,
                             pending_approval: Some(pending),
                             truncated,
                             messages: messages.clone(),
                         });
                     }
-                    Err(PendingOrFailed::Failed(message)) => {
+                    Err(PendingOrFailed::Failed { message, status }) => {
+                        tool_steps.push(ToolStep::failure(call, status, message.clone()));
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call.id.clone(),
                             content: message,
@@ -439,6 +444,7 @@ impl Agent {
             for prepared_call in prepared {
                 let call_id = prepared_call.call.id.clone();
                 let call_name = prepared_call.call.name.clone();
+                let step_call = prepared_call.call.clone();
                 match self.execute_prepared(authorizer, prepared_call).await {
                     Ok(output) => {
                         executed.push(ExecutedTool {
@@ -446,6 +452,7 @@ impl Agent {
                             name: call_name.clone(),
                             output: output.clone(),
                         });
+                        tool_steps.push(ToolStep::success(&step_call, &output));
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call_id,
                             content: truncate_json(
@@ -455,7 +462,8 @@ impl Agent {
                             is_error: false,
                         }));
                     }
-                    Err(PendingOrFailed::Failed(message)) => {
+                    Err(PendingOrFailed::Failed { message, status }) => {
+                        tool_steps.push(ToolStep::failure(&step_call, status, message.clone()));
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call_id.clone(),
                             content: message,
@@ -466,6 +474,11 @@ impl Agent {
                         // `execute_prepared` only commits already-approved
                         // calls; a pending result here would indicate a
                         // broken authorizer implementation.
+                        tool_steps.push(ToolStep::failure(
+                            &step_call,
+                            ToolStepStatus::Denied,
+                            "authorization changed during execution".to_string(),
+                        ));
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call_id,
                             content: "authorization changed during execution".to_string(),
@@ -485,6 +498,7 @@ impl Agent {
             invocation_id,
             text: final_text,
             executed,
+            tool_steps,
             pending_approval: None,
             truncated,
             messages,
@@ -572,12 +586,18 @@ impl Agent {
     ) -> Result<PreparedCall, PendingOrFailed> {
         let tool = registry.resolve(&call.name).map_err(|e| {
             self.audit(None, None, AuditOutcome::Failed, e.to_string());
-            PendingOrFailed::Failed(e.to_string())
+            PendingOrFailed::Failed {
+                message: e.to_string(),
+                status: ToolStepStatus::Failed,
+            }
         })?;
         let args: serde_json::Value = serde_json::from_str(&call.arguments).map_err(|e| {
             let message = format!("invalid tool arguments: {e}");
             self.audit(None, None, AuditOutcome::Failed, message.clone());
-            PendingOrFailed::Failed(message)
+            PendingOrFailed::Failed {
+                message,
+                status: ToolStepStatus::Failed,
+            }
         })?;
         // A policy Allow mints a ticket scoped to exactly the requested
         // resource (least privilege) and bound to this invocation. Brokers
@@ -602,9 +622,10 @@ impl Agent {
                         AuditOutcome::Denied,
                         reason.clone(),
                     );
-                    return Err(PendingOrFailed::Failed(format!(
-                        "denied by policy: {reason}"
-                    )));
+                    return Err(PendingOrFailed::Failed {
+                        message: format!("denied by policy: {reason}"),
+                        status: ToolStepStatus::Denied,
+                    });
                 }
                 AuthorizationDecision::RequireUserApproval { reason } => {
                     self.audit(
@@ -681,9 +702,10 @@ impl Agent {
                     AuditOutcome::Denied,
                     "grant was revoked or already consumed before execution".to_string(),
                 );
-                return Err(PendingOrFailed::Failed(
-                    "permission is no longer available for this tool call".to_string(),
-                ));
+                return Err(PendingOrFailed::Failed {
+                    message: "permission is no longer available for this tool call".to_string(),
+                    status: ToolStepStatus::Denied,
+                });
             }
             Some(CapabilityTicket::mint(
                 principal,
@@ -707,7 +729,7 @@ impl Agent {
         if let Some(ticket) = ticket {
             // Invocation binding must match the ticket or the broker
             // rejects it; keep both from the same mint.
-            ctx.invocation_id = ticket.invocation_id.clone();
+            ctx.invocation_id = ticket.invocation_id;
             ctx = ctx.with_ticket(ticket);
         }
         let (capability, resource) = match &requirement {
@@ -782,7 +804,10 @@ impl Agent {
                     name: call.name,
                     ok: false,
                 });
-                Err(PendingOrFailed::Failed(err.to_string()))
+                Err(PendingOrFailed::Failed {
+                    message: err.to_string(),
+                    status: tool_error_status(&err),
+                })
             }
         }
     }
@@ -812,12 +837,71 @@ pub struct ExecutedTool {
     pub output: ToolOutput,
 }
 
+/// The authoritative record of one model-requested tool step. Unlike
+/// [`ExecutedTool`], this also records calls that were denied or failed so a
+/// host can show the user what actually happened instead of relying on the
+/// model's final prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStepStatus {
+    Success,
+    Failed,
+    Denied,
+}
+
+impl ToolStepStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolStep {
+    pub id: String,
+    pub name: String,
+    pub status: ToolStepStatus,
+    pub ok: bool,
+    /// Successful tool output, kept as the model-facing JSON value. Failed
+    /// and denied calls carry their message in `error` instead.
+    pub output: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+impl ToolStep {
+    fn success(call: &ToolCall, output: &ToolOutput) -> Self {
+        Self {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            status: ToolStepStatus::Success,
+            ok: true,
+            output: Some(output.content.clone()),
+            error: None,
+        }
+    }
+
+    fn failure(call: &ToolCall, status: ToolStepStatus, error: String) -> Self {
+        Self {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            status,
+            ok: false,
+            output: None,
+            error: Some(error),
+        }
+    }
+}
+
 /// Outcome of a tool-calling turn.
 #[derive(Debug, Clone)]
 pub struct AgentOutcome {
     pub invocation_id: InvocationId,
     pub text: String,
     pub executed: Vec<ExecutedTool>,
+    pub tool_steps: Vec<ToolStep>,
     pub pending_approval: Option<PendingApproval>,
     pub truncated: bool,
     /// Conversation transcript after the turn (user/assistant/tool
@@ -830,7 +914,10 @@ pub struct AgentOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingOrFailed {
     Pending(PendingApproval),
-    Failed(String),
+    Failed {
+        message: String,
+        status: ToolStepStatus,
+    },
 }
 
 fn truncate_json(value: &serde_json::Value, max_bytes: usize) -> String {
@@ -839,6 +926,14 @@ fn truncate_json(value: &serde_json::Value, max_bytes: usize) -> String {
         text
     } else {
         format!("{}…[truncated]", &text[..max_bytes])
+    }
+}
+
+fn tool_error_status(error: &tool_core::ToolError) -> ToolStepStatus {
+    if matches!(error, tool_core::ToolError::Denied { .. }) {
+        ToolStepStatus::Denied
+    } else {
+        ToolStepStatus::Failed
     }
 }
 
@@ -966,6 +1061,93 @@ mod tests {
                 turns: std::sync::Mutex::new(turns.into_iter().rev().collect()),
                 seen: std::sync::Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    struct WrongPathRecoveryProvider {
+        wrong: std::path::PathBuf,
+        correct: std::path::PathBuf,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for WrongPathRecoveryProvider {
+        async fn stream(
+            &self,
+            request: ModelRequest,
+        ) -> Result<model_core::ModelStream, ModelError> {
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                let current = *calls;
+                *calls += 1;
+                current
+            };
+            let events = match call {
+                0 => vec![
+                    ModelStreamEvent::ToolCall(ToolCall {
+                        id: "wrong-path".to_string(),
+                        name: "filesystem.write".to_string(),
+                        arguments: serde_json::json!({
+                            "path": self.wrong,
+                            "content": "Hello from Utsuwa",
+                        })
+                        .to_string(),
+                    }),
+                    ModelStreamEvent::Done {
+                        finish_reason: FinishReason::ToolCalls,
+                    },
+                ],
+                1 => {
+                    let result = request
+                        .messages
+                        .iter()
+                        .find_map(|message| {
+                            message
+                                .tool_result
+                                .as_ref()
+                                .filter(|result| result.tool_call_id == "wrong-path")
+                        })
+                        .expect("failed write result must reach the model");
+                    assert!(result.is_error);
+                    assert!(result.content.contains("parent directory does not exist"));
+                    vec![
+                        ModelStreamEvent::ToolCall(ToolCall {
+                            id: "correct-path".to_string(),
+                            name: "filesystem.write".to_string(),
+                            arguments: serde_json::json!({
+                                "path": self.correct,
+                                "content": "Hello from Utsuwa",
+                            })
+                            .to_string(),
+                        }),
+                        ModelStreamEvent::Done {
+                            finish_reason: FinishReason::ToolCalls,
+                        },
+                    ]
+                }
+                _ => {
+                    let result = request
+                        .messages
+                        .iter()
+                        .find_map(|message| {
+                            message
+                                .tool_result
+                                .as_ref()
+                                .filter(|result| result.tool_call_id == "correct-path")
+                        })
+                        .expect("successful write result must reach the model");
+                    assert!(!result.is_error);
+                    vec![
+                        ModelStreamEvent::TextDelta("created it".to_string()),
+                        ModelStreamEvent::Done {
+                            finish_reason: FinishReason::Stop,
+                        },
+                    ]
+                }
+            };
+            Ok(Box::pin(futures_util::stream::iter(
+                events.into_iter().map(Ok),
+            )))
         }
     }
 
@@ -1425,6 +1607,72 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.text, "recovered");
         assert!(outcome.executed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn filesystem_write_missing_parent_error_drives_wrong_path_recovery() {
+        let home = std::env::temp_dir().join(format!(
+            "utsuwa-agent-write-recovery-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let desktop = home.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let wrong = home.join("Desktop/hello.txt");
+        let correct = desktop.join("hello.txt");
+        let provider = Arc::new(WrongPathRecoveryProvider {
+            wrong: wrong.clone(),
+            correct: correct.clone(),
+            calls: std::sync::Mutex::new(0),
+        });
+        let mut registry = tool_core::ToolRegistry::new();
+        registry
+            .register(Arc::new(tool_filesystem::WriteTool {
+                limits: tool_filesystem::FilesystemLimits::default(),
+            }))
+            .unwrap();
+        let grant = policy_core::GrantedScope::new(
+            capability_core::PrincipalKind::Agent,
+            capability_core::Capability::FilesystemWrite,
+            capability_core::ResourceScope::new(vec![capability_core::Resource::Path(
+                home.clone(),
+            )]),
+            policy_core::GrantLifetime::Session,
+            None,
+            None,
+        );
+        let outcome = Agent::new(provider)
+            .turn_with_tools(
+                vec![ModelMessage::user("create it")],
+                &registry,
+                &AuthorizationContext {
+                    grants: vec![grant],
+                    ..AuthorizationContext::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "created it");
+        assert_eq!(outcome.executed.len(), 1);
+        assert_eq!(outcome.tool_steps.len(), 2);
+        assert_eq!(outcome.tool_steps[0].status, ToolStepStatus::Failed);
+        assert!(!outcome.tool_steps[0].ok);
+        assert!(outcome.tool_steps[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("parent directory does not exist"));
+        assert_eq!(outcome.tool_steps[1].status, ToolStepStatus::Success);
+        assert_eq!(
+            outcome.tool_steps[1].output.as_ref().unwrap()["path"],
+            correct.to_string_lossy().as_ref()
+        );
+        assert!(!home.join("Desktop").exists());
+        assert_eq!(
+            std::fs::read_to_string(&correct).unwrap(),
+            "Hello from Utsuwa"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     /// Task 13 acceptance, end to end: with a session grant on a project

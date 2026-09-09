@@ -4,7 +4,7 @@
 //
 // Turn lifecycle over the bridge:
 //   invoke('agent.send_message', { text }) -> { accepted: true }
-//   ... `agent.turn_done` { text, executed, truncated }
+//   ... `agent.turn_done` { text, executed, tool_steps, truncated }
 //   ... `agent.turn_suspended` { text, request_id } (a `permission.requested`
 //       event carries the matching approval request for the dialog)
 //   ... `agent.turn_failed` { error }
@@ -17,15 +17,29 @@ export interface ExecutedStep {
 	output: unknown;
 }
 
+export type NativeToolStepStatus = 'success' | 'failed' | 'denied';
+
+/** Authoritative native result for every completed tool attempt. */
+export interface NativeToolStep {
+	id: string;
+	name: string;
+	status: NativeToolStepStatus;
+	ok: boolean;
+	output?: unknown;
+	error?: string;
+}
+
 export interface TurnDone {
 	text: string;
 	executed: ExecutedStep[];
+	toolSteps: NativeToolStep[];
 	truncated: boolean;
 }
 
 export interface TurnSuspended {
 	text: string;
 	request_id: string;
+	toolSteps: NativeToolStep[];
 }
 
 export interface AgentHistoryMessage {
@@ -70,13 +84,21 @@ export function parseAgentTurnEvent(event: string, data: unknown): AgentTurnEven
 				done: {
 					text: d.text,
 					executed: parseExecutedSteps(d.executed),
+					toolSteps: parseToolSteps(d.tool_steps, d.executed),
 					truncated: d.truncated === true
 				}
 			};
 		}
 		case 'agent.turn_suspended': {
 			if (typeof d?.text !== 'string' || typeof d?.request_id !== 'string') return null;
-			return { kind: 'suspended', suspended: { text: d.text, request_id: d.request_id } };
+			return {
+				kind: 'suspended',
+				suspended: {
+					text: d.text,
+					request_id: d.request_id,
+					toolSteps: parseToolSteps(d.tool_steps, [])
+				}
+			};
 		}
 		case 'agent.turn_failed':
 			return { kind: 'failed', error: typeof d?.error === 'string' ? d.error : 'unknown error' };
@@ -95,6 +117,36 @@ function parseExecutedSteps(value: unknown): ExecutedStep[] {
 		const step = item as Record<string, unknown>;
 		if (typeof step.id !== 'string' || typeof step.name !== 'string') continue;
 		out.push({ id: step.id, name: step.name, output: step.output });
+	}
+	return out;
+}
+
+function parseToolSteps(value: unknown, executedValue: unknown): NativeToolStep[] {
+	if (!Array.isArray(value)) {
+		return parseExecutedSteps(executedValue).map((step) => ({
+			id: step.id,
+			name: step.name,
+			status: 'success',
+			ok: true,
+			output: step.output
+		}));
+	}
+	const out: NativeToolStep[] = [];
+	for (const item of value) {
+		if (typeof item !== 'object' || item === null) continue;
+		const step = item as Record<string, unknown>;
+		if (typeof step.id !== 'string' || typeof step.name !== 'string' || typeof step.ok !== 'boolean') continue;
+		const status = step.status;
+		const parsedStatus: NativeToolStepStatus =
+			status === 'denied' ? 'denied' : status === 'failed' || step.ok === false ? 'failed' : 'success';
+		out.push({
+			id: step.id,
+			name: step.name,
+			status: parsedStatus,
+			ok: step.ok,
+			...(step.output !== null && step.output !== undefined ? { output: step.output } : {}),
+			...(typeof step.error === 'string' ? { error: step.error } : {})
+		});
 	}
 	return out;
 }
@@ -131,6 +183,8 @@ export interface AgentChatState {
 	latest: string;
 	/** Tool steps executed by the latest finished turn. */
 	executed: ExecutedStep[];
+	/** All completed native tool attempts, including failed/denied calls. */
+	toolSteps: NativeToolStep[];
 	/** Pending approval request id while suspended. */
 	requestId: string | null;
 	/** Failure message, if the last turn failed. */
@@ -138,7 +192,7 @@ export interface AgentChatState {
 }
 
 export function initialAgentChatState(): AgentChatState {
-	return { phase: 'idle', latest: '', executed: [], requestId: null, error: null };
+	return { phase: 'idle', latest: '', executed: [], toolSteps: [], requestId: null, error: null };
 }
 
 /** Pure state transition for one parsed turn event. */
@@ -154,6 +208,7 @@ export function reduceAgentEvent(state: AgentChatState, event: AgentTurnEvent): 
 				phase: 'idle',
 				latest: event.done.text,
 				executed: event.done.executed,
+				toolSteps: event.done.toolSteps,
 				requestId: null,
 				error: null
 			};
@@ -162,6 +217,7 @@ export function reduceAgentEvent(state: AgentChatState, event: AgentTurnEvent): 
 				...state,
 				phase: 'suspended',
 				latest: event.suspended.text,
+				toolSteps: event.suspended.toolSteps,
 				requestId: event.suspended.request_id
 			};
 		case 'failed':
@@ -173,5 +229,5 @@ export function reduceAgentEvent(state: AgentChatState, event: AgentTurnEvent): 
 
 /** State transition for a locally-sent message (turn starts running). */
 export function reduceAgentSend(state: AgentChatState): AgentChatState {
-	return { ...state, phase: 'running', latest: '', executed: [], requestId: null, error: null };
+	return { ...state, phase: 'running', latest: '', executed: [], toolSteps: [], requestId: null, error: null };
 }

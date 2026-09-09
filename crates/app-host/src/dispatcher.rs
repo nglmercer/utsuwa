@@ -1275,6 +1275,45 @@ mod tests {
     }
 
     #[test]
+    fn autonomous_setting_survives_runtime_restart() {
+        let storage = temp_storage("autonomous-restart");
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(
+                crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS,
+                &serde_json::json!(true),
+            )
+            .unwrap();
+
+        let start = |storage: Arc<Mutex<storage_core::Storage>>| {
+            AgentRuntime::start_with_factory(
+                Arc::new(Mutex::new(ApprovalQueue::new())),
+                Some(storage),
+                None,
+                Arc::new(|_| {}),
+                Arc::new(|| Err(crate::agent_runtime::RuntimeError::ModelNotConfigured)),
+            )
+            .unwrap()
+        };
+
+        let first = start(Arc::clone(&storage));
+        assert!(first.autonomous_full_access_enabled());
+        drop(first);
+
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(
+                crate::agent_runtime::SETTING_AUTONOMOUS_FULL_ACCESS,
+                &serde_json::json!(false),
+            )
+            .unwrap();
+        let second = start(Arc::clone(&storage));
+        assert!(!second.autonomous_full_access_enabled());
+    }
+
+    #[test]
     fn model_settings_use_native_storage_and_keychain_only() {
         use secret_core::SecretStore;
 

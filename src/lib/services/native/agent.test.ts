@@ -34,6 +34,34 @@ test('malformed steps are dropped, not fatal', () => {
 	assert.equal(event.done.executed[0].id, 'e2');
 });
 
+test('turn_done keeps failed and successful native tool attempts', () => {
+	const event = parseAgentTurnEvent('agent.turn_done', {
+		text: 'recovered',
+		tool_steps: [
+			{
+				id: 'call-1',
+				name: 'filesystem.write',
+				status: 'failed',
+				ok: false,
+				error: 'parent directory does not exist: /tmp/home/Desktop'
+			},
+			{
+				id: 'call-2',
+				name: 'filesystem.write',
+				status: 'success',
+				ok: true,
+				output: { path: '/tmp/home/Escritorio/hello.txt', created: true }
+			}
+		]
+	});
+	assert.equal(event?.kind, 'done');
+	if (event?.kind !== 'done') throw new Error('unreachable');
+	assert.equal(event.done.toolSteps.length, 2);
+	assert.equal(event.done.toolSteps[0].ok, false);
+	assert.match(event.done.toolSteps[0].error ?? '', /parent directory/);
+	assert.equal(event.done.toolSteps[1].output && (event.done.toolSteps[1].output as { path: string }).path, '/tmp/home/Escritorio/hello.txt');
+});
+
 test('suspended/failed/cancelled parse; foreign events ignored', () => {
 	const suspended = parseAgentTurnEvent('agent.turn_suspended', {
 		text: 'need approval',

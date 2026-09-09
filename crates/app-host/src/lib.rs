@@ -9,6 +9,7 @@ use ipc_core::HostEvent;
 
 pub mod agent_runtime;
 pub mod dispatcher;
+pub mod host_environment;
 pub mod protocol;
 pub use winit;
 
