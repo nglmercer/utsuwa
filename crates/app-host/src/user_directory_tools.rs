@@ -2679,6 +2679,33 @@ enum EditTargetStyle {
     ExplicitPath,
 }
 
+/// Some small models copy the host's `resolved_directory` metadata into the
+/// edit `path` field while also sending `location` + `filename`. Treat that
+/// value as a directory hint only when it is exactly the selected configured
+/// root (or its conventional, localized alias). The actual file target is
+/// still resolved and capability-checked from the semantic target.
+fn is_selected_directory_alias(
+    path: &Path,
+    target: &ResolvedEditTarget,
+    environment: &HostEnvironment,
+) -> bool {
+    let Some(configured) = environment.user_dirs.get(target.directory) else {
+        return false;
+    };
+    let same_canonical_root = path
+        .canonicalize()
+        .ok()
+        .zip(configured.canonicalize().ok())
+        .is_some_and(|(path, configured)| path == configured);
+    if same_canonical_root {
+        return true;
+    }
+    environment.home.as_deref().is_some_and(|home| {
+        lexical_absolute_path(path)
+            == lexical_absolute_path(&home.join(target.directory.conventional_name()))
+    })
+}
+
 /// Keep older callers that put a bare filename in `path` working, but never
 /// reinterpret an arbitrary path. A relative value is converted to the
 /// semantic filename form and then resolved only if it uniquely identifies an
@@ -2705,14 +2732,23 @@ fn normalize_unified_edit_args(
         let semantic_target =
             resolve_edit_target_with_purpose(&semantic_args, environment, tool, purpose)?;
         let path_matches = if Path::new(&path).is_absolute() {
-            let normalized = normalize_special_user_path(
-                Path::new(&path),
-                environment,
-                tool,
-                SpecialPathPurpose::ExistingFile,
-                EDIT_USER_FILE_TOOL,
-            )?;
-            lexical_absolute_path(&normalized.path) == lexical_absolute_path(&semantic_target.path)
+            if is_selected_directory_alias(Path::new(&path), &semantic_target, environment) {
+                true
+            } else {
+                let normalized = normalize_special_user_path(
+                    Path::new(&path),
+                    environment,
+                    tool,
+                    if matches!(purpose, TargetPurpose::Create) {
+                        SpecialPathPurpose::Write
+                    } else {
+                        SpecialPathPurpose::ExistingFile
+                    },
+                    EDIT_USER_FILE_TOOL,
+                )?;
+                lexical_absolute_path(&normalized.path)
+                    == lexical_absolute_path(&semantic_target.path)
+            }
         } else if looks_like_windows_absolute_path(&path) {
             false
         } else {
@@ -5044,6 +5080,24 @@ mod tests {
             tool_filesystem::FilesystemLimits::default(),
             environment(&home, &desktop),
         );
+        // A small model may copy `resolved_directory` into `path` while
+        // also providing the semantic file target. The directory hint is
+        // safe to ignore because location+filename identifies the file.
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "location": "desktop",
+                "filename": "note.txt",
+                "path": desktop.to_string_lossy(),
+                "old_text": "hello",
+                "new_text": "hi",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi");
+        std::fs::write(&target, "hello").unwrap();
+
         // A redundant matching path is safe and keeps older/model-generated
         // calls from failing before the edit reaches the filesystem broker.
         tool.invoke(
