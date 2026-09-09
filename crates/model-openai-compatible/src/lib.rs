@@ -797,7 +797,7 @@ fn map_finish_reason(reason: &str) -> FinishReason {
 }
 
 fn request_body(model: &str, request: &ModelRequest) -> serde_json::Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "stream": true,
         "messages": request.messages.iter().map(wire_message).collect::<Vec<_>>(),
@@ -809,9 +809,14 @@ fn request_body(model: &str, request: &ModelRequest) -> serde_json::Value {
                 "parameters": t.input_schema,
             }
         })).collect::<Vec<_>>(),
-        "max_tokens": request.max_tokens,
-        "temperature": request.temperature,
-    })
+    });
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    body
 }
 
 fn wire_message(message: &ModelMessage) -> serde_json::Value {
@@ -905,6 +910,26 @@ mod tests {
         assert_eq!(tool["function"]["name"], "filesystem.read");
         assert_eq!(tool["function"]["description"], "Read a file");
         assert_eq!(tool["function"]["parameters"]["required"][0], "path");
+    }
+
+    #[test]
+    fn openai_request_omits_unset_optional_numeric_fields() {
+        let request = ModelRequest::new(vec![ModelMessage::user("hello")]);
+        let body = request_body("test-model", &request);
+
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn openai_request_preserves_set_optional_numeric_fields() {
+        let mut request = ModelRequest::new(vec![ModelMessage::user("hello")]);
+        request.max_tokens = Some(128);
+        request.temperature = Some(0.4);
+        let body = request_body("test-model", &request);
+
+        assert_eq!(body["max_tokens"], 128);
+        assert!((body["temperature"].as_f64().unwrap() - 0.4).abs() < 1e-6);
     }
 
     #[test]
