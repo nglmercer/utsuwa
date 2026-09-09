@@ -9,6 +9,7 @@ import {
 	sendParams,
 	statusFor
 } from './agent.ts';
+import { summarizeNativeToolSteps } from './tool-receipts.ts';
 
 test('turn_done parses text, steps, and truncation', () => {
 	const event = parseAgentTurnEvent('agent.turn_done', {
@@ -60,6 +61,49 @@ test('turn_done keeps failed and successful native tool attempts', () => {
 	assert.equal(event.done.toolSteps[0].ok, false);
 	assert.match(event.done.toolSteps[0].error ?? '', /parent directory/);
 	assert.equal(event.done.toolSteps[1].output && (event.done.toolSteps[1].output as { path: string }).path, '/tmp/home/Escritorio/hello.txt');
+});
+
+test('native receipt summary treats a successful mutation retry as recovered', () => {
+	const event = parseAgentTurnEvent('agent.turn_done', {
+		text: 'created',
+		tool_steps: [
+			{
+				id: 'wrong',
+				name: 'filesystem.write',
+				status: 'failed',
+				ok: false,
+				error: 'parent directory does not exist'
+			},
+			{
+				id: 'right',
+				name: 'filesystem.create_user_file',
+				status: 'success',
+				ok: true,
+				output: { path: '/tmp/home/Escritorio/note.txt', created: true }
+			}
+		]
+	});
+	assert.equal(event?.kind, 'done');
+	if (event?.kind !== 'done') throw new Error('unreachable');
+	assert.equal(summarizeNativeToolSteps(event.done.toolSteps), 'recovered');
+});
+
+test('native receipt summary keeps an unrecovered failure as failed', () => {
+	const event = parseAgentTurnEvent('agent.turn_done', {
+		text: 'could not create it',
+		tool_steps: [
+			{
+				id: 'wrong',
+				name: 'filesystem.write',
+				status: 'failed',
+				ok: false,
+				error: 'parent directory does not exist'
+			}
+		]
+	});
+	assert.equal(event?.kind, 'done');
+	if (event?.kind !== 'done') throw new Error('unreachable');
+	assert.equal(summarizeNativeToolSteps(event.done.toolSteps), 'failed');
 });
 
 test('suspended/failed/cancelled parse; foreign events ignored', () => {

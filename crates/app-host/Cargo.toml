@@ -21,6 +21,7 @@ tool-core.workspace = true
 tool-filesystem.workspace = true
 tool-process.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 storage-core.workspace = true
@@ -30,6 +31,7 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid.workspace = true
 url.workspace = true
+iana-time-zone.workspace = true
 winit = "0.30"
 wry = "0.46"
 

@@ -33,8 +33,10 @@ audit-core = { path = "crates/audit-core" }
 desktop-linux = { path = "crates/desktop-linux" }
 bytes = "1"
 capability-core = { path = "crates/capability-core" }
+chrono = { version = "0.4", default-features = true }
 futures-core = "0.3"
 futures-util = "0.3"
+iana-time-zone = "0.1"
 ipc-core = { path = "crates/ipc-core" }
 keyring = { version = "4" }
 secret-core = { path = "crates/secret-core" }

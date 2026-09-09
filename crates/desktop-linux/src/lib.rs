@@ -39,6 +39,21 @@ impl From<LinuxError> for DesktopError {
     }
 }
 
+/// Convert X11's object-lifetime errors into a model-actionable result. A
+/// window can disappear after `desktop.inspect` and before a later operation;
+/// the model should refresh the snapshot instead of having to understand X11
+/// protocol error numbers.
+fn window_error(window_id: &str, error: LinuxError) -> DesktopError {
+    match error {
+        LinuxError::X(XError::Server { code: 3, .. })
+        // GetGeometry/GetImage report a vanished drawable as BadDrawable.
+        | LinuxError::X(XError::Server { code: 9, .. }) => {
+            DesktopError::StaleWindow(window_id.to_string())
+        }
+        other => other.into(),
+    }
+}
+
 pub struct LinuxBackend {
     conn: Mutex<XConn>,
     xtest_major: Option<u8>,
@@ -228,7 +243,8 @@ fn crc32(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{channel, crc32, encode_png, LinuxBackend};
+    use super::x11::XError;
+    use super::{channel, crc32, encode_png, window_error, LinuxBackend, LinuxError};
     use tool_desktop::DesktopBackend;
 
     #[test]
@@ -256,6 +272,31 @@ mod tests {
     #[test]
     fn crc32_known_value() {
         assert_eq!(crc32(b"123456789"), 0xCBF43926);
+    }
+
+    #[test]
+    fn bad_window_errors_are_recoverable() {
+        let error = window_error(
+            "0x123",
+            LinuxError::X(XError::Server {
+                code: 3,
+                major: 15,
+                minor: 0,
+            }),
+        );
+        assert!(matches!(error, tool_desktop::DesktopError::StaleWindow(id) if id == "0x123"));
+
+        let drawable_error = window_error(
+            "0x456",
+            LinuxError::X(XError::Server {
+                code: 9,
+                major: 14,
+                minor: 0,
+            }),
+        );
+        assert!(
+            matches!(drawable_error, tool_desktop::DesktopError::StaleWindow(id) if id == "0x456")
+        );
     }
 
     /// Live server when a display exists; `None` (clean skip) otherwise.
@@ -439,7 +480,10 @@ impl DesktopBackend for LinuxBackend {
         let window = Self::xid(window_id).map_err(DesktopError::from)?;
         let mut conn = self.lock()?;
         let mut out = Vec::new();
-        for child in conn.query_tree(window).map_err(LinuxError::from)? {
+        for child in conn
+            .query_tree(window)
+            .map_err(|error| window_error(window_id, error.into()))?
+        {
             let title = self.title_of(&mut conn, child);
             out.push(ElementNode {
                 id: format!("0x{child:x}"),
@@ -454,9 +498,23 @@ impl DesktopBackend for LinuxBackend {
     async fn invoke_element(&self, window_id: &str, element_id: &str) -> Result<(), DesktopError> {
         let target = Self::xid(element_id).or_else(|_| Self::xid(window_id)).map_err(DesktopError::from)?;
         let mut conn = self.lock()?;
+        // `raise` is a fire-and-forget X11 request, so validate the target
+        // with a reply-bearing request first. This catches a window that
+        // disappeared after inspect before an ignored void-request error can
+        // pollute the next operation.
+        conn.query_tree(target)
+            .map_err(|error| window_error(window_id, error.into()))?;
         // Raising a foreign window can fail (already gone, override
         // redirect): surface it, never pretend.
-        conn.raise(target).map_err(LinuxError::from)?;
+        conn.raise(target)
+            .map_err(|error| window_error(window_id, error.into()))?;
+        // Synchronize after the void raise request so a race where
+        // the XID disappears immediately is still reported here. Do this
+        // before the best-effort focus request: some window managers reject
+        // SetInputFocus even for a live window (BadMatch), and that legacy
+        // behavior remains non-fatal.
+        conn.query_tree(target)
+            .map_err(|error| window_error(window_id, error.into()))?;
         let _ = conn.set_input_focus(target);
         Ok(())
     }
@@ -484,7 +542,14 @@ impl DesktopBackend for LinuxBackend {
                     "whole-desktop capture unsupported: root has no backing pixmap on this server; capture a window instead".to_string(),
                 )
             }
-            other => DesktopError::from(LinuxError::X(other)),
+            other => {
+                let error = LinuxError::X(other);
+                if let Some(window_id) = window_id.filter(|id| !id.is_empty()) {
+                    window_error(window_id, error)
+                } else {
+                    error.into()
+                }
+            }
         })?;
         let masks = conn.root_masks;
         let (bpp, order) = (conn.bpp, conn.image_order);
@@ -544,7 +609,12 @@ impl DesktopBackend for LinuxBackend {
         if let Some(id) = window_id.filter(|s| !s.is_empty()) {
             let target = Self::xid(id).map_err(DesktopError::from)?;
             let mut conn = self.lock()?;
-            conn.raise(target).map_err(LinuxError::from)?;
+            conn.query_tree(target)
+                .map_err(|error| window_error(id, error.into()))?;
+            conn.raise(target)
+                .map_err(|error| window_error(id, error.into()))?;
+            conn.query_tree(target)
+                .map_err(|error| window_error(id, error.into()))?;
         }
         let mut conn = self.lock()?;
         conn.warp_pointer(at.x as i16, at.y as i16)
@@ -563,7 +633,12 @@ impl DesktopBackend for LinuxBackend {
         let mut conn = self.lock()?;
         if let Some(id) = window_id.filter(|s| !s.is_empty()) {
             let target = Self::xid(id).map_err(DesktopError::from)?;
-            conn.raise(target).map_err(LinuxError::from)?;
+            conn.query_tree(target)
+                .map_err(|error| window_error(id, error.into()))?;
+            conn.raise(target)
+                .map_err(|error| window_error(id, error.into()))?;
+            conn.query_tree(target)
+                .map_err(|error| window_error(id, error.into()))?;
             let _ = conn.set_input_focus(target);
         }
         let (shift_key, map) = self.keysym_map(&mut conn)?;

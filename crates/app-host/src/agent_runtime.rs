@@ -74,6 +74,10 @@ impl ToolProfile {
                     | "filesystem.patch"
                     | "filesystem.resolve_user_dir"
                     | "filesystem.write_user_file"
+                    | "desktop.list_windows"
+                    | "desktop.accessibility_tree"
+                    | "desktop.invoke_element"
+                    | "desktop.set_value"
             ),
         }
     }
@@ -1232,7 +1236,7 @@ fn host_environment_context_for(
         "Special filesystem directories are resolved by the operating system.".to_string(),
         "Use the exact paths listed in the host environment block or returned by system.environment."
             .to_string(),
-        "For files in Desktop/Documents/etc., use filesystem.create_user_file with location and filename; never construct a special-directory path yourself."
+        "For files in Desktop/Documents/etc., ALWAYS prefer filesystem.create_user_file with location and filename; do not first try filesystem.write or construct a special-directory path yourself."
             .to_string(),
         "For desktop capability questions use desktop.status; to see open windows use desktop.inspect. Filesystem Desktop and the graphical desktop backend are different."
             .to_string(),
@@ -1254,6 +1258,7 @@ fn host_environment_context_for(
             .to_string(),
         "Never claim an operation succeeded until the tool confirms success.".to_string(),
         "Never report success after a failed tool call.".to_string(),
+        "For the current date or current time, call system.time. Never infer the current date or time from model knowledge.".to_string(),
     ];
     format!(
         "{}\n\n<utsuwa_native_runtime>\n{}\n</utsuwa_native_runtime>",
@@ -1330,11 +1335,62 @@ impl tool_core::Tool for HostEnvironmentTool {
     }
 }
 
+/// Read-only clock facts for models that must use the host's actual current
+/// time instead of inferring it from training data or a conversation date.
+/// It deliberately snapshots the clock on every invocation.
+struct SystemTimeTool;
+
+#[async_trait::async_trait]
+impl tool_core::Tool for SystemTimeTool {
+    fn metadata(&self) -> tool_core::ToolMetadata {
+        tool_core::ToolMetadata {
+            id: capability_core::ToolId::new("system.time"),
+            description: "Return the current local and UTC time from the native host. Read-only, fresh on every call; use this instead of guessing the date or time.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {},
+            }),
+            effects: vec![tool_core::ToolEffect::ReadOnly],
+        }
+    }
+
+    async fn invoke(
+        &self,
+        _ctx: tool_core::ToolContext,
+        args: serde_json::Value,
+    ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+        if !args.is_object() {
+            return Err(tool_core::ToolError::InvalidArgs {
+                tool: "system.time".to_string(),
+                message: "args must be a JSON object".to_string(),
+            });
+        }
+
+        let utc = chrono::Utc::now();
+        let local = utc.with_timezone(&chrono::Local);
+        let mut content = serde_json::json!({
+            "local": local.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "utc": utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "date": local.format("%Y-%m-%d").to_string(),
+            "time": local.format("%H:%M:%S").to_string(),
+            "utc_offset": local.format("%:z").to_string(),
+            "unix_timestamp": utc.timestamp(),
+        });
+        if let Ok(timezone) = iana_time_zone::get_timezone() {
+            if let Some(object) = content.as_object_mut() {
+                object.insert("timezone".to_string(), serde_json::Value::String(timezone));
+            }
+        }
+        Ok(tool_core::ToolOutput::new(content))
+    }
+}
+
 /// Tools the agent may call, all behind policy + tickets: the filesystem
 /// plugin's declared capabilities, host-resolved user-directory writes and
-/// lookup, structured process execution, desktop tools, and the read-only
-/// system.environment lookup. The model-facing profile may hide redundant
-/// low-level variants without removing their implementations.
+/// lookup, structured process execution, desktop tools, and read-only
+/// system.environment/system.time lookups. The model-facing profile may hide
+/// redundant low-level variants without removing their implementations.
 fn default_registry(
     processes: &Arc<ProcessManager>,
     host_environment: HostEnvironment,
@@ -1389,6 +1445,7 @@ fn default_registry(
     tools.push(Arc::new(HostEnvironmentTool {
         environment: host_environment,
     }));
+    tools.push(Arc::new(SystemTimeTool));
     for tool in tools {
         if !tool_profile.allows_tool(&tool.metadata().id.0) {
             continue;
@@ -1532,6 +1589,7 @@ mod tests {
     use super::*;
     use model_core::{FinishReason, ModelError, ModelRequest, ModelStreamEvent, ToolCall};
     use std::time::{Duration, Instant};
+    use tool_core::Tool;
 
     #[test]
     fn provider_base_url_normalization_is_provider_aware() {
@@ -1755,12 +1813,41 @@ mod tests {
         assert!(context.contains("Current working directory:"));
         assert!(context.contains("Home directory:"));
         assert!(context.contains("Filesystem tools require absolute host-native paths."));
+        assert!(context.contains("ALWAYS prefer filesystem.create_user_file"));
+        assert!(context.contains("call system.time"));
         #[cfg(target_os = "linux")]
         {
             assert!(context.contains("OS: Linux"));
             assert!(context.contains("Path style: POSIX"));
             assert!(!context.contains("C:\\Users\\"));
         }
+    }
+
+    #[tokio::test]
+    async fn system_time_returns_fresh_parseable_native_clock_facts() {
+        let tool = SystemTimeTool;
+        assert!(tool.required_capability(&serde_json::json!({})).is_none());
+        let before = chrono::Utc::now().timestamp();
+        let output = tool
+            .invoke(
+                tool_core::ToolContext::new(capability_core::Principal::Agent(AgentId::new(
+                    "time-test",
+                ))),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let after = chrono::Utc::now().timestamp();
+        let content = &output.content;
+        let local =
+            chrono::DateTime::parse_from_rfc3339(content["local"].as_str().unwrap()).unwrap();
+        let utc = chrono::DateTime::parse_from_rfc3339(content["utc"].as_str().unwrap()).unwrap();
+        assert_eq!(content["date"], local.format("%Y-%m-%d").to_string());
+        assert_eq!(content["time"], local.format("%H:%M:%S").to_string());
+        assert_eq!(content["utc_offset"], local.format("%:z").to_string());
+        assert_eq!(content["unix_timestamp"], utc.timestamp());
+        assert!((before..=after).contains(&content["unix_timestamp"].as_i64().unwrap()));
+        assert!(utc.timestamp() >= 0);
     }
 
     #[cfg(target_os = "linux")]
@@ -2150,6 +2237,7 @@ mod tests {
             "filesystem.write_user_file",
             "filesystem.create_user_file",
             "system.environment",
+            "system.time",
             "desktop.status",
             "desktop.inspect",
         ];
@@ -2179,14 +2267,25 @@ mod tests {
         assert_eq!(tool_profile_for_provider(None), ToolProfile::Full);
 
         assert!(ToolProfile::Simple.allows_tool("system.environment"));
+        assert!(ToolProfile::Simple.allows_tool("system.time"));
         assert!(ToolProfile::Simple.allows_tool("filesystem.create_user_file"));
         assert!(ToolProfile::Simple.allows_tool("filesystem.read"));
         assert!(ToolProfile::Simple.allows_tool("filesystem.write"));
         assert!(ToolProfile::Simple.allows_tool("desktop.status"));
         assert!(ToolProfile::Simple.allows_tool("desktop.inspect"));
+        assert!(ToolProfile::Simple.allows_tool("desktop.screenshot"));
+        assert!(ToolProfile::Simple.allows_tool("desktop.click"));
+        assert!(ToolProfile::Simple.allows_tool("desktop.type_text"));
         assert!(!ToolProfile::Simple.allows_tool("filesystem.patch"));
         assert!(!ToolProfile::Simple.allows_tool("filesystem.write_user_file"));
+        assert!(!ToolProfile::Simple.allows_tool("desktop.list_windows"));
+        assert!(!ToolProfile::Simple.allows_tool("desktop.accessibility_tree"));
+        assert!(!ToolProfile::Simple.allows_tool("desktop.invoke_element"));
+        assert!(!ToolProfile::Simple.allows_tool("desktop.set_value"));
         assert!(ToolProfile::Full.allows_tool("filesystem.write_user_file"));
+        assert!(ToolProfile::Full.allows_tool("system.time"));
+        assert!(ToolProfile::Full.allows_tool("desktop.list_windows"));
+        assert!(ToolProfile::Full.allows_tool("desktop.accessibility_tree"));
     }
 
     #[test]
@@ -2224,6 +2323,7 @@ mod tests {
             .collect();
         for expected in [
             "system.environment",
+            "system.time",
             "filesystem.create_user_file",
             "filesystem.read",
             "filesystem.list",
@@ -2240,6 +2340,10 @@ mod tests {
             "filesystem.patch",
             "filesystem.resolve_user_dir",
             "filesystem.write_user_file",
+            "desktop.list_windows",
+            "desktop.accessibility_tree",
+            "desktop.invoke_element",
+            "desktop.set_value",
         ] {
             assert!(!ids.iter().any(|id| id == hidden), "unexpected {hidden}");
         }

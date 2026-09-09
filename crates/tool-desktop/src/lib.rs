@@ -55,6 +55,8 @@ pub struct Point {
 pub enum DesktopError {
     #[error("no desktop backend on this platform/session: {0}")]
     BackendUnavailable(String),
+    #[error("window '{0}' no longer exists")]
+    StaleWindow(String),
     #[error("unknown window '{0}'")]
     UnknownWindow(String),
     #[error("unknown element '{0}'")]
@@ -191,6 +193,16 @@ pub mod tools {
     fn backend_error(tool: &str, e: DesktopError) -> ToolError {
         match e {
             DesktopError::BackendUnavailable(detail) => failed(tool, detail),
+            DesktopError::StaleWindow(window_id) => failed(
+                tool,
+                serde_json::json!({
+                    "error": "stale_window_id",
+                    "window_id": window_id,
+                    "message": "The window no longer exists.",
+                    "next_tool": "desktop.inspect",
+                })
+                .to_string(),
+            ),
             other => failed(tool, other.to_string()),
         }
     }
@@ -296,8 +308,8 @@ pub mod tools {
             serde_json::json!({
                 "error": "invalid_window_id",
                 "received": received,
-                "expected": "exact id returned by desktop.list_windows",
-                "next_tool": "desktop.list_windows",
+                "expected": "exact id returned by desktop.inspect or desktop.list_windows",
+                "next_tool": "desktop.inspect",
             })
             .to_string(),
         )
@@ -327,14 +339,14 @@ pub mod tools {
     fn accessibility_tree_metadata() -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new("desktop.accessibility_tree"),
-            description: "Read one window's native hierarchy (element ids, roles, names, actions). 'window_id' must be the exact native id returned by desktop.list_windows. On the Linux X11 backend it is a hexadecimal id such as 0x3400012; do not use a window title, app name, 'Desktop', or 'Escritorio'. Prefer element actions over coordinates.".to_string(),
+            description: "Read one window's native hierarchy (element ids, roles, names, actions). 'window_id' must be the exact native window id returned by desktop.list_windows (or desktop.inspect). On the Linux X11 backend it is a hexadecimal id such as 0x3400012; do not use a window title, app name, 'Desktop', or 'Escritorio'. This Linux backend exposes the X11 window hierarchy, not a semantic AT-SPI accessibility tree. Prefer element actions over coordinates.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "window_id": {
                         "type": "string",
-                        "description": "Exact native window id returned by desktop.list_windows. Linux X11 ids look like 0x3400012; never use a title or app name."
+                        "description": "Exact native window id returned by desktop.list_windows (or desktop.inspect). Linux X11 ids look like 0x3400012; never use a title or app name."
                     }
                 },
                 "required": ["window_id"],
@@ -807,7 +819,7 @@ pub mod tools {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: capability_core::ToolId::new("desktop.status"),
-                description: "Report whether the native GUI desktop backend is available and which desktop observations and controls it supports. Read-only; this answers desktop capability questions without a window id. filesystem_desktop is the OS-configured file directory and is not the GUI desktop.".to_string(),
+                description: "Report whether the native GUI desktop backend is available and which desktop observations and controls it supports. Use this directly for questions such as whether the assistant can access, see, or control the desktop; do not inspect an arbitrary window for that answer. Read-only and requires no window id. filesystem_desktop is the OS-configured file directory and is not the GUI desktop.".to_string(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
@@ -818,26 +830,21 @@ pub mod tools {
         }
 
         fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
-            Some(CapabilityRequirement {
-                capability: Capability::DesktopObserve,
-                resource: Resource::Application(String::new()),
-            })
+            // Status contains only backend capability metadata and the
+            // already host-resolved filesystem Desktop path. It does not
+            // enumerate windows or reveal private desktop content, so it is
+            // safe to answer without DesktopObserve approval.
+            None
         }
 
         async fn invoke(
             &self,
-            ctx: ToolContext,
+            _ctx: ToolContext,
             args: serde_json::Value,
         ) -> Result<ToolOutput, ToolError> {
             if !args.is_object() {
                 return Err(invalid(Self::TOOL, "args must be a JSON object"));
             }
-            require_ticket(
-                Self::TOOL,
-                &ctx,
-                Capability::DesktopObserve,
-                Resource::Application(String::new()),
-            )?;
             Ok(ToolOutput::new(desktop_status_content(
                 &self.plugin,
                 self.filesystem_desktop.as_deref(),
@@ -1038,6 +1045,7 @@ pub struct FakeBackend {
     pub windows: Vec<WindowInfo>,
     pub clicks: std::sync::Mutex<Vec<(Option<String>, Point)>>,
     pub typed: std::sync::Mutex<Vec<(Option<String>, String)>>,
+    pub stale_window: Option<String>,
 }
 
 #[cfg(test)]
@@ -1051,6 +1059,7 @@ impl FakeBackend {
             }],
             clicks: std::sync::Mutex::new(Vec::new()),
             typed: std::sync::Mutex::new(Vec::new()),
+            stale_window: None,
         }
     }
 }
@@ -1062,6 +1071,9 @@ impl DesktopBackend for FakeBackend {
         Ok(self.windows.clone())
     }
     async fn accessibility_tree(&self, window_id: &str) -> Result<Vec<ElementNode>, DesktopError> {
+        if let Some(stale_window) = &self.stale_window {
+            return Err(DesktopError::StaleWindow(stale_window.clone()));
+        }
         if window_id != "w1" {
             return Err(DesktopError::UnknownWindow(window_id.to_string()));
         }
@@ -1376,11 +1388,11 @@ mod tests {
             plugin: plugin.clone(),
             filesystem_desktop: Some("/tmp/home/Escritorio".to_string()),
         };
-        let ctx = ctx_for(
-            Capability::DesktopObserve,
-            Resource::Application(String::new()),
-        );
-        let output = status.invoke(ctx, serde_json::json!({})).await.unwrap();
+        assert!(status.required_capability(&serde_json::json!({})).is_none());
+        let output = status
+            .invoke(ToolContext::new(Principal::User), serde_json::json!({}))
+            .await
+            .unwrap();
         assert_eq!(output.content["available"], true);
         assert_eq!(output.content["filesystem_desktop"], "/tmp/home/Escritorio");
         assert_eq!(output.content["gui_desktop_backend"], "desktop.test");
@@ -1417,7 +1429,7 @@ mod tests {
             .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("invalid_window_id"), "{message}");
-        assert!(message.contains("desktop.list_windows"), "{message}");
+        assert!(message.contains("desktop.inspect"), "{message}");
         assert!(!message.contains("bad window id"), "{message}");
 
         let native_tree = NativeAccessibilityTreeTool {
@@ -1432,7 +1444,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(native_error.to_string().contains("invalid_window_id"));
-        assert!(native_error.to_string().contains("desktop.list_windows"));
+        assert!(native_error.to_string().contains("desktop.inspect"));
+    }
+
+    #[tokio::test]
+    async fn stale_window_errors_point_back_to_inspect() {
+        let mut fake = FakeBackend::new();
+        fake.stale_window = Some("0x123".to_string());
+        let tree = AccessibilityTreeTool {
+            backend: Arc::new(fake),
+        };
+        let error = tree
+            .invoke(
+                ctx_for(
+                    Capability::DesktopObserve,
+                    Resource::Window("0x123".to_string()),
+                ),
+                serde_json::json!({"window_id": "0x123"}),
+            )
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("stale_window_id"), "{message}");
+        assert!(message.contains("0x123"), "{message}");
+        assert!(message.contains("desktop.inspect"), "{message}");
+        assert!(!message.contains("X11: X error reply"), "{message}");
     }
 
     #[tokio::test]

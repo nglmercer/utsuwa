@@ -1,5 +1,9 @@
 <script lang="ts">
 	import type { NativeToolStep } from '$lib/services/native/agent';
+	import {
+		isNativeMutation,
+		summarizeNativeToolSteps
+	} from '$lib/services/native/tool-receipts';
 
 	interface Props {
 		steps?: NativeToolStep[];
@@ -7,10 +11,6 @@
 	}
 
 	let { steps = [], floating = false }: Props = $props();
-
-	function isNativeMutation(name: string): boolean {
-		return /^(filesystem\.(write|write_user_file|create_user_file|patch|create|delete|move|mkdir)|process\.(spawn|kill)|desktop\.(click|invoke_element|type_text|set_value)|clipboard\.(write|set)|application\.launch|mcp\.|plugin\.)/.test(name);
-	}
 
 	function shouldShow(step: NativeToolStep): boolean {
 		return !step.ok || isNativeMutation(step.name);
@@ -46,27 +46,54 @@
 	function failureMessage(step: NativeToolStep): string {
 		return (step.error ?? 'Native operation failed').replace(/^tool [^:]+ failed:\s*/i, '');
 	}
+
+	function failedSteps(): NativeToolStep[] {
+		return steps.filter((step) => !step.ok);
+	}
 </script>
 
 {#if steps.some(shouldShow)}
 	<div class="native-tool-receipts" class:floating aria-label="Native tool results">
-		{#if steps.some((step) => !step.ok)}
+		{#if summarizeNativeToolSteps(steps) === 'recovered'}
+			<div class="native-tool-recovered" role="status">✓ Completed after retry</div>
+		{:else if summarizeNativeToolSteps(steps) === 'failed'}
 			<div class="native-tool-warning" role="alert">⚠ Native operation failed</div>
 		{/if}
-		{#each steps.filter(shouldShow) as step, index (`${step.id}-${index}`)}
-			{@const path = outputPath(step)}
-			{#if step.ok}
+		{#if summarizeNativeToolSteps(steps) === 'recovered'}
+			{#each steps.filter((step) => step.ok && isNativeMutation(step.name)) as step, index (`success-${step.id}-${index}`)}
+				{@const path = outputPath(step)}
 				<div class="native-tool-receipt success">
 					<span>✓ {successLabel(step)}</span>
 					{#if path}<code>{path}</code>{/if}
 				</div>
-			{:else}
-				<div class="native-tool-receipt failure">
-					<span>✗ {step.name} {failureLabel(step)}</span>
-					<small>{failureMessage(step)}</small>
-				</div>
+			{/each}
+			{#if failedSteps().length > 0}
+				<details class="native-tool-details">
+					<summary>Earlier failed attempts ({failedSteps().length})</summary>
+					{#each failedSteps() as step, index (`failure-${step.id}-${index}`)}
+						<div class="native-tool-receipt failure">
+							<span>✗ {step.name} {failureLabel(step)}</span>
+							<small>{failureMessage(step)}</small>
+						</div>
+					{/each}
+				</details>
 			{/if}
-		{/each}
+		{:else}
+			{#each steps.filter(shouldShow) as step, index (`${step.id}-${index}`)}
+				{@const path = outputPath(step)}
+				{#if step.ok}
+					<div class="native-tool-receipt success">
+						<span>✓ {successLabel(step)}</span>
+						{#if path}<code>{path}</code>{/if}
+					</div>
+				{:else}
+					<div class="native-tool-receipt failure">
+						<span>✗ {step.name} {failureLabel(step)}</span>
+						<small>{failureMessage(step)}</small>
+					</div>
+				{/if}
+			{/each}
+		{/if}
 	</div>
 {/if}
 
@@ -94,6 +121,25 @@
 		background: color-mix(in srgb, #f59e0b, transparent 86%);
 		color: #b45309;
 		font-weight: 600;
+	}
+
+	.native-tool-recovered {
+		padding: 0.4rem 0.55rem;
+		border-radius: var(--radius-md);
+		background: color-mix(in srgb, #22c55e, transparent 88%);
+		color: #15803d;
+		font-weight: 700;
+	}
+
+	.native-tool-details {
+		margin-top: 0.1rem;
+		color: var(--text-secondary);
+	}
+
+	.native-tool-details summary {
+		cursor: pointer;
+		padding: 0.25rem 0.55rem;
+		font-size: 0.9em;
 	}
 
 	.native-tool-receipt {
