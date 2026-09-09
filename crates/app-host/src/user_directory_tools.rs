@@ -6,8 +6,8 @@
 //! filesystem broker.
 
 use crate::file_target::{
-    ConversationFileContext, FileRef, FileResolver, FileTarget, FileTargetError,
-    FilesystemErrorCode, ResolvedFileTarget, TargetPurpose,
+    normalize_relative_path, ConversationFileContext, FileRef, FileResolver, FileTarget,
+    FileTargetError, FilesystemErrorCode, ResolvedFileTarget, TargetPurpose,
 };
 use crate::host_environment::{HostEnvironment, UserDirectory};
 use serde_json::{Map, Value};
@@ -1478,6 +1478,117 @@ fn resolve_edit_target_with_purpose(
     let has_location = object.contains_key("location")
         || object.contains_key("directory_id")
         || object.contains_key("directory");
+    if !has_location {
+        if let (Some(path), Some(filename)) = (
+            object.get("path").and_then(Value::as_str),
+            object.get("filename").and_then(Value::as_str),
+        ) {
+            if Path::new(path).is_absolute() && !Path::new(filename).is_absolute() {
+                if let Some(directory) = UserDirectory::ALL.into_iter().find(|directory| {
+                    is_configured_directory_alias(Path::new(path), Some(*directory), environment)
+                }) {
+                    let relative_path = normalize_relative_path(Path::new(filename))
+                        .map_err(|error| filesystem_error(tool, error))?;
+                    let resolved = FileResolver::new(environment.clone())
+                        .resolve_target(
+                            &FileTarget {
+                                directory,
+                                relative_path: relative_path.clone(),
+                            },
+                            purpose,
+                        )
+                        .map_err(|error| filesystem_error(tool, error))?;
+                    let resolved_directory = environment
+                        .user_dirs
+                        .get(directory)
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    return Ok(ResolvedEditTarget {
+                        directory,
+                        resolved_directory,
+                        relative_path,
+                        path: resolved.absolute_path,
+                        file_ref: resolved.file_ref,
+                    });
+                }
+                let normalized_path = normalize_special_user_path(
+                    Path::new(path),
+                    environment,
+                    tool,
+                    if matches!(purpose, TargetPurpose::Create) {
+                        SpecialPathPurpose::Write
+                    } else {
+                        SpecialPathPurpose::ExistingFile
+                    },
+                    EDIT_USER_FILE_TOOL,
+                )?;
+                let resolved_path = FileResolver::new(environment.clone())
+                    .descriptor_for_absolute(&normalized_path.path, purpose)
+                    .map_err(|error| filesystem_error(tool, error))?;
+                if let (Some(directory), Some(relative_path)) =
+                    (resolved_path.directory, resolved_path.relative_path)
+                {
+                    let relative_filename = PathBuf::from(filename);
+                    let filename_matches = relative_filename == relative_path
+                        || relative_filename
+                            .file_name()
+                            .zip(relative_path.file_name())
+                            .is_some_and(|(left, right)| left == right);
+                    if !filename_matches {
+                        return Err(retryable_target_args(
+                            tool,
+                            "path and filename identify different files",
+                        ));
+                    }
+                    let resolved_directory = environment
+                        .user_dirs
+                        .get(directory)
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default();
+                    return Ok(ResolvedEditTarget {
+                        directory,
+                        resolved_directory,
+                        relative_path,
+                        path: resolved_path.absolute_path,
+                        file_ref: resolved_path.file_ref,
+                    });
+                }
+            }
+        }
+    }
+    // Some models copy the complete displayed path into `filename` while
+    // also supplying another path hint. Resolve that value as a target
+    // instead of sending it through filename search, which rejects absolute
+    // filenames without a semantic location.
+    if !has_location {
+        if let Some(filename) = object.get("filename").and_then(Value::as_str) {
+            if Path::new(filename).is_absolute() {
+                let resolved = FileResolver::new(environment.clone())
+                    .descriptor_for_absolute(Path::new(filename), purpose)
+                    .map_err(|error| filesystem_error(tool, error))?;
+                let (Some(directory), Some(relative_path)) =
+                    (resolved.directory, resolved.relative_path)
+                else {
+                    return Err(retryable_target_args(
+                        tool,
+                        "absolute filename is not inside a configured user directory",
+                    ));
+                };
+                let resolved_directory = environment
+                    .user_dirs
+                    .get(directory)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                return Ok(ResolvedEditTarget {
+                    directory,
+                    resolved_directory,
+                    relative_path,
+                    path: resolved.absolute_path,
+                    file_ref: resolved.file_ref,
+                });
+            }
+        }
+    }
     let directory = if has_location {
         parse_location(&args, environment, tool)?
     } else {
@@ -1696,12 +1807,40 @@ fn path_only_args(path: &Path) -> serde_json::Value {
 /// contents are never placed in a generic validation diagnostic.
 fn single_line_edit_text(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
-    let mut non_empty = content.lines().filter(|line| !line.is_empty());
+    let mut non_empty = content.lines().filter(|line| !line.trim().is_empty());
     let line = non_empty.next()?;
     if non_empty.next().is_some() {
         return None;
     }
     Some(line.to_string())
+}
+
+fn is_iso_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+/// A narrow multiline recovery for the common "update the date" shape.
+/// This is deliberately limited to one unambiguous ISO date line; arbitrary
+/// multiline replacements still require the model to read and provide the
+/// exact old_text.
+fn unique_iso_date_line(path: &Path, new_text: &str) -> Option<String> {
+    if !is_iso_date(new_text) {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut matches = content
+        .lines()
+        .filter(|line| is_iso_date(line.trim()))
+        .map(str::to_owned);
+    let line = matches.next()?;
+    matches.next().is_none().then_some(line)
 }
 
 fn is_date_placeholder(text: &str) -> bool {
@@ -1823,6 +1962,166 @@ fn resolve_new_text_source(
     normalized.remove("new_text_source");
     normalized.insert("new_text".to_string(), Value::String(new_text));
     Ok(Value::Object(normalized))
+}
+
+fn looks_like_clock_text(value: &str) -> bool {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("Current hour:")
+        .or_else(|| value.strip_prefix("current hour:"))
+        .unwrap_or(value)
+        .trim();
+    let parts = value.split(':').collect::<Vec<_>>();
+    (parts.len() == 2 || parts.len() == 3)
+        && parts
+            .iter()
+            .all(|part| part.len() == 2 && part.as_bytes().iter().all(u8::is_ascii_digit))
+        && parts[0].parse::<u8>().is_ok_and(|hour| hour < 24)
+        && parts[1].parse::<u8>().is_ok_and(|minute| minute < 60)
+        && (parts.len() == 2 || parts[2].parse::<u8>().is_ok_and(|second| second < 60))
+}
+
+/// Small models sometimes use the replace-shaped edit call for "add the
+/// current hour" and omit old_text. That is deterministic only for a native
+/// clock value; arbitrary text remains a normal exact replacement request.
+fn normalize_clock_replacement_to_append(args: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = args.as_object() else {
+        return args.clone();
+    };
+    if object.contains_key("old_text") || edit_operation_kind(args) == EditOperationKind::Append {
+        return args.clone();
+    }
+    let has_current_time_source = object
+        .get("new_text_source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source == "current_time");
+    let is_clock_text = object
+        .get("new_text")
+        .and_then(Value::as_str)
+        .is_some_and(looks_like_clock_text);
+    if !has_current_time_source && !is_clock_text {
+        return args.clone();
+    }
+    let Some(new_text) = object.get("new_text").and_then(Value::as_str) else {
+        return args.clone();
+    };
+    let mut normalized = object.clone();
+    normalized.remove("old_text");
+    normalized.remove("new_text");
+    normalized.remove("new_text_source");
+    normalized.insert(
+        "operation_type".to_string(),
+        Value::String("append".to_string()),
+    );
+    normalized.insert("content".to_string(), Value::String(new_text.to_string()));
+    normalized.insert("_auto_next_line".to_string(), Value::Bool(true));
+    Value::Object(normalized)
+}
+
+fn next_line_append_content(path: &Path, content: String) -> String {
+    if content.is_empty() {
+        return content;
+    }
+    let needs_newline = std::fs::read(path)
+        .map(|current| !current.is_empty() && !current.ends_with(b"\n"))
+        .unwrap_or(false);
+    if needs_newline {
+        format!("\n{content}")
+    } else {
+        content
+    }
+}
+
+/// Validate legacy `location`/`filename` metadata without making it the
+/// source of truth when a canonical `file_ref` or structured target is
+/// already present. In particular, `file_ref + location` is a valid small
+/// model follow-up even when `filename` is omitted.
+fn validate_legacy_edit_hint(
+    object: &Map<String, Value>,
+    canonical: &ResolvedFileTarget,
+    environment: &HostEnvironment,
+    tool: &str,
+    purpose: TargetPurpose,
+) -> Result<(), ToolError> {
+    let has_location = object.contains_key("location")
+        || object.contains_key("directory_id")
+        || object.contains_key("directory");
+    let supplied_directory = if has_location {
+        Some(parse_location(
+            &Value::Object(object.clone()),
+            environment,
+            tool,
+        )?)
+    } else {
+        None
+    };
+
+    if let Some(directory) = supplied_directory {
+        let directory_matches = canonical.directory == Some(directory)
+            || (canonical.directory.is_none()
+                && environment
+                    .user_dirs
+                    .get(directory)
+                    .and_then(|root| root.canonicalize().ok())
+                    .is_some_and(|root| canonical.absolute_path.starts_with(root)));
+        if !directory_matches {
+            return Err(retryable_target_args(
+                tool,
+                "location does not identify the same file as the canonical target",
+            ));
+        }
+    }
+
+    let Some(filename) = object.get("filename") else {
+        return Ok(());
+    };
+    let filename = filename
+        .as_str()
+        .ok_or_else(|| invalid_args(tool, "'filename' must be a string when provided"))?;
+    if filename.trim().is_empty() {
+        return Err(invalid_args(tool, "'filename' must name a file"));
+    }
+
+    let candidate = if Path::new(filename).is_absolute() {
+        FileResolver::new(environment.clone())
+            .descriptor_for_absolute(Path::new(filename), purpose)
+            .map_err(|error| filesystem_error(tool, error))?
+            .absolute_path
+    } else if let Some(directory) = canonical.directory {
+        FileResolver::new(environment.clone())
+            .resolve_target(
+                &FileTarget {
+                    directory,
+                    relative_path: PathBuf::from(filename),
+                },
+                purpose,
+            )
+            .map_err(|error| filesystem_error(tool, error))?
+            .absolute_path
+    } else if filename
+        == canonical
+            .absolute_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+    {
+        // For an arbitrary explicit path, a bare filename can only be a
+        // harmless display-name hint when it matches the final component.
+        canonical.absolute_path.clone()
+    } else {
+        return Err(retryable_target_args(
+            tool,
+            "filename does not identify the same file as the canonical target",
+        ));
+    };
+
+    if candidate != canonical.absolute_path {
+        return Err(retryable_target_args(
+            tool,
+            "filename does not identify the same file as the canonical target",
+        ));
+    }
+    Ok(())
 }
 
 /// Repair the common model mistake of copying a displayed file path into a
@@ -2003,12 +2302,24 @@ fn normalize_structured_edit_args(
         || normalized.contains_key("directory_id")
         || normalized.contains_key("directory")
         || normalized.contains_key("filename");
-    let resolved_legacy_target = if has_legacy_target && (has_file_ref || has_target) {
-        let mut legacy = normalized.clone();
-        legacy.remove("file_ref");
-        legacy.remove("target");
+    let canonical_selector = resolved_file_ref.as_ref().or(resolved_target.as_ref());
+    if let Some(canonical_selector) = canonical_selector {
+        // A follow-up commonly contains a stable file_ref plus only copied
+        // directory metadata. Do not force that incomplete metadata through
+        // filename inference: the stable selector already identifies the
+        // exact file. Validate any supplied metadata against it, then drop
+        // the redundant fields below.
+        validate_legacy_edit_hint(
+            &normalized,
+            canonical_selector,
+            environment,
+            tool,
+            target_purpose,
+        )?;
+    }
+    let resolved_legacy_target = if has_legacy_target && canonical_selector.is_none() {
         Some(resolve_edit_target_with_purpose(
-            &Value::Object(legacy),
+            &Value::Object(normalized.clone()),
             environment,
             tool,
             target_purpose,
@@ -2186,7 +2497,9 @@ fn parse_unified_old_new(
 ) -> Result<(String, String), ToolError> {
     let (mut old_text, new_text) = supplied_edit_texts(args, EDIT_TOOL)?;
     if old_text.is_none() && new_text.is_some() {
-        old_text = single_line_edit_text(resolved_path);
+        old_text = single_line_edit_text(resolved_path).or_else(|| {
+            unique_iso_date_line(resolved_path, new_text.as_deref().unwrap_or_default())
+        });
     }
     let missing_old = old_text.is_none();
     let missing_new = new_text.is_none();
@@ -3003,6 +3316,55 @@ fn normalize_unified_edit_args(
     Ok(Value::Object(normalized))
 }
 
+fn edit_target_from_descriptor(
+    resolved: &ResolvedFileTarget,
+    environment: &HostEnvironment,
+) -> Option<ResolvedEditTarget> {
+    let directory = resolved.directory?;
+    let relative_path = resolved.relative_path.clone()?;
+    let resolved_directory = environment.user_dirs.get(directory)?.to_path_buf();
+    Some(ResolvedEditTarget {
+        directory,
+        resolved_directory,
+        relative_path,
+        path: resolved.absolute_path.clone(),
+        file_ref: resolved.file_ref.clone(),
+    })
+}
+
+/// Resolve an explicit path far enough to retain it as pending edit state
+/// when it belongs to a semantic user directory. Arbitrary allowed paths
+/// remain delegated to the explicit-path broker and are never converted into
+/// a user-directory capability.
+fn resolve_edit_path_target(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+    purpose: TargetPurpose,
+) -> Result<Option<ResolvedEditTarget>, ToolError> {
+    let Some(path) = args.get("path").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !Path::new(path).is_absolute() {
+        return Ok(None);
+    }
+    let normalized = normalize_special_user_path(
+        Path::new(path),
+        environment,
+        tool,
+        if matches!(purpose, TargetPurpose::Create) {
+            SpecialPathPurpose::Write
+        } else {
+            SpecialPathPurpose::ExistingFile
+        },
+        EDIT_USER_FILE_TOOL,
+    )?;
+    let resolved = FileResolver::new(environment.clone())
+        .descriptor_for_absolute(&normalized.path, purpose)
+        .map_err(|error| filesystem_error(tool, error))?;
+    Ok(edit_target_from_descriptor(&resolved, environment))
+}
+
 fn edit_target_style(args: &serde_json::Value, tool: &str) -> Result<EditTargetStyle, ToolError> {
     let object = args
         .as_object()
@@ -3093,6 +3455,7 @@ impl EditTool {
         let structured_args =
             normalize_structured_edit_args(args, &self.user_file.environment, EDIT_TOOL)?;
         let source_args = resolve_new_text_source(&structured_args, EDIT_TOOL)?;
+        let source_args = normalize_clock_replacement_to_append(&source_args);
         let supplied = supplied_edit_texts(&source_args, EDIT_TOOL)?;
         let pending = self.pending_snapshot();
         let object = source_args
@@ -3115,6 +3478,13 @@ impl EditTool {
                 EDIT_TOOL,
                 target_purpose,
             )?)
+        } else if object.contains_key("path") {
+            resolve_edit_path_target(
+                &source_args,
+                &self.user_file.environment,
+                EDIT_TOOL,
+                target_purpose,
+            )?
         } else if !object.contains_key("path") {
             if let Some(pending) = pending.as_ref() {
                 merged.insert(
@@ -3266,6 +3636,9 @@ impl EditTool {
     fn keep_pending_after_error(error: &ToolError) -> bool {
         match error {
             ToolError::RetryRequired { .. } => true,
+            ToolError::Filesystem {
+                retryable: true, ..
+            } => true,
             ToolError::Failed { message, .. } => message.contains("replacement block occurs"),
             _ => false,
         }
@@ -3355,12 +3728,17 @@ impl Tool for EditTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         let merged = match self.merged_args(args) {
             Ok(merged) => merged,
-            Err(_) => {
-                self.clear_pending_edit();
-                return None;
-            }
+            Err(_) => return None,
         };
         self.discard_if_explicit_target_changed(&merged);
+        // Preflight runs before invoke. Remember the model's valid partial
+        // values here as well, otherwise a capability lookup can erase the
+        // only state available for the following retry.
+        self.remember_edit_attempt(
+            merged.target.clone(),
+            merged.supplied_old_text.clone(),
+            merged.supplied_new_text.clone(),
+        );
         let normalized = normalize_unified_edit_args(
             &merged.args,
             &self.user_file.environment,
@@ -3399,10 +3777,18 @@ impl Tool for EditTool {
         let merged = match self.merged_args(&args) {
             Ok(merged) => merged,
             Err(error) => {
-                self.clear_pending_edit();
+                if !Self::keep_pending_after_error(&error) {
+                    self.clear_pending_edit();
+                }
                 return Err(error);
             }
         };
+        self.discard_if_explicit_target_changed(&merged);
+        self.remember_edit_attempt(
+            merged.target.clone(),
+            merged.supplied_old_text.clone(),
+            merged.supplied_new_text.clone(),
+        );
         let normalized = match normalize_unified_edit_args(
             &merged.args,
             &self.user_file.environment,
@@ -3415,14 +3801,18 @@ impl Tool for EditTool {
         ) {
             Ok(normalized) => normalized,
             Err(error) => {
-                self.clear_pending_edit();
+                if !Self::keep_pending_after_error(&error) {
+                    self.clear_pending_edit();
+                }
                 return Err(error);
             }
         };
         let style = match edit_target_style(&normalized, EDIT_TOOL) {
             Ok(style) => style,
             Err(error) => {
-                self.clear_pending_edit();
+                if !Self::keep_pending_after_error(&error) {
+                    self.clear_pending_edit();
+                }
                 return Err(error);
             }
         };
@@ -3440,22 +3830,33 @@ impl Tool for EditTool {
                 ) {
                     Ok(target) => target,
                     Err(error) => {
-                        self.clear_pending_edit();
+                        if !Self::keep_pending_after_error(&error) {
+                            self.clear_pending_edit();
+                        }
                         return Err(error);
                     }
                 };
-                self.remember_edit_attempt(
-                    Some(target.clone()),
-                    merged.supplied_old_text,
-                    merged.supplied_new_text,
-                );
                 if edit_operation_kind(&normalized) == EditOperationKind::Append {
                     let mut delegated = normalized;
                     if let Some(object) = delegated.as_object_mut() {
+                        let auto_next_line = object
+                            .remove("_auto_next_line")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false);
                         let content = object.remove("content").ok_or_else(|| {
                             invalid_args(EDIT_TOOL, "append operation requires text")
                         })?;
-                        object.insert("content".to_string(), content);
+                        let content = content.as_str().map(str::to_owned).ok_or_else(|| {
+                            invalid_args(EDIT_TOOL, "append text must be a string")
+                        })?;
+                        object.insert(
+                            "content".to_string(),
+                            Value::String(if auto_next_line {
+                                next_line_append_content(&target.path, content)
+                            } else {
+                                content
+                            }),
+                        );
                     }
                     return match self.append_user_file.invoke(ctx, delegated).await {
                         Ok(output) => {
@@ -3472,7 +3873,12 @@ impl Tool for EditTool {
                 }
                 let (old_text, new_text) = match parse_unified_old_new(&normalized, &target.path) {
                     Ok(values) => values,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        if !Self::keep_pending_after_error(&error) {
+                            self.clear_pending_edit();
+                        }
+                        return Err(error);
+                    }
                 };
                 let mut delegated = normalized;
                 if let Some(object) = delegated.as_object_mut() {
@@ -3493,7 +3899,6 @@ impl Tool for EditTool {
                 }
             }
             EditTargetStyle::ExplicitPath => {
-                self.clear_pending_edit();
                 let target = match resolve_edit_file_path(
                     &normalized,
                     &self.file.environment,
@@ -3501,19 +3906,46 @@ impl Tool for EditTool {
                     EDIT_USER_FILE_TOOL,
                 ) {
                     Ok(target) => target,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        if !Self::keep_pending_after_error(&error) {
+                            self.clear_pending_edit();
+                        }
+                        return Err(error);
+                    }
                 };
                 if edit_operation_kind(&normalized) == EditOperationKind::Append {
                     let mut delegated = normalized;
                     if let Some(object) = delegated.as_object_mut() {
+                        let auto_next_line = object
+                            .remove("_auto_next_line")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false);
                         let content = object.remove("content").ok_or_else(|| {
                             invalid_args(EDIT_TOOL, "append operation requires text")
                         })?;
-                        object.insert("content".to_string(), content);
+                        let content = content.as_str().map(str::to_owned).ok_or_else(|| {
+                            invalid_args(EDIT_TOOL, "append text must be a string")
+                        })?;
+                        object.insert(
+                            "content".to_string(),
+                            Value::String(if auto_next_line {
+                                next_line_append_content(&target.path, content)
+                            } else {
+                                content
+                            }),
+                        );
                     }
                     return self.append_file.invoke(ctx, delegated).await;
                 }
-                let (old_text, new_text) = parse_unified_old_new(&normalized, &target.path)?;
+                let (old_text, new_text) = match parse_unified_old_new(&normalized, &target.path) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        if !Self::keep_pending_after_error(&error) {
+                            self.clear_pending_edit();
+                        }
+                        return Err(error);
+                    }
+                };
                 let mut delegated = normalized;
                 if let Some(object) = delegated.as_object_mut() {
                     object.insert("old_text".to_string(), Value::String(old_text));
@@ -5114,6 +5546,136 @@ mod tests {
             .unwrap();
         assert_eq!(output.content["updated"], true);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "2026-09-09\n");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_updates_one_unambiguous_date_line_from_file_ref_and_location() {
+        let (home, desktop) = stale_home("utsuwa-edit-date-follow-up");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "2023-10-05\nCurrent hour: 14\n").unwrap();
+        let file_ref = FileRef::from_target(&FileTarget {
+            directory: UserDirectory::Desktop,
+            relative_path: PathBuf::from("note.txt"),
+        })
+        .unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "file_ref": file_ref,
+                    "location": "desktop",
+                    "new_text": "2026-09-09",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["updated"], true);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "2026-09-09\nCurrent hour: 14\n"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_recovers_the_real_path_then_completes_the_date_retry() {
+        let (home, desktop) = stale_home("utsuwa-edit-real-path-retry");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "2023-10-05\nCurrent hour: 14\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+
+        let first = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "path": target,
+                    "filename": "note.txt",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(first, ToolError::RetryRequired { .. }),
+            "{first:?}"
+        );
+        assert!(!first.to_string().contains("same file"));
+
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "location": "desktop",
+                "filename": "note.txt",
+                "new_text": "2026-09-09",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "2026-09-09\nCurrent hour: 14\n"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_appends_current_time_when_replace_old_text_is_missing() {
+        let (home, desktop) = stale_home("utsuwa-edit-clock-append");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "2026-09-09\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "new_text_source": "current_time",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["appended"], true);
+        let contents = std::fs::read_to_string(&target).unwrap();
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "2026-09-09");
+        assert!(looks_like_clock_text(lines[1]), "{contents:?}");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_accepts_a_full_filename_path_hint() {
+        let (home, desktop) = stale_home("utsuwa-edit-full-filename-hint");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "before").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "path": target,
+                "filename": target,
+                "old_text": "before",
+                "new_text": "after",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "after");
         std::fs::remove_dir_all(&home).unwrap();
     }
 
