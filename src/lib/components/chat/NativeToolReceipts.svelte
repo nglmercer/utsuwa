@@ -52,8 +52,21 @@
 		return step.status === 'denied' ? 'denied' : 'failed';
 	}
 
+	function isRetry(step: NativeToolStep): boolean {
+		return step.status === 'retry';
+	}
+
 	function failureMessage(step: NativeToolStep): string {
-		return (step.error ?? 'Native operation failed').replace(/^tool [^:]+ failed:\s*/i, '');
+		const raw = (step.error ?? 'Native operation failed').replace(/^tool [^:]+ failed:\s*/i, '');
+		if (step.status === 'retry') {
+			try {
+				const parsed = JSON.parse(raw) as { message?: unknown };
+				if (typeof parsed.message === 'string') return parsed.message;
+			} catch {
+				// Older/native-compatible retry messages remain displayable as text.
+			}
+		}
+		return raw;
 	}
 
 	function failedSteps(): NativeToolStep[] {
@@ -65,6 +78,8 @@
 	<div class="native-tool-receipts" class:floating aria-label="Native tool results">
 		{#if summarizeNativeToolSteps(steps) === 'recovered'}
 			<div class="native-tool-recovered" role="status">✓ Completed after retry</div>
+		{:else if summarizeNativeToolSteps(steps) === 'retry'}
+			<div class="native-tool-retry" role="status">↻ Edit needs more information</div>
 		{:else if summarizeNativeToolSteps(steps) === 'failed'}
 			<div class="native-tool-warning" role="alert">⚠ Native operation failed</div>
 		{/if}
@@ -78,12 +93,19 @@
 			{/each}
 			{#if failedSteps().length > 0}
 				<details class="native-tool-details">
-					<summary>Earlier failed attempts ({failedSteps().length})</summary>
+					<summary>Earlier attempts ({failedSteps().length})</summary>
 					{#each failedSteps() as step, index (`failure-${step.id}-${index}`)}
-						<div class="native-tool-receipt failure">
-							<span>✗ {step.name} {failureLabel(step)}</span>
-							<small>{failureMessage(step)}</small>
-						</div>
+						{#if isRetry(step)}
+							<div class="native-tool-receipt retry">
+								<span>↻ Edit needs more information</span>
+								<small>{failureMessage(step)}</small>
+							</div>
+						{:else}
+							<div class="native-tool-receipt failure">
+								<span>✗ {step.name} {failureLabel(step)}</span>
+								<small>{failureMessage(step)}</small>
+							</div>
+						{/if}
 					{/each}
 				</details>
 			{/if}
@@ -94,6 +116,11 @@
 					<div class="native-tool-receipt success">
 						<span>✓ {successLabel(step)}</span>
 						{#if path}<code>{path}</code>{/if}
+					</div>
+				{:else if isRetry(step)}
+					<div class="native-tool-receipt retry">
+						<span>↻ Edit needs more information</span>
+						<small>{failureMessage(step)}</small>
 					</div>
 				{:else}
 					<div class="native-tool-receipt failure">
@@ -140,6 +167,14 @@
 		font-weight: 700;
 	}
 
+	.native-tool-retry {
+		padding: 0.4rem 0.55rem;
+		border-radius: var(--radius-md);
+		background: color-mix(in srgb, #f59e0b, transparent 90%);
+		color: #b45309;
+		font-weight: 600;
+	}
+
 	.native-tool-details {
 		margin-top: 0.1rem;
 		color: var(--text-secondary);
@@ -172,6 +207,16 @@
 
 	.native-tool-receipt.failure > span {
 		color: #b91c1c;
+		font-weight: 600;
+	}
+
+	.native-tool-receipt.retry {
+		border-left-color: #f59e0b;
+		color: var(--text-secondary);
+	}
+
+	.native-tool-receipt.retry > span {
+		color: #b45309;
 		font-weight: 600;
 	}
 

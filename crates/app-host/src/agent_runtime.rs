@@ -1211,6 +1211,9 @@ fn host_environment_context_for(
     } else {
         "disabled; normal Utsuwa permission policy applies"
     };
+    let local_now = chrono::Local::now();
+    let current_local_date = local_now.format("%Y-%m-%d").to_string();
+    let current_local_datetime = local_now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let mut lines = vec![
         "<host_environment>".to_string(),
@@ -1230,6 +1233,8 @@ fn host_environment_context_for(
     }
     lines.extend([
         format!("Current working directory: {cwd_text}"),
+        format!("Current local date: {current_local_date}"),
+        format!("Current local datetime: {current_local_datetime}"),
         format!("Path separator: {}", environment.path_separator),
         format!("Path style: {}", environment.path_style),
         "Filesystem tools require absolute host-native paths.".to_string(),
@@ -1249,7 +1254,7 @@ fn host_environment_context_for(
             .to_string(),
         "You can create, read, overwrite, and edit files using the native filesystem tools."
             .to_string(),
-        "To edit an existing file, use filesystem.edit: pass location and filename for a file in Desktop/Documents/etc., or path for a file at an explicit absolute path; a unique existing filename may be resolved to its configured user directory when location is omitted. Never combine target styles unless both values identify the same file. For a date edit, follow this exact order: call system.time, call filesystem.read for the resolved file, then call filesystem.edit with the exact old_text copied from the read result and the actual new_text date from system.time. Never guess old_text, omit either edit field, or use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement."
+        "To edit an existing file, use filesystem.edit: pass location and filename for a file in Desktop/Documents/etc., or path for an explicit absolute path; a unique existing filename may be resolved to its configured user directory when location is omitted. Never combine target styles unless both values identify the same file. The host preserves valid target, old_text, and new_text values across same-turn retries. For a UTF-8 file with exactly one non-empty line, the host can infer old_text when new_text is present; for multi-line files, call filesystem.read and use the exact old_text. For basic date/time replacements, new_text_source may be current_date, current_time, or current_datetime. Use system.time when exact fresh clock or timezone details are needed. Never use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement."
             .to_string(),
         "For whole-file replacement in Desktop/Documents/etc. use filesystem.replace_user_file; to add text at the end use filesystem.append_user_file, or filesystem.append_file for an explicit absolute path."
             .to_string(),
@@ -1862,7 +1867,9 @@ mod tests {
             "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file"
         ));
         assert!(context.contains("use filesystem.edit:"));
-        assert!(context.contains("For a date edit, follow this exact order: call system.time"));
+        assert!(context.contains("Current local date:"));
+        assert!(context.contains("Current local datetime:"));
+        assert!(context.contains("new_text_source may be current_date"));
         assert!(context.contains("use a placeholder such as 'Updated date'"));
         assert!(context.contains("A failed edit attempt does not mean editing is unsupported"));
         assert!(context.contains(

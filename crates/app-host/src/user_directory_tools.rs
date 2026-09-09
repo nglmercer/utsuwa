@@ -724,12 +724,27 @@ impl Tool for CreateUserFileTool {
 /// One validated edit target inside an OS-configured user directory: the
 /// semantic directory, its resolved host path, the relative filename, and
 /// the exact absolute target the broker will mutate.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedEditTarget {
     directory: UserDirectory,
     resolved_directory: PathBuf,
     relative_path: PathBuf,
     path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct PendingEditState {
+    target: ResolvedEditTarget,
+    old_text: Option<String>,
+    new_text: Option<String>,
+}
+
+struct MergedEditArgs {
+    args: serde_json::Value,
+    target: Option<ResolvedEditTarget>,
+    explicit_target: bool,
+    supplied_old_text: Option<String>,
+    supplied_new_text: Option<String>,
 }
 
 fn required_string_field(
@@ -1030,24 +1045,27 @@ pub(crate) fn normalize_special_user_path(
     Ok(unchanged_special_path(path))
 }
 
-/// Append read-then-retry guidance when an edit fails only because the old
-/// text was not found. A wrong text match must never read as missing
-/// editing capability, and must never detour into creating another file.
+/// Convert an exact-match argument failure into structured retry guidance.
+/// A wrong text match must never read as missing editing capability, and must
+/// never detour into creating another file.
 fn with_read_retry_guidance(path: &Path, error: ToolError) -> ToolError {
     let ToolError::Failed { tool, message } = error else {
         return error;
     };
-    // Couples to PatchTool's exact diagnostic below; the match is
-    // deliberately narrow so only the not-found case is reworded.
-    if !message.contains("occurs 0 times") {
+    // Couples to PatchTool's exact diagnostic below; an exact-match count
+    // other than one is still a model-argument recovery problem, not a
+    // native mutation failure.
+    if !message.contains("replacement block occurs") {
         return ToolError::Failed { tool, message };
     }
-    ToolError::Failed {
+    ToolError::RetryRequired {
         tool,
-        message: format!(
-            "{message}\nRead the exact current contents with filesystem.read first (next_tool: filesystem.read, path: '{}'), then retry the edit with the exact old text. A failed edit attempt does not mean editing is unsupported. Do not offer to create a replacement file unless the user actually asks for a new file.",
-            path.display(),
-        ),
+        message: "Edit needs more information: old_text did not match exactly once".to_string(),
+        recovery: serde_json::json!({
+            "error": "old_text_mismatch",
+            "target": path.to_string_lossy(),
+            "next_tool": "filesystem.read",
+        }),
     }
 }
 
@@ -1055,14 +1073,14 @@ fn path_only_args(path: &Path) -> serde_json::Value {
     serde_json::json!({ "path": path.to_string_lossy() })
 }
 
-/// Return the exact text when an edit target is a small single-line file.
-/// This gives a weak model a safe retry hint without exposing multi-line file
-/// contents through an argument-validation error.
-fn single_line_edit_hint(path: &Path) -> Option<String> {
+/// Return the exact existing line only when the target is a UTF-8 file with
+/// one non-empty line. The caller uses this internally for a safe edit; the
+/// contents are never placed in a generic validation diagnostic.
+fn single_line_edit_text(path: &Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
-    let mut lines = content.lines();
-    let line = lines.next()?;
-    if line.is_empty() || lines.next().is_some() || line.len() > 1024 {
+    let mut non_empty = content.lines().filter(|line| !line.is_empty());
+    let line = non_empty.next()?;
+    if non_empty.next().is_some() {
         return None;
     }
     Some(line.to_string())
@@ -1077,15 +1095,11 @@ fn parse_old_new(
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
     let old_text = required_string_field(object, tool, "old_text").map_err(|_| {
-        let single_line_hint = single_line_edit_hint(resolved_path)
-            .map(|line| format!(" The file is one line; use old_text={line:?}."))
-            .unwrap_or_default();
         invalid_args(
             tool,
             format!(
-                "missing 'old_text': first call filesystem.read with path '{}', copy one exact current line, then retry filesystem.edit with both old_text and new_text. Do not guess old_text or use a placeholder such as 'Updated date'; a single unique line is enough, the whole file is not needed.{}",
-                resolved_path.display(),
-                single_line_hint
+                "missing 'old_text': read '{}' with filesystem.read, then retry with the exact text. Do not guess or use a placeholder such as 'Updated date'.",
+                resolved_path.display()
             ),
         )
     })?;
@@ -1114,6 +1128,159 @@ fn parse_old_new(
         ));
     }
     Ok((old_text, new_text))
+}
+
+fn optional_edit_text(
+    object: &Map<String, Value>,
+    tool: &str,
+    field: &str,
+) -> Result<Option<String>, ToolError> {
+    let Some(value) = object.get(field) else {
+        return Ok(None);
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| invalid_args(tool, format!("'{field}' must be a string when provided")))?;
+    Ok(Some(text.to_string()))
+}
+
+fn supplied_edit_texts(
+    args: &serde_json::Value,
+    tool: &str,
+) -> Result<(Option<String>, Option<String>), ToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
+    let old_text = optional_edit_text(object, tool, "old_text")?;
+    if old_text.as_deref().is_some_and(str::is_empty) {
+        return Err(invalid_args(tool, "'old_text' must not be empty"));
+    }
+    let new_text = optional_edit_text(object, tool, "new_text")?;
+    if new_text
+        .as_deref()
+        .is_some_and(|text| text.trim().eq_ignore_ascii_case("updated date"))
+    {
+        return Err(invalid_args(
+            tool,
+            "'new_text' is a placeholder; use the host's current date or another concrete replacement",
+        ));
+    }
+    Ok((old_text, new_text))
+}
+
+fn resolve_new_text_source(
+    args: &serde_json::Value,
+    tool: &str,
+) -> Result<serde_json::Value, ToolError> {
+    let Some(object) = args.as_object() else {
+        return Ok(args.clone());
+    };
+    let Some(source) = object.get("new_text_source") else {
+        return Ok(args.clone());
+    };
+    let source = source
+        .as_str()
+        .ok_or_else(|| invalid_args(tool, "'new_text_source' must be a string when provided"))?;
+    let local = chrono::Local::now();
+    let new_text = match source {
+        "current_date" => local.format("%Y-%m-%d").to_string(),
+        "current_time" => local.format("%H:%M:%S").to_string(),
+        "current_datetime" => local.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        _ => {
+            return Err(invalid_args(
+                tool,
+                "'new_text_source' must be one of: current_date, current_time, current_datetime",
+            ));
+        }
+    };
+    let mut normalized = object.clone();
+    normalized.remove("new_text_source");
+    normalized.insert("new_text".to_string(), Value::String(new_text));
+    Ok(Value::Object(normalized))
+}
+
+fn missing_edit_argument(path: &Path, missing: Vec<&str>, preserved: Vec<&str>) -> ToolError {
+    let mut recovery = serde_json::Map::new();
+    recovery.insert(
+        "error".to_string(),
+        Value::String(if missing.len() == 1 && missing[0] == "old_text" {
+            "old_text_required".to_string()
+        } else {
+            "missing_edit_argument".to_string()
+        }),
+    );
+    recovery.insert(
+        "missing".to_string(),
+        Value::Array(
+            missing
+                .iter()
+                .map(|field| Value::String((*field).to_string()))
+                .collect(),
+        ),
+    );
+    recovery.insert(
+        "target".to_string(),
+        Value::String(path.to_string_lossy().into_owned()),
+    );
+    recovery.insert(
+        "preserved".to_string(),
+        Value::Array(
+            preserved
+                .iter()
+                .map(|field| Value::String((*field).to_string()))
+                .collect(),
+        ),
+    );
+    if missing.contains(&"old_text") {
+        recovery.insert(
+            "next_tool".to_string(),
+            Value::String("filesystem.read".to_string()),
+        );
+    }
+    let message = if missing.len() == 1 && missing[0] == "old_text" {
+        "Edit needs more information: provide old_text or read the target file"
+    } else if missing.len() == 1 && missing[0] == "new_text" {
+        "Edit needs more information: provide new_text"
+    } else {
+        "Edit needs more information: provide old_text and new_text"
+    };
+    ToolError::RetryRequired {
+        tool: EDIT_TOOL.to_string(),
+        message: message.to_string(),
+        recovery: Value::Object(recovery),
+    }
+}
+
+/// Validate the unified edit arguments after pending values have been merged.
+/// A single-line target is safe to infer; arbitrary multi-line files are not.
+fn parse_unified_old_new(
+    args: &serde_json::Value,
+    resolved_path: &Path,
+) -> Result<(String, String), ToolError> {
+    let (mut old_text, new_text) = supplied_edit_texts(args, EDIT_TOOL)?;
+    if old_text.is_none() && new_text.is_some() {
+        old_text = single_line_edit_text(resolved_path);
+    }
+    let missing_old = old_text.is_none();
+    let missing_new = new_text.is_none();
+    if missing_old || missing_new {
+        let mut missing = Vec::new();
+        if missing_old {
+            missing.push("old_text");
+        }
+        if missing_new {
+            missing.push("new_text");
+        }
+        let mut preserved = Vec::new();
+        if old_text.is_some() {
+            preserved.push("old_text");
+        }
+        if new_text.is_some() {
+            preserved.push("new_text");
+        }
+        return Err(missing_edit_argument(resolved_path, missing, preserved));
+    }
+    Ok((old_text.unwrap_or_default(), new_text.unwrap_or_default()))
 }
 
 fn tag_user_file_output(
@@ -1833,7 +2000,7 @@ fn edit_target_style(args: &serde_json::Value, tool: &str) -> Result<EditTargetS
 pub(crate) struct EditTool {
     user_file: EditUserFileTool,
     file: EditFileTool,
-    retry_target: Arc<Mutex<Option<ResolvedEditTarget>>>,
+    pending_edit: Arc<Mutex<Option<PendingEditState>>>,
 }
 
 impl EditTool {
@@ -1844,54 +2011,142 @@ impl EditTool {
         Self {
             user_file: EditUserFileTool::new(limits.clone(), environment.clone()),
             file: EditFileTool::new(limits, environment),
-            retry_target: Arc::new(Mutex::new(None)),
+            pending_edit: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Reuse a target only for a target-less retry in this same tool instance.
-    /// The registry is created per agent turn, so this cannot carry a file
-    /// target into a later user request.
-    fn retry_args(&self, args: &serde_json::Value) -> serde_json::Value {
-        let Some(object) = args.as_object() else {
-            return args.clone();
-        };
-        let has_target = object.contains_key("location")
+    fn pending_snapshot(&self) -> Option<PendingEditState> {
+        self.pending_edit
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn merged_args(&self, args: &serde_json::Value) -> Result<MergedEditArgs, ToolError> {
+        let source_args = resolve_new_text_source(args, EDIT_TOOL)?;
+        let supplied = supplied_edit_texts(&source_args, EDIT_TOOL)?;
+        let pending = self.pending_snapshot();
+        let object = source_args
+            .as_object()
+            .ok_or_else(|| invalid_args(EDIT_TOOL, "args must be a JSON object"))?;
+        let has_semantic_target = object.contains_key("location")
             || object.contains_key("directory_id")
             || object.contains_key("directory")
-            || object.contains_key("filename")
-            || object.contains_key("path");
-        if has_target {
-            return args.clone();
+            || object.contains_key("filename");
+        let mut merged = object.clone();
+        let target = if has_semantic_target {
+            Some(resolve_edit_target(
+                &source_args,
+                &self.user_file.environment,
+                EDIT_TOOL,
+            )?)
+        } else if !object.contains_key("path") {
+            let Some(pending) = pending.as_ref() else {
+                return Ok(MergedEditArgs {
+                    args: source_args,
+                    target: None,
+                    explicit_target: false,
+                    supplied_old_text: supplied.0,
+                    supplied_new_text: supplied.1,
+                });
+            };
+            merged.insert(
+                "location".to_string(),
+                Value::String(pending.target.directory.json_key().to_string()),
+            );
+            merged.insert(
+                "filename".to_string(),
+                Value::String(pending.target.relative_path.to_string_lossy().into_owned()),
+            );
+            Some(pending.target.clone())
+        } else {
+            None
+        };
+
+        let same_target = target
+            .as_ref()
+            .zip(pending.as_ref())
+            .is_some_and(|(target, pending)| target == &pending.target);
+        if same_target {
+            if !merged.contains_key("old_text") {
+                if let Some(old_text) = pending.as_ref().and_then(|state| state.old_text.clone()) {
+                    merged.insert("old_text".to_string(), Value::String(old_text));
+                }
+            }
+            if !merged.contains_key("new_text") {
+                if let Some(new_text) = pending.as_ref().and_then(|state| state.new_text.clone()) {
+                    merged.insert("new_text".to_string(), Value::String(new_text));
+                }
+            }
         }
-        let Ok(guard) = self.retry_target.lock() else {
-            return args.clone();
-        };
-        let Some(target) = guard.as_ref() else {
-            return args.clone();
-        };
-        let mut retry = object.clone();
-        retry.insert(
-            "location".to_string(),
-            Value::String(target.directory.json_key().to_string()),
-        );
-        retry.insert(
-            "filename".to_string(),
-            Value::String(target.relative_path.to_string_lossy().into_owned()),
-        );
-        Value::Object(retry)
+
+        Ok(MergedEditArgs {
+            args: Value::Object(merged),
+            target,
+            explicit_target: has_semantic_target || object.contains_key("path"),
+            supplied_old_text: supplied.0,
+            supplied_new_text: supplied.1,
+        })
     }
 
-    fn remember_retry_target(&self, target: Option<ResolvedEditTarget>) {
+    fn remember_edit_attempt(
+        &self,
+        target: Option<ResolvedEditTarget>,
+        supplied_old_text: Option<String>,
+        supplied_new_text: Option<String>,
+    ) {
         if let Some(target) = target {
-            if let Ok(mut guard) = self.retry_target.lock() {
-                *guard = Some(target);
+            if let Ok(mut guard) = self.pending_edit.lock() {
+                if guard
+                    .as_ref()
+                    .is_some_and(|pending| pending.target == target)
+                {
+                    if let Some(pending) = guard.as_mut() {
+                        if supplied_old_text.is_some() {
+                            pending.old_text = supplied_old_text;
+                        }
+                        if supplied_new_text.is_some() {
+                            pending.new_text = supplied_new_text;
+                        }
+                    }
+                } else {
+                    *guard = Some(PendingEditState {
+                        target,
+                        old_text: supplied_old_text,
+                        new_text: supplied_new_text,
+                    });
+                }
             }
         }
     }
 
-    fn clear_retry_target(&self) {
-        if let Ok(mut guard) = self.retry_target.lock() {
+    fn clear_pending_edit(&self) {
+        if let Ok(mut guard) = self.pending_edit.lock() {
             *guard = None;
+        }
+    }
+
+    fn discard_if_explicit_target_changed(&self, merged: &MergedEditArgs) {
+        if !merged.explicit_target {
+            return;
+        }
+        if let Ok(mut guard) = self.pending_edit.lock() {
+            let same_target = merged
+                .target
+                .as_ref()
+                .zip(guard.as_ref())
+                .is_some_and(|(target, pending)| target == &pending.target);
+            if !same_target {
+                *guard = None;
+            }
+        }
+    }
+
+    fn keep_pending_after_error(error: &ToolError) -> bool {
+        match error {
+            ToolError::RetryRequired { .. } => true,
+            ToolError::Failed { message, .. } => message.contains("replacement block occurs"),
+            _ => false,
         }
     }
 }
@@ -1901,7 +2156,7 @@ impl Tool for EditTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(EDIT_TOOL),
-            description: "Edit one exact text block inside an existing file. For a file in Desktop/Documents/etc., pass location (desktop, documents, downloads, pictures, music, videos, public_share, or templates) and filename (note.txt); if filename is omitted, a unique existing direct file in that location is inferred. If location is omitted, a unique existing filename is resolved against the host's configured user directories. For a file at an explicit absolute path, pass path instead. For compatibility, a relative path is treated as a filename only when it uniquely identifies an existing configured user-directory file. Prefer one target style; if both are supplied, they must identify the same file. After a validation error, a same-turn retry may reuse the previously resolved target when it supplies old_text and new_text. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
+            description: "Edit one exact text block inside an existing file. Use location plus filename for Desktop/Documents/etc., or path for an explicit absolute path. Target, old_text, and new_text may be completed across same-turn retries; the host preserves valid pending values. A UTF-8 file with exactly one non-empty line can be edited without first reading it. For date/time replacements, new_text_source may be current_date, current_time, or current_datetime. Exact-match safety, capability tickets, symlink checks, and atomic mutation remain enforced by the filesystem broker.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1926,18 +2181,30 @@ impl Tool for EditTool {
                     "new_text": {
                         "type": "string",
                         "description": "Replacement text."
+                    },
+                    "new_text_source": {
+                        "type": "string",
+                        "enum": ["current_date", "current_time", "current_datetime"],
+                        "description": "Resolve replacement text from the native local clock. Use instead of new_text for basic date/time edits."
                     }
-                },
-                "required": ["old_text", "new_text"]
+                }
             }),
             effects: vec![tool_core::ToolEffect::FilesystemWrite],
         }
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let args = self.retry_args(args);
+        let merged = match self.merged_args(args) {
+            Ok(merged) => merged,
+            Err(_) => {
+                self.clear_pending_edit();
+                return None;
+            }
+        };
+        self.discard_if_explicit_target_changed(&merged);
         let normalized =
-            normalize_unified_edit_args(&args, &self.user_file.environment, EDIT_TOOL).ok()?;
+            normalize_unified_edit_args(&merged.args, &self.user_file.environment, EDIT_TOOL)
+                .ok()?;
         match edit_target_style(&normalized, EDIT_TOOL).ok()? {
             EditTargetStyle::UserFile => self.user_file.required_capability(&normalized),
             EditTargetStyle::ExplicitPath => self.file.required_capability(&normalized),
@@ -1949,31 +2216,87 @@ impl Tool for EditTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let args = self.retry_args(&args);
+        let merged = match self.merged_args(&args) {
+            Ok(merged) => merged,
+            Err(error) => {
+                self.clear_pending_edit();
+                return Err(error);
+            }
+        };
         let normalized =
-            normalize_unified_edit_args(&args, &self.user_file.environment, EDIT_TOOL)?;
-        match edit_target_style(&normalized, EDIT_TOOL)? {
+            match normalize_unified_edit_args(&merged.args, &self.user_file.environment, EDIT_TOOL)
+            {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    self.clear_pending_edit();
+                    return Err(error);
+                }
+            };
+        let style = match edit_target_style(&normalized, EDIT_TOOL) {
+            Ok(style) => style,
+            Err(error) => {
+                self.clear_pending_edit();
+                return Err(error);
+            }
+        };
+        match style {
             EditTargetStyle::UserFile => {
-                let target =
-                    resolve_edit_target(&normalized, &self.user_file.environment, EDIT_TOOL).ok();
-                match self.user_file.invoke(ctx, normalized).await {
+                let target = match resolve_edit_target(
+                    &normalized,
+                    &self.user_file.environment,
+                    EDIT_TOOL,
+                ) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        self.clear_pending_edit();
+                        return Err(error);
+                    }
+                };
+                self.remember_edit_attempt(
+                    Some(target.clone()),
+                    merged.supplied_old_text,
+                    merged.supplied_new_text,
+                );
+                let (old_text, new_text) = match parse_unified_old_new(&normalized, &target.path) {
+                    Ok(values) => values,
+                    Err(error) => return Err(error),
+                };
+                let mut delegated = normalized;
+                if let Some(object) = delegated.as_object_mut() {
+                    object.insert("old_text".to_string(), Value::String(old_text));
+                    object.insert("new_text".to_string(), Value::String(new_text));
+                }
+                match self.user_file.invoke(ctx, delegated).await {
                     Ok(output) => {
-                        self.clear_retry_target();
+                        self.clear_pending_edit();
                         Ok(output)
                     }
                     Err(error) => {
-                        self.remember_retry_target(target);
+                        if !Self::keep_pending_after_error(&error) {
+                            self.clear_pending_edit();
+                        }
                         Err(error)
                     }
                 }
             }
             EditTargetStyle::ExplicitPath => {
-                self.clear_retry_target();
-                let result = self.file.invoke(ctx, normalized).await;
-                if result.is_ok() {
-                    self.clear_retry_target();
+                self.clear_pending_edit();
+                let target = match resolve_edit_file_path(
+                    &normalized,
+                    &self.file.environment,
+                    EDIT_FILE_TOOL,
+                    EDIT_USER_FILE_TOOL,
+                ) {
+                    Ok(target) => target,
+                    Err(error) => return Err(error),
+                };
+                let (old_text, new_text) = parse_unified_old_new(&normalized, &target.path)?;
+                let mut delegated = normalized;
+                if let Some(object) = delegated.as_object_mut() {
+                    object.insert("old_text".to_string(), Value::String(old_text));
+                    object.insert("new_text".to_string(), Value::String(new_text));
                 }
-                result
+                self.file.invoke(ctx, delegated).await
             }
         }
     }
@@ -2526,8 +2849,12 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(missing, ToolError::Failed { .. }), "{missing:?}");
-        assert!(missing.to_string().contains("0 times"));
+        assert!(
+            matches!(missing, ToolError::RetryRequired { .. }),
+            "{missing:?}"
+        );
+        assert!(missing.to_string().contains("old_text_mismatch"));
+        assert!(missing.to_string().contains("filesystem.read"));
         let ambiguous = tool
             .invoke(
                 ticketed_context(&target),
@@ -2541,10 +2868,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(ambiguous, ToolError::Failed { .. }),
+            matches!(ambiguous, ToolError::RetryRequired { .. }),
             "{ambiguous:?}"
         );
-        assert!(ambiguous.to_string().contains("2 times"));
+        assert!(ambiguous.to_string().contains("old_text_mismatch"));
         let placeholder = tool
             .invoke(
                 ticketed_context(&target),
@@ -2887,14 +3214,13 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, ToolError::Failed { .. }), "{error:?}");
-        let message = error.to_string();
-        assert!(message.contains("occurs 0 times"), "{message}");
-        assert!(message.contains("filesystem.read"), "{message}");
         assert!(
-            message.contains("Do not offer to create a replacement file"),
-            "{message}"
+            matches!(error, ToolError::RetryRequired { .. }),
+            "{error:?}"
         );
+        let message = error.to_string();
+        assert!(message.contains("old_text_mismatch"), "{message}");
+        assert!(message.contains("filesystem.read"), "{message}");
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "exact current contents"
@@ -2933,7 +3259,7 @@ mod tests {
             "{missing:?}"
         );
         assert!(missing.to_string().contains("filesystem.read"));
-        assert!(missing.to_string().contains("exact current contents"));
+        assert!(!missing.to_string().contains("exact current contents"));
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "exact current contents"
@@ -3192,6 +3518,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unified_edit_infers_the_only_non_empty_line_without_reading() {
+        let (home, desktop) = stale_home("utsuwa-edit-single-line-inference");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "2026-09-08\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let schema = tool.metadata().input_schema;
+        assert!(schema.get("required").is_none());
+        assert_eq!(
+            schema["properties"]["new_text_source"]["enum"],
+            serde_json::json!(["current_date", "current_time", "current_datetime"])
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "new_text": "2026-09-09",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["updated"], true);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "2026-09-09\n");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_merges_new_text_across_a_multiline_retry() {
+        let (home, desktop) = stale_home("utsuwa-edit-merge-new");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "Version 1\nDetails\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let first = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "new_text": "Version 2",
+                }),
+            )
+            .await
+            .unwrap_err();
+        match &first {
+            ToolError::RetryRequired { recovery, .. } => {
+                assert_eq!(recovery["error"], "old_text_required");
+                assert_eq!(recovery["preserved"], serde_json::json!(["new_text"]));
+                assert_eq!(recovery["next_tool"], "filesystem.read");
+            }
+            other => panic!("expected structured retry, got {other:?}"),
+        }
+        assert!(!first.to_string().contains("Version 1"));
+
+        let retry = serde_json::json!({ "old_text": "Version 1" });
+        let requirement = tool
+            .required_capability(&retry)
+            .expect("pending target must authorize the retry");
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(target.canonicalize().unwrap_or(target.clone()))
+        );
+        tool.invoke(ticketed_context(&target), retry).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "Version 2\nDetails\n"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_preserves_old_text_for_a_reverse_partial_retry() {
+        let (home, desktop) = stale_home("utsuwa-edit-merge-old");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "Version 1\nDetails\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let first = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "old_text": "Version 1",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(first, ToolError::RetryRequired { .. }),
+            "{first:?}"
+        );
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({ "new_text": "Version 2" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "Version 2\nDetails\n"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_resets_pending_values_when_the_target_changes() {
+        let (home, desktop) = stale_home("utsuwa-edit-target-reset");
+        let documents = home.join("Documentos");
+        std::fs::create_dir_all(&documents).unwrap();
+        let note = desktop.join("note.txt");
+        let report = documents.join("report.txt");
+        std::fs::write(&note, "Note 1\nDetails\n").unwrap();
+        std::fs::write(&report, "Report 1\nDetails\n").unwrap();
+        let mut host = environment(&home, &desktop);
+        host.user_dirs.documents = Some(documents.clone());
+        let tool = EditTool::new(tool_filesystem::FilesystemLimits::default(), host);
+
+        let first = tool
+            .invoke(
+                ticketed_context(&note),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "note.txt",
+                    "new_text": "Note 2",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(first, ToolError::RetryRequired { .. }),
+            "{first:?}"
+        );
+
+        let changed_target = tool
+            .invoke(
+                ticketed_context(&report),
+                serde_json::json!({
+                    "location": "documents",
+                    "filename": "report.txt",
+                    "old_text": "Report 1",
+                }),
+            )
+            .await
+            .unwrap_err();
+        match changed_target {
+            ToolError::RetryRequired { recovery, .. } => {
+                assert_eq!(recovery["target"], report.to_string_lossy().as_ref());
+                assert_eq!(recovery["preserved"], serde_json::json!(["old_text"]));
+            }
+            other => panic!("expected report retry, got {other:?}"),
+        }
+
+        tool.invoke(
+            ticketed_context(&report),
+            serde_json::json!({ "new_text": "Report 2" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&note).unwrap(), "Note 1\nDetails\n");
+        assert_eq!(
+            std::fs::read_to_string(&report).unwrap(),
+            "Report 2\nDetails\n"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unified_edit_resolves_new_text_from_the_native_clock() {
+        let (home, desktop) = stale_home("utsuwa-edit-text-source");
+        let target = desktop.join("note.txt");
+        std::fs::write(&target, "Version 1\nDetails\n").unwrap();
+        let tool = EditTool::new(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let expected = chrono::Local::now().format("%Y-%m-%d").to_string();
+        tool.invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "location": "desktop",
+                "filename": "note.txt",
+                "old_text": "Version 1",
+                "new_text_source": "current_date",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            format!("{expected}\nDetails\n")
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
     async fn unified_edit_resolves_a_unique_bare_filename_to_desktop() {
         let (home, desktop) = stale_home("utsuwa-edit-bare-filename");
         let target = desktop.join("note.txt");
@@ -3258,7 +3788,7 @@ mod tests {
     async fn unified_edit_reuses_the_last_target_for_a_targetless_retry() {
         let (home, desktop) = stale_home("utsuwa-edit-targetless-retry");
         let target = desktop.join("note.txt");
-        std::fs::write(&target, "Updated date").unwrap();
+        std::fs::write(&target, "Updated date\nDetails").unwrap();
         let tool = EditTool::new(
             tool_filesystem::FilesystemLimits::default(),
             environment(&home, &desktop),
@@ -3274,7 +3804,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(first, ToolError::InvalidArgs { .. }), "{first:?}");
+        assert!(
+            matches!(first, ToolError::RetryRequired { .. }),
+            "{first:?}"
+        );
 
         let retry_args = serde_json::json!({
             "old_text": "Updated date",
@@ -3292,7 +3825,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "2026-09-09");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "2026-09-09\nDetails"
+        );
         std::fs::remove_dir_all(&home).unwrap();
     }
 

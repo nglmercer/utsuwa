@@ -108,12 +108,42 @@ pub enum ToolError {
     InvalidId(String),
     #[error("invalid arguments for {tool}: {message}")]
     InvalidArgs { tool: String, message: String },
+    /// The tool call is valid enough to retry, but the host needs another
+    /// model argument before it can execute. `recovery` is model-facing
+    /// structured data; `message` remains a short human-readable summary.
+    #[error("retry required for {tool}: {message} ({recovery})")]
+    RetryRequired {
+        tool: String,
+        message: String,
+        recovery: serde_json::Value,
+    },
     #[error("permission denied for {tool}: {reason}")]
     Denied { tool: String, reason: String },
     #[error("tool {tool} failed: {message}")]
     Failed { tool: String, message: String },
     #[error("tool {0} timed out")]
     Timeout(String),
+}
+
+impl ToolError {
+    /// Serialize recoverable validation as a compact JSON object for the
+    /// model-facing tool result. Other errors keep their established text
+    /// form, while callers can still use `Display` for human/audit detail.
+    pub fn model_message(&self) -> String {
+        match self {
+            Self::RetryRequired {
+                message, recovery, ..
+            } => {
+                let mut object = recovery.as_object().cloned().unwrap_or_default();
+                object.insert(
+                    "message".to_string(),
+                    serde_json::Value::String(message.clone()),
+                );
+                serde_json::Value::Object(object).to_string()
+            }
+            other => other.to_string(),
+        }
+    }
 }
 
 /// The OS authority a tool needs for a given call. Returned by
@@ -132,10 +162,7 @@ pub trait Tool: Send + Sync {
     /// Declare the privileged capability this call needs, if any.
     /// Evaluated per-call because the resource often comes from args.
     /// The default (`None`) is for pure tools with no OS effects.
-    fn required_capability(
-        &self,
-        _args: &serde_json::Value,
-    ) -> Option<CapabilityRequirement> {
+    fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
         None
     }
 
@@ -179,8 +206,7 @@ impl ToolRegistry {
     }
 
     pub fn list(&self) -> Vec<ToolMetadata> {
-        let mut out: Vec<ToolMetadata> =
-            self.tools.values().map(|t| t.metadata()).collect();
+        let mut out: Vec<ToolMetadata> = self.tools.values().map(|t| t.metadata()).collect();
         out.sort_by(|a, b| a.id.0.cmp(&b.id.0));
         out
     }
@@ -305,13 +331,17 @@ mod tests {
     async fn unknown_tool_and_bad_args_are_typed_errors() {
         let registry = ToolRegistry::new();
         assert_eq!(
-            registry.invoke("nope.x", ctx(), serde_json::json!({})).await,
+            registry
+                .invoke("nope.x", ctx(), serde_json::json!({}))
+                .await,
             Err(ToolError::NotFound("nope.x".to_string()))
         );
         let mut registry = ToolRegistry::new();
         registry.register(Arc::new(EchoTool)).unwrap();
         assert!(matches!(
-            registry.invoke("system.echo", ctx(), serde_json::json!([1])).await,
+            registry
+                .invoke("system.echo", ctx(), serde_json::json!([1]))
+                .await,
             Err(ToolError::InvalidArgs { .. })
         ));
     }

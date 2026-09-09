@@ -106,6 +106,25 @@ test('native receipt summary keeps an unrecovered failure as failed', () => {
 	assert.equal(summarizeNativeToolSteps(event.done.toolSteps), 'failed');
 });
 
+test('recoverable edit validation is shown as retry-needed, not failed', () => {
+	const event = parseAgentTurnEvent('agent.turn_done', {
+		text: 'I need the current line',
+		tool_steps: [
+			{
+				id: 'edit-1',
+				name: 'filesystem.edit',
+				status: 'retry',
+				ok: false,
+				error: 'Edit needs more information'
+			}
+		]
+	});
+	assert.equal(event?.kind, 'done');
+	if (event?.kind !== 'done') throw new Error('unreachable');
+	assert.equal(event.done.toolSteps[0].status, 'retry');
+	assert.equal(summarizeNativeToolSteps(event.done.toolSteps), 'retry');
+});
+
 test('suspended/failed/cancelled parse; foreign events ignored', () => {
 	const suspended = parseAgentTurnEvent('agent.turn_suspended', {
 		text: 'need approval',

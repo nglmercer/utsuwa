@@ -1,6 +1,6 @@
 import type { NativeToolStep } from './agent';
 
-export type NativeToolReceiptSummary = 'success' | 'recovered' | 'failed';
+export type NativeToolReceiptSummary = 'success' | 'recovered' | 'retry' | 'failed';
 
 /** Tool calls that can be shown as a deterministic native mutation receipt. */
 export function isNativeMutation(name: string): boolean {
@@ -40,13 +40,16 @@ export function isSupersededFailure(steps: NativeToolStep[], index: number): boo
  * family is a recovered turn, while an unrecovered failure remains failed.
  */
 export function summarizeNativeToolSteps(steps: NativeToolStep[]): NativeToolReceiptSummary {
-	const failures = steps
+	const unsuccessful = steps
 		.map((step, index) => ({ step, index }))
 		.filter(({ step }) => !step.ok);
-	if (failures.length === 0) return 'success';
+	if (unsuccessful.length === 0) return 'success';
 
-	const hasRecoveredFailure = failures.some(({ index }) => isSupersededFailure(steps, index));
+	const failures = unsuccessful.filter(({ step }) => step.status !== 'retry');
+	const retries = unsuccessful.filter(({ step }) => step.status === 'retry');
+	const hasRecoveredFailure = unsuccessful.some(({ index }) => isSupersededFailure(steps, index));
 	const hasUnrecoveredFailure = failures.some(({ index }) => !isSupersededFailure(steps, index));
 	if (hasRecoveredFailure && !hasUnrecoveredFailure) return 'recovered';
+	if (retries.length > 0 && !hasUnrecoveredFailure) return 'retry';
 	return 'failed';
 }

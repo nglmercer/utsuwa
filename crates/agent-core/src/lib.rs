@@ -782,6 +782,7 @@ impl Agent {
                 Ok(output)
             }
             Err(err) => {
+                let model_message = err.model_message();
                 let detail = match (authorizer.authorization_mode(), requirement.as_ref()) {
                     (Some(mode), Some(_)) => format!("{}; authorization_mode={mode}", err),
                     _ => err.to_string(),
@@ -805,7 +806,7 @@ impl Agent {
                     ok: false,
                 });
                 Err(PendingOrFailed::Failed {
-                    message: err.to_string(),
+                    message: model_message,
                     status: tool_error_status(&err),
                 })
             }
@@ -845,6 +846,7 @@ pub struct ExecutedTool {
 #[serde(rename_all = "snake_case")]
 pub enum ToolStepStatus {
     Success,
+    Retry,
     Failed,
     Denied,
 }
@@ -853,6 +855,7 @@ impl ToolStepStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
+            Self::Retry => "retry",
             Self::Failed => "failed",
             Self::Denied => "denied",
         }
@@ -930,10 +933,10 @@ fn truncate_json(value: &serde_json::Value, max_bytes: usize) -> String {
 }
 
 fn tool_error_status(error: &tool_core::ToolError) -> ToolStepStatus {
-    if matches!(error, tool_core::ToolError::Denied { .. }) {
-        ToolStepStatus::Denied
-    } else {
-        ToolStepStatus::Failed
+    match error {
+        tool_core::ToolError::RetryRequired { .. } => ToolStepStatus::Retry,
+        tool_core::ToolError::Denied { .. } => ToolStepStatus::Denied,
+        _ => ToolStepStatus::Failed,
     }
 }
 

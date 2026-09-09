@@ -17,7 +17,7 @@ export interface ExecutedStep {
 	output: unknown;
 }
 
-export type NativeToolStepStatus = 'success' | 'failed' | 'denied';
+export type NativeToolStepStatus = 'success' | 'retry' | 'failed' | 'denied';
 
 /** Authoritative native result for every completed tool attempt. */
 export interface NativeToolStep {
@@ -138,7 +138,13 @@ function parseToolSteps(value: unknown, executedValue: unknown): NativeToolStep[
 		if (typeof step.id !== 'string' || typeof step.name !== 'string' || typeof step.ok !== 'boolean') continue;
 		const status = step.status;
 		const parsedStatus: NativeToolStepStatus =
-			status === 'denied' ? 'denied' : status === 'failed' || step.ok === false ? 'failed' : 'success';
+			status === 'denied'
+				? 'denied'
+				: status === 'retry'
+					? 'retry'
+					: status === 'failed' || step.ok === false
+						? 'failed'
+						: 'success';
 		out.push({
 			id: step.id,
 			name: step.name,
