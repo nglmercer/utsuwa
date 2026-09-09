@@ -11,6 +11,7 @@ pub mod agent_runtime;
 pub mod dispatcher;
 pub mod host_environment;
 pub mod protocol;
+mod user_directory_tools;
 pub use winit;
 
 /// Errors surfaced by the host. No panics cross this boundary.

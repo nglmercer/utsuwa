@@ -70,7 +70,7 @@ impl UserDirectory {
         }
     }
 
-    const fn conventional_name(self) -> &'static str {
+    pub const fn conventional_name(self) -> &'static str {
         match self {
             Self::Desktop => "Desktop",
             Self::Documents => "Documents",
@@ -141,6 +141,10 @@ pub struct HostEnvironment {
     pub home: Option<PathBuf>,
     pub cwd: Option<PathBuf>,
     pub user_dirs: UserDirectories,
+    /// The XDG user-directory file that supplied the resolved paths on Linux.
+    /// `None` is expected on non-Linux hosts or when the host has no readable
+    /// XDG configuration.
+    pub xdg_config_source: Option<PathBuf>,
     pub path_style: &'static str,
     pub path_separator: &'static str,
 }
@@ -152,12 +156,20 @@ impl HostEnvironment {
             .as_deref()
             .map(resolve_user_directories)
             .unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        let xdg_config_source = home.as_deref().and_then(|home| {
+            let xdg_config_home = configured_xdg_home();
+            xdg_user_dirs_config_source(home, xdg_config_home.as_deref())
+        });
+        #[cfg(not(target_os = "linux"))]
+        let xdg_config_source = None;
         Self {
             os: std::env::consts::OS,
             architecture: std::env::consts::ARCH,
             home,
             cwd: std::env::current_dir().ok(),
             user_dirs,
+            xdg_config_source,
             path_style: host_path_style(),
             path_separator: host_path_separator(),
         }
@@ -183,6 +195,12 @@ impl HostEnvironment {
             let cwd = Value::String(cwd.to_string_lossy().into_owned());
             value.insert("cwd".to_string(), cwd.clone());
             value.insert("current_working_directory".to_string(), cwd);
+        }
+        if let Some(source) = &self.xdg_config_source {
+            value.insert(
+                "xdg_config_source".to_string(),
+                Value::String(source.to_string_lossy().into_owned()),
+            );
         }
         value.insert(
             "path_separator".to_string(),
@@ -228,18 +246,10 @@ pub fn resolve_linux_user_directories(
     let mut resolved = UserDirectories::default();
 
     for directory in UserDirectory::ALL {
-        let path = configured
-            .get(directory)
-            .map(Path::to_path_buf)
-            .or_else(|| {
-                // The only conventional Linux fallback is Desktop, and it is
-                // accepted only when the directory already exists. For all
-                // other special directories, an absent XDG assignment means
-                // the host does not know the location.
-                (config_contents.is_none() && directory == UserDirectory::Desktop)
-                    .then(|| existing_directory(&home.join(directory.conventional_name())))
-                    .flatten()
-            });
+        // Linux user directories are authoritative only when supplied by the
+        // XDG configuration. An existing ~/Desktop is not evidence: it may be
+        // a stale directory created by an older application version.
+        let path = configured.get(directory).map(Path::to_path_buf);
         resolved.set(directory, path);
     }
     resolved
@@ -253,10 +263,21 @@ pub fn resolve_linux_user_directories_from_config(
     home: &Path,
     xdg_config_home: Option<&Path>,
 ) -> UserDirectories {
-    let contents = xdg_config_home
-        .and_then(|config_home| std::fs::read_to_string(config_home.join("user-dirs.dirs")).ok())
-        .or_else(|| std::fs::read_to_string(home.join(".config/user-dirs.dirs")).ok());
+    let contents = xdg_user_dirs_config_source(home, xdg_config_home)
+        .and_then(|source| std::fs::read_to_string(source).ok());
     resolve_linux_user_directories(home, contents.as_deref())
+}
+
+#[cfg(target_os = "linux")]
+fn xdg_user_dirs_config_source(home: &Path, xdg_config_home: Option<&Path>) -> Option<PathBuf> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(config_home) = xdg_config_home {
+        candidates.push(config_home.join("user-dirs.dirs"));
+    }
+    candidates.push(home.join(".config/user-dirs.dirs"));
+    candidates
+        .into_iter()
+        .find(|path| std::fs::read_to_string(path).is_ok())
 }
 
 /// Parse the XDG user-dirs file and retain only existing directories.
@@ -479,18 +500,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn conventional_desktop_fallback_requires_an_existing_directory() {
-        let home = temp_home("fallback");
+    fn linux_does_not_infer_conventional_desktop_without_xdg_configuration() {
+        let home = temp_home("no-fallback");
+        std::fs::create_dir_all(home.join("Desktop")).unwrap();
         assert!(resolve_linux_user_directories(&home, None)
             .desktop
             .is_none());
-        std::fs::create_dir_all(home.join("Desktop")).unwrap();
-        assert_eq!(
-            resolve_linux_user_directories(&home, None)
-                .desktop
-                .as_deref(),
-            Some(home.join("Desktop").as_path())
-        );
     }
 
     #[cfg(target_os = "linux")]
@@ -527,6 +542,34 @@ mod tests {
 
         let dirs = resolve_linux_user_directories_from_config(&home, Some(&home.join("missing")));
         assert_eq!(dirs.documents.as_deref(), Some(documents.as_path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn config_source_prefers_xdg_config_home_and_falls_back_to_home_config() {
+        let home = temp_home("source");
+        let xdg_config_home = home.join("xdg-config");
+        std::fs::create_dir_all(&xdg_config_home).unwrap();
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::write(
+            xdg_config_home.join("user-dirs.dirs"),
+            "XDG_DESKTOP_DIR=\"$HOME/xdg-desktop\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join(".config/user-dirs.dirs"),
+            "XDG_DESKTOP_DIR=\"$HOME/home-desktop\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            xdg_user_dirs_config_source(&home, Some(&xdg_config_home)),
+            Some(xdg_config_home.join("user-dirs.dirs"))
+        );
+        assert_eq!(
+            xdg_user_dirs_config_source(&home, Some(&home.join("missing"))),
+            Some(home.join(".config/user-dirs.dirs"))
+        );
     }
 
     #[test]

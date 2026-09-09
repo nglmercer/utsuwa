@@ -9,7 +9,7 @@
 	let { steps = [], floating = false }: Props = $props();
 
 	function isNativeMutation(name: string): boolean {
-		return /^(filesystem\.(write|patch|create|delete|move|mkdir)|process\.(spawn|kill)|desktop\.(click|invoke_element|type_text|set_value)|clipboard\.(write|set)|application\.launch|mcp\.|plugin\.)/.test(name);
+		return /^(filesystem\.(write|write_user_file|patch|create|delete|move|mkdir)|process\.(spawn|kill)|desktop\.(click|invoke_element|type_text|set_value)|clipboard\.(write|set)|application\.launch|mcp\.|plugin\.)/.test(name);
 	}
 
 	function shouldShow(step: NativeToolStep): boolean {
@@ -26,7 +26,9 @@
 		const output = typeof step.output === 'object' && step.output !== null
 			? (step.output as Record<string, unknown>)
 			: null;
-		if (step.name === 'filesystem.write') return output?.created === true ? 'Created' : 'Updated';
+		if (step.name === 'filesystem.write' || step.name === 'filesystem.write_user_file') {
+			return output?.created === true ? 'Created' : 'Updated';
+		}
 		if (step.name === 'filesystem.patch') return 'Updated';
 		if (step.name === 'process.spawn') return 'Started process';
 		if (step.name === 'process.kill') return 'Stopped process';
