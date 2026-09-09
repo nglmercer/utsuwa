@@ -51,6 +51,14 @@ impl FileRef {
         Ok(Self(format!("file:path:{}", path.to_string_lossy())))
     }
 
+    /// Stable identity for a configured user directory itself, used to
+    /// list it. The trailing empty segment is intentional: `semantic_parts`
+    /// splits `desktop:` into `("desktop", "")`, which
+    /// [`FileResolver::resolve_target`] reads as the directory root.
+    pub fn from_directory(directory: UserDirectory) -> Self {
+        Self(format!("file:{}:", directory.json_key()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -78,8 +86,11 @@ impl FileRef {
         };
         let directory =
             UserDirectory::from_json_key(directory).ok_or_else(|| invalid_ref(self.as_str()))?;
+        // An empty segment names the directory itself (`file:desktop:`);
+        // `resolve_target` reads it as the root, file operations keep
+        // rejecting it downstream.
         if relative.is_empty() {
-            return Err(invalid_ref(self.as_str()));
+            return Ok((directory, PathBuf::new()));
         }
         let relative = PathBuf::from(relative.replace('/', std::path::MAIN_SEPARATOR_STR));
         let relative = normalize_relative_path(&relative)?;
@@ -226,6 +237,19 @@ pub fn validate_relative_path(path: &Path) -> Result<(), FileTargetError> {
     Ok(())
 }
 
+/// True when a relative path carries no file name (empty, `.`, `/`),
+/// i.e. the caller means the directory root rather than a file inside it.
+/// [`normalize_relative_path`] still rejects these for file operations;
+/// [`FileResolver::resolve_target`] accepts them for reads.
+fn is_directory_root_request(path: &Path) -> bool {
+    path.components().all(|component| {
+        matches!(
+            component,
+            Component::CurDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
 pub fn normalize_relative_path(path: &Path) -> Result<PathBuf, FileTargetError> {
     validate_relative_path(path)?;
     let mut normalized = PathBuf::new();
@@ -267,7 +291,20 @@ impl FileResolver {
         target: &FileTarget,
         purpose: TargetPurpose,
     ) -> Result<ResolvedFileTarget, FileTargetError> {
-        let relative_path = normalize_relative_path(&target.relative_path)?;
+        let relative_path = match normalize_relative_path(&target.relative_path) {
+            Ok(relative_path) => Some(relative_path),
+            Err(error) if is_directory_root_request(&target.relative_path) => {
+                // `{"directory": "desktop", "relative_path": ""}` (or ".")
+                // names the directory itself for listings. Only reads accept
+                // this: creation keeps the strict error so a missing filename
+                // can never resolve to its parent directory.
+                if !matches!(purpose, TargetPurpose::Existing) {
+                    return Err(error);
+                }
+                None
+            }
+            Err(error) => return Err(error),
+        };
         let root = self
             .environment
             .user_dirs
@@ -284,6 +321,26 @@ impl FileResolver {
                 )
             })?;
         let root = canonical_root(root)?;
+        let Some(relative_path) = relative_path else {
+            if !root.is_dir() {
+                return Err(FileTargetError::new(
+                    FilesystemErrorCode::DirectoryUnavailable,
+                    format!(
+                        "{} directory is not available on this host",
+                        target.directory.json_key()
+                    ),
+                    Some(target.directory.json_key().to_string()),
+                    true,
+                ));
+            }
+            return Ok(ResolvedFileTarget {
+                file_ref: FileRef::from_directory(target.directory),
+                directory: Some(target.directory),
+                relative_path: None,
+                display_path: root.to_string_lossy().into_owned(),
+                absolute_path: root,
+            });
+        };
         let lexical = root.join(&relative_path);
         let absolute = validate_target(&root, &lexical, purpose)?;
         let file_ref = FileRef::from_target(&FileTarget {
@@ -326,12 +383,22 @@ impl FileResolver {
         }
         let path = file_ref.absolute_path()?;
         let absolute = if matches!(purpose, TargetPurpose::Existing) {
-            canonical_existing(&path).map_err(|mut error| {
-                error.code = FilesystemErrorCode::StaleFileRef;
-                error.message = "file_ref no longer resolves to an existing file".to_string();
-                error.retryable = false;
-                error
-            })?
+            match canonical_existing(&path) {
+                Ok(absolute) => absolute,
+                // A compatibility reference to a directory (issued by a
+                // listing tag) resolves to a directory descriptor instead
+                // of going stale: the broker still authorizes the path,
+                // and file tools reject directories at their own layer.
+                Err(error) if error.code == FilesystemErrorCode::TargetIsDirectory => {
+                    return self.descriptor_for_directory(&path);
+                }
+                Err(mut error) => {
+                    error.code = FilesystemErrorCode::StaleFileRef;
+                    error.message = "file_ref no longer resolves to an existing file".to_string();
+                    error.retryable = false;
+                    return Err(error);
+                }
+            }
         } else {
             canonical_creation(&path)?
         };
@@ -412,6 +479,81 @@ impl FileResolver {
             TargetPurpose::Existing => canonical_existing(path)?,
             TargetPurpose::Create => canonical_creation(path)?,
         };
+        Ok(ResolvedFileTarget {
+            file_ref: FileRef::from_absolute_path(&absolute)?,
+            directory: None,
+            relative_path: None,
+            display_path: absolute.to_string_lossy().into_owned(),
+            absolute_path: absolute,
+        })
+    }
+
+    /// Resolve a configured user directory itself (for listings). The
+    /// descriptor carries no relative path; reads resolve it to the root.
+    pub fn resolve_directory(
+        &self,
+        directory: UserDirectory,
+    ) -> Result<ResolvedFileTarget, FileTargetError> {
+        self.resolve_target(
+            &FileTarget {
+                directory,
+                relative_path: PathBuf::new(),
+            },
+            TargetPurpose::Existing,
+        )
+    }
+
+    /// Resolve an absolute path that names an existing directory. Exact
+    /// configured roots map to semantic directory descriptors (which
+    /// round-trip through [`FileResolver::resolve_target`]); anything else
+    /// maps to a compatibility descriptor (round-trips through the
+    /// compatibility branch of [`FileResolver::resolve_ref`]). Missing
+    /// paths keep their file-oriented errors; nothing is created.
+    pub fn descriptor_for_directory(
+        &self,
+        path: &Path,
+    ) -> Result<ResolvedFileTarget, FileTargetError> {
+        if !path.is_absolute() {
+            return Err(FileTargetError::new(
+                FilesystemErrorCode::InvalidRelativePath,
+                "directory target must be absolute",
+                Some(path.to_string_lossy().into_owned()),
+                true,
+            ));
+        }
+        let absolute = path.canonicalize().map_err(|error| {
+            FileTargetError::new(
+                FilesystemErrorCode::FileNotFound,
+                format!("target directory is unavailable: {error}"),
+                Some(path.to_string_lossy().into_owned()),
+                true,
+            )
+        })?;
+        if !absolute.is_dir() {
+            return Err(FileTargetError::new(
+                FilesystemErrorCode::TargetIsFile,
+                "target is not a directory",
+                Some(path.to_string_lossy().into_owned()),
+                true,
+            ));
+        }
+        for directory in UserDirectory::ALL {
+            let Some(root) = self.environment.user_dirs.get(directory) else {
+                continue;
+            };
+            let Ok(root) = root.canonicalize() else {
+                continue;
+            };
+            if absolute == root {
+                return Ok(ResolvedFileTarget {
+                    file_ref: FileRef::from_directory(directory),
+                    directory: Some(directory),
+                    relative_path: None,
+                    display_path: absolute.to_string_lossy().into_owned(),
+                    absolute_path: absolute,
+                });
+            }
+        }
         Ok(ResolvedFileTarget {
             file_ref: FileRef::from_absolute_path(&absolute)?,
             directory: None,
@@ -846,5 +988,115 @@ mod tests {
             "file:desktop:file-4.txt"
         );
         assert_eq!(context.recent_files.len(), 5);
+    }
+
+    fn directory_root(name: &str) -> (PathBuf, HostEnvironment) {
+        let root = test_root(name);
+        let _ = std::fs::remove_dir_all(&root);
+        let desktop = root.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let environment = environment(&root);
+        (root, environment)
+    }
+
+    #[test]
+    fn empty_relative_path_resolves_the_directory_root_for_reads() {
+        let (_root, environment) = directory_root("dir-root");
+        let resolver = FileResolver::new(environment.clone());
+        for relative in [PathBuf::new(), PathBuf::from(""), PathBuf::from(".")] {
+            let resolved = resolver
+                .resolve_target(
+                    &FileTarget {
+                        directory: UserDirectory::Desktop,
+                        relative_path: relative,
+                    },
+                    TargetPurpose::Existing,
+                )
+                .unwrap();
+            assert_eq!(resolved.directory, Some(UserDirectory::Desktop));
+            assert_eq!(resolved.relative_path, None);
+            assert_eq!(resolved.file_ref.as_str(), "file:desktop:");
+            assert!(resolved.absolute_path.is_dir());
+            assert_eq!(
+                resolved.absolute_path,
+                environment
+                    .user_dirs
+                    .desktop
+                    .as_deref()
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_relative_path_stays_strict_for_creation() {
+        let (_root, environment) = directory_root("dir-create");
+        let resolver = FileResolver::new(environment);
+        let error = resolver
+            .resolve_target(
+                &FileTarget {
+                    directory: UserDirectory::Desktop,
+                    relative_path: PathBuf::new(),
+                },
+                TargetPurpose::Create,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, FilesystemErrorCode::InvalidRelativePath);
+    }
+
+    #[test]
+    fn directory_file_ref_round_trips_through_the_resolver() {
+        let (_root, environment) = directory_root("dir-ref");
+        let resolver = FileResolver::new(environment);
+        let file_ref = FileRef::from_directory(UserDirectory::Desktop);
+        assert_eq!(file_ref.as_str(), "file:desktop:");
+        assert!(file_ref.is_semantic());
+        let parsed = FileRef::parse(file_ref.as_str()).unwrap();
+        let resolved = resolver
+            .resolve_ref(&parsed, TargetPurpose::Existing)
+            .unwrap();
+        assert_eq!(resolved.directory, Some(UserDirectory::Desktop));
+        assert!(resolved.absolute_path.is_dir());
+    }
+
+    #[test]
+    fn descriptor_for_directory_maps_roots_and_subdirs() {
+        let (_root, environment) = directory_root("dir-descriptor");
+        std::fs::create_dir_all(
+            environment
+                .user_dirs
+                .desktop
+                .as_deref()
+                .unwrap()
+                .join("sub"),
+        )
+        .unwrap();
+        let resolver = FileResolver::new(environment.clone());
+        let desktop = environment.user_dirs.desktop.as_deref().unwrap();
+
+        let root = resolver.descriptor_for_directory(desktop).unwrap();
+        assert_eq!(root.directory, Some(UserDirectory::Desktop));
+        assert_eq!(root.file_ref.as_str(), "file:desktop:");
+
+        let sub = resolver
+            .descriptor_for_directory(&desktop.join("sub"))
+            .unwrap();
+        assert_eq!(sub.directory, None);
+        assert!(sub.file_ref.as_str().starts_with("file:path:"));
+        // Compatibility directory references resolve back for reads.
+        let back = resolver
+            .resolve_ref(&sub.file_ref, TargetPurpose::Existing)
+            .unwrap();
+        assert_eq!(back.absolute_path, sub.absolute_path);
+
+        let missing = resolver.descriptor_for_directory(&desktop.join("missing"));
+        assert_eq!(missing.unwrap_err().code, FilesystemErrorCode::FileNotFound);
+
+        let file = desktop.join("note.txt");
+        std::fs::write(&file, "x").unwrap();
+        let not_dir = resolver.descriptor_for_directory(&file);
+        assert_eq!(not_dir.unwrap_err().code, FilesystemErrorCode::TargetIsFile);
     }
 }

@@ -32,6 +32,7 @@ pub(crate) const EDIT_TOOL: &str = "filesystem.edit";
 pub(crate) const REPLACE_USER_FILE_TOOL: &str = "filesystem.replace_user_file";
 pub(crate) const APPEND_USER_FILE_TOOL: &str = "filesystem.append_user_file";
 pub(crate) const APPEND_FILE_TOOL: &str = "filesystem.append_file";
+pub(crate) const LIST_TOOL: &str = "filesystem.list";
 pub(crate) const DEFAULT_USER_FILENAME: &str = "note.txt";
 
 pub(crate) fn invalid_args(tool: &str, message: impl Into<String>) -> ToolError {
@@ -103,8 +104,18 @@ pub(crate) fn tag_file_output(
     purpose: TargetPurpose,
 ) {
     let resolver = FileResolver::new(environment.clone());
-    let Ok(resolved) = resolver.descriptor_for_absolute(path, purpose) else {
-        return;
+    let resolved = match resolver.descriptor_for_absolute(path, purpose) {
+        Ok(resolved) => resolved,
+        // Directory outputs (listings) tag the directory itself; file
+        // tools never reach this fallback with a directory because their
+        // normalization already rejected it.
+        Err(error) if error.code == FilesystemErrorCode::TargetIsDirectory => {
+            match resolver.descriptor_for_directory(path) {
+                Ok(resolved) => resolved,
+                Err(_) => return,
+            }
+        }
+        Err(_) => return,
     };
     if let Some(object) = output.content.as_object_mut() {
         object.insert(
@@ -290,29 +301,36 @@ pub(crate) fn normalize_host_file_args(
             FileRef::parse(raw).and_then(|file_ref| resolver.resolve_ref(&file_ref, purpose));
         match resolved {
             Ok(resolved) => candidates.push(("file_ref", resolved)),
-            Err(error)
-                if error.code == FilesystemErrorCode::InvalidFileRef
-                    && !has_target
-                    && !has_path
-                    && active_file_from_context(active_context).is_some() =>
-            {
-                // A tiny model can copy or truncate the active reference.
-                // The malformed value identifies no file, so the only safe
-                // recovery is the already successful active target. Resolve
-                // it again so current permissions and symlink checks still
-                // apply; never use this fallback for a stale or valid but
-                // mismatched reference.
-                let active = active_file_from_context(active_context)
-                    .expect("active context was checked above");
-                let resolved = resolver
-                    .resolve_ref(&active, purpose)
-                    .map_err(|error| filesystem_error(tool, error))?;
-                tracing::debug!(
-                    tool = %tool,
-                    active_file_ref = %resolved.file_ref,
-                    "recovered malformed file_ref from active file context"
-                );
-                candidates.push(("active_file", resolved));
+            Err(error) if error.code == FilesystemErrorCode::InvalidFileRef => {
+                // A malformed reference identifies no file, so it cannot
+                // disagree with sibling selectors: ignore it and resolve
+                // the rest. Small models frequently echo a bare filename
+                // here while also sending the real path.
+                if has_target || has_path {
+                    tracing::debug!(
+                        tool = %tool,
+                        received = %raw,
+                        "ignored malformed file_ref; resolving sibling selectors"
+                    );
+                } else if let Some(active) = active_file_from_context(active_context) {
+                    // A tiny model can copy or truncate the active reference.
+                    // The malformed value identifies no file, so the only safe
+                    // recovery is the already successful active target. Resolve
+                    // it again so current permissions and symlink checks still
+                    // apply; never use this fallback for a stale or valid but
+                    // mismatched reference.
+                    let resolved = resolver
+                        .resolve_ref(&active, purpose)
+                        .map_err(|error| filesystem_error(tool, error))?;
+                    tracing::debug!(
+                        tool = %tool,
+                        active_file_ref = %resolved.file_ref,
+                        "recovered malformed file_ref from active file context"
+                    );
+                    candidates.push(("active_file", resolved));
+                } else {
+                    return Err(filesystem_error(tool, error));
+                }
             }
             Err(error) => return Err(filesystem_error(tool, error)),
         }
@@ -374,9 +392,23 @@ pub(crate) fn normalize_host_file_args(
                 },
                 "filesystem.create_user_file",
             )?;
-            let resolved = resolver
-                .descriptor_for_absolute(&normalized_special.path, purpose)
-                .map_err(|error| filesystem_error(tool, error))?;
+            let resolved = resolver.descriptor_for_absolute(&normalized_special.path, purpose);
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                // `filesystem.list` names the directory itself: an absolute
+                // directory path resolves to a directory descriptor instead
+                // of failing. Every other tool keeps the file-oriented
+                // error, so reads and edits on directories do not change.
+                Err(error)
+                    if error.code == FilesystemErrorCode::TargetIsDirectory
+                        && tool == LIST_TOOL =>
+                {
+                    resolver
+                        .descriptor_for_directory(&normalized_special.path)
+                        .map_err(|error| filesystem_error(tool, error))?
+                }
+                Err(error) => return Err(filesystem_error(tool, error)),
+            };
             candidates.push(("path", resolved));
         }
     }

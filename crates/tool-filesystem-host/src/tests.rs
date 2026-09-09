@@ -2186,3 +2186,151 @@ fn raw_write_error_explains_the_configured_localized_desktop() {
     assert!(enriched.to_string().contains("/home/meme/Escritorio"));
     assert!(enriched.to_string().contains("filesystem.create_user_file"));
 }
+
+fn list_tool(home: &Path, desktop: &Path) -> HostAwarePathTool {
+    HostAwarePathTool::list(
+        tool_filesystem::FilesystemLimits::default(),
+        environment(home, desktop),
+    )
+}
+
+#[tokio::test]
+async fn host_list_accepts_semantic_directory_target() {
+    let (home, desktop) = stale_home("host-list-semantic-target");
+    std::fs::write(desktop.join("note.txt"), "hi\n").unwrap();
+    let tool = list_tool(&home, &desktop);
+
+    let output = tool
+        .invoke(
+            read_ticketed_context(&desktop),
+            serde_json::json!({
+                "target": { "directory": "desktop", "relative_path": "" },
+            }),
+        )
+        .await
+        .unwrap();
+    let names: Vec<&str> = output.content["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert!(names.contains(&"note.txt"));
+    assert_eq!(output.content["file_ref"], "file:desktop:");
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[tokio::test]
+async fn host_list_resolves_absolute_directory_and_tags_it() {
+    let (home, desktop) = stale_home("host-list-absolute-dir");
+    std::fs::write(desktop.join("note.txt"), "hi\n").unwrap();
+    let tool = list_tool(&home, &desktop);
+
+    let output = tool
+        .invoke(
+            read_ticketed_context(&desktop),
+            serde_json::json!({ "path": desktop.to_string_lossy() }),
+        )
+        .await
+        .unwrap();
+    assert!(output.content["entries"].as_array().unwrap().len() >= 1);
+    assert_eq!(output.content["file_ref"], "file:desktop:");
+    assert_eq!(output.content["directory"], "desktop");
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[tokio::test]
+async fn host_list_follows_directory_file_ref() {
+    let (home, desktop) = stale_home("host-list-dir-ref");
+    std::fs::write(desktop.join("note.txt"), "hi\n").unwrap();
+    let tool = list_tool(&home, &desktop);
+
+    let first = tool
+        .invoke(
+            read_ticketed_context(&desktop),
+            serde_json::json!({ "path": desktop.to_string_lossy() }),
+        )
+        .await
+        .unwrap();
+    let file_ref = first.content["file_ref"].as_str().unwrap().to_string();
+
+    let second = tool
+        .invoke(
+            read_ticketed_context(&desktop),
+            serde_json::json!({ "file_ref": file_ref }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.content["entries"], first.content["entries"]);
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[tokio::test]
+async fn malformed_file_ref_with_valid_path_resolves_the_path() {
+    // A small model echoed a bare filename as file_ref while also sending
+    // the real path. The malformed reference identifies no file, so the
+    // call resolves the valid selector instead of failing.
+    let (home, desktop) = stale_home("host-read-malformed-ref");
+    let target = desktop.join("note.txt");
+    std::fs::write(&target, "2026-09-08\n").unwrap();
+    let tool = HostAwarePathTool::read(
+        tool_filesystem::FilesystemLimits::default(),
+        environment(&home, &desktop),
+    );
+
+    let output = tool
+        .invoke(
+            read_ticketed_context(&target),
+            serde_json::json!({
+                "file_ref": "note.txt",
+                "path": target.to_string_lossy(),
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.content["content"], "2026-09-08\n");
+    assert_eq!(output.content["file_ref"], "file:desktop:note.txt");
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[tokio::test]
+async fn malformed_file_ref_alone_still_fails_without_context() {
+    let (home, desktop) = stale_home("host-read-malformed-alone");
+    let tool = HostAwarePathTool::read(
+        tool_filesystem::FilesystemLimits::default(),
+        environment(&home, &desktop),
+    );
+
+    let error = tool
+        .invoke(
+            read_ticketed_context(&desktop),
+            serde_json::json!({ "file_ref": "note.txt" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Filesystem { .. }));
+    assert!(error.model_message().contains("invalid_file_ref"));
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[tokio::test]
+async fn read_on_directory_still_rejected_as_retryable() {
+    // Directories keep their file-oriented error for file tools; only
+    // `filesystem.list` resolves them.
+    let (home, desktop) = stale_home("host-read-dir");
+    let tool = HostAwarePathTool::read(
+        tool_filesystem::FilesystemLimits::default(),
+        environment(&home, &desktop),
+    );
+
+    let error = tool
+        .invoke(
+            read_ticketed_context(&desktop),
+            serde_json::json!({ "path": desktop.to_string_lossy() }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::Filesystem { .. }));
+    assert!(error.model_message().contains("directory"));
+    std::fs::remove_dir_all(&home).unwrap();
+}

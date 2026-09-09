@@ -1,4 +1,4 @@
-//! Host-aware read/stat/range/patch tools over the filesystem broker.
+//! Host-aware read/stat/range/patch/list tools over the filesystem broker.
 
 use crate::common::{host_file_metadata, normalize_host_file_args, tag_file_output};
 use file_target::{ConversationFileContext, TargetPurpose};
@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tool_core::{CapabilityRequirement, Tool, ToolContext, ToolError, ToolMetadata, ToolOutput};
-use tool_filesystem::{PatchTool, ReadRangeTool, ReadTool, StatTool};
+use tool_filesystem::{ListTool, PatchTool, ReadRangeTool, ReadTool, StatTool};
 
 /// Host adapter for absolute-path filesystem tools. It accepts the canonical
 /// `file_ref`/`target` contract, normalizes compatible absolute paths, then
@@ -59,6 +59,21 @@ impl HostAwarePathTool {
     ) -> Self {
         Self {
             inner: Arc::new(PatchTool { limits }),
+            environment,
+            purpose: TargetPurpose::Existing,
+            active_context: None,
+        }
+    }
+
+    /// Directory listing with the same `file_ref`/`target` contract as the
+    /// file tools, so models never have to guess localized absolute paths
+    /// (e.g. `/home/u/Desktop` vs `/home/u/Escritorio`) to explore.
+    pub(crate) fn list(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
+        Self {
+            inner: Arc::new(ListTool { limits }),
             environment,
             purpose: TargetPurpose::Existing,
             active_context: None,

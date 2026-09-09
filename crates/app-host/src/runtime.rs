@@ -582,6 +582,8 @@ mod tests {
             "Do not tell the user that file editing is unavailable unless the native tool actually returns an unavailable or denied result"
         ));
         assert!(context.contains("call system.time"));
+        assert!(context.contains("empty target.relative_path"));
+        assert!(context.contains("never invent a file_ref"));
         #[cfg(target_os = "linux")]
         {
             assert!(context.contains("OS: Linux"));

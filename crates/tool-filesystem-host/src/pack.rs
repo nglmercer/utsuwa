@@ -58,6 +58,17 @@ impl ToolPack for HostFilesystemPack {
             .map(tool_filesystem::plugin::tools_for_plugin)
             .unwrap_or_default();
         if let Some(plugin) = selected_fs {
+            if plugin.supports(tool_filesystem::plugin::FsCapability::List) {
+                if let Some(index) = tools
+                    .iter()
+                    .position(|tool| tool.metadata().id.0 == "filesystem.list")
+                {
+                    tools[index] = Arc::new(
+                        HostAwarePathTool::list(plugin.limits.clone(), host_environment.clone())
+                            .with_active_context(file_context.clone()),
+                    );
+                }
+            }
             if plugin.supports(tool_filesystem::plugin::FsCapability::Read) {
                 if let Some(index) = tools
                     .iter()

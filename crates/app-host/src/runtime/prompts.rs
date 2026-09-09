@@ -137,7 +137,7 @@ fn host_environment_context_for_context(
             .to_string(),
         "Never guess /Desktop, /Escritorio, /Documents, C:\\Users, or another special directory."
             .to_string(),
-        "If the host does not know a directory, inspect the filesystem with filesystem.list, filesystem.stat, or filesystem.glob before performing a mutation."
+        "If the host does not know a directory, inspect the filesystem with filesystem.list, filesystem.stat, or filesystem.glob before performing a mutation. To list a known directory, call filesystem.list with target.directory and an empty target.relative_path."
             .to_string(),
         "Never invent a path when its location is unknown.".to_string(),
         "If a tool returns an error, use its error information to correct the call rather than pretending the operation succeeded."
@@ -145,7 +145,7 @@ fn host_environment_context_for_context(
         format!(
             "Autonomous Full Access is {mode_text}. When it is enabled, you may use available native tools without asking the user for additional permission; the native host has already received the user's consent."
         ),
-        "After a filesystem tool succeeds, use file_ref for later tool calls and display_path only for the human-facing final response."
+        "After a filesystem tool succeeds, use file_ref for later tool calls and display_path only for the human-facing final response. Omit file_ref when no previous tool result provided one; never invent a file_ref value."
             .to_string(),
         "Never claim an operation succeeded until the tool confirms success.".to_string(),
         "Never report success after a failed tool call.".to_string(),
