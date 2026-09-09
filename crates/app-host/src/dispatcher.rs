@@ -650,6 +650,23 @@ impl Dispatcher {
         } else {
             None
         };
+        if key == crate::agent_runtime::SETTING_TOOL_PROFILE {
+            let valid = value
+                .as_str()
+                .map(|profile| {
+                    matches!(
+                        profile.trim().to_ascii_lowercase().as_str(),
+                        "simple" | "full"
+                    )
+                })
+                .unwrap_or(false);
+            if !valid {
+                return Err(IpcErrorBody {
+                    code: ErrorCode::InvalidParams,
+                    message: format!("settings.set '{key}' requires the string 'simple' or 'full'"),
+                });
+            }
+        }
         {
             let storage = storage.lock().map_err(|_| IpcErrorBody {
                 code: ErrorCode::Internal,
@@ -1234,6 +1251,24 @@ mod tests {
             ))
             .unwrap();
         assert!(script.contains("requires a boolean value"), "{script}");
+
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"37","method":"settings.set","params":{{"key":"{}","value":"simple"}}}}"#,
+                crate::agent_runtime::SETTING_TOOL_PROFILE
+            ))
+            .unwrap();
+        assert!(script.contains("\"ok\":true"), "{script}");
+        let script = dispatcher
+            .handle_message(&format!(
+                r#"{{"id":"38","method":"settings.set","params":{{"key":"{}","value":"tiny"}}}}"#,
+                crate::agent_runtime::SETTING_TOOL_PROFILE
+            ))
+            .unwrap();
+        assert!(
+            script.contains("requires the string 'simple' or 'full'"),
+            "{script}"
+        );
     }
 
     #[test]

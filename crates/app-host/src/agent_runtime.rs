@@ -17,7 +17,7 @@
 
 use crate::host_environment::HostEnvironment;
 use crate::user_directory_tools::{
-    HostAwareWriteTool, ResolveUserDirectoryTool, UserDirectoryWriteTool,
+    CreateUserFileTool, HostAwareWriteTool, ResolveUserDirectoryTool, UserDirectoryWriteTool,
 };
 use agent_core::{Agent, AgentEvent, AgentLimits, ToolAuthorizer, ToolReplayCache};
 use audit_core::AuditSink;
@@ -51,6 +51,76 @@ pub const SETTING_PLUGIN_DIR: &str = "plugin.dir";
 /// Native persistent setting for the explicit Agent-only autonomous mode.
 /// Missing or invalid values are treated as `false`.
 pub const SETTING_AUTONOMOUS_FULL_ACCESS: &str = "agent.autonomous_full_access";
+/// Optional native model-facing tool profile. When absent, local providers
+/// use the small-model profile and other providers use the complete profile.
+pub const SETTING_TOOL_PROFILE: &str = "agent.tool_profile";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolProfile {
+    Simple,
+    Full,
+}
+
+impl ToolProfile {
+    fn allows_tool(self, tool_id: &str) -> bool {
+        match self {
+            Self::Full => true,
+            Self::Simple => !matches!(
+                tool_id,
+                "filesystem.stat"
+                    | "filesystem.read_range"
+                    | "filesystem.search_text"
+                    | "filesystem.glob"
+                    | "filesystem.patch"
+                    | "filesystem.resolve_user_dir"
+                    | "filesystem.write_user_file"
+            ),
+        }
+    }
+}
+
+pub fn tool_profile_for_provider(provider: Option<&str>) -> ToolProfile {
+    match provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+    {
+        Some(provider)
+            if provider.eq_ignore_ascii_case("lmstudio")
+                || provider.eq_ignore_ascii_case("ollama") =>
+        {
+            ToolProfile::Simple
+        }
+        _ => ToolProfile::Full,
+    }
+}
+
+fn configured_tool_profile(storage: Option<&Arc<Mutex<Storage>>>) -> ToolProfile {
+    let Some(storage) = storage else {
+        return ToolProfile::Full;
+    };
+    let Ok(storage) = storage.lock() else {
+        tracing::warn!("tool profile storage lock failed; using full profile");
+        return ToolProfile::Full;
+    };
+    if let Ok(Some(value)) = storage.get_setting(SETTING_TOOL_PROFILE) {
+        if let Some(profile) = value.as_str() {
+            match profile.trim().to_ascii_lowercase().as_str() {
+                "simple" => return ToolProfile::Simple,
+                "full" => return ToolProfile::Full,
+                _ => tracing::warn!(
+                    profile = %profile,
+                    "unknown agent.tool_profile value; inferring from provider"
+                ),
+            }
+        }
+    }
+    let provider = storage
+        .get_setting(SETTING_PROVIDER)
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_owned));
+    tool_profile_for_provider(provider.as_deref())
+}
 
 /// Transcript cap: oldest messages are dropped past this bound so a long
 /// session cannot grow memory (or model context) without limit.
@@ -540,10 +610,15 @@ impl AgentRuntime {
     }
 
     /// Register `desktop.*` tools for the active plugin's declared
-    /// capabilities. With the stub plugin nothing registers: every
-    /// desktop call stays behind policy + tickets, and actions the
-    /// platform lacks (e.g. `set_value` on X11) stay invisible.
-    fn attach_desktop_tools(&self, registry: &mut ToolRegistry) {
+    /// capabilities. Status/inspect remain available as honest read-only
+    /// facts even with the stub; actions the platform lacks (e.g.
+    /// `set_value` on X11) stay invisible.
+    fn attach_desktop_tools(
+        &self,
+        registry: &mut ToolRegistry,
+        host_environment: &HostEnvironment,
+        tool_profile: ToolProfile,
+    ) {
         let plugin = match self.desktop.lock() {
             Ok(plugin) => plugin.clone(),
             Err(_) => {
@@ -551,10 +626,17 @@ impl AgentRuntime {
                 return;
             }
         };
-        if !plugin.is_available() {
-            return;
-        }
-        for tool in tool_desktop::tools::for_plugin(&plugin) {
+        let filesystem_desktop = host_environment
+            .user_dirs
+            .desktop
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        for tool in
+            tool_desktop::tools::for_plugin_with_filesystem_desktop(&plugin, filesystem_desktop)
+        {
+            if !tool_profile.allows_tool(&tool.metadata().id.0) {
+                continue;
+            }
             if let Err(e) = registry.register(tool) {
                 tracing::warn!(error = %e, "desktop tool registration failed");
             }
@@ -849,8 +931,9 @@ impl AgentRuntime {
         // mirror is also updated by settings.set, so a toggle during an active
         // turn is observed by the next authorization request immediately.
         let autonomous_full_access = self.refresh_autonomous_full_access();
+        let tool_profile = configured_tool_profile(self.storage.as_ref());
         let host_environment = HostEnvironment::snapshot();
-        log_host_environment(&host_environment);
+        log_host_environment(&host_environment, tool_profile);
         let history_system_prompt = transcript
             .first()
             .filter(|message| message.role == model_core::ModelRole::System)
@@ -888,26 +971,27 @@ impl AgentRuntime {
             }
         };
         let agent = agent.with_replay_cache(replay_cache.clone());
-        let mut registry = match default_registry(&self.processes, host_environment.clone()) {
-            Ok(registry) => registry,
-            Err(err) => {
-                if self.is_current(generation) {
-                    if let Ok(queue) = self.approvals.lock() {
-                        queue.end_task(&task_id);
+        let mut registry =
+            match default_registry(&self.processes, host_environment.clone(), tool_profile) {
+                Ok(registry) => registry,
+                Err(err) => {
+                    if self.is_current(generation) {
+                        if let Ok(queue) = self.approvals.lock() {
+                            queue.end_task(&task_id);
+                        }
                     }
+                    self.emit_if_current(
+                        generation,
+                        "agent.turn_failed",
+                        serde_json::json!({ "error": err.to_string() }),
+                    );
+                    return;
                 }
-                self.emit_if_current(
-                    generation,
-                    "agent.turn_failed",
-                    serde_json::json!({ "error": err.to_string() }),
-                );
-                return;
-            }
-        };
+            };
         self.attach_mcp_tools(&mut registry).await;
         self.attach_plugin_tools(&mut registry);
         self.attach_memory_tools(&mut registry);
-        self.attach_desktop_tools(&mut registry);
+        self.attach_desktop_tools(&mut registry, &host_environment, tool_profile);
         let tool_ids: Vec<String> = registry
             .list()
             .into_iter()
@@ -1061,7 +1145,7 @@ fn host_os_label() -> &'static str {
     crate::host_environment::host_os_label()
 }
 
-fn log_host_environment(environment: &HostEnvironment) {
+fn log_host_environment(environment: &HostEnvironment, tool_profile: ToolProfile) {
     let path_for_log = |path: Option<&std::path::Path>| {
         path.map(|path| path.display().to_string())
             .unwrap_or_else(|| "not_available".to_string())
@@ -1083,6 +1167,7 @@ fn log_host_environment(environment: &HostEnvironment) {
         downloads = %path_for_log(environment.user_dirs.downloads.as_deref()),
         desktop_source = %desktop_source,
         xdg_config_source = %path_for_log(environment.xdg_config_source.as_deref()),
+        tool_profile = ?tool_profile,
         "native host environment resolved"
     );
 }
@@ -1147,7 +1232,9 @@ fn host_environment_context_for(
         "Special filesystem directories are resolved by the operating system.".to_string(),
         "Use the exact paths listed in the host environment block or returned by system.environment."
             .to_string(),
-        "For files in Desktop/Documents/etc., use filesystem.write_user_file; set directory_id to a semantic identifier such as 'desktop', never put an absolute path in directory_id."
+        "For files in Desktop/Documents/etc., use filesystem.create_user_file with location and filename; never construct a special-directory path yourself."
+            .to_string(),
+        "For desktop capability questions use desktop.status; to see open windows use desktop.inspect. Filesystem Desktop and the graphical desktop backend are different."
             .to_string(),
         "Never translate filesystem directory names according to the language of the conversation."
             .to_string(),
@@ -1243,14 +1330,15 @@ impl tool_core::Tool for HostEnvironmentTool {
     }
 }
 
-/// Tools the agent may call, all behind policy + tickets: the
-/// filesystem plugin's declared capabilities (list/stat/read/read_range/
-/// search_text/glob/patch/write), host-resolved user-directory writes and
-/// lookup, structured process execution (spawn/status/kill, no shell), and
-/// the read-only system.environment lookup.
+/// Tools the agent may call, all behind policy + tickets: the filesystem
+/// plugin's declared capabilities, host-resolved user-directory writes and
+/// lookup, structured process execution, desktop tools, and the read-only
+/// system.environment lookup. The model-facing profile may hide redundant
+/// low-level variants without removing their implementations.
 fn default_registry(
     processes: &Arc<ProcessManager>,
     host_environment: HostEnvironment,
+    tool_profile: ToolProfile,
 ) -> Result<ToolRegistry, RuntimeError> {
     let mut registry = ToolRegistry::new();
     let mut fs_plugins = tool_filesystem::plugin::FsPluginRegistry::new();
@@ -1271,6 +1359,10 @@ fn default_registry(
                     host_environment.clone(),
                 ));
             }
+            tools.push(Arc::new(CreateUserFileTool::new(
+                plugin.limits.clone(),
+                host_environment.clone(),
+            )));
             tools.push(Arc::new(UserDirectoryWriteTool::new(
                 plugin.limits,
                 host_environment.clone(),
@@ -1298,6 +1390,9 @@ fn default_registry(
         environment: host_environment,
     }));
     for tool in tools {
+        if !tool_profile.allows_tool(&tool.metadata().id.0) {
+            continue;
+        }
         registry
             .register(tool)
             .map_err(|e| RuntimeError::Tools(e.to_string()))?;
@@ -2053,13 +2148,100 @@ mod tests {
             "process.kill",
             "filesystem.resolve_user_dir",
             "filesystem.write_user_file",
+            "filesystem.create_user_file",
             "system.environment",
+            "desktop.status",
+            "desktop.inspect",
         ];
         for tool_id in expected {
             assert!(
                 tools.iter().any(|tool| tool.name == tool_id),
                 "native request is missing {tool_id}"
             );
+        }
+    }
+
+    #[test]
+    fn local_model_profile_is_small_but_keeps_high_level_tools() {
+        assert_eq!(
+            tool_profile_for_provider(Some("lmstudio")),
+            ToolProfile::Simple
+        );
+        assert_eq!(
+            tool_profile_for_provider(Some("ollama")),
+            ToolProfile::Simple
+        );
+        assert_eq!(
+            tool_profile_for_provider(Some("LMStudio")),
+            ToolProfile::Simple
+        );
+        assert_eq!(tool_profile_for_provider(Some("openai")), ToolProfile::Full);
+        assert_eq!(tool_profile_for_provider(None), ToolProfile::Full);
+
+        assert!(ToolProfile::Simple.allows_tool("system.environment"));
+        assert!(ToolProfile::Simple.allows_tool("filesystem.create_user_file"));
+        assert!(ToolProfile::Simple.allows_tool("filesystem.read"));
+        assert!(ToolProfile::Simple.allows_tool("filesystem.write"));
+        assert!(ToolProfile::Simple.allows_tool("desktop.status"));
+        assert!(ToolProfile::Simple.allows_tool("desktop.inspect"));
+        assert!(!ToolProfile::Simple.allows_tool("filesystem.patch"));
+        assert!(!ToolProfile::Simple.allows_tool("filesystem.write_user_file"));
+        assert!(ToolProfile::Full.allows_tool("filesystem.write_user_file"));
+    }
+
+    #[test]
+    fn explicit_model_tool_profile_overrides_provider_inference() {
+        let storage_dir =
+            std::env::temp_dir().join(format!("utsuwa-tool-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let storage = Arc::new(Mutex::new(
+            Storage::open(&storage_dir.join("state.db")).unwrap(),
+        ));
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(SETTING_PROVIDER, &serde_json::json!("lmstudio"))
+            .unwrap();
+        assert_eq!(configured_tool_profile(Some(&storage)), ToolProfile::Simple);
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(SETTING_TOOL_PROFILE, &serde_json::json!("full"))
+            .unwrap();
+        assert_eq!(configured_tool_profile(Some(&storage)), ToolProfile::Full);
+        std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    #[test]
+    fn simple_profile_filters_redundant_builtin_tools_from_model_registry() {
+        let processes = Arc::new(ProcessManager::new(ProcessLimits::default()));
+        let registry =
+            default_registry(&processes, HostEnvironment::snapshot(), ToolProfile::Simple).unwrap();
+        let ids: Vec<String> = registry
+            .list()
+            .into_iter()
+            .map(|metadata| metadata.id.0)
+            .collect();
+        for expected in [
+            "system.environment",
+            "filesystem.create_user_file",
+            "filesystem.read",
+            "filesystem.list",
+            "filesystem.write",
+            "process.spawn",
+        ] {
+            assert!(ids.iter().any(|id| id == expected), "missing {expected}");
+        }
+        for hidden in [
+            "filesystem.stat",
+            "filesystem.read_range",
+            "filesystem.search_text",
+            "filesystem.glob",
+            "filesystem.patch",
+            "filesystem.resolve_user_dir",
+            "filesystem.write_user_file",
+        ] {
+            assert!(!ids.iter().any(|id| id == hidden), "unexpected {hidden}");
         }
     }
 

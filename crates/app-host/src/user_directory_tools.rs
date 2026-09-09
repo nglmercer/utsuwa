@@ -22,6 +22,10 @@ const USER_DIRECTORY_ENUM: [&str; 8] = [
     "templates",
 ];
 
+const CREATE_USER_FILE_TOOL: &str = "filesystem.create_user_file";
+const WRITE_USER_FILE_TOOL: &str = "filesystem.write_user_file";
+const DEFAULT_USER_FILENAME: &str = "note.txt";
+
 fn invalid_args(tool: &str, message: impl Into<String>) -> ToolError {
     ToolError::InvalidArgs {
         tool: tool.to_string(),
@@ -144,6 +148,47 @@ fn parse_directory(
     })
 }
 
+/// The simpler user-file tool calls its semantic selector "location". Keep
+/// accepting the two older spellings as a compatibility bridge, but always
+/// resolve the value through the same host-owned directory table.
+fn parse_location(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+) -> Result<UserDirectory, ToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
+    let (field, value) = if let Some(value) = object.get("location") {
+        (
+            "location",
+            value
+                .as_str()
+                .ok_or_else(|| invalid_args(tool, "'location' must be a string"))?,
+        )
+    } else if let Some(value) = object.get("directory_id") {
+        (
+            "directory_id",
+            value
+                .as_str()
+                .ok_or_else(|| invalid_args(tool, "'directory_id' must be a string"))?,
+        )
+    } else if let Some(value) = object.get("directory") {
+        (
+            "directory",
+            value
+                .as_str()
+                .ok_or_else(|| invalid_args(tool, "'directory' must be a string"))?,
+        )
+    } else {
+        return Err(invalid_args(tool, "missing string 'location' argument"));
+    };
+    parse_directory_value(value, environment, tool).map_err(|error| match error {
+        ToolError::InvalidArgs { message, .. } => invalid_args(tool, format!("{field}: {message}")),
+        error => error,
+    })
+}
+
 fn reject_unsafe_relative_path(relative_path: &Path) -> bool {
     relative_path.components().any(|component| {
         matches!(
@@ -156,7 +201,26 @@ fn reject_unsafe_relative_path(relative_path: &Path) -> bool {
 struct ResolvedUserFile {
     directory: UserDirectory,
     resolved_directory: PathBuf,
+    relative_path: PathBuf,
+    generated_filename: bool,
     write_args: serde_json::Value,
+}
+
+fn write_args_for_path(object: &Map<String, Value>, path: &Path) -> serde_json::Value {
+    let mut write_args = serde_json::Value::Object(object.clone());
+    let write_object = write_args
+        .as_object_mut()
+        .expect("write args cloned from a JSON object");
+    write_object.remove("directory");
+    write_object.remove("directory_id");
+    write_object.remove("location");
+    write_object.remove("relative_path");
+    write_object.remove("filename");
+    write_object.insert(
+        "path".to_string(),
+        serde_json::Value::String(path.to_string_lossy().into_owned()),
+    );
+    write_args
 }
 
 fn resolve_user_file_args(
@@ -194,22 +258,135 @@ fn resolve_user_file_args(
     let resolved_directory = base.to_path_buf();
     let path = base.join(relative_path);
 
-    let mut write_args = serde_json::Value::Object(object.clone());
-    let write_object = write_args
-        .as_object_mut()
-        .expect("write args cloned from a JSON object");
-    write_object.remove("directory");
-    write_object.remove("directory_id");
-    write_object.remove("relative_path");
-    write_object.insert(
-        "path".to_string(),
-        serde_json::Value::String(path.to_string_lossy().into_owned()),
-    );
-
     Ok(ResolvedUserFile {
         directory,
         resolved_directory,
-        write_args,
+        relative_path: relative_path.to_path_buf(),
+        generated_filename: false,
+        write_args: write_args_for_path(object, &path),
+    })
+}
+
+fn lexical_absolute_path(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+fn looks_like_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+}
+
+/// Normalize the model-facing filename against one already validated host
+/// directory. Absolute compatibility values are accepted only when their
+/// normalized path is below that exact directory; arbitrary absolute paths
+/// never become an alternate write API.
+fn normalize_filename(
+    filename: &str,
+    base: &Path,
+    tool: &str,
+) -> Result<(PathBuf, PathBuf), ToolError> {
+    if filename.trim().is_empty() {
+        return Err(invalid_args(tool, "'filename' must name a file"));
+    }
+    if !cfg!(target_os = "windows") && looks_like_windows_absolute_path(filename) {
+        return Err(invalid_args(
+            tool,
+            "'filename' must use the host-native path style and stay inside the selected directory",
+        ));
+    }
+    let supplied = Path::new(filename);
+    if supplied
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(invalid_args(
+            tool,
+            "'filename' must not contain '..' path components",
+        ));
+    }
+    let normalized_base = lexical_absolute_path(base).unwrap_or_else(|| base.to_path_buf());
+    let (relative, target) = if supplied.is_absolute() {
+        let target = lexical_absolute_path(supplied).ok_or_else(|| {
+            invalid_args(tool, "'filename' must be a valid absolute host-native path")
+        })?;
+        let relative = target.strip_prefix(&normalized_base).map_err(|_| {
+            invalid_args(
+                tool,
+                "an absolute 'filename' is accepted only when it is inside the selected host directory",
+            )
+        })?;
+        (relative.to_path_buf(), target)
+    } else {
+        let relative = supplied.to_path_buf();
+        (relative.clone(), normalized_base.join(&relative))
+    };
+    if reject_unsafe_relative_path(&relative) {
+        return Err(invalid_args(
+            tool,
+            "'filename' must name a file below the selected user directory",
+        ));
+    }
+    Ok((relative, target))
+}
+
+fn optional_filename(object: &Map<String, Value>, tool: &str) -> Result<(String, bool), ToolError> {
+    match object.get("filename") {
+        None | Some(Value::Null) => Ok((DEFAULT_USER_FILENAME.to_string(), true)),
+        Some(value) => {
+            let filename = value
+                .as_str()
+                .ok_or_else(|| invalid_args(tool, "'filename' must be a string when provided"))?;
+            if filename.trim().is_empty() {
+                Ok((DEFAULT_USER_FILENAME.to_string(), true))
+            } else {
+                Ok((filename.to_string(), false))
+            }
+        }
+    }
+}
+
+fn resolve_create_user_file_args(
+    args: &serde_json::Value,
+    environment: &HostEnvironment,
+    tool: &str,
+) -> Result<ResolvedUserFile, ToolError> {
+    let object = args
+        .as_object()
+        .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
+    let directory = parse_location(args, environment, tool)?;
+    let base = environment.user_dirs.get(directory).ok_or_else(|| {
+        failed(
+            tool,
+            format!(
+                "the host-configured {} directory is not available",
+                directory.prompt_label()
+            ),
+        )
+    })?;
+    let (filename, generated_filename) = optional_filename(object, tool)?;
+    let (relative_path, path) = normalize_filename(&filename, base, tool)?;
+    Ok(ResolvedUserFile {
+        directory,
+        resolved_directory: base.to_path_buf(),
+        relative_path,
+        generated_filename,
+        write_args: write_args_for_path(object, &path),
     })
 }
 
@@ -256,7 +433,7 @@ pub(crate) fn enrich_write_error(error: ToolError, environment: &HostEnvironment
     ToolError::Failed {
         tool,
         message: format!(
-            "{message}. The host-configured {} directory is {}. Use filesystem.write_user_file with directory_id='{}', or retry using that exact resolved path",
+            "{message}. The host-configured {} directory is {}. Use filesystem.create_user_file with location='{}', or retry using that exact resolved path",
             directory.prompt_label(),
             configured.display(),
             directory.json_key(),
@@ -269,7 +446,7 @@ impl Tool for HostAwareWriteTool {
     fn metadata(&self) -> ToolMetadata {
         let mut metadata = self.inner.metadata();
         metadata.description.push_str(
-            " Prefer filesystem.write_user_file for OS-configured Desktop, Documents, Downloads, Pictures, Music, Videos, Public, or Templates directories.",
+            " Prefer filesystem.create_user_file for OS-configured Desktop, Documents, Downloads, Pictures, Music, Videos, Public, or Templates directories; use filesystem.write only for arbitrary explicit paths.",
         );
         metadata
     }
@@ -321,8 +498,8 @@ impl UserDirectoryWriteTool {
 impl Tool for UserDirectoryWriteTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
-            id: capability_core::ToolId::new("filesystem.write_user_file"),
-            description: "Create or overwrite a UTF-8 file inside an operating-system configured user directory such as Desktop or Documents. Prefer this tool whenever the user refers to Desktop, Documents, Downloads, Pictures, Music, Videos, Public, or Templates. Set directory_id to a semantic identifier such as desktop; the host resolves it. For compatibility, an exact host-resolved directory path or the configured basename is also accepted. Never use an arbitrary absolute path or translate directory names. The relative path must stay below the selected directory, and parent directories must already exist unless create_parents=true.".to_string(),
+            id: capability_core::ToolId::new(WRITE_USER_FILE_TOOL),
+            description: "Compatibility alias for creating or overwriting a UTF-8 file inside an operating-system configured user directory. Prefer filesystem.create_user_file with location and filename. Set directory_id to a semantic identifier such as desktop; the host resolves it. For compatibility, an exact host-resolved directory path or configured basename is accepted. Never use an arbitrary absolute path or translate directory names. The relative path must stay below the selected directory, and parent directories must already exist unless create_parents=true.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -358,7 +535,7 @@ impl Tool for UserDirectoryWriteTool {
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         let resolved =
-            resolve_user_file_args(args, &self.environment, "filesystem.write_user_file").ok()?;
+            resolve_user_file_args(args, &self.environment, WRITE_USER_FILE_TOOL).ok()?;
         // The inner tool computes the same canonical/lexical resource that it
         // will validate in `invoke`; no capability is minted for the symbolic
         // directory name supplied by the model.
@@ -370,8 +547,7 @@ impl Tool for UserDirectoryWriteTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let resolved =
-            resolve_user_file_args(&args, &self.environment, "filesystem.write_user_file")?;
+        let resolved = resolve_user_file_args(&args, &self.environment, WRITE_USER_FILE_TOOL)?;
         let directory = resolved.directory.json_key();
         let mut output = self.inner.invoke(ctx, resolved.write_args).await?;
         if let Some(object) = output.content.as_object_mut() {
@@ -389,6 +565,109 @@ impl Tool for UserDirectoryWriteTool {
             object.insert(
                 "directory".to_string(),
                 serde_json::Value::String(directory.to_string()),
+            );
+        }
+        Ok(output)
+    }
+}
+
+/// Preferred small-model interface for files in OS-configured user
+/// directories. It resolves the semantic location and safe filename in the
+/// native host, then delegates to the existing filesystem write broker.
+pub(crate) struct CreateUserFileTool {
+    inner: WriteTool,
+    environment: HostEnvironment,
+}
+
+impl CreateUserFileTool {
+    pub(crate) fn new(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
+        Self {
+            inner: WriteTool { limits },
+            environment,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_environment(
+        limits: tool_filesystem::FilesystemLimits,
+        environment: HostEnvironment,
+    ) -> Self {
+        Self::new(limits, environment)
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for CreateUserFileTool {
+    fn metadata(&self) -> ToolMetadata {
+        ToolMetadata {
+            id: capability_core::ToolId::new(CREATE_USER_FILE_TOOL),
+            description: "Create or overwrite a UTF-8 file inside an operating-system configured user directory such as Desktop or Documents. Prefer this tool whenever the user refers to Desktop, Documents, Downloads, Pictures, Music, Public, or Templates; the host resolves the location and you must not construct its path. Use a semantic location such as desktop, not an absolute directory path. The filename may be a file name or relative subpath; parent directories must already exist unless create_parents=true. An absolute filename is accepted only when it is inside the selected host directory.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "enum": USER_DIRECTORY_ENUM,
+                        "description": "Semantic operating-system user directory identifier: desktop, documents, downloads, pictures, music, videos, public_share, or templates. Do not construct or translate a filesystem path."
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "File name such as hello.txt, or a relative subpath such as notes/hello.txt. The host may normalize an absolute path only when it is inside the selected configured directory. If omitted, the host uses a safe deterministic default."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "UTF-8 file contents."
+                    },
+                    "create_parents": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Explicitly create missing parent directories for a relative subpath. Omit or set false to require existing parents."
+                    }
+                },
+                "required": ["location", "content"]
+            }),
+            effects: vec![tool_core::ToolEffect::FilesystemWrite],
+        }
+    }
+
+    fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
+        let resolved =
+            resolve_create_user_file_args(args, &self.environment, CREATE_USER_FILE_TOOL).ok()?;
+        self.inner.required_capability(&resolved.write_args)
+    }
+
+    async fn invoke(
+        &self,
+        ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let resolved =
+            resolve_create_user_file_args(&args, &self.environment, CREATE_USER_FILE_TOOL)?;
+        let directory_id = resolved.directory.json_key();
+        let resolved_filename = resolved.relative_path.to_string_lossy().into_owned();
+        let generated_filename = resolved.generated_filename;
+        let mut output = self.inner.invoke(ctx, resolved.write_args).await?;
+        if let Some(object) = output.content.as_object_mut() {
+            object.insert(
+                "location".to_string(),
+                Value::String(directory_id.to_string()),
+            );
+            object.insert(
+                "directory_id".to_string(),
+                Value::String(directory_id.to_string()),
+            );
+            object.insert(
+                "resolved_directory".to_string(),
+                Value::String(resolved.resolved_directory.to_string_lossy().into_owned()),
+            );
+            object.insert("filename".to_string(), Value::String(resolved_filename));
+            object.insert(
+                "generated_filename".to_string(),
+                Value::Bool(generated_filename),
             );
         }
         Ok(output)
@@ -600,6 +879,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_user_file_resolves_location_without_constructing_a_path() {
+        let home =
+            std::env::temp_dir().join(format!("utsuwa-create-user-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let desktop = home.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let target = desktop.join("date.txt");
+        let wrong = home.join("Desktop");
+        let tool = CreateUserFileTool::with_environment(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let args = serde_json::json!({
+            "location": "desktop",
+            "filename": "date.txt",
+            "content": "today",
+        });
+        let requirement = tool
+            .required_capability(&args)
+            .expect("the host resolved target needs filesystem write");
+        assert_eq!(requirement.capability, Capability::FilesystemWrite);
+        assert_eq!(
+            requirement.resource,
+            Resource::Path(target.canonicalize().unwrap_or(target.clone()))
+        );
+        let output = tool.invoke(ticketed_context(&target), args).await.unwrap();
+        assert_eq!(output.content["location"], "desktop");
+        assert_eq!(output.content["filename"], "date.txt");
+        assert_eq!(
+            output.content["resolved_directory"],
+            desktop.to_string_lossy().as_ref()
+        );
+        assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "today");
+        assert!(!wrong.exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_user_file_normalizes_an_absolute_filename_only_inside_selected_dir() {
+        let home = std::env::temp_dir().join(format!(
+            "utsuwa-create-user-file-absolute-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let desktop = home.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let target = desktop.join("date.txt");
+        let tool = CreateUserFileTool::with_environment(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&desktop),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": target.to_string_lossy(),
+                    "content": "absolute compatibility",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["filename"], "date.txt");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "absolute compatibility"
+        );
+
+        let error = tool
+            .invoke(
+                ticketed_context(&home.join("outside.txt")),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "/etc/date.txt",
+                    "content": "must reject",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+        assert!(error
+            .to_string()
+            .contains("inside the selected host directory"));
+        assert!(!home.join("outside.txt").exists());
+
+        let parent_escape = tool
+            .invoke(
+                ticketed_context(&home.join("escape.txt")),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "../escape.txt",
+                    "content": "must reject",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(parent_escape, ToolError::InvalidArgs { .. }));
+        assert!(!home.join("escape.txt").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_user_file_allows_explicit_nested_parent_creation() {
+        let home = std::env::temp_dir().join(format!(
+            "utsuwa-create-user-file-nested-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let desktop = home.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let target = desktop.join("notes/hello.txt");
+        let tool = CreateUserFileTool::with_environment(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&desktop),
+                serde_json::json!({
+                    "location": "desktop",
+                    "filename": "notes/hello.txt",
+                    "content": "nested",
+                    "create_parents": true,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["path"], target.to_string_lossy().as_ref());
+        assert!(target.is_file());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_user_file_uses_a_safe_default_filename_when_omitted() {
+        let home = std::env::temp_dir().join(format!(
+            "utsuwa-create-user-file-default-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        let desktop = home.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let target = desktop.join(DEFAULT_USER_FILENAME);
+        let tool = CreateUserFileTool::with_environment(
+            tool_filesystem::FilesystemLimits::default(),
+            environment(&home, &desktop),
+        );
+        let output = tool
+            .invoke(
+                ticketed_context(&target),
+                serde_json::json!({
+                    "location": "desktop",
+                    "content": "default name",
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["filename"], DEFAULT_USER_FILENAME);
+        assert_eq!(output.content["generated_filename"], true);
+        assert!(target.is_file());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[tokio::test]
     async fn write_user_file_rejects_arbitrary_absolute_directory_path() {
         let home = std::env::temp_dir().join(format!(
             "utsuwa-user-directory-reject-{}",
@@ -684,6 +1127,6 @@ mod tests {
         };
         let enriched = enrich_write_error(error, &environment);
         assert!(enriched.to_string().contains("/home/meme/Escritorio"));
-        assert!(enriched.to_string().contains("filesystem.write_user_file"));
+        assert!(enriched.to_string().contains("filesystem.create_user_file"));
     }
 }
