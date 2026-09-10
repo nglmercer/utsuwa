@@ -10,10 +10,25 @@ export type MediaErrorCategory =
 	| 'constraints'
 	| 'unknown';
 
+export interface MediaErrorDetails {
+	name?: string;
+	message?: string;
+}
+
 function getStringProperty(error: unknown, property: 'name' | 'message'): string | undefined {
 	if ((typeof error !== 'object' && typeof error !== 'function') || error === null) return undefined;
 	const value = (error as Record<string, unknown>)[property];
 	return typeof value === 'string' ? value : undefined;
+}
+
+/** Read standard error fields without requiring a same-realm DOMException. */
+export function getMediaErrorDetails(error: unknown): MediaErrorDetails {
+	const details: MediaErrorDetails = {};
+	const name = getStringProperty(error, 'name');
+	const message = getStringProperty(error, 'message');
+	if (name !== undefined) details.name = name;
+	if (message !== undefined) details.message = message;
+	return details;
 }
 
 /**
@@ -22,7 +37,7 @@ function getStringProperty(error: unknown, property: 'name' | 'message'): string
  * so checking the exception name is more portable than `instanceof`.
  */
 export function classifyMediaError(error: unknown): MediaErrorCategory {
-	switch (getStringProperty(error, 'name')) {
+	switch (getMediaErrorDetails(error).name) {
 		case 'NotAllowedError':
 		case 'SecurityError':
 			return 'permission-denied';
@@ -62,7 +77,7 @@ export function getMediaErrorMessage(device: MediaDeviceKind, error: unknown): s
 		case 'constraints':
 			return `${label} does not meet requirements.`;
 		case 'unknown': {
-			const message = getStringProperty(error, 'message');
+			const message = getMediaErrorDetails(error).message;
 			return message ? `${label} error: ${message}` : `Failed to access ${deviceName}`;
 		}
 	}

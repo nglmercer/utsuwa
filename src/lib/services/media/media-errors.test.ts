@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classifyMediaError, getMediaErrorMessage } from './media-errors.ts';
+import { classifyMediaError, getMediaErrorDetails, getMediaErrorMessage } from './media-errors.ts';
 
 test('classifies standard media capture errors by device-independent category', () => {
 	assert.equal(classifyMediaError(new DOMException('denied', 'NotAllowedError')), 'permission-denied');
@@ -41,4 +41,12 @@ test('preserves useful messages for otherwise unknown errors', () => {
 		'Microphone error: driver unavailable'
 	);
 	assert.equal(getMediaErrorMessage('camera', {}), 'Failed to access camera');
+});
+
+test('reads error details across object realms', () => {
+	assert.deepEqual(getMediaErrorDetails({ name: 'NotAllowedError', message: 'blocked' }), {
+		name: 'NotAllowedError',
+		message: 'blocked'
+	});
+	assert.deepEqual(getMediaErrorDetails(null), {});
 });

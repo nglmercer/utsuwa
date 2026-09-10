@@ -81,7 +81,9 @@ class WebSpeechService {
 		this.recognition = new SpeechRecognition!();
 		this.callbacks = callbacks;
 
-		this.recognition.continuous = true;
+		// Treat each activation as one utterance so Web Speech has the same
+		// speak → pause → complete behavior as recorded STT.
+		this.recognition.continuous = false;
 		this.recognition.interimResults = true;
 		this.recognition.lang = 'en-US';
 		this.recognition.maxAlternatives = 1;
@@ -114,6 +116,12 @@ class WebSpeechService {
 		this.recognition.onend = () => {
 			this.isListening = false;
 			this.callbacks?.onEnd();
+		};
+
+		this.recognition.onspeechend = () => {
+			// `onend` remains the single completion path; stopping here asks the
+			// browser to close this one-utterance recognition session.
+			if (this.isListening) this.recognition?.stop();
 		};
 
 		this.recognition.onerror = (event: SpeechRecognitionErrorEvent) => {

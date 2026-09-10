@@ -1,5 +1,11 @@
 import type { SpeechRecognitionCallbacks } from './web-speech.ts';
-import { getMediaErrorMessage } from '../media/media-errors.ts';
+import { getMediaErrorDetails, getMediaErrorMessage } from '../media/media-errors.ts';
+import {
+	calculateRms,
+	DEFAULT_INITIAL_SILENCE_MS,
+	DEFAULT_MAX_RECORDING_MS,
+	VoiceActivityDetector
+} from '../media/voice-activity.ts';
 
 export interface SttTransportContext {
 	signal: AbortSignal;
@@ -7,10 +13,11 @@ export interface SttTransportContext {
 }
 
 /**
- * Provider-independent transport for push-to-talk recordings.
+ * Provider-independent transport for one-utterance recordings.
  *
- * The recorder owns microphone permissions, MediaRecorder, audio levels, and
- * cancellation. Providers only need to turn the finished Blob into text.
+ * The recorder owns microphone permissions, MediaRecorder, voice activity,
+ * audio levels, and cancellation. Providers only need to turn the finished
+ * Blob into text. Manual stop remains available as an explicit fallback.
  */
 export interface RecordedSttTransport {
 	transcribe(audio: Blob, context: SttTransportContext): Promise<string>;
@@ -35,6 +42,19 @@ export function isAbortError(error: unknown): boolean {
 	return typeof DOMException !== 'undefined' && error instanceof DOMException && error.name === 'AbortError';
 }
 
+function logMediaAccessFailure(error: unknown): void {
+	const { name, message } = getMediaErrorDetails(error);
+	const mediaDevices = typeof navigator !== 'undefined' ? navigator.mediaDevices : undefined;
+	console.warn('[RecordedSttService] getUserMedia failed', {
+		name,
+		message,
+		origin: typeof window !== 'undefined' ? window.location.origin : undefined,
+		isSecureContext: typeof window !== 'undefined' ? window.isSecureContext : undefined,
+		hasMediaDevices: !!mediaDevices,
+		hasGetUserMedia: typeof mediaDevices?.getUserMedia === 'function'
+	});
+}
+
 export class RecordedSttService {
 	private transport: RecordedSttTransport | null = null;
 	private mediaRecorder: MediaRecorder | null = null;
@@ -45,6 +65,11 @@ export class RecordedSttService {
 	private animFrameId: number | null = null;
 	private callbacks: SpeechRecognitionCallbacks | null = null;
 	private abortController: AbortController | null = null;
+	private voiceActivityDetector: VoiceActivityDetector | null = null;
+	private initialSilenceTimer: ReturnType<typeof setTimeout> | null = null;
+	private maximumDurationTimer: ReturnType<typeof setTimeout> | null = null;
+	private vadEnabled = false;
+	private discardRecording = false;
 	private listening = false;
 	private transcribing = false;
 	private sessionId = 0;
@@ -79,12 +104,15 @@ export class RecordedSttService {
 		const sessionId = ++this.sessionId;
 		this.callbacks = callbacks;
 		this.audioChunks = [];
+		this.clearVoiceActivityTimers();
+		this.discardRecording = false;
 
 		let stream: MediaStream;
 		try {
 			stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 		} catch (error) {
 			if (sessionId !== this.sessionId) return false;
+			logMediaAccessFailure(error);
 			callbacks.onError(getMediaErrorMessage('microphone', error));
 			this.callbacks = null;
 			return false;
@@ -119,7 +147,9 @@ export class RecordedSttService {
 				this.analyser = this.audioContext.createAnalyser();
 				this.analyser.fftSize = 256;
 				source.connect(this.analyser);
-				this.startLevelMonitoring();
+				void this.audioContext.resume().catch(() => {
+					// Recording and VAD can continue if the webview keeps the context suspended.
+				});
 			} catch {
 				// Recording can continue without level monitoring on restricted webviews.
 				this.audioContext?.close();
@@ -152,6 +182,7 @@ export class RecordedSttService {
 		try {
 			this.mediaRecorder.start(250);
 			this.listening = true;
+			this.startVoiceActivity(sessionId);
 			return true;
 		} catch {
 			this.callbacks = null;
@@ -162,9 +193,7 @@ export class RecordedSttService {
 	}
 
 	stopListening(): void {
-		if (this.mediaRecorder && this.listening) {
-			this.mediaRecorder.stop();
-		}
+		this.requestStop(false);
 	}
 
 	abort(): void {
@@ -177,6 +206,60 @@ export class RecordedSttService {
 		this.transcribing = false;
 	}
 
+	private startVoiceActivity(sessionId: number): void {
+		const detector = new VoiceActivityDetector();
+		detector.start(performance.now());
+		this.voiceActivityDetector = detector;
+		this.vadEnabled = !!this.analyser;
+
+		if (this.vadEnabled) {
+			this.initialSilenceTimer = setTimeout(() => {
+				if (sessionId !== this.sessionId || !this.listening || detector.hasDetectedSpeech) return;
+				this.requestStop(true);
+			}, DEFAULT_INITIAL_SILENCE_MS);
+		}
+
+		this.maximumDurationTimer = setTimeout(() => {
+			if (sessionId !== this.sessionId || !this.listening) return;
+			this.requestStop(this.vadEnabled && !detector.hasDetectedSpeech);
+		}, DEFAULT_MAX_RECORDING_MS);
+
+		this.startLevelMonitoring(sessionId);
+	}
+
+	private processVoiceActivity(sessionId: number, rms: number, now: number): void {
+		const detector = this.voiceActivityDetector;
+		if (!detector || sessionId !== this.sessionId) return;
+
+		switch (detector.update(rms, now)) {
+			case 'speech-start':
+				if (this.initialSilenceTimer !== null) {
+					clearTimeout(this.initialSilenceTimer);
+					this.initialSilenceTimer = null;
+				}
+				break;
+			case 'speech-end':
+				this.requestStop(false);
+				break;
+			case 'initial-silence':
+				this.requestStop(true);
+				break;
+			case 'maximum-duration':
+				this.requestStop(this.vadEnabled && !detector.hasDetectedSpeech);
+				break;
+		}
+	}
+
+	private requestStop(discard: boolean): void {
+		if (!this.mediaRecorder || !this.listening) return;
+
+		this.discardRecording ||= discard;
+		this.listening = false;
+		this.clearVoiceActivityTimers();
+		this.stopLevelMonitoring();
+		if (this.mediaRecorder.state !== 'inactive') this.mediaRecorder.stop();
+	}
+
 	private getSupportedMimeType(): string | undefined {
 		// mp4/m4a first for Safari/WKWebView, then webm for Chromium.
 		const types = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
@@ -186,16 +269,16 @@ export class RecordedSttService {
 		return undefined;
 	}
 
-	private startLevelMonitoring(): void {
-		if (!this.analyser || !this.callbacks?.onAudioLevel) return;
+	private startLevelMonitoring(sessionId: number): void {
+		if (!this.analyser) return;
 
-		const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+		const dataArray = new Uint8Array(this.analyser.fftSize);
 		const tick = () => {
-			if (!this.analyser || !this.listening) return;
-			this.analyser.getByteFrequencyData(dataArray);
-			let sum = 0;
-			for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-			const level = dataArray.length ? sum / (dataArray.length * 255) : 0;
+			if (!this.analyser || !this.listening || sessionId !== this.sessionId) return;
+			this.analyser.getByteTimeDomainData(dataArray);
+			const level = calculateRms(dataArray);
+			this.processVoiceActivity(sessionId, level, performance.now());
+			if (!this.listening || sessionId !== this.sessionId) return;
 			this.callbacks?.onAudioLevel?.(level);
 			this.animFrameId = requestAnimationFrame(tick);
 		};
@@ -206,14 +289,30 @@ export class RecordedSttService {
 		if (sessionId !== this.sessionId) return;
 
 		this.listening = false;
+		this.clearVoiceActivityTimers();
 		this.stopLevelMonitoring();
 		this.releaseStream();
 
+		const discardRecording = this.discardRecording;
+		this.discardRecording = false;
 		const callbacks = this.callbacks;
 		const transport = this.transport;
-		if (!callbacks || !transport) return;
+		if (discardRecording) {
+			this.audioChunks = [];
+			this.mediaRecorder = null;
+			this.callbacks = null;
+			callbacks?.onEnd();
+			return;
+		}
+		if (!callbacks || !transport) {
+			this.audioChunks = [];
+			this.mediaRecorder = null;
+			this.callbacks = null;
+			return;
+		}
 
 		if (this.audioChunks.length === 0) {
+			this.mediaRecorder = null;
 			this.callbacks = null;
 			callbacks.onEnd();
 			return;
@@ -288,13 +387,29 @@ export class RecordedSttService {
 	}
 
 	private cleanup(): void {
+		this.clearVoiceActivityTimers();
 		this.stopLevelMonitoring();
 		if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
 			this.mediaRecorder.stop();
 		}
 		this.mediaRecorder = null;
 		this.audioChunks = [];
+		this.discardRecording = false;
 		this.releaseStream();
+	}
+
+	private clearVoiceActivityTimers(): void {
+		if (this.initialSilenceTimer !== null) {
+			clearTimeout(this.initialSilenceTimer);
+			this.initialSilenceTimer = null;
+		}
+		if (this.maximumDurationTimer !== null) {
+			clearTimeout(this.maximumDurationTimer);
+			this.maximumDurationTimer = null;
+		}
+		this.voiceActivityDetector?.reset();
+		this.voiceActivityDetector = null;
+		this.vadEnabled = false;
 	}
 }
 

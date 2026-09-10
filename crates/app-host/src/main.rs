@@ -97,11 +97,13 @@ fn debug_filter(level: &str) -> String {
 /// is serviced by the platform backend; it does not open a media stream.
 /// Camera access stays explicitly denied until Utsuwa has a camera feature.
 fn permission_response(kind: PermissionKind) -> PermissionResponse {
-    match kind {
+    let response = match kind {
         PermissionKind::Microphone => PermissionResponse::Allow,
         PermissionKind::Camera => PermissionResponse::Deny,
         _ => PermissionResponse::Default,
-    }
+    };
+    tracing::info!(?kind, ?response, "webview permission request");
+    response
 }
 
 /// Initialize stderr logging for normal runs and stderr + a rolling file for
