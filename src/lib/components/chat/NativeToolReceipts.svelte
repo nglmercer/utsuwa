@@ -59,17 +59,96 @@
 		return step.status === 'retry';
 	}
 
+	interface FailureDetails {
+		code?: string;
+		message?: string;
+		reason?: string;
+		retryAction?: string;
+		nextTool?: string;
+		suggestedTarget?: { directory?: string; relative_path?: string };
+	}
+
+	function failureDetails(step: NativeToolStep): FailureDetails | null {
+		if (!step.error) return null;
+		try {
+			const parsed = JSON.parse(step.error) as unknown;
+			if (typeof parsed !== 'object' || parsed === null) return null;
+			const root = parsed as Record<string, unknown>;
+			const nested = typeof root.error === 'object' && root.error !== null
+				? root.error as Record<string, unknown>
+				: root;
+			const suggested = nested.suggested_target;
+			return {
+				...(typeof nested.code === 'string' ? { code: nested.code } : {}),
+				...(typeof nested.message === 'string' ? { message: nested.message } : {}),
+				...(typeof nested.reason === 'string' ? { reason: nested.reason } : {}),
+				...(typeof nested.retry_action === 'string' ? { retryAction: nested.retry_action } : {}),
+				...(typeof nested.next_tool === 'string' ? { nextTool: nested.next_tool } : {}),
+				...(typeof suggested === 'object' && suggested !== null
+					? { suggestedTarget: suggested as FailureDetails['suggestedTarget'] }
+					: {})
+			};
+		} catch {
+			return null;
+		}
+	}
+
 	function failureMessage(step: NativeToolStep): string {
 		const raw = (step.error ?? 'Native operation failed').replace(/^tool [^:]+ failed:\s*/i, '');
-		if (step.status === 'retry') {
-			try {
-				const parsed = JSON.parse(raw) as { message?: unknown };
-				if (typeof parsed.message === 'string') return parsed.message;
-			} catch {
-				// Older/native-compatible retry messages remain displayable as text.
-			}
-		}
+		const details = failureDetails(step);
+		if (details?.message) return details.message;
+		if (details?.reason) return details.reason;
 		return raw;
+	}
+
+	function failureTitle(step: NativeToolStep): string {
+		const code = failureDetails(step)?.code;
+		switch (code) {
+			case 'file_not_found':
+				return 'File does not exist';
+			case 'stale_file_ref':
+				return 'File reference is stale';
+			case 'target_is_directory':
+				return 'Target is a directory';
+			case 'repeated_tool_call':
+				return 'Repeated operation blocked';
+			case 'invalid_file_target':
+				return 'File target needs correction';
+			default:
+				return step.status === 'retry' ? 'Operation needs correction' : `${step.name} ${failureLabel(step)}`;
+		}
+	}
+
+	function failureAction(step: NativeToolStep): string | null {
+		const details = failureDetails(step);
+		if (!details) return null;
+		if (details.code === 'repeated_tool_call' || details.retryAction === 'change_arguments') {
+			return 'Change the target or operation; the same call will not be retried.';
+		}
+		if (details.code === 'file_not_found' || details.retryAction === 'change_operation_or_target') {
+			const suggested = details.suggestedTarget;
+			const target = suggested?.directory && suggested.relative_path
+				? ` Suggested target: ${suggested.directory}/${suggested.relative_path}.`
+				: '';
+			return `Check the target, or create the file with filesystem.create_user_file.${target}`;
+		}
+		if (details.code === 'stale_file_ref' || details.retryAction === 'refresh_file_reference') {
+			return 'Refresh the file with filesystem.read, filesystem.stat, or filesystem.list.';
+		}
+		if (details.code === 'target_is_directory') {
+			return 'Choose a file inside this directory with filesystem.list.';
+		}
+		return details.nextTool ? `Next step: ${details.nextTool}.` : null;
+	}
+
+	function retrySummaryLabel(): string {
+		const step = steps.find((candidate) => candidate.status === 'retry');
+		return step ? failureTitle(step) : 'Operation needs correction';
+	}
+
+	function failureSummaryLabel(): string {
+		const step = steps.find((candidate) => !candidate.ok);
+		return step ? failureTitle(step) : 'Native operation failed';
 	}
 
 	function failedSteps(): NativeToolStep[] {
@@ -82,9 +161,9 @@
 		{#if summarizeNativeToolSteps(steps) === 'recovered'}
 			<div class="native-tool-recovered" role="status">✓ Completed after retry</div>
 		{:else if summarizeNativeToolSteps(steps) === 'retry'}
-			<div class="native-tool-retry" role="status">↻ Edit needs more information</div>
+			<div class="native-tool-retry" role="status">↻ {retrySummaryLabel()}</div>
 		{:else if summarizeNativeToolSteps(steps) === 'failed'}
-			<div class="native-tool-warning" role="alert">⚠ Native operation failed</div>
+			<div class="native-tool-warning" role="alert">⚠ {failureSummaryLabel()}</div>
 		{/if}
 		{#if summarizeNativeToolSteps(steps) === 'recovered'}
 			{#each steps.filter((step) => step.ok && isNativeMutation(step.name)) as step, index (`success-${step.id}-${index}`)}
@@ -100,13 +179,15 @@
 					{#each failedSteps() as step, index (`failure-${step.id}-${index}`)}
 						{#if isRetry(step)}
 							<div class="native-tool-receipt retry">
-								<span>↻ Edit needs more information</span>
+								<span>↻ {failureTitle(step)}</span>
 								<small>{failureMessage(step)}</small>
+								{#if failureAction(step)}<small>{failureAction(step)}</small>{/if}
 							</div>
 						{:else}
 							<div class="native-tool-receipt failure">
-								<span>✗ {step.name} {failureLabel(step)}</span>
+								<span>✗ {failureTitle(step)}</span>
 								<small>{failureMessage(step)}</small>
+								{#if failureAction(step)}<small>{failureAction(step)}</small>{/if}
 							</div>
 						{/if}
 					{/each}
@@ -122,13 +203,15 @@
 					</div>
 				{:else if isRetry(step)}
 					<div class="native-tool-receipt retry">
-						<span>↻ Edit needs more information</span>
+						<span>↻ {failureTitle(step)}</span>
 						<small>{failureMessage(step)}</small>
+						{#if failureAction(step)}<small>{failureAction(step)}</small>{/if}
 					</div>
 				{:else}
 					<div class="native-tool-receipt failure">
-						<span>✗ {step.name} {failureLabel(step)}</span>
+						<span>✗ {failureTitle(step)}</span>
 						<small>{failureMessage(step)}</small>
+						{#if failureAction(step)}<small>{failureAction(step)}</small>{/if}
 					</div>
 				{/if}
 			{/each}

@@ -6,8 +6,8 @@ use crate::common::{
     retryable_target_args, tag_file_output, EDIT_TOOL, EDIT_USER_FILE_TOOL,
 };
 use file_target::{
-    normalize_relative_path, FileRef, FileResolver, FileTarget, FilesystemErrorCode,
-    ResolvedFileTarget, TargetPurpose,
+    normalize_relative_path, FileRef, FileResolver, FileTarget, FileTargetError,
+    FilesystemErrorCode, ResolvedFileTarget, TargetPurpose,
 };
 use host_core::{HostEnvironment, UserDirectory};
 use serde_json::{Map, Value};
@@ -446,16 +446,24 @@ pub(crate) fn normalize_special_user_path(
                         attempted: path.to_path_buf(),
                     });
                 }
-                return Err(failed(
+                return Err(filesystem_error(
                     tool,
-                    format!(
-                        "file_not_found: '{}' does not exist. The host-configured {} directory is '{}'; the same file name was not found there either (checked '{}'). Use {next_tool} with location='{}' after creating the file, or retry with the exact absolute path",
-                        path.display(),
-                        directory.prompt_label(),
-                        configured.display(),
-                        candidate.display(),
-                        directory.json_key(),
-                    ),
+                    FileTargetError {
+                        code: FilesystemErrorCode::FileNotFound,
+                        message: format!(
+                            "'{}' does not exist. The host-configured {} directory is '{}'; the same file name was not found there either (checked '{}'). Use {next_tool} to verify the target or filesystem.create_user_file when creating a new file",
+                            path.display(),
+                            directory.prompt_label(),
+                            configured.display(),
+                            candidate.display(),
+                        ),
+                        received: Some(path.to_string_lossy().into_owned()),
+                        retryable: true,
+                        suggested_target: Some(FileTarget {
+                            directory,
+                            relative_path: PathBuf::from(file_name),
+                        }),
+                    },
                 ));
             }
             SpecialPathPurpose::Write => {
@@ -498,6 +506,8 @@ pub(crate) fn with_read_retry_guidance(path: &Path, error: ToolError) -> ToolErr
             "error": "old_text_mismatch",
             "target": path.to_string_lossy(),
             "next_tool": "filesystem.read",
+            "retry_action": "read_current_text",
+            "retry_same_arguments": false,
         }),
     }
 }
@@ -1186,6 +1196,15 @@ pub(crate) fn missing_edit_argument(
                 .collect(),
         ),
     );
+    recovery.insert(
+        "retry_action".to_string(),
+        Value::String(if missing.contains(&"old_text") {
+            "read_current_text".to_string()
+        } else {
+            "provide_missing_edit_text".to_string()
+        }),
+    );
+    recovery.insert("retry_same_arguments".to_string(), Value::Bool(false));
     if missing.contains(&"old_text") {
         recovery.insert(
             "next_tool".to_string(),

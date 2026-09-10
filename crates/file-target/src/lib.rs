@@ -342,7 +342,16 @@ impl FileResolver {
             });
         };
         let lexical = root.join(&relative_path);
-        let absolute = validate_target(&root, &lexical, purpose)?;
+        let absolute = match validate_target(&root, &lexical, purpose) {
+            Ok(absolute) => absolute,
+            Err(error) if error.code == FilesystemErrorCode::FileNotFound => {
+                return Err(error.with_suggested_target(FileTarget {
+                    directory: target.directory,
+                    relative_path: relative_path.clone(),
+                }));
+            }
+            Err(error) => return Err(error),
+        };
         let file_ref = FileRef::from_target(&FileTarget {
             directory: target.directory,
             relative_path: relative_path.clone(),
@@ -423,7 +432,16 @@ impl FileResolver {
         }
         let lexical_path = lexical_absolute_path(path);
         let canonical = match purpose {
-            TargetPurpose::Existing => canonical_existing(path)?,
+            TargetPurpose::Existing => match canonical_existing(path) {
+                Ok(canonical) => canonical,
+                Err(error) if error.code == FilesystemErrorCode::FileNotFound => {
+                    if let Some(target) = self.suggested_target_for_absolute_path(path) {
+                        return Err(error.with_suggested_target(target));
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            },
             TargetPurpose::Create => canonical_creation(path)?,
         };
         let mut lexically_inside = false;
@@ -431,7 +449,15 @@ impl FileResolver {
             let Some(root) = self.environment.user_dirs.get(directory) else {
                 continue;
             };
-            let root = canonical_root(root)?;
+            let root = match canonical_root(root) {
+                Ok(root) => root,
+                // A missing optional user directory must not make an
+                // unrelated explicit path unusable. Existing absolute paths
+                // are still canonicalized and authorized below; the missing
+                // directory is simply not a semantic mapping candidate.
+                Err(_) if matches!(purpose, TargetPurpose::Existing) => continue,
+                Err(error) => return Err(error),
+            };
             lexically_inside = lexically_inside
                 || lexical_path
                     .as_deref()
@@ -462,6 +488,37 @@ impl FileResolver {
             ));
         }
         Ok(None)
+    }
+
+    /// Return a semantic target for a missing absolute path when its parent
+    /// is safely inside a configured user directory. This is only a recovery
+    /// hint; it never creates a file or authorizes an operation.
+    pub fn suggested_target_for_absolute_path(&self, path: &Path) -> Option<FileTarget> {
+        if !path.is_absolute() {
+            return None;
+        }
+        let parent = path.parent()?.canonicalize().ok()?;
+        let file_name = path.file_name()?.to_os_string();
+        for directory in UserDirectory::ALL {
+            let Some(configured_root) = self.environment.user_dirs.get(directory) else {
+                continue;
+            };
+            let Ok(root) = configured_root.canonicalize() else {
+                continue;
+            };
+            if !parent.starts_with(&root) {
+                continue;
+            }
+            let relative_path = parent.strip_prefix(&root).ok()?.join(file_name.clone());
+            if validate_relative_path(&relative_path).is_err() {
+                continue;
+            }
+            return Some(FileTarget {
+                directory,
+                relative_path,
+            });
+        }
+        None
     }
 
     /// Resolve any absolute path to a stable descriptor. Paths inside a
@@ -821,6 +878,54 @@ mod tests {
             document_target.file_ref.as_str(),
             "file:documents:project/src/config.toml"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn missing_paths_inside_configured_directories_get_semantic_recovery_targets() {
+        let root = test_root("missing-suggestion");
+        let _ = std::fs::remove_dir_all(&root);
+        let desktop = root.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let missing = desktop.join("resumen_hoy.txt");
+        let resolver = FileResolver::new(environment(&root));
+
+        let error = resolver
+            .normalize_absolute_path(&missing, TargetPurpose::Existing)
+            .unwrap_err();
+        assert_eq!(error.code, FilesystemErrorCode::FileNotFound);
+        assert_eq!(error.retryable, true);
+        assert_eq!(
+            error.suggested_target,
+            Some(FileTarget {
+                directory: UserDirectory::Desktop,
+                relative_path: PathBuf::from("resumen_hoy.txt"),
+            })
+        );
+
+        let semantic_error = resolver
+            .resolve_target(
+                &FileTarget {
+                    directory: UserDirectory::Desktop,
+                    relative_path: PathBuf::from("resumen_hoy.txt"),
+                },
+                TargetPurpose::Existing,
+            )
+            .unwrap_err();
+        assert_eq!(semantic_error.suggested_target, error.suggested_target);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn missing_paths_outside_configured_directories_get_no_creation_hint() {
+        let root = test_root("missing-outside-suggestion");
+        let _ = std::fs::remove_dir_all(&root);
+        let desktop = root.join("Escritorio");
+        std::fs::create_dir_all(&desktop).unwrap();
+        let resolver = FileResolver::new(environment(&root));
+        assert!(resolver
+            .suggested_target_for_absolute_path(&root.join("project/resumen_hoy.txt"))
+            .is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
 

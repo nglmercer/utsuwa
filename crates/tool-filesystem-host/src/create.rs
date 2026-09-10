@@ -40,7 +40,7 @@ impl Tool for CreateUserFileTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(CREATE_USER_FILE_TOOL),
-            description: "Create or overwrite a UTF-8 file inside an operating-system configured user directory such as Desktop or Documents. Prefer this tool whenever the user refers to Desktop, Documents, Downloads, Pictures, Music, Public, or Templates; the host resolves the location and you must not construct its path. Use a semantic location such as desktop, not an absolute directory path. The filename may be a file name or relative subpath; parent directories must already exist unless create_parents=true. An absolute filename is accepted only when it is inside the selected host directory.".to_string(),
+            description: "Create or overwrite a UTF-8 file inside an operating-system configured user directory such as Desktop or Documents. Use this tool for requests to create, make, save, or write a new file; do not call filesystem.edit first when the file may not exist. Prefer this tool whenever the user refers to Desktop, Documents, Downloads, Pictures, Music, Public, or Templates; the host resolves the location and you must not construct its path. Use a semantic location such as desktop, not an absolute directory path. The filename may be a file name or relative subpath; parent directories must already exist unless create_parents=true. An absolute filename is accepted only when it is inside the selected host directory.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,

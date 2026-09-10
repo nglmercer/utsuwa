@@ -50,26 +50,110 @@ pub(crate) fn failed(tool: &str, message: impl Into<String>) -> ToolError {
 }
 
 pub(crate) fn filesystem_error(tool: &str, error: FileTargetError) -> ToolError {
+    let FileTargetError {
+        code,
+        message,
+        received,
+        retryable,
+        suggested_target,
+    } = error;
     let mut details = serde_json::Map::new();
-    if let Some(received) = error.received {
+    if let Some(received) = received {
         details.insert("received".to_string(), Value::String(received));
     }
-    if let Some(target) = error.suggested_target {
-        details.insert(
+    details.extend(filesystem_recovery(tool, code, suggested_target.as_ref()));
+    ToolError::Filesystem {
+        tool: tool.to_string(),
+        code: serde_json::to_string(&code)
+            .unwrap_or_else(|_| "io_failure".to_string())
+            .trim_matches('"')
+            .to_string(),
+        retryable,
+        message,
+        details: Value::Object(details),
+    }
+}
+
+fn filesystem_recovery(
+    tool: &str,
+    code: FilesystemErrorCode,
+    suggested_target: Option<&FileTarget>,
+) -> Map<String, Value> {
+    let (retry_action, next_tools): (&str, &[&str]) = match code {
+        FilesystemErrorCode::FileNotFound if is_existing_file_tool(tool) => (
+            "change_operation_or_target",
+            &[
+                "filesystem.stat",
+                "filesystem.read",
+                "filesystem.create_user_file",
+            ],
+        ),
+        FilesystemErrorCode::StaleFileRef => (
+            "refresh_file_reference",
+            &["filesystem.stat", "filesystem.read", "filesystem.list"],
+        ),
+        FilesystemErrorCode::TargetIsDirectory => {
+            ("select_file", &["filesystem.list", "filesystem.stat"])
+        }
+        FilesystemErrorCode::DirectoryNotFound => (
+            "inspect_or_create_directory",
+            &["filesystem.list", "filesystem.create_user_file"],
+        ),
+        FilesystemErrorCode::FileNotFound => {
+            ("correct_target", &["filesystem.stat", "filesystem.list"])
+        }
+        _ if is_retryable_target_error(code) => ("correct_target", &["filesystem.stat"]),
+        _ => ("do_not_retry", &[]),
+    };
+
+    let mut recovery = Map::new();
+    recovery.insert(
+        "retry_action".to_string(),
+        Value::String(retry_action.to_string()),
+    );
+    recovery.insert("retry_same_arguments".to_string(), Value::Bool(false));
+    recovery.insert(
+        "next_tools".to_string(),
+        Value::Array(
+            next_tools
+                .iter()
+                .map(|tool| Value::String((*tool).to_string()))
+                .collect(),
+        ),
+    );
+    if let Some(next_tool) = next_tools.first() {
+        recovery.insert(
+            "next_tool".to_string(),
+            Value::String((*next_tool).to_string()),
+        );
+    }
+    if let Some(target) = suggested_target {
+        recovery.insert(
             "suggested_target".to_string(),
             serde_json::to_value(target).unwrap_or(Value::Null),
         );
     }
-    ToolError::Filesystem {
-        tool: tool.to_string(),
-        code: serde_json::to_string(&error.code)
-            .unwrap_or_else(|_| "io_failure".to_string())
-            .trim_matches('"')
-            .to_string(),
-        retryable: error.retryable,
-        message: error.message,
-        details: Value::Object(details),
-    }
+    recovery
+}
+
+fn is_existing_file_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        EDIT_TOOL | EDIT_FILE_TOOL | EDIT_USER_FILE_TOOL | REPLACE_USER_FILE_TOOL
+    )
+}
+
+fn is_retryable_target_error(code: FilesystemErrorCode) -> bool {
+    matches!(
+        code,
+        FilesystemErrorCode::InvalidDirectory
+            | FilesystemErrorCode::DirectoryUnavailable
+            | FilesystemErrorCode::InvalidRelativePath
+            | FilesystemErrorCode::InvalidFileRef
+            | FilesystemErrorCode::OutsideAllowedDirectory
+            | FilesystemErrorCode::PathTraversal
+            | FilesystemErrorCode::AmbiguousTarget
+    )
 }
 
 pub(crate) fn file_target_descriptor(resolved: &ResolvedFileTarget) -> Value {
@@ -233,6 +317,8 @@ pub(crate) fn retryable_target_args(tool: &str, message: impl Into<String>) -> T
         recovery: serde_json::json!({
             "error": "invalid_file_target",
             "reason": message.into(),
+            "retry_action": "correct_target",
+            "retry_same_arguments": false,
             "target_fields": ["file_ref", "target", "location", "filename", "path"],
             "next_tool": tool,
         }),

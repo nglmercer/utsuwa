@@ -574,14 +574,16 @@ mod tests {
             "Filesystem tools prefer file_ref or semantic directory ids with relative paths"
         ));
         assert!(context.contains(
-            "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file"
+            "For creating new files in Desktop/Documents/etc., use filesystem.create_user_file"
         ));
+        assert!(context.contains("never first try filesystem.edit or filesystem.write"));
         assert!(context.contains("use filesystem.edit:"));
         assert!(context.contains("Current local date:"));
         assert!(context.contains("Current local datetime:"));
         assert!(context.contains("new_text_source may be current_date"));
         assert!(context.contains("use a placeholder such as 'Updated date'"));
         assert!(context.contains("A failed edit attempt does not mean editing is unsupported"));
+        assert!(context.contains("Never repeat the exact same filesystem arguments"));
         assert!(context.contains(
             "Do not tell the user that file editing is unavailable unless the native tool actually returns an unavailable or denied result"
         ));

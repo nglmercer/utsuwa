@@ -117,7 +117,7 @@ fn host_environment_context_for_context(
         "Special filesystem directories are resolved by the operating system.".to_string(),
         "The host owns path resolution, localization, canonicalization, and capability validation. Do not reconstruct localized filesystem roots from display_path."
             .to_string(),
-        "For creating new files in Desktop/Documents/etc., prefer filesystem.create_user_file with location and filename; do not first try filesystem.write or construct a special-directory path yourself. For existing files, use filesystem.edit."
+        "For creating new files in Desktop/Documents/etc., use filesystem.create_user_file with location and filename; never first try filesystem.edit or filesystem.write when the file may not exist, and never construct a special-directory path yourself. For existing files, use filesystem.edit."
             .to_string(),
         "You can create, read, overwrite, and edit files using the native filesystem tools."
             .to_string(),
@@ -125,7 +125,7 @@ fn host_environment_context_for_context(
             .to_string(),
         "For whole-file replacement in Desktop/Documents/etc. use filesystem.replace_user_file; to add text at the end use filesystem.append_user_file, or filesystem.append_file for an explicit absolute path."
             .to_string(),
-        "If an edit operation fails because a path or text match was wrong, correct the tool arguments and retry. A failed edit attempt does not mean editing is unsupported. Do not offer to create a replacement file unless the user actually asks for a new file."
+        "If an edit operation fails because a path or text match was wrong, follow the structured recovery fields from the tool result. Never repeat the exact same filesystem arguments after file_not_found, stale_file_ref, repeated_tool_call, or another retry result. Use filesystem.stat/filesystem.read to verify an existing target, or use filesystem.create_user_file when the user asked for a new file. A failed edit attempt does not mean editing is unsupported."
             .to_string(),
         "Do not tell the user that file editing is unavailable unless the native tool actually returns an unavailable or denied result."
             .to_string(),

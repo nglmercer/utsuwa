@@ -1,12 +1,12 @@
 //! Explicit-path edit tool (legacy shape).
 
-use crate::common::{invalid_args, EDIT_FILE_TOOL, EDIT_USER_FILE_TOOL};
+use crate::common::{filesystem_error, invalid_args, EDIT_FILE_TOOL, EDIT_USER_FILE_TOOL};
 use crate::edit_args::{
     normalize_special_user_path, parse_old_new, patch_args_for, path_only_args,
     required_string_field, tag_normalized_from, with_read_retry_guidance, NormalizedSpecialPath,
     SpecialPathPurpose,
 };
-use file_target::TargetPurpose;
+use file_target::{FileResolver, TargetPurpose};
 use host_core::HostEnvironment;
 use serde_json::Value;
 use std::path::Path;
@@ -49,13 +49,24 @@ pub(crate) fn resolve_edit_file_path(
         .as_object()
         .ok_or_else(|| invalid_args(tool, "args must be a JSON object"))?;
     let path = required_string_field(object, tool, "path")?;
-    normalize_special_user_path(
+    if !Path::new(&path).is_absolute() {
+        return Err(invalid_args(tool, "path must be absolute"));
+    }
+    let normalized = normalize_special_user_path(
         Path::new(&path),
         environment,
         tool,
         SpecialPathPurpose::ExistingFile,
         next_tool,
-    )
+    )?;
+    let resolved = FileResolver::new(environment.clone())
+        .descriptor_for_absolute(&normalized.path, TargetPurpose::Existing)
+        .map_err(|error| filesystem_error(tool, error))?;
+    Ok(NormalizedSpecialPath {
+        path: resolved.absolute_path,
+        mapped: normalized.mapped,
+        attempted: normalized.attempted,
+    })
 }
 
 #[async_trait::async_trait]
@@ -63,14 +74,14 @@ impl Tool for EditFileTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(EDIT_FILE_TOOL),
-            description: "Edit one exact text block inside an existing file at an explicit absolute host-native path. Use this only for arbitrary paths; for Desktop/Documents/etc. prefer filesystem.edit or filesystem.edit_user_file. A stale conventional path such as $HOME/Desktop is normalized to the OS-configured directory when unambiguous. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
+            description: "Edit one exact text block inside an existing file at an explicit absolute host-native path. Never use this to create a new file; use filesystem.create_user_file for that. Use this only for arbitrary paths; for Desktop/Documents/etc. prefer filesystem.edit or filesystem.edit_user_file. A stale conventional path such as $HOME/Desktop is normalized to the OS-configured directory when unambiguous. If the target is missing, inspect it or change to the create tool; do not repeat the same edit arguments. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Absolute host-native path of the existing file."
+                        "description": "Absolute host-native path of an existing file only. If it does not exist, use filesystem.create_user_file instead of retrying this edit."
                     },
                     "old_text": {
                         "type": "string",

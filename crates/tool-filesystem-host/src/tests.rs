@@ -960,9 +960,18 @@ async fn edit_file_reports_a_structured_error_when_nothing_exists() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, ToolError::Failed { .. }), "{error:?}");
+    assert!(
+        matches!(
+            &error,
+            ToolError::Filesystem {
+                code,
+                retryable: true,
+                ..
+            } if code == "file_not_found"
+        ),
+        "{error:?}"
+    );
     let message = error.to_string();
-    assert!(message.contains("file_not_found"), "{message}");
     assert!(
         message.contains(&stale.to_string_lossy().into_owned()),
         "{message}"
@@ -972,6 +981,9 @@ async fn edit_file_reports_a_structured_error_when_nothing_exists() {
         "{message}"
     );
     assert!(message.contains("filesystem.edit_user_file"), "{message}");
+    let model_message = error.model_message();
+    assert!(model_message.contains("file_not_found"), "{model_message}");
+    assert!(model_message.contains("filesystem.create_user_file"));
     // No capability is minted for a call that cannot resolve a target.
     assert!(tool
         .required_capability(&serde_json::json!({
@@ -980,6 +992,51 @@ async fn edit_file_reports_a_structured_error_when_nothing_exists() {
             "new_text": "new",
         }))
         .is_none());
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[tokio::test]
+async fn unified_edit_missing_target_explains_create_or_reselect_recovery() {
+    let (home, desktop) = stale_home("utsuwa-edit-missing-recovery");
+    let missing = desktop.join("resumen_hoy.txt");
+    let tool = EditTool::new(
+        tool_filesystem::FilesystemLimits::default(),
+        environment(&home, &desktop),
+    );
+    let error = tool
+        .invoke(
+            ToolContext::new(Principal::Agent(AgentId::new("edit-missing-recovery"))),
+            serde_json::json!({
+                "path": missing.to_string_lossy(),
+                "old_text": "old",
+                "new_text": "new",
+            }),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, ToolError::Filesystem { ref code, retryable: true, .. } if code == "file_not_found"),
+        "{error:?}"
+    );
+    let model_error: serde_json::Value = serde_json::from_str(&error.model_message()).unwrap();
+    let details = &model_error["error"];
+    assert_eq!(details["retry_action"], "change_operation_or_target");
+    assert_eq!(details["retry_same_arguments"], false);
+    assert_eq!(details["next_tool"], "filesystem.stat");
+    assert!(details["next_tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool == "filesystem.create_user_file"));
+    assert_eq!(
+        details["suggested_target"],
+        serde_json::json!({
+            "directory": "desktop",
+            "relative_path": "resumen_hoy.txt"
+        })
+    );
+    assert!(!missing.exists());
     std::fs::remove_dir_all(&home).unwrap();
 }
 

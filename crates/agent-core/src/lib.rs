@@ -358,6 +358,11 @@ impl Agent {
         let mut truncated = false;
         let mut final_text = String::new();
         let mut read_only_follow_up_nudged = false;
+        // A deterministic filesystem validation failure must not cause the
+        // model to spin by emitting the exact same mutation again. The model
+        // can still recover by changing the target, reading the file, or
+        // selecting the create tool.
+        let mut blocked_retries: HashMap<String, String> = HashMap::new();
 
         for _ in 0..self.limits.max_iterations {
             let mut request = ModelRequest::new(messages.clone());
@@ -373,10 +378,12 @@ impl Agent {
             truncated |= turn_truncated;
             final_text = text.clone();
             if calls.is_empty() {
-                let should_nudge = !read_only_follow_up_nudged
-                    && executed
-                        .last()
-                        .is_some_and(|step| Self::tool_may_need_follow_up(&step.name));
+                let last_tool_needs_text_continuation = executed.last().is_some_and(|step| {
+                    Self::tool_may_need_follow_up(&step.name)
+                        && (!matches!(step.name.as_str(), "filesystem.read")
+                            || text.trim().is_empty())
+                });
+                let should_nudge = !read_only_follow_up_nudged && last_tool_needs_text_continuation;
                 if should_nudge {
                     let last_tool = executed
                         .last()
@@ -425,6 +432,22 @@ impl Agent {
                     tool_name = %call.name,
                     "model requested native tool"
                 );
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                    let key = replay_key(&call.name, &args);
+                    if let Some(message) = blocked_retries.get(&key) {
+                        tool_steps.push(ToolStep::failure(
+                            call,
+                            ToolStepStatus::Failed,
+                            message.clone(),
+                        ));
+                        results.push(ModelMessage::tool_result(ToolResult {
+                            tool_call_id: call.id.clone(),
+                            content: message.clone(),
+                            is_error: true,
+                        }));
+                        continue;
+                    }
+                }
                 if let Some(output) = self.replayed_output(registry, call) {
                     executed.push(ExecutedTool {
                         id: call.id.clone(),
@@ -466,6 +489,7 @@ impl Agent {
                 let call_id = prepared_call.call.id.clone();
                 let call_name = prepared_call.call.name.clone();
                 let step_call = prepared_call.call.clone();
+                let retry_key = replay_key(&call_name, &prepared_call.args);
                 match self.execute_prepared(authorizer, prepared_call).await {
                     Ok(output) => {
                         executed.push(ExecutedTool {
@@ -484,6 +508,12 @@ impl Agent {
                         }));
                     }
                     Err(PendingOrFailed::Failed { message, status }) => {
+                        if should_block_same_tool_retry(&call_name, status, &message) {
+                            blocked_retries.insert(
+                                retry_key,
+                                repeated_tool_call_message(&call_name, &message),
+                            );
+                        }
                         tool_steps.push(ToolStep::failure(&step_call, status, message.clone()));
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call_id.clone(),
@@ -999,6 +1029,58 @@ fn tool_error_status(error: &tool_core::ToolError) -> ToolStepStatus {
         tool_core::ToolError::Denied { .. } => ToolStepStatus::Denied,
         _ => ToolStepStatus::Failed,
     }
+}
+
+fn should_block_same_tool_retry(tool: &str, status: ToolStepStatus, message: &str) -> bool {
+    if !tool.starts_with("filesystem.") {
+        return false;
+    }
+    if status == ToolStepStatus::Retry {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(message) else {
+        return false;
+    };
+    let code = match value.get("error") {
+        Some(serde_json::Value::Object(error)) => {
+            error.get("code").and_then(|value| value.as_str())
+        }
+        Some(serde_json::Value::String(code)) => Some(code.as_str()),
+        _ => None,
+    };
+    matches!(
+        code,
+        Some(
+            "file_not_found"
+                | "stale_file_ref"
+                | "invalid_file_target"
+                | "invalid_directory"
+                | "directory_unavailable"
+                | "invalid_relative_path"
+                | "outside_allowed_directory"
+                | "path_traversal"
+                | "symlink_escape"
+                | "target_is_directory"
+                | "directory_not_found"
+                | "invalid_file_ref"
+                | "ambiguous_target"
+                | "repeated_tool_call"
+        )
+    )
+}
+
+fn repeated_tool_call_message(tool: &str, previous_error: &str) -> String {
+    serde_json::json!({
+        "error": "repeated_tool_call",
+        "code": "repeated_tool_call",
+        "retryable": false,
+        "retry_action": "change_arguments",
+        "retry_same_arguments": false,
+        "tool": tool,
+        "message": "The exact same filesystem call already failed. Do not repeat it; change the target or operation, read/stat the target, or use filesystem.create_user_file when the user asked to create a new file.",
+        "previous_error": previous_error,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -1761,6 +1843,101 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.text, "recovered");
         assert!(outcome.executed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_filesystem_retry_is_blocked_until_arguments_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RetryFilesystemTool {
+            invocations: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl tool_core::Tool for RetryFilesystemTool {
+            fn metadata(&self) -> tool_core::ToolMetadata {
+                tool_core::ToolMetadata {
+                    id: capability_core::ToolId::new("filesystem.edit"),
+                    description: "test filesystem edit".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    effects: vec![tool_core::ToolEffect::FilesystemWrite],
+                }
+            }
+
+            async fn invoke(
+                &self,
+                _ctx: tool_core::ToolContext,
+                _args: serde_json::Value,
+            ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+                self.invocations.fetch_add(1, Ordering::SeqCst);
+                Err(tool_core::ToolError::RetryRequired {
+                    tool: "filesystem.edit".to_string(),
+                    message: "change the file target".to_string(),
+                    recovery: serde_json::json!({
+                        "error": "file_not_found",
+                        "retry_same_arguments": false,
+                        "next_tool": "filesystem.create_user_file"
+                    }),
+                })
+            }
+        }
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut registry = tool_core::ToolRegistry::new();
+        registry
+            .register(Arc::new(RetryFilesystemTool {
+                invocations: Arc::clone(&invocations),
+            }))
+            .unwrap();
+        let arguments = serde_json::json!({
+            "path": "/home/meme/Escritorio/resumen_hoy.txt",
+            "old_text": "old",
+            "new_text": "new"
+        })
+        .to_string();
+        let provider = Arc::new(QueueProvider::new(vec![
+            vec![
+                ModelStreamEvent::ToolCall(ToolCall {
+                    id: "first-edit".to_string(),
+                    name: "filesystem.edit".to_string(),
+                    arguments: arguments.clone(),
+                }),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                ModelStreamEvent::ToolCall(ToolCall {
+                    id: "repeated-edit".to_string(),
+                    name: "filesystem.edit".to_string(),
+                    arguments,
+                }),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            text_turn("choose a different operation"),
+        ]));
+
+        let outcome = Agent::new(provider)
+            .turn_with_tools(
+                vec![ModelMessage::user("create the file")],
+                &registry,
+                &AuthorizationContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "choose a different operation");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.tool_steps[0].status, ToolStepStatus::Retry);
+        assert_eq!(outcome.tool_steps[1].status, ToolStepStatus::Failed);
+        assert!(outcome.messages.iter().any(|message| {
+            message
+                .tool_result
+                .as_ref()
+                .is_some_and(|result| result.content.contains("repeated_tool_call"))
+        }));
     }
 
     #[tokio::test]

@@ -270,7 +270,7 @@ impl Tool for EditTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(EDIT_TOOL),
-            description: "Edit or append to an existing file. Prefer file_ref from a previous successful filesystem result; otherwise use target.directory (a semantic id such as desktop) plus target.relative_path. The host also accepts legacy location+filename or an absolute path as a safe compatibility fallback. Use operation.type=replace with old_text/new_text, or operation.type=append with text. Target and edit values may be completed across same-turn retries; valid pending values are preserved. Exact-match safety, capability tickets, canonical path checks, symlink checks, and atomic mutation remain enforced by the filesystem broker.".to_string(),
+            description: "Edit or append to an existing file only. Never use this tool to create a new file; use filesystem.create_user_file when the user asks to create, make, save, or write a file that may not exist. Prefer file_ref from a previous successful filesystem result; otherwise use target.directory (a semantic id such as desktop) plus target.relative_path. The host also accepts legacy location+filename or an absolute path as a safe compatibility fallback. Use operation.type=replace with old_text/new_text, or operation.type=append with text. If the target is missing, do not repeat the same arguments: inspect it with filesystem.stat/filesystem.read or switch to filesystem.create_user_file. Target and edit values may be completed across same-turn retries; valid pending values are preserved. Exact-match safety, capability tickets, canonical path checks, symlink checks, and atomic mutation remain enforced by the filesystem broker.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -306,7 +306,7 @@ impl Tool for EditTool {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Absolute host-native path of the existing file. Use instead of location+filename for arbitrary paths; do not combine with location or filename. A relative value is accepted only as a compatibility alias for a unique existing configured user-directory filename."
+                        "description": "Absolute host-native path of an existing file only. Use instead of location+filename for arbitrary paths; do not combine with location or filename. A relative value is accepted only as a compatibility alias for a unique existing configured user-directory filename. If it does not exist, use filesystem.create_user_file instead of retrying this call."
                     },
                     "old_text": {
                         "type": "string",

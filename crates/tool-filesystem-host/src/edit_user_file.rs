@@ -37,7 +37,7 @@ impl Tool for EditUserFileTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(EDIT_USER_FILE_TOOL),
-            description: "Edit one exact text block inside an existing file in an operating-system configured user directory such as Desktop or Documents. Use a semantic location such as desktop, never a constructed path. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
+            description: "Edit one exact text block inside an existing file in an operating-system configured user directory such as Desktop or Documents. Never use this to create a new file; use filesystem.create_user_file for that. Use a semantic location such as desktop, never a constructed path. If the target is missing, inspect it or change to the create tool; do not repeat the same edit arguments. Read the file first with filesystem.read, then pass the exact old_text and replacement new_text; old_text must occur exactly once. Do not use a placeholder such as 'Updated date'. Use filesystem.replace_user_file for a complete replacement.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
