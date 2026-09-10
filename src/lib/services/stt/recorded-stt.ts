@@ -1,4 +1,5 @@
 import type { SpeechRecognitionCallbacks } from './web-speech.ts';
+import { getMediaErrorMessage } from '../media/media-errors.ts';
 
 export interface SttTransportContext {
 	signal: AbortSignal;
@@ -71,7 +72,7 @@ export class RecordedSttService {
 			return false;
 		}
 		if (!this.isSupported()) {
-			callbacks.onError('Microphone access is not supported in this browser.');
+			callbacks.onError(getMediaErrorMessage('microphone', { name: 'NotSupportedError' }));
 			return false;
 		}
 
@@ -84,17 +85,7 @@ export class RecordedSttService {
 			stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 		} catch (error) {
 			if (sessionId !== this.sessionId) return false;
-			if (error instanceof DOMException) {
-				const messages: Record<string, string> = {
-					NotAllowedError: 'Microphone access denied. Check system permissions.',
-					NotFoundError: 'No microphone found. Please connect a microphone.',
-					NotReadableError: 'Microphone is busy or in use by another app.',
-					OverconstrainedError: 'Microphone does not meet requirements.'
-				};
-				callbacks.onError(messages[error.name] || `Microphone error: ${error.message}`);
-			} else {
-				callbacks.onError('Failed to access microphone');
-			}
+			callbacks.onError(getMediaErrorMessage('microphone', error));
 			this.callbacks = null;
 			return false;
 		}

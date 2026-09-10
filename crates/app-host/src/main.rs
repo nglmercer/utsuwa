@@ -24,7 +24,7 @@ use std::sync::{
     mpsc::{Receiver, Sender},
     Arc, Mutex,
 };
-use wry::WebViewBuilder;
+use wry::{PermissionKind, PermissionResponse, WebViewBuilder};
 
 #[cfg(not(target_os = "linux"))]
 use winit::{
@@ -88,6 +88,20 @@ fn debug_filter(level: &str) -> String {
         .map(|module| format!("{module}={level}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Native policy for permissions requested by the embedded frontend.
+///
+/// Microphone access is still requested by the frontend at the point of the
+/// user's recording click. The WebView handler only decides how that request
+/// is serviced by the platform backend; it does not open a media stream.
+/// Camera access stays explicitly denied until Utsuwa has a camera feature.
+fn permission_response(kind: PermissionKind) -> PermissionResponse {
+    match kind {
+        PermissionKind::Microphone => PermissionResponse::Allow,
+        PermissionKind::Camera => PermissionResponse::Deny,
+        _ => PermissionResponse::Default,
+    }
 }
 
 /// Initialize stderr logging for normal runs and stderr + a rolling file for
@@ -183,6 +197,7 @@ fn configure_builder(
 
     let mut builder = WebViewBuilder::new()
         .with_url(&initial_url)
+        .with_permission_handler(permission_response)
         .with_navigation_handler(move |url| {
             let allowed = protocol::is_navigation_allowed(&url, dev_mode);
             if !allowed {
@@ -570,5 +585,34 @@ fn main() {
         });
         let dispatcher = start_host(emit, dev_grant_workspace);
         run_winit(config, dispatcher, reply_tx, reply_rx, event_loop);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_policy_allows_microphone_and_denies_camera() {
+        assert_eq!(
+            permission_response(PermissionKind::Microphone),
+            PermissionResponse::Allow
+        );
+        assert_eq!(
+            permission_response(PermissionKind::Camera),
+            PermissionResponse::Deny
+        );
+    }
+
+    #[test]
+    fn permission_policy_leaves_other_permissions_at_the_platform_default() {
+        assert_eq!(
+            permission_response(PermissionKind::DisplayCapture),
+            PermissionResponse::Default
+        );
+        assert_eq!(
+            permission_response(PermissionKind::Geolocation),
+            PermissionResponse::Default
+        );
     }
 }
