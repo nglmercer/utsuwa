@@ -27,6 +27,11 @@ export interface RecordedSttTransport {
 
 export const DEFAULT_RECORDED_STT_TIMEOUT_MS = 30_000;
 
+export interface RecordedSttStartOptions {
+	/** Disable automatic end-of-speech so a diagnostic can isolate the provider. */
+	autoStop?: boolean;
+}
+
 export function getAudioExtension(mimeType: string): string {
 	const mime = mimeType.toLowerCase();
 	if (mime.includes('webm')) return 'webm';
@@ -81,7 +86,10 @@ export class RecordedSttService {
 		return this.transcribing;
 	}
 
-	async startListening(callbacks: SpeechRecognitionCallbacks): Promise<boolean> {
+	async startListening(
+		callbacks: SpeechRecognitionCallbacks,
+		options: RecordedSttStartOptions = {}
+	): Promise<boolean> {
 		if (this.listening) return true;
 		if (!this.transport) {
 			callbacks.onError('Speech-to-text is not configured. Set it up in Settings > Voice Input.');
@@ -173,7 +181,7 @@ export class RecordedSttService {
 		try {
 			this.mediaRecorder.start(250);
 			this.listening = true;
-			this.startVoiceActivity(sessionId);
+			this.startVoiceActivity(sessionId, options);
 			return true;
 		} catch {
 			this.callbacks = null;
@@ -197,22 +205,22 @@ export class RecordedSttService {
 		this.transcribing = false;
 	}
 
-	private startVoiceActivity(sessionId: number): void {
-		const detector = new VoiceActivityDetector();
-		detector.start(performance.now());
+	private startVoiceActivity(sessionId: number, options: RecordedSttStartOptions): void {
+		this.vadEnabled = options.autoStop !== false && !!this.analyser;
+		const detector = this.vadEnabled ? new VoiceActivityDetector() : null;
+		detector?.start(performance.now());
 		this.voiceActivityDetector = detector;
-		this.vadEnabled = !!this.analyser;
 
 		if (this.vadEnabled) {
 			this.initialSilenceTimer = setTimeout(() => {
-				if (sessionId !== this.sessionId || !this.listening || detector.hasDetectedSpeech) return;
+				if (sessionId !== this.sessionId || !this.listening || detector?.hasDetectedSpeech) return;
 				this.requestStop(true);
 			}, DEFAULT_INITIAL_SILENCE_MS);
 		}
 
 		this.maximumDurationTimer = setTimeout(() => {
 			if (sessionId !== this.sessionId || !this.listening) return;
-			this.requestStop(this.vadEnabled && !detector.hasDetectedSpeech);
+			this.requestStop(this.vadEnabled && !detector?.hasDetectedSpeech);
 		}, DEFAULT_MAX_RECORDING_MS);
 
 		this.startLevelMonitoring(sessionId);
@@ -222,7 +230,15 @@ export class RecordedSttService {
 		const detector = this.voiceActivityDetector;
 		if (!detector || sessionId !== this.sessionId) return;
 
-		switch (detector.update(rms, now)) {
+		const event = detector.update(rms, now);
+		if (event) {
+			console.debug('[RecordedSttService] voice activity', {
+				event,
+				rms: Number(rms.toFixed(4))
+			});
+		}
+
+		switch (event) {
 			case 'speech-start':
 				if (this.initialSilenceTimer !== null) {
 					clearTimeout(this.initialSilenceTimer);
@@ -310,6 +326,7 @@ export class RecordedSttService {
 		}
 
 		this.transcribing = true;
+		callbacks.onTranscriptionStart?.();
 		const actualMime = this.mediaRecorder?.mimeType || this.audioChunks.find((chunk) => chunk.type)?.type || 'audio/webm';
 		const audioBlob = new Blob(this.audioChunks, { type: actualMime });
 		this.audioChunks = [];

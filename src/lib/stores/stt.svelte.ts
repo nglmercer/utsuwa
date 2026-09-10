@@ -16,6 +16,15 @@ export interface SttSessionObserver {
 	onEnd?: (text: string) => void;
 	/** Called for a provider, microphone, or transcription failure. */
 	onError?: (message: string) => void;
+	/** Called with the raw normalized RMS level while recorded STT is active. */
+	onAudioLevel?: (level: number) => void;
+	/** Called after recording stops and before the provider request begins. */
+	onTranscriptionStart?: () => void;
+}
+
+export interface SttStartOptions {
+	/** Keep recording until the caller presses stop, useful for provider diagnostics. */
+	autoStop?: boolean;
 }
 
 function createSttStore() {
@@ -125,7 +134,8 @@ function createSttStore() {
 
 	async function startListening(
 		onComplete: (text: string) => void,
-		observer: SttSessionObserver = {}
+		observer: SttSessionObserver = {},
+		options: SttStartOptions = {}
 	): Promise<boolean> {
 		if (!browser) return false;
 		if (isListening || isTranscribing || sessionMode) return false;
@@ -142,7 +152,7 @@ function createSttStore() {
 		error = null;
 		transcript = '';
 		interimTranscript = '';
-		audioLevel = 0.2;
+		audioLevel = 0;
 
 		const callbacks = {
 			onResult: (text: string, isFinal: boolean) => {
@@ -154,7 +164,16 @@ function createSttStore() {
 			onEnd: () => handleEnd(currentSessionId, onComplete, observer),
 			onError: (message: string) => handleError(currentSessionId, message, observer),
 			onAudioLevel: (level: number) => {
-				if (currentSessionId === sessionId) audioLevel = level;
+				if (currentSessionId === sessionId) {
+					audioLevel = level;
+					observer.onAudioLevel?.(level);
+				}
+			},
+			onTranscriptionStart: () => {
+				if (currentSessionId !== sessionId) return;
+				isListening = false;
+				isTranscribing = true;
+				observer.onTranscriptionStart?.();
 			}
 		};
 
@@ -163,7 +182,7 @@ function createSttStore() {
 			started = webSpeechService.startListening(callbacks);
 		} else {
 			configureRecordedStt(providerId);
-			started = await recordedSttService.startListening(callbacks);
+			started = await recordedSttService.startListening(callbacks, options);
 		}
 
 		if (started && currentSessionId === sessionId) {

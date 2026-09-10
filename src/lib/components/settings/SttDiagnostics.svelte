@@ -6,6 +6,7 @@
 		type MicrophoneMonitorError,
 		type MicrophoneMonitorState
 	} from '$lib/services/media/microphone-monitor';
+	import { normalizeMicrophoneLevel } from '$lib/services/media/microphone-monitor';
 	import { sttStore, type SttSessionObserver } from '$lib/stores/stt.svelte';
 	import { getSTTProvider } from '$lib/services/providers/registry';
 
@@ -18,6 +19,10 @@
 	let sttTestState = $state<SttTestState>('idle');
 	let sttTestTranscript = $state('');
 	let sttTestError = $state<string | null>(null);
+	let sttInputLevel = $state(0);
+	let sttPeakInputLevel = $state(0);
+	let sttHasLevelMeter = $state(false);
+	let automaticSpeechEnd = $state(true);
 	let sttTestSessionId = 0;
 
 	const activeProvider = $derived(sttStore.activeProvider);
@@ -26,6 +31,8 @@
 			? 'Browser Web Speech'
 			: (getSTTProvider(activeProvider)?.name ?? activeProvider)
 	);
+	const sttInputPercent = $derived(Math.round(sttInputLevel * 100));
+	const sttPeakInputPercent = $derived(Math.round(sttPeakInputLevel * 100));
 
 	const microphoneMonitor = new MicrophoneMonitor({
 		onStateChange: (state) => {
@@ -84,6 +91,20 @@
 		sttTestState = 'error';
 	}
 
+	function handleSttAudioLevel(level: number, sessionId: number): void {
+		if (sessionId !== sttTestSessionId) return;
+		const normalized = normalizeMicrophoneLevel(level);
+		sttHasLevelMeter = true;
+		sttInputLevel = normalized;
+		sttPeakInputLevel = Math.max(sttPeakInputLevel, normalized);
+	}
+
+	function clearSttLevel(): void {
+		sttInputLevel = 0;
+		sttPeakInputLevel = 0;
+		sttHasLevelMeter = false;
+	}
+
 	async function startSttTest(): Promise<void> {
 		if (sttTestState === 'starting' || sttTestState === 'listening' || sttTestState === 'transcribing') return;
 		if (sttStore.isListening || sttStore.isTranscribing) {
@@ -96,9 +117,14 @@
 		const sessionId = ++sttTestSessionId;
 		sttTestTranscript = '';
 		sttTestError = null;
+		clearSttLevel();
 		sttTestState = 'starting';
 
 		const observer: SttSessionObserver = {
+			onAudioLevel: (level) => handleSttAudioLevel(level, sessionId),
+			onTranscriptionStart: () => {
+				if (sessionId === sttTestSessionId) sttTestState = 'transcribing';
+			},
 			onError: (message) => handleSttError(message, sessionId),
 			onEnd: (text) => handleSttEnd(text, sessionId)
 		};
@@ -108,7 +134,8 @@
 				sttTestTranscript = text;
 				sttTestState = 'success';
 			},
-			observer
+			observer,
+			{ autoStop: automaticSpeechEnd }
 		);
 
 		if (sessionId !== sttTestSessionId) return;
@@ -132,6 +159,7 @@
 		if (sttTestState === 'starting' || !sttStore.isListening) {
 			++sttTestSessionId;
 			sttStore.cancel();
+			clearSttLevel();
 			sttTestState = 'idle';
 			return;
 		}
@@ -152,6 +180,7 @@
 		sttTestState = 'idle';
 		sttTestTranscript = '';
 		sttTestError = null;
+		clearSttLevel();
 	}
 
 	onDestroy(() => {
@@ -274,7 +303,7 @@
 				{#if sttTestState === 'starting'}
 					Requesting microphone…
 				{:else if sttTestState === 'listening'}
-					Speak now, then pause to finish automatically.
+					{automaticSpeechEnd ? 'Speak now, then pause to finish automatically.' : 'Speak now, then stop manually to test the provider.'}
 				{:else if sttTestState === 'transcribing'}
 					Transcribing test audio…
 				{:else if sttTestState === 'success'}
@@ -285,6 +314,51 @@
 					No transcription test run yet.
 				{/if}
 			</div>
+
+			{#if sttTestState === 'starting' || sttTestState === 'listening' || sttTestState === 'transcribing' || sttHasLevelMeter}
+				<div class="level-meter">
+					<div class="level-label">
+						<span>{sttTestState === 'listening' ? 'STT live input' : 'STT peak input'}</span>
+						<span>{sttTestState === 'listening' ? sttInputPercent : sttPeakInputPercent}%</span>
+					</div>
+					<div
+						class="level-track"
+						role="progressbar"
+						aria-label="Speech-to-text microphone input level"
+						aria-valuemin="0"
+						aria-valuemax="100"
+						aria-valuenow={sttTestState === 'listening' ? sttInputPercent : sttPeakInputPercent}
+					>
+						<div
+							class="level-fill"
+							style:width={`${(sttTestState === 'listening' ? sttInputPercent : sttPeakInputPercent)}%`}
+						></div>
+					</div>
+					{#if sttTestState === 'starting'}
+						<p class="diagnostic-note">Waiting for microphone permission; the meter starts after capture begins.</p>
+					{:else if !sttHasLevelMeter}
+						<p class="diagnostic-note">No audio level is exposed by this WebView. Run the microphone access check for the permission details.</p>
+					{:else if sttTestState === 'listening'}
+						<p class="diagnostic-note">If this stays at 0%, the stream has no live signal. If it moves but speech is not detected, the VAD is the failing layer.</p>
+					{:else}
+						<p class="diagnostic-note">Peak input observed before recording stopped.</p>
+					{/if}
+				</div>
+			{/if}
+
+			<label class="test-option">
+				<input
+					type="checkbox"
+					bind:checked={automaticSpeechEnd}
+					disabled={sttTestState === 'starting' || sttTestState === 'listening' || sttTestState === 'transcribing'}
+				/>
+				<span>End automatically after silence</span>
+			</label>
+			<p class="diagnostic-note">
+				{automaticSpeechEnd
+					? 'Use this to validate speak → pause → transcribe. Turn it off to isolate the provider and stop the recording yourself.'
+					: 'Manual mode bypasses VAD. Speak, then click “Stop and transcribe” to test upload, API key, quota, and provider response.'}
+			</p>
 
 			{#if sttTestState === 'success'}
 				<div class="transcript-result">
@@ -426,6 +500,19 @@
 		overflow: hidden;
 		border-radius: var(--radius-full);
 		background: var(--bg-tertiary);
+	}
+
+	.test-option {
+		display: flex;
+		align-items: center;
+		gap: 0.45rem;
+		font-size: 0.7rem;
+		font-weight: 600;
+		color: var(--text-secondary);
+	}
+
+	.test-option input {
+		accent-color: var(--accent);
 	}
 
 	.level-fill {

@@ -27,6 +27,16 @@ test('requires confirmed speech before starting the silence window', () => {
 	assert.equal(detector.update(0.01, 1_700), 'speech-end');
 });
 
+test('detects speech from a low-gain microphone', () => {
+	const detector = new VoiceActivityDetector();
+	detector.start(0);
+
+	assert.equal(detector.update(0.006, 100), null);
+	assert.equal(detector.update(0.025, 200), null);
+	assert.equal(detector.update(0.025, 300), 'speech-start');
+	assert.equal(detector.hasDetectedSpeech, true);
+});
+
 test('short pauses do not end an utterance', () => {
 	const detector = new VoiceActivityDetector();
 	detector.start(0);

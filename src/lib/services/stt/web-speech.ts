@@ -3,6 +3,7 @@ export interface SpeechRecognitionCallbacks {
 	onEnd: () => void;
 	onError: (error: string) => void;
 	onAudioLevel?: (level: number) => void;
+	onTranscriptionStart?: () => void;
 }
 
 // Type declarations for Web Speech API

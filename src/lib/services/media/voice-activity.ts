@@ -35,7 +35,10 @@ const DEFAULT_CONFIG: ResolvedVoiceActivityConfig = {
 	speechEndSilenceMs: DEFAULT_SPEECH_END_SILENCE_MS,
 	maxRecordingMs: DEFAULT_MAX_RECORDING_MS,
 	speechConfirmationMs: DEFAULT_SPEECH_CONFIRMATION_MS,
-	minSpeechRms: 0.04,
+	// Low-gain laptop/WebView microphones often produce speech RMS values in
+	// the 0.015–0.04 range. Keep the floor low and let the noise multiplier
+	// reject a quiet room instead of requiring a loud microphone.
+	minSpeechRms: 0.015,
 	noiseMultiplier: 2.2,
 	noiseSmoothing: 0.05
 };
@@ -62,7 +65,7 @@ export function calculateRms(samples: Uint8Array): number {
 export class VoiceActivityDetector {
 	private readonly config: ResolvedVoiceActivityConfig;
 	private startedAt: number | null = null;
-	private noiseFloor = 0.02;
+	private noiseFloor = 0.005;
 	private speechCandidateAt: number | null = null;
 	private silenceStartedAt: number | null = null;
 	private speechDetected = false;
@@ -74,7 +77,7 @@ export class VoiceActivityDetector {
 
 	start(now: number): void {
 		this.startedAt = now;
-		this.noiseFloor = 0.02;
+		this.noiseFloor = 0.005;
 		this.speechCandidateAt = null;
 		this.silenceStartedAt = null;
 		this.speechDetected = false;
@@ -83,7 +86,7 @@ export class VoiceActivityDetector {
 
 	reset(): void {
 		this.startedAt = null;
-		this.noiseFloor = 0.02;
+		this.noiseFloor = 0.005;
 		this.speechCandidateAt = null;
 		this.silenceStartedAt = null;
 		this.speechDetected = false;
