@@ -1,5 +1,5 @@
 import type { SpeechRecognitionCallbacks } from './web-speech.ts';
-import { getMediaErrorDetails, getMediaErrorMessage } from '../media/media-errors.ts';
+import { getMediaAccessErrorDetails, getMediaErrorMessage } from '../media/media-errors.ts';
 import {
 	calculateRms,
 	DEFAULT_INITIAL_SILENCE_MS,
@@ -43,16 +43,7 @@ export function isAbortError(error: unknown): boolean {
 }
 
 function logMediaAccessFailure(error: unknown): void {
-	const { name, message } = getMediaErrorDetails(error);
-	const mediaDevices = typeof navigator !== 'undefined' ? navigator.mediaDevices : undefined;
-	console.warn('[RecordedSttService] getUserMedia failed', {
-		name,
-		message,
-		origin: typeof window !== 'undefined' ? window.location.origin : undefined,
-		isSecureContext: typeof window !== 'undefined' ? window.isSecureContext : undefined,
-		hasMediaDevices: !!mediaDevices,
-		hasGetUserMedia: typeof mediaDevices?.getUserMedia === 'function'
-	});
+	console.warn('[RecordedSttService] getUserMedia failed', getMediaAccessErrorDetails('microphone', error));
 }
 
 export class RecordedSttService {
@@ -93,7 +84,7 @@ export class RecordedSttService {
 	async startListening(callbacks: SpeechRecognitionCallbacks): Promise<boolean> {
 		if (this.listening) return true;
 		if (!this.transport) {
-			callbacks.onError('Speech-to-text is not configured. Set it up in Settings > Persona.');
+			callbacks.onError('Speech-to-text is not configured. Set it up in Settings > Voice Input.');
 			return false;
 		}
 		if (!this.isSupported()) {

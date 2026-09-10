@@ -11,6 +11,13 @@ import type { SttProviderId } from '$lib/types';
 
 type RecordedSttProviderId = Exclude<SttProviderId, 'web-speech'>;
 
+export interface SttSessionObserver {
+	/** Called when the activation ends, including an empty/no-speech result. */
+	onEnd?: (text: string) => void;
+	/** Called for a provider, microphone, or transcription failure. */
+	onError?: (message: string) => void;
+}
+
 function createSttStore() {
 	let isListening = $state(false);
 	let isTranscribing = $state(false);
@@ -72,7 +79,7 @@ function createSttStore() {
 		const config = settingsStore.getProviderConfig(providerId);
 		if (config.apiKey) return true;
 		const provider = getSTTProvider(providerId);
-		setError(`${provider?.name ?? 'This STT provider'} API key is required. Set it up in Settings → Persona.`);
+		setError(`${provider?.name ?? 'This STT provider'} API key is required. Set it up in Settings → Voice Input.`);
 		return false;
 	}
 
@@ -86,7 +93,11 @@ function createSttStore() {
 		}
 	}
 
-	function handleEnd(currentSessionId: number, onComplete: (text: string) => void): void {
+	function handleEnd(
+		currentSessionId: number,
+		onComplete: (text: string) => void,
+		observer?: SttSessionObserver
+	): void {
 		if (currentSessionId !== sessionId) return;
 		isListening = false;
 		isTranscribing = false;
@@ -96,11 +107,13 @@ function createSttStore() {
 		transcript = '';
 		interimTranscript = '';
 		if (finalText) onComplete(finalText);
+		observer?.onEnd?.(finalText);
 	}
 
-	function handleError(currentSessionId: number, message: string): void {
+	function handleError(currentSessionId: number, message: string, observer?: SttSessionObserver): void {
 		if (currentSessionId !== sessionId) return;
 		console.error('[STT Store] Error:', message);
+		observer?.onError?.(message);
 		setError(message);
 		isListening = false;
 		isTranscribing = false;
@@ -110,15 +123,18 @@ function createSttStore() {
 		audioLevel = 0;
 	}
 
-	async function startListening(onComplete: (text: string) => void): Promise<void> {
-		if (!browser) return;
-		if (isListening || isTranscribing || sessionMode) return;
+	async function startListening(
+		onComplete: (text: string) => void,
+		observer: SttSessionObserver = {}
+	): Promise<boolean> {
+		if (!browser) return false;
+		if (isListening || isTranscribing || sessionMode) return false;
 
 		const providerId = activeSttProvider;
-		if (!ensureProviderConfigured(providerId)) return;
+		if (!ensureProviderConfigured(providerId)) return false;
 		if (providerId !== 'web-speech' && !recordedSttService.isSupported()) {
 			showUnsupportedError();
-			return;
+			return false;
 		}
 
 		const currentSessionId = ++sessionId;
@@ -135,8 +151,8 @@ function createSttStore() {
 					audioLevel = isFinal ? 0.3 : 0.5 + Math.random() * 0.5;
 				}
 			},
-			onEnd: () => handleEnd(currentSessionId, onComplete),
-			onError: (message: string) => handleError(currentSessionId, message),
+			onEnd: () => handleEnd(currentSessionId, onComplete, observer),
+			onError: (message: string) => handleError(currentSessionId, message, observer),
 			onAudioLevel: (level: number) => {
 				if (currentSessionId === sessionId) audioLevel = level;
 			}
@@ -156,6 +172,7 @@ function createSttStore() {
 			sessionMode = null;
 			audioLevel = 0;
 		}
+		return started;
 	}
 
 	function stopListening(): void {
@@ -197,9 +214,9 @@ function createSttStore() {
 
 	function showUnsupportedError(): void {
 		if (isDesktopBuild()) {
-			setError('Add an STT API key or a local STT server in Settings → Persona for voice input on desktop.');
+			setError('Add an STT API key or a local STT server in Settings → Voice Input for voice input on desktop.');
 		} else {
-			setError('Voice input is not supported in this browser. Add an STT provider in Settings → Persona, or try Chrome/Edge.');
+			setError('Voice input is not supported in this browser. Add an STT provider in Settings → Voice Input, or try Chrome/Edge.');
 		}
 	}
 
@@ -221,6 +238,9 @@ function createSttStore() {
 	}
 
 	return {
+		get activeProvider() {
+			return activeSttProvider;
+		},
 		get isListening() {
 			return isListening;
 		},

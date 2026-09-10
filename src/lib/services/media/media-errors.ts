@@ -15,6 +15,20 @@ export interface MediaErrorDetails {
 	message?: string;
 }
 
+/** Browser/WebView facts that help distinguish permission from platform setup. */
+export interface MediaEnvironmentDetails {
+	origin?: string;
+	isSecureContext?: boolean;
+	hasMediaDevices: boolean;
+	hasGetUserMedia: boolean;
+}
+
+/** A user-facing media failure together with the details needed to diagnose it. */
+export interface MediaAccessErrorDetails extends MediaErrorDetails, MediaEnvironmentDetails {
+	category: MediaErrorCategory;
+	userMessage: string;
+}
+
 function getStringProperty(error: unknown, property: 'name' | 'message'): string | undefined {
 	if ((typeof error !== 'object' && typeof error !== 'function') || error === null) return undefined;
 	const value = (error as Record<string, unknown>)[property];
@@ -29,6 +43,17 @@ export function getMediaErrorDetails(error: unknown): MediaErrorDetails {
 	if (name !== undefined) details.name = name;
 	if (message !== undefined) details.message = message;
 	return details;
+}
+
+/** Read the runtime capabilities of the current page without touching media. */
+export function getMediaEnvironmentDetails(): MediaEnvironmentDetails {
+	const mediaDevices = typeof navigator !== 'undefined' ? navigator.mediaDevices : undefined;
+	return {
+		origin: typeof window !== 'undefined' ? window.location.origin : undefined,
+		isSecureContext: typeof window !== 'undefined' ? window.isSecureContext : undefined,
+		hasMediaDevices: !!mediaDevices,
+		hasGetUserMedia: typeof mediaDevices?.getUserMedia === 'function'
+	};
 }
 
 /**
@@ -81,4 +106,19 @@ export function getMediaErrorMessage(device: MediaDeviceKind, error: unknown): s
 			return message ? `${label} error: ${message}` : `Failed to access ${deviceName}`;
 		}
 	}
+}
+
+/** Build the same diagnostic payload for microphone and future camera services. */
+export function getMediaAccessErrorDetails(
+	device: MediaDeviceKind,
+	error: unknown,
+	environment: MediaEnvironmentDetails = getMediaEnvironmentDetails()
+): MediaAccessErrorDetails {
+	const details = getMediaErrorDetails(error);
+	return {
+		...details,
+		...environment,
+		category: classifyMediaError(error),
+		userMessage: getMediaErrorMessage(device, error)
+	};
 }
