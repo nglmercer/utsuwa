@@ -214,7 +214,7 @@ fn configure_builder(
     });
     let media_registry = dispatcher.media_registry();
     builder = builder.with_custom_protocol(protocol::APP_SCHEME.to_string(), move |_, req| {
-        if req.uri().host() == Some("media") {
+        if app_host::audio::is_media_path(req.uri().path()) {
             media_registry.handle(req)
         } else if let Some(server) = &asset_server {
             server.handle(req)

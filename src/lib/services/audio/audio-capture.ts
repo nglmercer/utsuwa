@@ -48,6 +48,13 @@ export interface AudioCaptureDiagnostics {
 	durationMs: number;
 	mimeType?: string;
 	droppedChunks?: number;
+	stopIpcSucceeded?: boolean;
+	mediaUrl?: string;
+	mediaFetchStarted?: boolean;
+	mediaFetchStatus?: number;
+	mediaFetchFailure?: string;
+	fetchedBlobSize?: number;
+	fetchedBlobType?: string;
 }
 
 export interface CaptureOptions {
@@ -70,6 +77,20 @@ export interface AudioCaptureBackend {
 	readonly name: AudioCaptureBackendName;
 }
 
+export class AudioMediaTransferError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'AudioMediaTransferError';
+	}
+}
+
+export function isAudioMediaTransferError(error: unknown): error is AudioMediaTransferError {
+	return (
+		error instanceof AudioMediaTransferError ||
+		(error instanceof Error && error.name === 'AudioMediaTransferError')
+	);
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
 	return typeof value === 'object' && value !== null && !Array.isArray(value)
 		? (value as Record<string, unknown>)
@@ -82,6 +103,10 @@ function asNumber(value: unknown): number | undefined {
 
 function asString(value: unknown): string | undefined {
 	return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function describeError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 function stopReason(value: unknown): AudioCaptureStopReason {
@@ -211,12 +236,60 @@ export class NativeAudioCaptureBackend implements AudioCaptureBackend {
 
 		try {
 			const result = asRecord(await bridge.invoke('audio_capture.stop', {}));
-			const mediaUrl = asString(result?.media_url) ?? `companion://media/${captureId}`;
-			const response = await fetch(mediaUrl);
-			if (!response.ok) throw new Error(`Native audio media request failed (${response.status}).`);
-			const fetched = await response.blob();
-			const mimeType = asString(result?.mime_type) ?? fetched.type ?? 'audio/wav';
+			this.diagnostics = { ...this.diagnostics, stopIpcSucceeded: true };
 			this.updateFinalDiagnostics(result);
+
+			const mediaUrl =
+				asString(result?.media_url) ?? `companion://app/__media/${captureId}`;
+			this.diagnostics = {
+				...this.diagnostics,
+				mediaUrl,
+				mediaFetchStarted: true
+			};
+			this.publishDiagnostics();
+			console.debug('[AudioCapture] media-fetch-start', {
+				captureId,
+				mediaUrl,
+				wavBytes: this.diagnostics.wavBytes,
+				durationMs: this.diagnostics.durationMs
+			});
+
+			let response: Response;
+			try {
+				response = await fetch(mediaUrl);
+			} catch (error) {
+				throw this.mediaTransferFailure(mediaUrl, describeError(error));
+			}
+			const status = asNumber(response.status);
+			this.diagnostics = {
+				...this.diagnostics,
+				...(status === undefined ? {} : { mediaFetchStatus: status })
+			};
+			this.publishDiagnostics();
+			if (!response.ok) {
+				throw this.mediaTransferFailure(mediaUrl, `HTTP-like status ${response.status}`);
+			}
+
+			let fetched: Blob;
+			try {
+				fetched = await response.blob();
+			} catch (error) {
+				throw this.mediaTransferFailure(mediaUrl, describeError(error));
+			}
+			this.diagnostics = {
+				...this.diagnostics,
+				fetchedBlobSize: fetched.size,
+				fetchedBlobType: fetched.type || undefined
+			};
+			this.publishDiagnostics();
+			console.debug('[AudioCapture] media-fetch-success', {
+				captureId,
+				mediaUrl,
+				status,
+				blobSize: fetched.size,
+				blobType: fetched.type
+			});
+			const mimeType = asString(result?.mime_type) ?? fetched.type ?? 'audio/wav';
 			return fetched.type === mimeType ? fetched : new Blob([fetched], { type: mimeType });
 		} finally {
 			this.detachEventListener();
@@ -305,6 +378,19 @@ export class NativeAudioCaptureBackend implements AudioCaptureBackend {
 			this.diagnostics.vadEvent = 'maximum-duration';
 		}
 		this.publishDiagnostics();
+	}
+
+	private mediaTransferFailure(mediaUrl: string, detail: string): AudioMediaTransferError {
+		const message = `Native audio media fetch failed for ${mediaUrl}: ${detail || 'unknown error'}`;
+		this.diagnostics = { ...this.diagnostics, mediaFetchFailure: message };
+		this.publishDiagnostics();
+		console.warn('[AudioCapture] media-fetch-failure', {
+			captureId: this.captureId,
+			mediaUrl,
+			status: this.diagnostics.mediaFetchStatus,
+			error: message
+		});
+		return new AudioMediaTransferError(message);
 	}
 
 	private publishDiagnostics(): void {

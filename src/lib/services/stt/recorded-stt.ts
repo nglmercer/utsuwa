@@ -11,6 +11,7 @@ import {
 } from '../media/voice-activity.ts';
 import {
 	createAudioCaptureBackend,
+	isAudioMediaTransferError,
 	type AudioCaptureBackend,
 	type AudioCaptureDiagnostics,
 	type AudioCaptureStopReason
@@ -33,6 +34,7 @@ export type RecordedSttResultStatus =
 	| 'empty-recording'
 	| 'microphone-ended'
 	| 'recorder-error'
+	| 'media-transfer-error'
 	| 'provider-empty'
 	| 'provider-error'
 	| 'timeout';
@@ -58,6 +60,13 @@ export interface RecordedSttDiagnostics {
 	sampleRate?: number;
 	channels?: number;
 	wavBytes?: number;
+	stopIpcSucceeded?: boolean;
+	mediaUrl?: string;
+	mediaFetchStarted?: boolean;
+	mediaFetchStatus?: number;
+	mediaFetchFailure?: string;
+	fetchedBlobSize?: number;
+	fetchedBlobType?: string;
 	stopReason?: RecordingStopReason;
 
 	vadEnabled: boolean;
@@ -211,6 +220,8 @@ export function formatRecordedSttResultError(
 			return result.error ?? 'Microphone access failed.';
 		case 'recorder-error':
 			return result.error ?? 'The audio recorder failed.';
+		case 'media-transfer-error':
+			return result.error ?? 'Could not retrieve the recorded audio from the native host.';
 		case 'provider-empty':
 			return result.error ?? 'The STT provider returned an empty transcription.';
 		case 'timeout':
@@ -281,6 +292,13 @@ export class RecordedSttService {
 	private captureChannels: number | undefined;
 	private captureWavBytes: number | undefined;
 	private captureMimeType: string | undefined;
+	private stopIpcSucceeded: boolean | undefined;
+	private mediaUrl: string | undefined;
+	private mediaFetchStarted: boolean | undefined;
+	private mediaFetchStatus: number | undefined;
+	private mediaFetchFailure: string | undefined;
+	private fetchedBlobSize: number | undefined;
+	private fetchedBlobType: string | undefined;
 
 	configure(transport: RecordedSttTransport | null): void {
 		this.transport = transport;
@@ -449,7 +467,11 @@ export class RecordedSttService {
 			this.applyCaptureDiagnostics(backend.getDiagnostics());
 			this.audioBackend = null;
 			this.recordingStartedAt = null;
-			const result = this.makeResult('recorder-error', this.buildDiagnostics(currentTime()), message);
+			const result = this.makeResult(
+				isAudioMediaTransferError(error) ? 'media-transfer-error' : 'recorder-error',
+				this.buildDiagnostics(currentTime()),
+				message
+			);
 			this.finishWithoutProvider(sessionId, callbacks, result, 'error');
 			return;
 		}
@@ -519,6 +541,13 @@ export class RecordedSttService {
 		this.captureChannels = diagnostics.channels;
 		this.captureWavBytes = diagnostics.wavBytes;
 		this.captureMimeType = diagnostics.mimeType;
+		this.stopIpcSucceeded = diagnostics.stopIpcSucceeded;
+		this.mediaUrl = diagnostics.mediaUrl;
+		this.mediaFetchStarted = diagnostics.mediaFetchStarted;
+		this.mediaFetchStatus = diagnostics.mediaFetchStatus;
+		this.mediaFetchFailure = diagnostics.mediaFetchFailure;
+		this.fetchedBlobSize = diagnostics.fetchedBlobSize;
+		this.fetchedBlobType = diagnostics.fetchedBlobType;
 		if (diagnostics.analyserAvailable !== undefined) this.analyserAvailable = diagnostics.analyserAvailable;
 		if (diagnostics.backend === 'web-media-recorder' && diagnostics.analyserAvailable === false) {
 			this.vadEnabled = false;
@@ -741,6 +770,13 @@ export class RecordedSttService {
 			sampleRate: this.captureSampleRate,
 			channels: this.captureChannels,
 			wavBytes: this.captureWavBytes,
+			stopIpcSucceeded: this.stopIpcSucceeded,
+			mediaUrl: this.mediaUrl,
+			mediaFetchStarted: this.mediaFetchStarted,
+			mediaFetchStatus: this.mediaFetchStatus,
+			mediaFetchFailure: this.mediaFetchFailure,
+			fetchedBlobSize: this.fetchedBlobSize,
+			fetchedBlobType: this.fetchedBlobType,
 			stopReason: this.stopReason,
 			vadEnabled: this.vadEnabled,
 			analyserAvailable: this.analyserAvailable,
@@ -814,6 +850,13 @@ export class RecordedSttService {
 		this.captureChannels = undefined;
 		this.captureWavBytes = undefined;
 		this.captureMimeType = undefined;
+		this.stopIpcSucceeded = undefined;
+		this.mediaUrl = undefined;
+		this.mediaFetchStarted = undefined;
+		this.mediaFetchStatus = undefined;
+		this.mediaFetchFailure = undefined;
+		this.fetchedBlobSize = undefined;
+		this.fetchedBlobType = undefined;
 		this.audioAutoStop = true;
 		this.audioBackend = null;
 		this.audioStopPromise = null;

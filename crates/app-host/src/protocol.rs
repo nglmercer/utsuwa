@@ -238,6 +238,15 @@ mod tests {
     }
 
     #[test]
+    fn app_assets_still_go_to_the_asset_server() {
+        let (_d, s) = server_with(&[("app.js", "console.log(1)")]);
+        assert!(!crate::audio::is_media_path("/app.js"));
+        let res = get(&s, "companion://app/app.js");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["Content-Type"], "text/javascript");
+    }
+
+    #[test]
     fn traversal_and_wrong_host_fail_closed() {
         let (_d, s) = server_with(&[("index.html", "hi")]);
         assert_eq!(

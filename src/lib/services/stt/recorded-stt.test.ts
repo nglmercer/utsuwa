@@ -166,6 +166,60 @@ async function startManualSession(transport: RecordedSttTransport) {
 	return { restore, service, results, errors };
 }
 
+function installNativeCaptureMocks(): () => void {
+	const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+	const previousFetch = globalThis.fetch;
+	const eventTarget = new EventTarget();
+	const bridge = {
+		invoke: async (method: string) => {
+			if (method === 'audio_capture.start') {
+				return {
+					capture_id: 'native-transfer-failure',
+					backend: 'native-cpal',
+					device: 'Test microphone',
+					sample_rate: 48_000,
+					channels: 2
+				};
+			}
+			if (method === 'audio_capture.stop') {
+				return {
+					capture_id: 'native-transfer-failure',
+					media_url: 'companion://app/__media/native-transfer-failure',
+					mime_type: 'audio/wav',
+					duration_ms: 1_500,
+					wav_bytes: 192,
+					stats: {
+						current_rms: 0.04,
+						peak_rms: 0.22,
+						noise_floor: 0.005,
+						speech_threshold: 0.015,
+						speech_candidate_active: false,
+						speech_detected: true,
+						silence_duration_ms: 1_000,
+						chunk_count: 16,
+						dropped_chunks: 0
+					}
+				};
+			}
+			throw new Error(`unexpected method: ${method}`);
+		}
+	};
+
+	Object.defineProperty(globalThis, 'window', {
+		configurable: true,
+		value: Object.assign(eventTarget, { utsuwa: bridge })
+	});
+	globalThis.fetch = async () => {
+		throw new Error('Load failed');
+	};
+
+	return () => {
+		globalThis.fetch = previousFetch;
+		if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+		else Reflect.deleteProperty(globalThis, 'window');
+	};
+}
+
 test('manual stop sends a non-empty recording without enabling VAD', async () => {
 	let providerCalls = 0;
 	const session = await startManualSession({
@@ -261,5 +315,41 @@ test('cancellation prevents an old provider response from reaching callbacks', a
 		assert.equal(session.errors.length, 0);
 	} finally {
 		session.restore();
+	}
+});
+
+test('native media transfer failure is distinct and never starts the STT provider', async () => {
+	const restore = installNativeCaptureMocks();
+	const service = new RecordedSttService();
+	let providerCalls = 0;
+	service.configure({
+		transcribe: async () => {
+			providerCalls++;
+			return 'must not run';
+		}
+	});
+	const results: RecordedSttSessionResult[] = [];
+	const errors: string[] = [];
+	const callbacks = {
+		...createCallbacks(results, errors),
+		onSessionResult: (result: RecordedSttSessionResult) => results.push(result)
+	};
+
+	try {
+		assert.equal(await service.startListening(callbacks, { autoStop: false }), true);
+		service.stopListening();
+		await waitForMicrotasks();
+
+		assert.equal(providerCalls, 0);
+		assert.equal(results.length, 1);
+		assert.equal(results[0]?.status, 'media-transfer-error');
+		assert.match(errors[0] ?? '', /Load failed/);
+		assert.equal(results[0]?.diagnostics.stopIpcSucceeded, true);
+		assert.equal(results[0]?.diagnostics.mediaFetchStarted, true);
+		assert.equal(results[0]?.diagnostics.wavBytes, 192);
+		assert.equal(results[0]?.diagnostics.durationMs, 1_500);
+		assert.match(results[0]?.diagnostics.mediaFetchFailure ?? '', /Load failed/);
+	} finally {
+		restore();
 	}
 });

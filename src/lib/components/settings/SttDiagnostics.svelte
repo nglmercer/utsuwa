@@ -456,9 +456,11 @@
 						<p class="diagnostic-note">The microphone and provider are separate checks. This result points to the recording layer.</p>
 					{:else if sttFinalStatus === 'provider-empty' || sttFinalStatus === 'provider-error' || sttFinalStatus === 'timeout'}
 						<p class="diagnostic-note">The recording reached the provider layer; inspect the provider-specific error above.</p>
-					{:else if sttFinalStatus === 'microphone-error' || sttFinalStatus === 'microphone-ended'}
-						<p class="diagnostic-note">The capture layer failed before provider transcription could start.</p>
-					{:else}
+						{:else if sttFinalStatus === 'microphone-error' || sttFinalStatus === 'microphone-ended'}
+							<p class="diagnostic-note">The capture layer failed before provider transcription could start.</p>
+						{:else if sttFinalStatus === 'media-transfer-error'}
+							<p class="diagnostic-note">Native capture stopped, but the WebView could not retrieve the WAV. The provider was not contacted.</p>
+						{:else}
 						<p class="diagnostic-note">If this is a microphone error, run the microphone access check first.</p>
 					{/if}
 				</div>
@@ -519,6 +521,30 @@
 						{#if sttDiagnostics.wavBytes !== undefined}
 							<dt>WAV bytes</dt>
 							<dd>{sttDiagnostics.wavBytes}</dd>
+						{/if}
+						{#if sttDiagnostics.stopIpcSucceeded !== undefined}
+							<dt>Stop IPC succeeded</dt>
+							<dd>{formatBoolean(sttDiagnostics.stopIpcSucceeded)}</dd>
+						{/if}
+						{#if sttDiagnostics.mediaUrl}
+							<dt>Media URL</dt>
+							<dd>{sttDiagnostics.mediaUrl}</dd>
+						{/if}
+						{#if sttDiagnostics.mediaFetchStarted !== undefined}
+							<dt>Media fetch started</dt>
+							<dd>{formatBoolean(sttDiagnostics.mediaFetchStarted)}</dd>
+						{/if}
+						{#if sttDiagnostics.mediaFetchStatus !== undefined}
+							<dt>Media fetch status</dt>
+							<dd>{sttDiagnostics.mediaFetchStatus}</dd>
+						{/if}
+						{#if sttDiagnostics.mediaFetchFailure}
+							<dt>Media fetch failure</dt>
+							<dd>{sttDiagnostics.mediaFetchFailure}</dd>
+						{/if}
+						{#if sttDiagnostics.fetchedBlobSize !== undefined}
+							<dt>Fetched Blob</dt>
+							<dd>{sttDiagnostics.fetchedBlobSize} bytes · {sttDiagnostics.fetchedBlobType ?? 'unknown type'}</dd>
 						{/if}
 						<dt>Recording duration</dt>
 						<dd>{formatDuration(sttDiagnostics.durationMs)}</dd>
