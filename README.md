@@ -228,8 +228,7 @@ To run the desktop app from source, you'll need the [Rust toolchain](https://rus
 # Install Rust (if not already installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# Build and run the desktop app (bundled frontend served by the host)
-pnpm build:native
+# Build and run the desktop app (Cargo refreshes the bundled frontend)
 cargo run
 
 # Native frontend development (run this in one terminal)
@@ -334,7 +333,7 @@ pnpm preview      # Preview production build
 pnpm lint         # Type-check the project (svelte-check)
 pnpm check        # Same as lint (alias)
 pnpm check:watch  # Type-check in watch mode
-cargo run         # Run the native desktop app (bundled frontend)
+cargo run         # Build the frontend and run the native desktop app
 cargo run -- --dev # Native app against the Svelte dev server
 cargo run -p app-host -- --debug # Native host logs for tool/filesystem debugging
 cargo run -p app-host -- --trace # Very verbose native host logs

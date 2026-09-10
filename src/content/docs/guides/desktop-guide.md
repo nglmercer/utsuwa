@@ -23,19 +23,29 @@ It runs on Linux today (X11/XWayland and native Wayland) with the same binary co
 git clone https://github.com/JuiceBoxxGames/utsuwa.git
 cd utsuwa
 
-# Install frontend dependencies and build the bundled assets
+# Install frontend dependencies
 pnpm install
-pnpm build
 
-# Run the desktop app
+# Cargo builds the bundled frontend before starting the desktop app
 cargo run
 ```
 
-`cargo run` serves the bundled frontend from `build/`. For frontend development with hot reload, run the native Vite script alongside the host:
+`cargo run` refreshes the static frontend in `build/` with
+`pnpm build:native`, then serves those assets from the embedded WebView. For
+frontend development with hot reload, run the native Vite script alongside the
+host:
 
 ```bash
 pnpm dev:native
 cargo run -- --dev
+```
+
+The Cargo hook also runs for development commands. To skip the redundant
+static build while using Vite hot reload, set `UTSUWA_SKIP_WEB_BUILD=1`:
+
+```bash
+pnpm dev:native
+UTSUWA_SKIP_WEB_BUILD=1 cargo run -- --dev
 ```
 
 `pnpm dev` remains the browser-only workflow. It does not expose the Rust

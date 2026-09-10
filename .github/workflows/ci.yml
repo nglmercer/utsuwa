@@ -60,4 +60,4 @@ jobs:
         run: mkdir -p build
 
       - name: Cargo check
-        run: cargo check --workspace --all-targets
+        run: UTSUWA_SKIP_WEB_BUILD=1 cargo check --workspace --all-targets
