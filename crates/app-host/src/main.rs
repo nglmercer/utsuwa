@@ -79,6 +79,7 @@ const DEBUG_LOG_MODULES: &[&str] = &[
     "memory",
     "storage_core",
     "secret_core",
+    "audio_capture",
     "model_openai_compatible",
 ];
 
@@ -188,7 +189,7 @@ fn configure_builder(
         Ok(server) => Some(server),
         Err(err) => {
             if dev_mode {
-                tracing::info!(%err, "no asset dir; custom scheme disabled in dev mode");
+                tracing::info!(%err, "no asset dir; media custom scheme remains enabled in dev mode");
                 None
             } else {
                 tracing::error!(%err, "cannot serve bundled frontend (set UTSUWA_ASSET_DIR)");
@@ -211,11 +212,20 @@ fn configure_builder(
         tracing::warn!(%url, "blocked new-window request (needs host.open_external_url)");
         wry::NewWindowResponse::Deny
     });
-    if let Some(server) = asset_server {
-        builder = builder.with_custom_protocol(protocol::APP_SCHEME.to_string(), move |_, req| {
+    let media_registry = dispatcher.media_registry();
+    builder = builder.with_custom_protocol(protocol::APP_SCHEME.to_string(), move |_, req| {
+        if req.uri().host() == Some("media") {
+            media_registry.handle(req)
+        } else if let Some(server) = &asset_server {
             server.handle(req)
-        });
-    }
+        } else {
+            wry::http::Response::builder()
+                .status(wry::http::StatusCode::FORBIDDEN)
+                .header("Content-Type", "text/plain")
+                .body(std::borrow::Cow::Borrowed(b"forbidden" as &[u8]))
+                .unwrap_or_else(|_| wry::http::Response::new(std::borrow::Cow::Borrowed(&[])))
+        }
+    });
     let ipc_dispatcher = dispatcher.clone();
     builder = builder.with_initialization_script(BRIDGE_JS);
     Some(builder.with_ipc_handler(move |request| {
@@ -510,6 +520,11 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
         .with_approvals(Arc::clone(&approvals))
         .with_audit(Arc::clone(&audit))
         .with_secret_store(Arc::clone(&secrets));
+    let audio_manager = Arc::new(app_host::audio::AudioCaptureManager::new(
+        dispatcher.media_registry(),
+        Arc::clone(&emit),
+    ));
+    dispatcher = dispatcher.with_audio_capture(audio_manager);
     if let Some(store) = &storage {
         dispatcher = dispatcher.with_storage(Arc::clone(store));
     }

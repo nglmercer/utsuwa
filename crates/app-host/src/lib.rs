@@ -7,6 +7,7 @@
 
 use ipc_core::HostEvent;
 
+pub mod audio;
 pub mod ipc;
 pub mod protocol;
 pub mod runtime;

@@ -470,6 +470,20 @@
 					<dl>
 						<dt>Provider</dt>
 						<dd>{activeProviderName}</dd>
+						<dt>Backend</dt>
+						<dd>{sttDiagnostics.backend ?? 'unknown'}</dd>
+						{#if sttDiagnostics.device}
+							<dt>Device</dt>
+							<dd>{sttDiagnostics.device}</dd>
+						{/if}
+						{#if sttDiagnostics.sampleRate}
+							<dt>Sample rate</dt>
+							<dd>{sttDiagnostics.sampleRate} Hz</dd>
+						{/if}
+						{#if sttDiagnostics.channels}
+							<dt>Channels</dt>
+							<dd>{sttDiagnostics.channels}</dd>
+						{/if}
 						<dt>Session mode</dt>
 						<dd>{sttTestMode ?? 'unknown'}</dd>
 						<dt>Current input</dt>
@@ -502,6 +516,10 @@
 						<dd>{sttDiagnostics.chunkCount}</dd>
 						<dt>Recorded bytes</dt>
 						<dd>{sttDiagnostics.recordedBytes}</dd>
+						{#if sttDiagnostics.wavBytes !== undefined}
+							<dt>WAV bytes</dt>
+							<dd>{sttDiagnostics.wavBytes}</dd>
+						{/if}
 						<dt>Recording duration</dt>
 						<dd>{formatDuration(sttDiagnostics.durationMs)}</dd>
 						<dt>Provider request started</dt>

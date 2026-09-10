@@ -4,6 +4,7 @@ members = [
     "crates/agent-core",
     "crates/app-host",
     "crates/audit-core",
+    "crates/audio-capture",
     "crates/tool-filesystem",
     "crates/capability-core",
     "crates/ipc-core",
@@ -35,6 +36,7 @@ license = "AGPL-3.0-or-later"
 agent-core = { path = "crates/agent-core" }
 async-trait = "0.1"
 audit-core = { path = "crates/audit-core" }
+audio-capture = { path = "crates/audio-capture" }
 desktop-linux = { path = "crates/desktop-linux" }
 bytes = "1"
 capability-core = { path = "crates/capability-core" }

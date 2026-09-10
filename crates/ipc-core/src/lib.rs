@@ -48,6 +48,12 @@ pub enum IpcMethod {
     /// client. This is needed when a provider does not enable WebView CORS.
     #[serde(rename = "providers.fetch_models")]
     ProvidersFetchModels,
+    #[serde(rename = "audio_capture.start")]
+    AudioCaptureStart,
+    #[serde(rename = "audio_capture.stop")]
+    AudioCaptureStop,
+    #[serde(rename = "audio_capture.cancel")]
+    AudioCaptureCancel,
     #[serde(rename = "activity.list")]
     ActivityList,
     #[serde(rename = "plugin.list")]

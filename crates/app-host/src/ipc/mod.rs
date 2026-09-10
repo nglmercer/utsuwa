@@ -6,6 +6,7 @@
 
 pub mod activity;
 pub mod agent;
+pub mod audio;
 pub mod dispatcher;
 pub mod permissions;
 pub mod plugins;

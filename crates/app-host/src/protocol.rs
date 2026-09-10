@@ -152,6 +152,7 @@ fn mime_for(path: &Path) -> &'static str {
         Some("ttf") => "font/ttf",
         Some("otf") => "font/otf",
         Some("mp3") => "audio/mpeg",
+        Some("wav") => "audio/wav",
         Some("mp4") => "video/mp4",
         Some("webm") => "video/webm",
         Some("wasm") => "application/wasm",

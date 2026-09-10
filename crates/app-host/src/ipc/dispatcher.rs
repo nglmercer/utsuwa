@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 /// methods needing a missing attachment fail with a typed error.
 pub struct Dispatcher {
     pub app_version: String,
+    pub(crate) audio_capture: Option<Arc<crate::audio::AudioCaptureManager>>,
+    pub(crate) media_registry: Arc<crate::audio::MediaRegistry>,
     pub(crate) approvals: Option<Arc<Mutex<ApprovalQueue>>>,
     pub(crate) agent: Option<Arc<AgentRuntime>>,
     pub(crate) storage: Option<Arc<Mutex<storage_core::Storage>>>,
@@ -29,6 +31,8 @@ impl Clone for Dispatcher {
     fn clone(&self) -> Self {
         Self {
             app_version: self.app_version.clone(),
+            audio_capture: self.audio_capture.clone(),
+            media_registry: self.media_registry.clone(),
             approvals: self.approvals.clone(),
             agent: self.agent.clone(),
             storage: self.storage.clone(),
@@ -42,6 +46,8 @@ impl Dispatcher {
     pub fn new(app_version: impl Into<String>) -> Self {
         Self {
             app_version: app_version.into(),
+            audio_capture: None,
+            media_registry: Arc::new(crate::audio::MediaRegistry::new()),
             approvals: None,
             agent: None,
             storage: None,
@@ -80,6 +86,20 @@ impl Dispatcher {
     pub fn with_secret_store(mut self, secrets: Arc<dyn secret_core::SecretStore>) -> Self {
         self.secrets = Some(secrets);
         self
+    }
+
+    /// Attach native CPAL capture. The media registry is created with the
+    /// dispatcher and remains available to the custom companion scheme.
+    pub fn with_audio_capture(
+        mut self,
+        audio_capture: Arc<crate::audio::AudioCaptureManager>,
+    ) -> Self {
+        self.audio_capture = Some(audio_capture);
+        self
+    }
+
+    pub fn media_registry(&self) -> Arc<crate::audio::MediaRegistry> {
+        self.media_registry.clone()
     }
 
     /// Parse one raw frontend message. Returns the script payloads the host
@@ -189,6 +209,9 @@ impl Dispatcher {
                 code: ipc_core::ErrorCode::Internal,
                 message: "providers.fetch_models must be dispatched asynchronously".to_string(),
             }),
+            IpcMethod::AudioCaptureStart => self.audio_capture_start(request),
+            IpcMethod::AudioCaptureStop => self.audio_capture_stop(),
+            IpcMethod::AudioCaptureCancel => self.audio_capture_cancel(),
             IpcMethod::ActivityList => self.activity_list(request),
             IpcMethod::PluginList => self.plugin_list(),
             IpcMethod::PluginEnable => self.plugin_manage(request, PluginOp::Enable),
