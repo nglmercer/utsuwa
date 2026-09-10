@@ -1,4 +1,10 @@
-import type { SpeechRecognitionCallbacks } from './web-speech';
+import type { SpeechRecognitionCallbacks } from './web-speech.ts';
+import {
+	isAbortError,
+	recordedSttService,
+	type RecordedSttTransport,
+	type SttTransportContext
+} from './recorded-stt.ts';
 
 export interface OpenAiSttConfig {
 	// Base URL ending in /v1 (or a full custom URL). Trailing slashes are trimmed.
@@ -12,8 +18,8 @@ export interface OpenAiSttConfig {
 	connectionHint?: string;
 }
 
-// The transcription request shape, split out so it can be unit tested without a
-// browser (MediaRecorder/getUserMedia). OpenAI-compatible servers — OpenAI,
+// The transcription request shape is split out so it can be unit tested without
+// a browser (MediaRecorder/getUserMedia). OpenAI-compatible servers — OpenAI,
 // Groq, Speaches, faster-whisper-server, whisper.cpp — all accept this.
 export function buildTranscriptionRequest(
 	config: OpenAiSttConfig,
@@ -34,260 +40,86 @@ export function buildTranscriptionRequest(
 	return { url: `${base}/audio/transcriptions`, headers, body: form };
 }
 
-// Records mic audio and transcribes it via any OpenAI-compatible
-// /v1/audio/transcriptions endpoint. Groq and local servers (Speaches,
-// faster-whisper-server, whisper.cpp) share this exact client — only the base
-// URL, model, and whether an API key is sent differ.
-class OpenAiSttService {
-	private config: OpenAiSttConfig | null = null;
-	private mediaRecorder: MediaRecorder | null = null;
-	private audioChunks: Blob[] = [];
-	private stream: MediaStream | null = null;
-	private analyser: AnalyserNode | null = null;
-	private audioContext: AudioContext | null = null;
-	private animFrameId: number | null = null;
-	private callbacks: SpeechRecognitionCallbacks | null = null;
-	private abortController: AbortController | null = null;
-	private listening = false;
-	private transcribing = false;
+/** Transport for OpenAI-compatible /audio/transcriptions endpoints. */
+export class OpenAiSttTransport implements RecordedSttTransport {
+	readonly timeoutMs = 30_000;
+	private readonly config: OpenAiSttConfig;
 
-	configure(config: OpenAiSttConfig) {
+	constructor(config: OpenAiSttConfig) {
 		this.config = config;
 	}
 
+	async transcribe(audio: Blob, context: SttTransportContext): Promise<string> {
+		const { url, headers, body } = buildTranscriptionRequest(this.config, audio, context.filename);
+
+		let response: Response;
+		try {
+			response = await fetch(url, {
+				method: 'POST',
+				headers,
+				body,
+				signal: context.signal
+			});
+		} catch (error) {
+			if (isAbortError(error)) throw error;
+			throw new Error(
+				this.config.connectionHint ||
+					(error instanceof Error ? error.message : `Failed to reach ${this.config.label}`)
+			);
+		}
+
+		if (!response.ok) {
+			const errorData = await response.json().catch(() => ({}));
+			const msg =
+				(errorData as { error?: { message?: string } })?.error?.message ||
+				`${this.config.label} error (${response.status})`;
+			throw new Error(msg);
+		}
+
+		const data = (await response.json()) as { text?: string };
+		return data.text?.trim() ?? '';
+	}
+}
+
+/**
+ * Compatibility wrapper for callers that used the old OpenAI-specific service.
+ * The actual recorder is shared with Gemini and all other recorded transports.
+ */
+class OpenAiSttService {
+	private config: OpenAiSttConfig | null = null;
+
+	configure(config: OpenAiSttConfig): void {
+		this.config = config;
+		recordedSttService.configure(new OpenAiSttTransport(config));
+	}
+
 	isSupported(): boolean {
-		return !!navigator.mediaDevices?.getUserMedia;
+		return recordedSttService.isSupported();
+	}
+
+	getIsListening(): boolean {
+		return recordedSttService.getIsListening();
+	}
+
+	getIsTranscribing(): boolean {
+		return recordedSttService.getIsTranscribing();
 	}
 
 	isConfigured(): boolean {
 		return !!this.config?.baseUrl && !!this.config?.model;
 	}
 
-	getIsListening(): boolean {
-		return this.listening;
-	}
-
-	getIsTranscribing(): boolean {
-		return this.transcribing;
-	}
-
-	async startListening(callbacks: SpeechRecognitionCallbacks): Promise<boolean> {
-		if (this.listening) return true;
-		if (!this.config) {
-			callbacks.onError('Speech-to-text is not configured. Set it up in Settings > Persona.');
-			return false;
-		}
-
-		this.callbacks = callbacks;
-		this.audioChunks = [];
-
-		try {
-			this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-		} catch (err) {
-			if (err instanceof DOMException) {
-				const messages: Record<string, string> = {
-					NotAllowedError: 'Microphone access denied. Check system permissions.',
-					NotFoundError: 'No microphone found. Please connect a microphone.',
-					NotReadableError: 'Microphone is busy or in use by another app.',
-					OverconstrainedError: 'Microphone does not meet requirements.'
-				};
-				callbacks.onError(messages[err.name] || `Microphone error: ${err.message}`);
-			} else {
-				callbacks.onError('Failed to access microphone');
-			}
-			return false;
-		}
-
-		// Watch for mic disconnection
-		this.stream.getTracks().forEach((track) => {
-			track.onended = () => {
-				if (this.listening) {
-					this.callbacks?.onError('Microphone disconnected');
-					this.cleanup();
-					this.listening = false;
-					this.callbacks?.onEnd();
-				}
-			};
-		});
-
-		// Set up audio analysis for real levels
-		this.audioContext = new AudioContext();
-		const source = this.audioContext.createMediaStreamSource(this.stream);
-		this.analyser = this.audioContext.createAnalyser();
-		this.analyser.fftSize = 256;
-		source.connect(this.analyser);
-		this.startLevelMonitoring();
-
-		// Record audio — mimeType may be undefined to let browser pick default
-		const mimeType = this.getSupportedMimeType();
-		try {
-			this.mediaRecorder = mimeType
-				? new MediaRecorder(this.stream, { mimeType })
-				: new MediaRecorder(this.stream);
-		} catch {
-			callbacks.onError('Audio recording not supported on this platform');
-			this.releaseStream();
-			return false;
-		}
-
-		this.mediaRecorder.ondataavailable = (e) => {
-			if (e.data.size > 0) this.audioChunks.push(e.data);
-		};
-
-		this.mediaRecorder.onstop = () => this.handleRecordingStop();
-
-		this.mediaRecorder.start(250);
-		this.listening = true;
-		return true;
+	startListening(callbacks: SpeechRecognitionCallbacks): Promise<boolean> {
+		return recordedSttService.startListening(callbacks);
 	}
 
 	stopListening(): void {
-		if (this.mediaRecorder && this.listening) {
-			this.mediaRecorder.stop();
-		}
+		recordedSttService.stopListening();
 	}
 
 	abort(): void {
-		this.abortController?.abort();
-		this.abortController = null;
-		this.callbacks = null;
-		this.cleanup();
-		this.listening = false;
-		this.transcribing = false;
-	}
-
-	private getSupportedMimeType(): string | undefined {
-		// mp4/m4a first for Safari/WKWebView, then webm for Chromium
-		const types = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus'];
-		for (const type of types) {
-			if (MediaRecorder.isTypeSupported(type)) return type;
-		}
-		// Let browser pick its default
-		return undefined;
-	}
-
-	private startLevelMonitoring() {
-		if (!this.analyser || !this.callbacks?.onAudioLevel) return;
-
-		const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
-		const tick = () => {
-			if (!this.analyser || !this.listening) return;
-			this.analyser.getByteFrequencyData(dataArray);
-			let sum = 0;
-			for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
-			const level = sum / (dataArray.length * 255);
-			this.callbacks?.onAudioLevel?.(level);
-			this.animFrameId = requestAnimationFrame(tick);
-		};
-		this.animFrameId = requestAnimationFrame(tick);
-	}
-
-	private async handleRecordingStop() {
-		this.listening = false;
-		this.stopLevelMonitoring();
-		this.releaseStream();
-
-		// abort() was called — don't transcribe or fire callbacks
-		if (!this.callbacks || !this.config) return;
-
-		if (this.audioChunks.length === 0) {
-			this.callbacks?.onEnd();
-			return;
-		}
-
-		this.transcribing = true;
-		const actualMime = this.mediaRecorder?.mimeType || 'audio/mp4';
-		const audioBlob = new Blob(this.audioChunks, { type: actualMime });
-		this.audioChunks = [];
-
-		const ext = actualMime.includes('webm') ? 'webm' : actualMime.includes('ogg') ? 'ogg' : 'm4a';
-
-		this.abortController = new AbortController();
-		const timeoutId = setTimeout(() => this.abortController?.abort(), 30000);
-
-		try {
-			const { url, headers, body } = buildTranscriptionRequest(
-				this.config,
-				audioBlob,
-				`recording.${ext}`
-			);
-
-			const response = await fetch(url, {
-				method: 'POST',
-				headers,
-				body,
-				signal: this.abortController.signal
-			});
-
-			clearTimeout(timeoutId);
-
-			if (!response.ok) {
-				const errorData = await response.json().catch(() => ({}));
-				const msg =
-					(errorData as { error?: { message?: string } })?.error?.message ||
-					`${this.config.label} error (${response.status})`;
-				this.callbacks?.onError(msg);
-				this.transcribing = false;
-				return;
-			}
-
-			const data = (await response.json()) as { text: string };
-			const text = data.text?.trim();
-			this.transcribing = false;
-
-			if (text) {
-				this.callbacks?.onResult(text, true);
-			}
-			this.callbacks?.onEnd();
-		} catch (err) {
-			clearTimeout(timeoutId);
-			this.transcribing = false;
-			if (err instanceof DOMException && err.name === 'AbortError') {
-				// Aborted by user or timeout — don't surface as error
-				this.callbacks?.onEnd();
-				return;
-			}
-			// A thrown fetch means the server was unreachable/blocked (vs. an HTTP
-			// error, handled above), so prefer the connection hint when we have one.
-			const msg =
-				this.config.connectionHint ||
-				(err instanceof Error ? err.message : `Failed to reach ${this.config.label}`);
-			this.callbacks?.onError(msg);
-		} finally {
-			this.abortController = null;
-		}
-	}
-
-	private stopLevelMonitoring() {
-		if (this.animFrameId !== null) {
-			cancelAnimationFrame(this.animFrameId);
-			this.animFrameId = null;
-		}
-	}
-
-	private releaseStream() {
-		if (this.stream) {
-			this.stream.getTracks().forEach((t) => t.stop());
-			this.stream = null;
-		}
-		if (this.audioContext) {
-			this.audioContext.close();
-			this.audioContext = null;
-		}
-		this.analyser = null;
-	}
-
-	private cleanup() {
-		this.stopLevelMonitoring();
-		if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
-			this.mediaRecorder.stop();
-		}
-		this.mediaRecorder = null;
-		this.audioChunks = [];
-		this.releaseStream();
+		recordedSttService.abort();
 	}
 }
 
-// A single shared recorder. The store configures it for whichever OpenAI-compatible
-// STT provider (Groq or a local server) is active before each session.
 export const openAiSttService = new OpenAiSttService();

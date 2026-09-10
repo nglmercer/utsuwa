@@ -1,10 +1,15 @@
 import { browser } from '$app/environment';
 import { webSpeechService } from '$lib/services/stt/web-speech';
-import { openAiSttService } from '$lib/services/stt/openai-stt';
+import { recordedSttService } from '$lib/services/stt/recorded-stt';
+import { GeminiSttTransport, DEFAULT_GEMINI_STT_MODEL } from '$lib/services/stt/gemini-stt';
+import { OpenAiSttTransport } from '$lib/services/stt/openai-stt';
 import { getSTTBaseUrl, getLocalSTTConnectionHint } from '$lib/services/providers/local-endpoints';
 import { getSTTProvider } from '$lib/services/providers/registry';
 import { isDesktopBuild } from '$lib/services/platform/platform';
 import { settingsStore } from '$lib/stores/settings.svelte';
+import type { SttProviderId } from '$lib/types';
+
+type RecordedSttProviderId = Exclude<SttProviderId, 'web-speech'>;
 
 function createSttStore() {
 	let isListening = $state(false);
@@ -14,142 +19,167 @@ function createSttStore() {
 	let error = $state<string | null>(null);
 	let audioLevel = $state(0);
 	let errorTimeout: ReturnType<typeof setTimeout> | null = null;
+	let sessionId = 0;
+	let sessionMode: 'recorded' | 'web-speech' | null = null;
 
-	// Which OpenAI-compatible STT provider to use, if any. A configured local
-	// server wins over Groq (mirrors how a Groq key wins over Web Speech), and
-	// both fall back to the browser's Web Speech API when neither is set up.
-	const activeOpenAiStt = $derived.by<string | null>(() => {
-		if (!browser) return null;
+	// An explicit selection wins. A null selection preserves the legacy priority
+	// for existing installations and users who have not chosen a provider yet.
+	const activeSttProvider = $derived.by<SttProviderId>(() => {
+		if (!browser) return 'web-speech';
+		if (settingsStore.selectedSttProvider) return settingsStore.selectedSttProvider;
 		if (settingsStore.isProviderAdded('local-stt')) return 'local-stt';
 		if (settingsStore.getProviderConfig('groq-stt').apiKey) return 'groq-stt';
 		if (settingsStore.getProviderConfig('openai-stt').apiKey) return 'openai-stt';
-		return null;
+		if (settingsStore.getProviderConfig('gemini-stt').apiKey) return 'gemini-stt';
+		return 'web-speech';
 	});
-	const useOpenAiStt = $derived(activeOpenAiStt !== null);
 
-	// Point the shared recorder at the active provider's endpoint before a session.
-	function configureOpenAiStt(providerId: string) {
+	function configureRecordedStt(providerId: RecordedSttProviderId): void {
 		const config = settingsStore.getProviderConfig(providerId);
 		const meta = getSTTProvider(providerId);
+
+		if (providerId === 'gemini-stt') {
+			recordedSttService.configure(
+				new GeminiSttTransport({
+					apiKey: config.apiKey ?? '',
+					model: config.modelId || meta?.models?.[0]?.id || DEFAULT_GEMINI_STT_MODEL
+				})
+			);
+			return;
+		}
+
 		const baseUrl = getSTTBaseUrl(providerId, config.baseUrl || meta?.defaultBaseUrl);
 		const model =
 			config.modelId ||
 			meta?.models?.[0]?.id ||
 			(providerId === 'groq-stt' ? 'whisper-large-v3-turbo' : 'whisper-1');
 		const isLocal = providerId === 'local-stt';
-		openAiSttService.configure({
-			baseUrl,
-			model,
-			apiKey: config.apiKey || undefined,
-			label: isLocal ? 'the local STT server' : (meta?.name ?? 'the STT server'),
-			connectionHint: isLocal
-				? getLocalSTTConnectionHint(baseUrl, browser ? window.location.origin : undefined)
-				: undefined
-		});
+		recordedSttService.configure(
+			new OpenAiSttTransport({
+				baseUrl,
+				model,
+				apiKey: config.apiKey || undefined,
+				label: isLocal ? 'the local STT server' : (meta?.name ?? 'the STT server'),
+				connectionHint: isLocal
+					? getLocalSTTConnectionHint(baseUrl, browser ? window.location.origin : undefined)
+					: undefined
+			})
+		);
 	}
 
-	async function startListening(onComplete: (text: string) => void) {
-		if (!browser) return;
-		if (isListening || isTranscribing) return;
+	function ensureProviderConfigured(providerId: SttProviderId): boolean {
+		if (providerId === 'web-speech' || providerId === 'local-stt') return true;
+		const config = settingsStore.getProviderConfig(providerId);
+		if (config.apiKey) return true;
+		const provider = getSTTProvider(providerId);
+		setError(`${provider?.name ?? 'This STT provider'} API key is required. Set it up in Settings → Persona.`);
+		return false;
+	}
 
+	function handleResult(currentSessionId: number, text: string, isFinal: boolean): void {
+		if (currentSessionId !== sessionId) return;
+		if (isFinal) {
+			transcript = transcript ? `${transcript} ${text}` : text;
+			interimTranscript = '';
+		} else {
+			interimTranscript = text;
+		}
+	}
+
+	function handleEnd(currentSessionId: number, onComplete: (text: string) => void): void {
+		if (currentSessionId !== sessionId) return;
+		isListening = false;
+		isTranscribing = false;
+		sessionMode = null;
+		audioLevel = 0;
+		const finalText = transcript.trim();
+		transcript = '';
+		interimTranscript = '';
+		if (finalText) onComplete(finalText);
+	}
+
+	function handleError(currentSessionId: number, message: string): void {
+		if (currentSessionId !== sessionId) return;
+		console.error('[STT Store] Error:', message);
+		setError(message);
+		isListening = false;
+		isTranscribing = false;
+		sessionMode = null;
+		transcript = '';
+		interimTranscript = '';
+		audioLevel = 0;
+	}
+
+	async function startListening(onComplete: (text: string) => void): Promise<void> {
+		if (!browser) return;
+		if (isListening || isTranscribing || sessionMode) return;
+
+		const providerId = activeSttProvider;
+		if (!ensureProviderConfigured(providerId)) return;
+		if (providerId !== 'web-speech' && !recordedSttService.isSupported()) {
+			showUnsupportedError();
+			return;
+		}
+
+		const currentSessionId = ++sessionId;
+		sessionMode = providerId === 'web-speech' ? 'web-speech' : 'recorded';
 		error = null;
 		transcript = '';
 		interimTranscript = '';
 		audioLevel = 0.2;
 
-		if (useOpenAiStt && activeOpenAiStt) {
-			// Point the recorder at the active provider (local server or Groq)
-			configureOpenAiStt(activeOpenAiStt);
-
-			const started = await openAiSttService.startListening({
-				onResult: (text, isFinal) => {
-					if (isFinal) {
-						transcript = transcript ? transcript + ' ' + text : text;
-						interimTranscript = '';
-					} else {
-						interimTranscript = text;
-					}
-				},
-				onEnd: () => {
-					isListening = false;
-					isTranscribing = false;
-					audioLevel = 0;
-					const finalText = transcript.trim();
-					transcript = '';
-					interimTranscript = '';
-					if (finalText) {
-						onComplete(finalText);
-					}
-				},
-				onError: (err) => {
-					console.error('[STT Store] Error:', err);
-					setError(err);
-					isListening = false;
-					isTranscribing = false;
-					transcript = '';
-					interimTranscript = '';
-					audioLevel = 0;
-				},
-				onAudioLevel: (level) => {
-					audioLevel = level;
+		const callbacks = {
+			onResult: (text: string, isFinal: boolean) => {
+				handleResult(currentSessionId, text, isFinal);
+				if (providerId === 'web-speech' && currentSessionId === sessionId) {
+					audioLevel = isFinal ? 0.3 : 0.5 + Math.random() * 0.5;
 				}
-			});
-
-			if (started) {
-				isListening = true;
+			},
+			onEnd: () => handleEnd(currentSessionId, onComplete),
+			onError: (message: string) => handleError(currentSessionId, message),
+			onAudioLevel: (level: number) => {
+				if (currentSessionId === sessionId) audioLevel = level;
 			}
+		};
+
+		let started = false;
+		if (providerId === 'web-speech') {
+			started = webSpeechService.startListening(callbacks);
 		} else {
-			const started = webSpeechService.startListening({
-				onResult: (text, isFinal) => {
-					if (isFinal) {
-						transcript = transcript ? transcript + ' ' + text : text;
-						interimTranscript = '';
-						audioLevel = 0.3;
-					} else {
-						interimTranscript = text;
-						audioLevel = 0.5 + Math.random() * 0.5;
-					}
-				},
-				onEnd: () => {
-					isListening = false;
-					audioLevel = 0;
-					const finalText = transcript.trim();
-					transcript = '';
-					interimTranscript = '';
-					if (finalText) {
-						onComplete(finalText);
-					}
-				},
-				onError: (err) => {
-					console.error('[STT Store] Error:', err);
-					setError(err);
-					isListening = false;
-					transcript = '';
-					interimTranscript = '';
-					audioLevel = 0;
-				}
-			});
+			configureRecordedStt(providerId);
+			started = await recordedSttService.startListening(callbacks);
+		}
 
-			if (started) {
-				isListening = true;
-			}
+		if (started && currentSessionId === sessionId) {
+			isListening = true;
+		} else if (!started && currentSessionId === sessionId) {
+			sessionMode = null;
+			audioLevel = 0;
 		}
 	}
 
-	function stopListening() {
-		if (useOpenAiStt) {
-			// Recorded audio is transcribed on stop
+	function stopListening(): void {
+		if (sessionMode === 'recorded') {
+			isListening = false;
 			isTranscribing = true;
-			openAiSttService.stopListening();
-		} else {
+			recordedSttService.stopListening();
+		} else if (sessionMode === 'web-speech') {
+			isListening = false;
 			webSpeechService.stopListening();
 		}
 	}
 
-	function cancel() {
-		if (useOpenAiStt) {
-			openAiSttService.abort();
+	function cancel(): void {
+		const mode = sessionMode;
+		++sessionId;
+		sessionMode = null;
+		if (mode === 'recorded') {
+			recordedSttService.abort();
+		} else if (mode === 'web-speech') {
+			webSpeechService.abort();
 		} else {
+			// Covers a start canceled while getUserMedia is still pending.
+			recordedSttService.abort();
 			webSpeechService.abort();
 		}
 		isListening = false;
@@ -159,28 +189,22 @@ function createSttStore() {
 		audioLevel = 0;
 	}
 
-	function isSupported() {
+	function isSupported(): boolean {
 		if (!browser) return false;
-		// A local or Groq server works on any platform if a mic is available
-		if (useOpenAiStt && openAiSttService.isSupported()) return true;
-		// Web Speech is feature-detected: present in Chrome/Edge, absent in
-		// the native webview and other browsers.
-		if (webSpeechService.isSupported()) return true;
-		return false;
+		if (activeSttProvider === 'web-speech') return webSpeechService.isSupported();
+		return recordedSttService.isSupported();
 	}
 
-	function showUnsupportedError() {
+	function showUnsupportedError(): void {
 		if (isDesktopBuild()) {
-			setError('Add a Groq key or a local STT server in Settings → Persona for voice input on desktop.');
+			setError('Add an STT API key or a local STT server in Settings → Persona for voice input on desktop.');
 		} else {
-			setError('Voice input is not supported in this browser. Add a Groq key or a local STT server in Settings → Persona, or try Chrome/Edge.');
+			setError('Voice input is not supported in this browser. Add an STT provider in Settings → Persona, or try Chrome/Edge.');
 		}
 	}
 
-	function setError(message: string) {
-		if (errorTimeout) {
-			clearTimeout(errorTimeout);
-		}
+	function setError(message: string): void {
+		if (errorTimeout) clearTimeout(errorTimeout);
 		error = message;
 		errorTimeout = setTimeout(() => {
 			error = null;
@@ -188,7 +212,7 @@ function createSttStore() {
 		}, 4000);
 	}
 
-	function clearError() {
+	function clearError(): void {
 		if (errorTimeout) {
 			clearTimeout(errorTimeout);
 			errorTimeout = null;
@@ -210,9 +234,7 @@ function createSttStore() {
 			return interimTranscript;
 		},
 		get displayTranscript() {
-			if (transcript && interimTranscript) {
-				return transcript + ' ' + interimTranscript;
-			}
+			if (transcript && interimTranscript) return `${transcript} ${interimTranscript}`;
 			return transcript || interimTranscript;
 		},
 		get error() {

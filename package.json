@@ -49,6 +49,7 @@
 	},
 	"dependencies": {
 		"@fontsource-variable/inter": "^5.2.8",
+		"@google/genai": "^2.21.0",
 		"@pixiv/three-vrm": "^3.4.5",
 		"@pixiv/three-vrm-animation": "^3.4.5",
 		"@threlte/core": "^8.3.1",

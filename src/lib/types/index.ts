@@ -21,6 +21,10 @@ export type LLMProvider =
 // TTS Provider IDs
 export type TTSProvider = 'elevenlabs' | 'openai-tts' | 'local-tts' | 'omnivoice';
 
+// Voice input providers. Browser Web Speech is kept separate from the provider
+// registry because it does not use a remote provider configuration.
+export type SttProviderId = 'web-speech' | 'local-stt' | 'groq-stt' | 'openai-stt' | 'gemini-stt';
+
 // Provider configuration (stored in settings)
 export interface ProviderConfig {
 	apiKey?: string;

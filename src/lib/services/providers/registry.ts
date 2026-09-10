@@ -254,6 +254,16 @@ export const TTS_PROVIDERS: ProviderMetadata[] = [
 
 export const STT_PROVIDERS: ProviderMetadata[] = [
 	{
+		id: 'gemini-stt',
+		name: 'Google Gemini',
+		description: 'Gemini 3.5 speech-to-text',
+		category: 'stt',
+		icon: '✨',
+		requiresApiKey: true,
+		defaultBaseUrl: 'https://generativelanguage.googleapis.com/',
+		models: [{ id: 'gemini-3.5-transcribe', name: 'Gemini 3.5 Transcribe' }]
+	},
+	{
 		id: 'groq-stt',
 		name: 'Groq',
 		description: 'Fast speech-to-text via Whisper',

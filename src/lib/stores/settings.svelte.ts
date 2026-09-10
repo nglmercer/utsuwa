@@ -1,5 +1,5 @@
 import { browser } from '$app/environment';
-import type { ProviderConfig } from '$lib/types';
+import type { ProviderConfig, SttProviderId } from '$lib/types';
 import { LLM_PROVIDERS, TTS_PROVIDERS, STT_PROVIDERS } from '$lib/services/providers/registry';
 import { getLLMProvider } from '$lib/services/providers/registry';
 import { modulesStore } from '$lib/stores/modules.svelte';
@@ -11,6 +11,13 @@ import type { ModelInfo } from '$lib/services/providers/model-capabilities';
 
 export type ProviderCategory = 'llm' | 'tts' | 'stt';
 
+function parseSttProvider(value: unknown): SttProviderId | null {
+	if (value === 'web-speech' || value === 'local-stt' || value === 'groq-stt' || value === 'openai-stt' || value === 'gemini-stt') {
+		return value;
+	}
+	return null;
+}
+
 function createSettingsStore() {
 	// Provider configurations (keyed by provider id)
 	// This is the SINGLE SOURCE OF TRUTH for credentials
@@ -21,6 +28,8 @@ function createSettingsStore() {
 
 	// Track which providers have been explicitly added by user
 	let addedProviders = $state<Record<string, boolean>>({});
+	// Null preserves the legacy automatic provider priority for existing users.
+	let selectedSttProvider = $state<SttProviderId | null>(null);
 
 	// Desktop hotkey configuration
 	let hotkeys = $state<HotkeyConfig>({ ...DEFAULT_HOTKEYS });
@@ -35,6 +44,7 @@ function createSettingsStore() {
 				const parsed = JSON.parse(saved);
 				providerConfigs = parsed.providerConfigs ?? {};
 				addedProviders = parsed.addedProviders ?? {};
+				selectedSttProvider = parseSttProvider(parsed.sttProvider);
 				hotkeys = { ...DEFAULT_HOTKEYS, ...parsed.hotkeys };
 
 				// Migrate old settings format if needed
@@ -81,14 +91,13 @@ function createSettingsStore() {
 					return [providerId, config];
 				})
 			);
-			localStorage.setItem(
-				'utsuwa-settings',
-				JSON.stringify({
-					providerConfigs: persistedProviderConfigs,
-					addedProviders,
-					hotkeys
-				})
-			);
+			const persistedSettings: Record<string, unknown> = {
+				providerConfigs: persistedProviderConfigs,
+				addedProviders,
+				hotkeys
+			};
+			if (selectedSttProvider) persistedSettings.sttProvider = selectedSttProvider;
+			localStorage.setItem('utsuwa-settings', JSON.stringify(persistedSettings));
 		}
 	}
 
@@ -171,6 +180,7 @@ function createSettingsStore() {
 					const parsed = JSON.parse(e.newValue);
 					providerConfigs = parsed.providerConfigs ?? {};
 					addedProviders = parsed.addedProviders ?? {};
+					selectedSttProvider = parseSttProvider(parsed.sttProvider);
 					hotkeys = { ...DEFAULT_HOTKEYS, ...parsed.hotkeys };
 				} catch {
 					// Ignore malformed data from other window
@@ -215,6 +225,11 @@ function createSettingsStore() {
 	// Check if a provider has been added by user
 	function isProviderAdded(providerId: string): boolean {
 		return addedProviders[providerId] ?? false;
+	}
+
+	function setSelectedSttProvider(providerId: SttProviderId | null): void {
+		selectedSttProvider = providerId;
+		save();
 	}
 
 	// Check if a provider is properly configured (has required credentials)
@@ -329,6 +344,9 @@ function createSettingsStore() {
 		get addedProviders() {
 			return addedProviders;
 		},
+		get selectedSttProvider() {
+			return selectedSttProvider;
+		},
 
 		// Legacy compatibility getters
 		get anthropicApiKey() {
@@ -347,6 +365,7 @@ function createSettingsStore() {
 		markProviderAdded,
 		removeProvider,
 		isProviderAdded,
+		setSelectedSttProvider,
 		isProviderConfigured,
 		getConfiguredProviders,
 		getAddedProviders,

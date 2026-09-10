@@ -1,7 +1,25 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { LLM_PROVIDERS, TTS_PROVIDERS, getLLMProvider, getTTSProvider, providerSupportsVision } from './registry.ts';
+import {
+	LLM_PROVIDERS,
+	TTS_PROVIDERS,
+	getLLMProvider,
+	getSTTProvider,
+	getTTSProvider,
+	providerSupportsVision
+} from './registry.ts';
+
+test('Gemini Transcribe is registered as a dedicated STT provider', () => {
+	const gemini = getSTTProvider('gemini-stt');
+
+	assert.ok(gemini, 'Gemini STT should be registered');
+	assert.equal(gemini?.name, 'Google Gemini');
+	assert.equal(gemini?.description, 'Gemini 3.5 speech-to-text');
+	assert.equal(gemini?.requiresApiKey, true);
+	assert.equal(gemini?.defaultBaseUrl, 'https://generativelanguage.googleapis.com/');
+	assert.deepEqual(gemini?.models, [{ id: 'gemini-3.5-transcribe', name: 'Gemini 3.5 Transcribe' }]);
+});
 
 test('Kilo is a registered optional-key public gateway', () => {
 	const kilo = getLLMProvider('kilo');
