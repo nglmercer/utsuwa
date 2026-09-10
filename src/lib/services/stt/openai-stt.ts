@@ -43,14 +43,24 @@ export function buildTranscriptionRequest(
 /** Transport for OpenAI-compatible /audio/transcriptions endpoints. */
 export class OpenAiSttTransport implements RecordedSttTransport {
 	readonly timeoutMs = 30_000;
+	readonly emptyResultMessage: string;
 	private readonly config: OpenAiSttConfig;
 
 	constructor(config: OpenAiSttConfig) {
 		this.config = config;
+		this.emptyResultMessage = `${config.label} returned an empty transcription.`;
 	}
 
 	async transcribe(audio: Blob, context: SttTransportContext): Promise<string> {
 		const { url, headers, body } = buildTranscriptionRequest(this.config, audio, context.filename);
+		context.onStage?.('upload-start');
+		console.debug('[STT provider] upload-start', {
+			provider: this.config.label,
+			bytes: audio.size,
+			mimeType: audio.type,
+			filename: context.filename
+		});
+		context.onStage?.('transcription-start');
 
 		let response: Response;
 		try {
@@ -76,8 +86,15 @@ export class OpenAiSttTransport implements RecordedSttTransport {
 			throw new Error(msg);
 		}
 
+		context.onStage?.('upload-success');
 		const data = (await response.json()) as { text?: string };
-		return data.text?.trim() ?? '';
+		context.onStage?.('transcription-success');
+		const text = data.text?.trim() ?? '';
+		console.debug('[STT provider] transcription-success', {
+			provider: this.config.label,
+			characters: text.length
+		});
+		return text;
 	}
 }
 

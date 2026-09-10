@@ -7,6 +7,13 @@
 		type MicrophoneMonitorState
 	} from '$lib/services/media/microphone-monitor';
 	import { normalizeMicrophoneLevel } from '$lib/services/media/microphone-monitor';
+	import type { MediaAccessErrorDetails } from '$lib/services/media/media-errors';
+	import {
+		formatRecordedSttResultError,
+		type RecordedSttDiagnostics,
+		type RecordedSttResultStatus,
+		type RecordedSttSessionResult
+	} from '$lib/services/stt/recorded-stt';
 	import { sttStore, type SttSessionObserver } from '$lib/stores/stt.svelte';
 	import { getSTTProvider } from '$lib/services/providers/registry';
 
@@ -16,12 +23,18 @@
 	let microphoneLevel = $state(0);
 	let microphoneError = $state<MicrophoneMonitorError | null>(null);
 	let hasLevelMeter = $state(false);
+	let microphoneCurrentRms = $state(0);
+	let microphonePeakRms = $state(0);
 	let sttTestState = $state<SttTestState>('idle');
 	let sttTestTranscript = $state('');
 	let sttTestError = $state<string | null>(null);
 	let sttInputLevel = $state(0);
 	let sttPeakInputLevel = $state(0);
 	let sttHasLevelMeter = $state(false);
+	let sttDiagnostics = $state<RecordedSttDiagnostics | null>(null);
+	let sttMediaError = $state<MediaAccessErrorDetails | null>(null);
+	let sttFinalStatus = $state<RecordedSttResultStatus | null>(null);
+	let sttTestMode = $state<'auto' | 'manual' | null>(null);
 	let automaticSpeechEnd = $state(true);
 	let sttTestSessionId = 0;
 
@@ -42,6 +55,10 @@
 		},
 		onLevel: (level) => {
 			microphoneLevel = level;
+		},
+		onMetrics: (metrics) => {
+			microphoneCurrentRms = metrics.currentRms;
+			microphonePeakRms = metrics.peakRms;
 		},
 		onError: (error) => {
 			microphoneError = error;
@@ -84,10 +101,19 @@
 		sttTestState = 'error';
 	}
 
-	function handleSttEnd(text: string, sessionId: number): void {
+	function handleSttEnd(text: string, sessionId: number, result?: RecordedSttSessionResult): void {
 		if (sessionId !== sttTestSessionId) return;
 		if (text.trim()) return;
-		sttTestError = 'No speech was detected. Speak clearly, then pause to finish the test.';
+		if (result) {
+			sttFinalStatus = result.status;
+			sttDiagnostics = result.diagnostics;
+			sttMediaError = result.mediaError ?? null;
+		}
+		sttTestError = result?.status === 'no-speech'
+			? formatRecordedSttResultError(result)
+			: sttFinalStatus === 'no-speech'
+				? (sttTestError ?? 'No speech was detected by automatic speech detection.')
+				: 'No transcription text was returned.';
 		sttTestState = 'error';
 	}
 
@@ -99,10 +125,34 @@
 		sttPeakInputLevel = Math.max(sttPeakInputLevel, normalized);
 	}
 
+	function handleSttDiagnostics(diagnostics: RecordedSttDiagnostics, sessionId: number): void {
+		if (sessionId !== sttTestSessionId) return;
+		sttDiagnostics = diagnostics;
+		sttHasLevelMeter = diagnostics.analyserAvailable;
+		sttInputLevel = normalizeMicrophoneLevel(diagnostics.currentRms);
+		sttPeakInputLevel = normalizeMicrophoneLevel(diagnostics.peakRms);
+	}
+
+	function handleSttSessionResult(result: RecordedSttSessionResult, sessionId: number): void {
+		if (sessionId !== sttTestSessionId) return;
+		sttFinalStatus = result.status;
+		sttDiagnostics = result.diagnostics;
+		sttMediaError = result.mediaError ?? null;
+		sttHasLevelMeter = result.diagnostics.analyserAvailable;
+		sttInputLevel = normalizeMicrophoneLevel(result.diagnostics.currentRms);
+		sttPeakInputLevel = normalizeMicrophoneLevel(result.diagnostics.peakRms);
+		if (result.status === 'no-speech') {
+			sttTestError = formatRecordedSttResultError(result);
+			sttTestState = 'error';
+		}
+	}
+
 	function clearSttLevel(): void {
 		sttInputLevel = 0;
 		sttPeakInputLevel = 0;
 		sttHasLevelMeter = false;
+		sttDiagnostics = null;
+		sttMediaError = null;
 	}
 
 	async function startSttTest(): Promise<void> {
@@ -118,15 +168,19 @@
 		sttTestTranscript = '';
 		sttTestError = null;
 		clearSttLevel();
+		sttFinalStatus = null;
+		sttTestMode = automaticSpeechEnd ? 'auto' : 'manual';
 		sttTestState = 'starting';
 
 		const observer: SttSessionObserver = {
 			onAudioLevel: (level) => handleSttAudioLevel(level, sessionId),
+			onDiagnostics: (diagnostics) => handleSttDiagnostics(diagnostics, sessionId),
+			onSessionResult: (result) => handleSttSessionResult(result, sessionId),
 			onTranscriptionStart: () => {
 				if (sessionId === sttTestSessionId) sttTestState = 'transcribing';
 			},
 			onError: (message) => handleSttError(message, sessionId),
-			onEnd: (text) => handleSttEnd(text, sessionId)
+			onEnd: (text, result) => handleSttEnd(text, sessionId, result)
 		};
 		const started = await sttStore.startListening(
 			(text) => {
@@ -181,6 +235,16 @@
 		sttTestTranscript = '';
 		sttTestError = null;
 		clearSttLevel();
+		sttFinalStatus = null;
+		sttTestMode = null;
+	}
+
+	function formatNumber(value: number | undefined, digits = 3): string {
+		return value === undefined ? 'unknown' : value.toFixed(digits);
+	}
+
+	function formatDuration(durationMs: number | undefined): string {
+		return durationMs === undefined ? 'unknown' : `${Math.round(durationMs)} ms`;
 	}
 
 	onDestroy(() => {
@@ -235,6 +299,10 @@
 						<p class="diagnostic-note">Capture succeeded, but this WebView does not expose an audio level meter.</p>
 					{:else}
 						<p class="diagnostic-note">Talk or tap near the microphone. Stop the test when finished.</p>
+						<div class="raw-level-summary">
+							<span>Raw RMS</span>
+							<span>current {microphoneCurrentRms.toFixed(3)} · peak {microphonePeakRms.toFixed(3)}</span>
+						</div>
 					{/if}
 				</div>
 			{/if}
@@ -303,7 +371,13 @@
 				{#if sttTestState === 'starting'}
 					Requesting microphone…
 				{:else if sttTestState === 'listening'}
-					{automaticSpeechEnd ? 'Speak now, then pause to finish automatically.' : 'Speak now, then stop manually to test the provider.'}
+					{#if sttTestMode === 'auto' && sttDiagnostics && !sttDiagnostics.vadEnabled}
+						Automatic speech detection is unavailable here; speak, then stop manually.
+					{:else if sttTestMode === 'auto'}
+						Speak now, then pause to finish automatically.
+					{:else}
+						Speak now, then stop manually to test the provider.
+					{/if}
 				{:else if sttTestState === 'transcribing'}
 					Transcribing test audio…
 				{:else if sttTestState === 'success'}
@@ -343,6 +417,12 @@
 					{:else}
 						<p class="diagnostic-note">Peak input observed before recording stopped.</p>
 					{/if}
+					{#if sttDiagnostics}
+						<div class="raw-level-summary">
+							<span>Raw RMS</span>
+							<span>current {formatNumber(sttDiagnostics.currentRms)} · peak {formatNumber(sttDiagnostics.peakRms)}</span>
+						</div>
+					{/if}
 				</div>
 			{/if}
 
@@ -370,8 +450,86 @@
 			{#if sttTestError}
 				<div class="diagnostic-error" role="alert">
 					<strong>{sttTestError}</strong>
-					<p class="diagnostic-note">If this is a microphone error, run the microphone access check first.</p>
+					{#if sttFinalStatus === 'no-speech'}
+						<p class="diagnostic-note">Automatic speech detection stopped without sending audio to the provider. Try manual mode next.</p>
+					{:else if sttFinalStatus === 'recorder-empty' || sttFinalStatus === 'empty-recording' || sttFinalStatus === 'recorder-error'}
+						<p class="diagnostic-note">The microphone and provider are separate checks. This result points to the recording layer.</p>
+					{:else if sttFinalStatus === 'provider-empty' || sttFinalStatus === 'provider-error' || sttFinalStatus === 'timeout'}
+						<p class="diagnostic-note">The recording reached the provider layer; inspect the provider-specific error above.</p>
+					{:else if sttFinalStatus === 'microphone-error' || sttFinalStatus === 'microphone-ended'}
+						<p class="diagnostic-note">The capture layer failed before provider transcription could start.</p>
+					{:else}
+						<p class="diagnostic-note">If this is a microphone error, run the microphone access check first.</p>
+					{/if}
 				</div>
+			{/if}
+
+			{#if sttDiagnostics}
+				<details class="technical-details">
+					<summary>Technical details</summary>
+					<dl>
+						<dt>Provider</dt>
+						<dd>{activeProviderName}</dd>
+						<dt>Session mode</dt>
+						<dd>{sttTestMode ?? 'unknown'}</dd>
+						<dt>Current input</dt>
+						<dd>{Math.round(sttInputLevel * 100)}%</dd>
+						<dt>Peak input</dt>
+						<dd>{Math.round(sttPeakInputLevel * 100)}%</dd>
+						<dt>Raw current RMS</dt>
+						<dd>{formatNumber(sttDiagnostics.currentRms)}</dd>
+						<dt>Raw peak RMS</dt>
+						<dd>{formatNumber(sttDiagnostics.peakRms)}</dd>
+						<dt>VAD enabled</dt>
+						<dd>{formatBoolean(sttDiagnostics.vadEnabled)}</dd>
+						<dt>Speech detected</dt>
+						<dd>{formatBoolean(sttDiagnostics.speechDetected)}</dd>
+						<dt>Noise floor</dt>
+						<dd>{formatNumber(sttDiagnostics.noiseFloor)}</dd>
+						<dt>Speech threshold</dt>
+						<dd>{formatNumber(sttDiagnostics.speechThreshold)}</dd>
+						<dt>Speech candidate</dt>
+						<dd>{formatBoolean(sttDiagnostics.speechCandidateActive)}</dd>
+						<dt>Silence duration</dt>
+						<dd>{formatDuration(sttDiagnostics.silenceDurationMs)}</dd>
+						<dt>VAD event</dt>
+						<dd>{sttDiagnostics.vadEvent ?? 'none'}</dd>
+						<dt>Stop reason</dt>
+						<dd>{sttDiagnostics.stopReason ?? 'not stopped'}</dd>
+						<dt>Recorder MIME</dt>
+						<dd>{sttDiagnostics.mimeType ?? 'unknown'}</dd>
+						<dt>Chunk count</dt>
+						<dd>{sttDiagnostics.chunkCount}</dd>
+						<dt>Recorded bytes</dt>
+						<dd>{sttDiagnostics.recordedBytes}</dd>
+						<dt>Recording duration</dt>
+						<dd>{formatDuration(sttDiagnostics.durationMs)}</dd>
+						<dt>Provider request started</dt>
+						<dd>{formatBoolean(sttDiagnostics.providerStarted)}</dd>
+						<dt>Upload started</dt>
+						<dd>{formatBoolean(sttDiagnostics.uploadStarted)}</dd>
+						<dt>Transcription started</dt>
+						<dd>{formatBoolean(sttDiagnostics.transcriptionStarted)}</dd>
+						<dt>Provider stage</dt>
+						<dd>{sttDiagnostics.providerStage ?? 'none'}</dd>
+						<dt>Final status</dt>
+						<dd>{sttFinalStatus ?? 'in progress'}</dd>
+						{#if sttMediaError}
+							<dt>Media error category</dt>
+							<dd>{sttMediaError.category}</dd>
+							<dt>Media error</dt>
+							<dd>{sttMediaError.name ?? 'unknown'}{sttMediaError.message ? ` — ${sttMediaError.message}` : ''}</dd>
+							<dt>Origin</dt>
+							<dd>{sttMediaError.origin ?? 'unknown'}</dd>
+							<dt>Secure context</dt>
+							<dd>{formatBoolean(sttMediaError.isSecureContext)}</dd>
+							<dt>mediaDevices</dt>
+							<dd>{formatBoolean(sttMediaError.hasMediaDevices)}</dd>
+							<dt>getUserMedia</dt>
+							<dd>{formatBoolean(sttMediaError.hasGetUserMedia)}</dd>
+						{/if}
+					</dl>
+				</details>
 			{/if}
 
 			<div class="diagnostic-actions">
@@ -523,6 +681,20 @@
 		transition: width 80ms linear;
 	}
 
+	.raw-level-summary {
+		display: flex;
+		justify-content: space-between;
+		gap: 0.5rem;
+		font-size: 0.66rem;
+		font-family: var(--font-mono);
+		color: var(--text-tertiary);
+	}
+
+	.raw-level-summary span:first-child {
+		font-family: inherit;
+		font-weight: 600;
+	}
+
 	.diagnostic-note {
 		margin: 0;
 		font-size: 0.68rem;
@@ -578,6 +750,36 @@
 
 	.diagnostic-error p {
 		margin: 0;
+	}
+
+	.technical-details {
+		font-size: 0.67rem;
+		color: var(--text-secondary);
+	}
+
+	.technical-details summary {
+		cursor: pointer;
+		font-weight: 600;
+		color: var(--text-secondary);
+	}
+
+	.technical-details dl {
+		display: grid;
+		grid-template-columns: auto minmax(0, 1fr);
+		gap: 0.2rem 0.5rem;
+		margin: 0.45rem 0 0;
+	}
+
+	.technical-details dt {
+		font-weight: 600;
+	}
+
+	.technical-details dd {
+		min-width: 0;
+		margin: 0;
+		overflow-wrap: anywhere;
+		font-family: var(--font-mono);
+		text-align: right;
 	}
 
 	.transcript-result {

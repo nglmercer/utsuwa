@@ -1,9 +1,13 @@
+import type { RecordedSttDiagnostics, RecordedSttSessionResult } from './recorded-stt.ts';
+
 export interface SpeechRecognitionCallbacks {
 	onResult: (transcript: string, isFinal: boolean) => void;
-	onEnd: () => void;
+	onEnd: (result?: RecordedSttSessionResult) => void;
 	onError: (error: string) => void;
 	onAudioLevel?: (level: number) => void;
 	onTranscriptionStart?: () => void;
+	onDiagnostics?: (diagnostics: RecordedSttDiagnostics) => void;
+	onSessionResult?: (result: RecordedSttSessionResult) => void;
 }
 
 // Type declarations for Web Speech API
@@ -63,6 +67,7 @@ class WebSpeechService {
 	private recognition: SpeechRecognition | null = null;
 	private callbacks: SpeechRecognitionCallbacks | null = null;
 	private isListening = false;
+	private sessionId = 0;
 
 	isSupported(): boolean {
 		return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
@@ -79,21 +84,25 @@ class WebSpeechService {
 		}
 
 		const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-		this.recognition = new SpeechRecognition!();
+		const recognition = new SpeechRecognition!();
+		const sessionId = ++this.sessionId;
+		this.recognition = recognition;
 		this.callbacks = callbacks;
 
 		// Treat each activation as one utterance so Web Speech has the same
 		// speak → pause → complete behavior as recorded STT.
-		this.recognition.continuous = false;
-		this.recognition.interimResults = true;
-		this.recognition.lang = 'en-US';
-		this.recognition.maxAlternatives = 1;
+		recognition.continuous = false;
+		recognition.interimResults = true;
+		recognition.lang = 'en-US';
+		recognition.maxAlternatives = 1;
 
-		this.recognition.onstart = () => {
+		recognition.onstart = () => {
+			if (sessionId !== this.sessionId) return;
 			this.isListening = true;
 		};
 
-		this.recognition.onresult = (event: SpeechRecognitionEvent) => {
+		recognition.onresult = (event: SpeechRecognitionEvent) => {
+			if (sessionId !== this.sessionId) return;
 			let finalTranscript = '';
 			let interimTranscript = '';
 
@@ -114,22 +123,23 @@ class WebSpeechService {
 			}
 		};
 
-		this.recognition.onend = () => {
-			this.isListening = false;
-			this.callbacks?.onEnd();
+		recognition.onend = () => {
+			this.finish(sessionId);
 		};
 
-		this.recognition.onspeechend = () => {
+		recognition.onspeechend = () => {
+			if (sessionId !== this.sessionId) return;
 			// `onend` remains the single completion path; stopping here asks the
 			// browser to close this one-utterance recognition session.
-			if (this.isListening) this.recognition?.stop();
+			if (this.isListening) recognition.stop();
 		};
 
-		this.recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+		recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+			if (sessionId !== this.sessionId) return;
 			this.isListening = false;
 			// Silently ignore these common non-error cases
 			if (event.error === 'aborted' || event.error === 'no-speech') {
-				this.callbacks?.onEnd();
+				this.finish(sessionId);
 				return;
 			}
 			// Map error codes to user-friendly messages
@@ -139,13 +149,21 @@ class WebSpeechService {
 				'network': 'Network error occurred',
 				'service-not-allowed': 'Speech service not allowed'
 			};
-			this.callbacks?.onError(errorMessages[event.error] || `Speech error: ${event.error}`);
+			const currentCallbacks = this.callbacks;
+			this.callbacks = null;
+			this.recognition = null;
+			currentCallbacks?.onError(errorMessages[event.error] || `Speech error: ${event.error}`);
 		};
 
 		try {
-			this.recognition.start();
+			recognition.start();
 			return true;
 		} catch (e) {
+			if (sessionId === this.sessionId) {
+				this.callbacks = null;
+				this.recognition = null;
+				this.isListening = false;
+			}
 			callbacks.onError('Failed to start speech recognition');
 			return false;
 		}
@@ -158,14 +176,25 @@ class WebSpeechService {
 	}
 
 	abort(): void {
-		if (this.recognition) {
-			this.recognition.abort();
-			this.isListening = false;
-		}
+		const recognition = this.recognition;
+		++this.sessionId;
+		this.recognition = null;
+		this.callbacks = null;
+		this.isListening = false;
+		recognition?.abort();
 	}
 
 	getIsListening(): boolean {
 		return this.isListening;
+	}
+
+	private finish(sessionId: number): void {
+		if (sessionId !== this.sessionId) return;
+		this.isListening = false;
+		const callbacks = this.callbacks;
+		this.callbacks = null;
+		this.recognition = null;
+		callbacks?.onEnd();
 	}
 }
 

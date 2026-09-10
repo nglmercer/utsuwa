@@ -1,6 +1,7 @@
 import { GoogleGenAI, type Interactions } from '@google/genai';
 import {
 	isAbortError,
+	RecordedSttProviderEmptyError,
 	type RecordedSttTransport,
 	type SttTransportContext
 } from './recorded-stt.ts';
@@ -163,6 +164,7 @@ export function formatGeminiSttError(error: unknown, stage: 'upload' | 'transcri
 export class GeminiSttTransport implements RecordedSttTransport {
 	readonly timeoutMs = GEMINI_STT_TIMEOUT_MS;
 	readonly timeoutMessage = 'Gemini transcription timed out. Please try again.';
+	readonly emptyResultMessage = 'Gemini returned an empty transcription.';
 
 	private readonly config: GeminiSttConfig;
 	private readonly clientFactory: GeminiSttClientFactory;
@@ -182,10 +184,19 @@ export class GeminiSttTransport implements RecordedSttTransport {
 
 		const client = this.clientFactory(this.config.apiKey);
 		const mimeType = normalizeAudioMimeType(audio.type);
+		const model = this.config.model || DEFAULT_GEMINI_STT_MODEL;
 		let uploadedName: string | undefined;
 		let stage: 'upload' | 'transcription' = 'upload';
 
 		try {
+			context.onStage?.('upload-start');
+			console.debug('[Gemini STT] upload-start', {
+				bytes: audio.size,
+				blobMimeType: audio.type,
+				uploadMimeType: mimeType,
+				filename: context.filename,
+				model
+			});
 			const uploaded = await client.files.upload({
 				file: audio,
 				config: {
@@ -195,8 +206,16 @@ export class GeminiSttTransport implements RecordedSttTransport {
 				}
 			});
 			uploadedName = uploaded.name;
-
 			if (!uploaded.uri) throw new Error('Gemini audio upload returned no URI.');
+			console.debug('[Gemini STT] upload-success', {
+				bytes: audio.size,
+				blobMimeType: audio.type,
+				uploadMimeType: normalizeAudioMimeType(uploaded.mimeType || mimeType),
+				uriPresent: !!uploaded.uri,
+				fileNamePresent: !!uploaded.name
+			});
+			context.onStage?.('upload-success');
+
 			if (context.signal.aborted) {
 				const error = new Error('The Gemini transcription was aborted.');
 				error.name = 'AbortError';
@@ -204,6 +223,13 @@ export class GeminiSttTransport implements RecordedSttTransport {
 			}
 
 			stage = 'transcription';
+			context.onStage?.('transcription-start');
+			console.debug('[Gemini STT] transcription-start', {
+				model,
+				blobMimeType: audio.type,
+				requestMimeType: normalizeAudioMimeType(uploaded.mimeType || mimeType),
+				uriPresent: true
+			});
 			const interaction = await client.interactions.create(
 				buildGeminiTranscriptionRequest(
 					this.config,
@@ -220,18 +246,22 @@ export class GeminiSttTransport implements RecordedSttTransport {
 			}
 
 			const text = interaction.output_text?.trim() ?? '';
-			if (!text) throw new Error('Gemini returned an empty transcription.');
+			if (!text) throw new RecordedSttProviderEmptyError(this.emptyResultMessage);
+			context.onStage?.('transcription-success');
+			console.debug('[Gemini STT] transcription-success', { characters: text.length, model });
 			return text;
 		} catch (error) {
 			if (isAbortError(error) || context.signal.aborted) throw error;
 			if (
 				error instanceof Error &&
-				(error.message === 'Gemini audio upload returned no URI.' || error.message === 'Gemini returned an empty transcription.')
+				(error.message === 'Gemini audio upload returned no URI.' ||
+					error instanceof RecordedSttProviderEmptyError)
 			) {
 				throw error;
 			}
 			throw new Error(formatGeminiSttError(error, stage));
 		} finally {
+			console.debug('[Gemini STT] cleanup', { uploadedFile: !!uploadedName });
 			if (uploadedName) {
 				try {
 					await client.files.delete({ name: uploadedName });

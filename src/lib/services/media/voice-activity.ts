@@ -10,6 +10,17 @@ export type VoiceActivityEvent =
 	| 'initial-silence'
 	| 'maximum-duration';
 
+export interface VoiceActivityDiagnostics {
+	currentRms: number;
+	peakRms: number;
+	noiseFloor: number;
+	speechThreshold: number;
+	speechCandidateActive: boolean;
+	speechDetected: boolean;
+	silenceDurationMs: number;
+	vadEvent?: VoiceActivityEvent;
+}
+
 export interface VoiceActivityConfig {
 	initialSilenceMs?: number;
 	speechEndSilenceMs?: number;
@@ -70,6 +81,9 @@ export class VoiceActivityDetector {
 	private silenceStartedAt: number | null = null;
 	private speechDetected = false;
 	private terminal = false;
+	private currentRms = 0;
+	private peakRms = 0;
+	private lastEvent: VoiceActivityEvent | undefined;
 
 	constructor(config: VoiceActivityConfig = {}) {
 		this.config = { ...DEFAULT_CONFIG, ...config };
@@ -82,6 +96,9 @@ export class VoiceActivityDetector {
 		this.silenceStartedAt = null;
 		this.speechDetected = false;
 		this.terminal = false;
+		this.currentRms = 0;
+		this.peakRms = 0;
+		this.lastEvent = undefined;
 	}
 
 	reset(): void {
@@ -91,10 +108,55 @@ export class VoiceActivityDetector {
 		this.silenceStartedAt = null;
 		this.speechDetected = false;
 		this.terminal = false;
+		this.currentRms = 0;
+		this.peakRms = 0;
+		this.lastEvent = undefined;
 	}
 
 	get hasDetectedSpeech(): boolean {
 		return this.speechDetected;
+	}
+
+	get currentThreshold(): number {
+		return Math.max(this.config.minSpeechRms, this.noiseFloor * this.config.noiseMultiplier);
+	}
+
+	get currentRmsValue(): number {
+		return this.currentRms;
+	}
+
+	get peakRmsValue(): number {
+		return this.peakRms;
+	}
+
+	get currentNoiseFloor(): number {
+		return this.noiseFloor;
+	}
+
+	get isSpeechCandidateActive(): boolean {
+		return this.speechCandidateAt !== null && !this.speechDetected;
+	}
+
+	get lastVadEvent(): VoiceActivityEvent | undefined {
+		return this.lastEvent;
+	}
+
+	getSilenceDuration(now: number): number {
+		if (this.silenceStartedAt === null) return 0;
+		return Math.max(0, now - this.silenceStartedAt);
+	}
+
+	getDiagnostics(now: number): VoiceActivityDiagnostics {
+		return {
+			currentRms: this.currentRms,
+			peakRms: this.peakRms,
+			noiseFloor: this.noiseFloor,
+			speechThreshold: this.currentThreshold,
+			speechCandidateActive: this.isSpeechCandidateActive,
+			speechDetected: this.speechDetected,
+			silenceDurationMs: this.getSilenceDuration(now),
+			vadEvent: this.lastEvent
+		};
 	}
 
 	update(rms: number, now: number): VoiceActivityEvent | null {
@@ -102,13 +164,15 @@ export class VoiceActivityDetector {
 		if (this.terminal || this.startedAt === null) return null;
 
 		const elapsed = Math.max(0, now - this.startedAt);
+		const level = Number.isFinite(rms) ? Math.max(0, rms) : 0;
+		this.currentRms = level;
+		this.peakRms = Math.max(this.peakRms, level);
 		if (elapsed >= this.config.maxRecordingMs) {
 			this.terminal = true;
-			return 'maximum-duration';
+			return this.emit('maximum-duration');
 		}
 
-		const level = Number.isFinite(rms) ? Math.max(0, rms) : 0;
-		const threshold = Math.max(this.config.minSpeechRms, this.noiseFloor * this.config.noiseMultiplier);
+		const threshold = this.currentThreshold;
 		if (level >= threshold) {
 			this.silenceStartedAt = null;
 			this.speechCandidateAt ??= now;
@@ -117,7 +181,7 @@ export class VoiceActivityDetector {
 				now - this.speechCandidateAt >= this.config.speechConfirmationMs
 			) {
 				this.speechDetected = true;
-				return 'speech-start';
+				return this.emit('speech-start');
 			}
 		} else {
 			this.speechCandidateAt = null;
@@ -128,15 +192,20 @@ export class VoiceActivityDetector {
 				this.silenceStartedAt ??= now;
 				if (now - this.silenceStartedAt >= this.config.speechEndSilenceMs) {
 					this.terminal = true;
-					return 'speech-end';
+					return this.emit('speech-end');
 				}
 			}
 		}
 
 		if (!this.speechDetected && elapsed >= this.config.initialSilenceMs) {
 			this.terminal = true;
-			return 'initial-silence';
+			return this.emit('initial-silence');
 		}
 		return null;
+	}
+
+	private emit(event: VoiceActivityEvent): VoiceActivityEvent {
+		this.lastEvent = event;
+		return event;
 	}
 }

@@ -63,3 +63,37 @@ test('maximum duration is a hard guardrail', () => {
 	detector.start(0);
 	assert.equal(detector.update(0, DEFAULT_MAX_RECORDING_MS), 'maximum-duration');
 });
+
+test('exposes raw VAD diagnostics without applying display amplification', () => {
+	const detector = new VoiceActivityDetector();
+	detector.start(0);
+
+	detector.update(0.01, 100);
+	const quiet = detector.getDiagnostics(100);
+	assert.equal(quiet.currentRms, 0.01);
+	assert.equal(quiet.peakRms, 0.01);
+	assert.equal(quiet.speechThreshold, 0.015);
+	assert.equal(quiet.speechDetected, false);
+
+	assert.equal(detector.update(0.1, 200), null);
+	const candidate = detector.getDiagnostics(200);
+	assert.equal(candidate.currentRms, 0.1);
+	assert.equal(candidate.peakRms, 0.1);
+	assert.equal(candidate.speechCandidateActive, true);
+	assert.equal(candidate.speechThreshold, 0.015);
+
+	assert.equal(detector.update(0.1, 300), 'speech-start');
+	const speaking = detector.getDiagnostics(300);
+	assert.equal(speaking.speechDetected, true);
+	assert.equal(speaking.vadEvent, 'speech-start');
+});
+
+test('adapts the noise floor and keeps the threshold above quiet noise', () => {
+	const detector = new VoiceActivityDetector({ minSpeechRms: 0.01, noiseMultiplier: 2 });
+	detector.start(0);
+
+	detector.update(0.008, 100);
+	const diagnostics = detector.getDiagnostics(100);
+	assert.ok(diagnostics.noiseFloor > 0.005);
+	assert.ok(diagnostics.speechThreshold >= 0.01);
+});

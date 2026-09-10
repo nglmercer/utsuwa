@@ -8,8 +8,14 @@ export type MicrophoneMonitorState = 'idle' | 'requesting' | 'monitoring' | 'err
 
 export type MicrophoneMonitorError = MediaAccessErrorDetails;
 
+export interface MicrophoneMonitorMetrics {
+	currentRms: number;
+	peakRms: number;
+}
+
 export interface MicrophoneMonitorCallbacks {
 	onLevel?: (level: number) => void;
+	onMetrics?: (metrics: MicrophoneMonitorMetrics) => void;
 	onStateChange?: (state: MicrophoneMonitorState) => void;
 	onError?: (error: MicrophoneMonitorError) => void;
 }
@@ -34,6 +40,8 @@ export class MicrophoneMonitor {
 	private analyser: AnalyserNode | null = null;
 	private animationFrameId: number | null = null;
 	private sessionId = 0;
+	private currentRms = 0;
+	private peakRms = 0;
 
 	constructor(callbacks: MicrophoneMonitorCallbacks = {}) {
 		this.callbacks = callbacks;
@@ -55,6 +63,14 @@ export class MicrophoneMonitor {
 		return this.level;
 	}
 
+	getCurrentRms(): number {
+		return this.currentRms;
+	}
+
+	getPeakRms(): number {
+		return this.peakRms;
+	}
+
 	getHasLevelMeter(): boolean {
 		return this.analyser !== null;
 	}
@@ -67,6 +83,7 @@ export class MicrophoneMonitor {
 		const sessionId = ++this.sessionId;
 		this.error = null;
 		this.setLevel(0);
+		this.resetMetrics();
 		this.setState('requesting');
 
 		if (!this.isSupported()) {
@@ -90,6 +107,7 @@ export class MicrophoneMonitor {
 		}
 
 		this.stream = stream;
+		console.debug('[MicrophoneMonitor] microphone-granted', { trackCount: stream.getTracks().length });
 		this.stream.getTracks().forEach((track) => {
 			track.onended = () => {
 				if (sessionId !== this.sessionId || this.state !== 'monitoring') return;
@@ -112,6 +130,7 @@ export class MicrophoneMonitor {
 		this.releaseMedia();
 		this.error = null;
 		this.setLevel(0);
+		this.resetMetrics();
 		this.setState('idle');
 	}
 
@@ -125,12 +144,26 @@ export class MicrophoneMonitor {
 		this.callbacks.onLevel?.(level);
 	}
 
+	private setMetrics(currentRms: number): void {
+		this.currentRms = currentRms;
+		this.peakRms = Math.max(this.peakRms, currentRms);
+		this.callbacks.onMetrics?.({ currentRms: this.currentRms, peakRms: this.peakRms });
+	}
+
+	private resetMetrics(): void {
+		this.currentRms = 0;
+		this.peakRms = 0;
+		this.callbacks.onMetrics?.({ currentRms: 0, peakRms: 0 });
+	}
+
 	private fail(error: unknown, userMessage?: string): void {
 		this.stopLevelMonitoring();
 		this.releaseMedia();
 		const details = getMediaAccessErrorDetails('microphone', error);
+		console.warn('[MicrophoneMonitor] microphone-error', details);
 		this.error = userMessage ? { ...details, userMessage } : details;
 		this.setLevel(0);
+		this.resetMetrics();
 		this.setState('error');
 		this.callbacks.onError?.(this.error);
 	}
@@ -161,7 +194,9 @@ export class MicrophoneMonitor {
 		const tick = () => {
 			if (!this.analyser || this.state !== 'monitoring' || sessionId !== this.sessionId) return;
 			this.analyser.getByteTimeDomainData(dataArray);
-			this.setLevel(normalizeMicrophoneLevel(calculateRms(dataArray)));
+			const currentRms = calculateRms(dataArray);
+			this.setMetrics(currentRms);
+			this.setLevel(normalizeMicrophoneLevel(currentRms));
 			this.animationFrameId = requestAnimationFrame(tick);
 		};
 		this.animationFrameId = requestAnimationFrame(tick);

@@ -1,6 +1,12 @@
 import { browser } from '$app/environment';
 import { webSpeechService } from '$lib/services/stt/web-speech';
-import { recordedSttService } from '$lib/services/stt/recorded-stt';
+import {
+	formatRecordedSttResultError,
+	recordedSttService,
+	type RecordedSttDiagnostics,
+	type RecordedSttLifecycleState,
+	type RecordedSttSessionResult
+} from '$lib/services/stt/recorded-stt';
 import { GeminiSttTransport, DEFAULT_GEMINI_STT_MODEL } from '$lib/services/stt/gemini-stt';
 import { OpenAiSttTransport } from '$lib/services/stt/openai-stt';
 import { getSTTBaseUrl, getLocalSTTConnectionHint } from '$lib/services/providers/local-endpoints';
@@ -13,13 +19,17 @@ type RecordedSttProviderId = Exclude<SttProviderId, 'web-speech'>;
 
 export interface SttSessionObserver {
 	/** Called when the activation ends, including an empty/no-speech result. */
-	onEnd?: (text: string) => void;
+	onEnd?: (text: string, result?: RecordedSttSessionResult) => void;
 	/** Called for a provider, microphone, or transcription failure. */
 	onError?: (message: string) => void;
-	/** Called with the raw normalized RMS level while recorded STT is active. */
+	/** Called with the raw RMS level while recorded STT is active. */
 	onAudioLevel?: (level: number) => void;
 	/** Called after recording stops and before the provider request begins. */
 	onTranscriptionStart?: () => void;
+	/** Called with live and final recorder/VAD diagnostics. */
+	onDiagnostics?: (diagnostics: RecordedSttDiagnostics) => void;
+	/** Called once with the typed result for every non-cancelled recorded session. */
+	onSessionResult?: (result: RecordedSttSessionResult) => void;
 }
 
 export interface SttStartOptions {
@@ -34,6 +44,9 @@ function createSttStore() {
 	let interimTranscript = $state('');
 	let error = $state<string | null>(null);
 	let audioLevel = $state(0);
+	let diagnostics = $state<RecordedSttDiagnostics | null>(null);
+	let lastSessionResult = $state<RecordedSttSessionResult | null>(null);
+	let lifecycleState = $state<RecordedSttLifecycleState>('idle');
 	let errorTimeout: ReturnType<typeof setTimeout> | null = null;
 	let sessionId = 0;
 	let sessionMode: 'recorded' | 'web-speech' | null = null;
@@ -88,6 +101,7 @@ function createSttStore() {
 		const config = settingsStore.getProviderConfig(providerId);
 		if (config.apiKey) return true;
 		const provider = getSTTProvider(providerId);
+		lifecycleState = 'error';
 		setError(`${provider?.name ?? 'This STT provider'} API key is required. Set it up in Settings → Voice Input.`);
 		return false;
 	}
@@ -105,18 +119,25 @@ function createSttStore() {
 	function handleEnd(
 		currentSessionId: number,
 		onComplete: (text: string) => void,
-		observer?: SttSessionObserver
+		observer: SttSessionObserver | undefined,
+		result?: RecordedSttSessionResult
 	): void {
 		if (currentSessionId !== sessionId) return;
+		if (result) {
+			diagnostics = result.diagnostics;
+			lastSessionResult = result;
+		}
 		isListening = false;
 		isTranscribing = false;
+		lifecycleState = result?.status === 'complete' || !result ? 'complete' : 'error';
 		sessionMode = null;
 		audioLevel = 0;
 		const finalText = transcript.trim();
 		transcript = '';
 		interimTranscript = '';
 		if (finalText) onComplete(finalText);
-		observer?.onEnd?.(finalText);
+		if (result?.status === 'no-speech') setError(formatRecordedSttResultError(result));
+		observer?.onEnd?.(finalText, result);
 	}
 
 	function handleError(currentSessionId: number, message: string, observer?: SttSessionObserver): void {
@@ -126,6 +147,7 @@ function createSttStore() {
 		setError(message);
 		isListening = false;
 		isTranscribing = false;
+		lifecycleState = 'error';
 		sessionMode = null;
 		transcript = '';
 		interimTranscript = '';
@@ -143,16 +165,20 @@ function createSttStore() {
 		const providerId = activeSttProvider;
 		if (!ensureProviderConfigured(providerId)) return false;
 		if (providerId !== 'web-speech' && !recordedSttService.isSupported()) {
+			lifecycleState = 'error';
 			showUnsupportedError();
 			return false;
 		}
 
 		const currentSessionId = ++sessionId;
 		sessionMode = providerId === 'web-speech' ? 'web-speech' : 'recorded';
+		lifecycleState = 'requesting-microphone';
 		error = null;
 		transcript = '';
 		interimTranscript = '';
 		audioLevel = 0;
+		diagnostics = null;
+		lastSessionResult = null;
 
 		const callbacks = {
 			onResult: (text: string, isFinal: boolean) => {
@@ -161,13 +187,27 @@ function createSttStore() {
 					audioLevel = isFinal ? 0.3 : 0.5 + Math.random() * 0.5;
 				}
 			},
-			onEnd: () => handleEnd(currentSessionId, onComplete, observer),
+			onEnd: (result: RecordedSttSessionResult | undefined) => handleEnd(currentSessionId, onComplete, observer, result),
 			onError: (message: string) => handleError(currentSessionId, message, observer),
 			onAudioLevel: (level: number) => {
 				if (currentSessionId === sessionId) {
-					audioLevel = level;
+					// Recorded transports report raw RMS; the visualizer gets the
+					// display-normalized value only at this boundary.
+					audioLevel = Math.min(1, Math.max(0, level * 6));
 					observer.onAudioLevel?.(level);
 				}
+			},
+			onDiagnostics: (currentDiagnostics: RecordedSttDiagnostics) => {
+				if (currentSessionId !== sessionId) return;
+				diagnostics = currentDiagnostics;
+				observer.onDiagnostics?.(currentDiagnostics);
+			},
+			onSessionResult: (result: RecordedSttSessionResult) => {
+				if (currentSessionId !== sessionId) return;
+				diagnostics = result.diagnostics;
+				lastSessionResult = result;
+				lifecycleState = result.status === 'complete' ? 'complete' : 'error';
+				observer.onSessionResult?.(result);
 			},
 			onTranscriptionStart: () => {
 				if (currentSessionId !== sessionId) return;
@@ -187,8 +227,10 @@ function createSttStore() {
 
 		if (started && currentSessionId === sessionId) {
 			isListening = true;
+			lifecycleState = 'recording';
 		} else if (!started && currentSessionId === sessionId) {
 			sessionMode = null;
+			lifecycleState = 'error';
 			audioLevel = 0;
 		}
 		return started;
@@ -198,9 +240,11 @@ function createSttStore() {
 		if (sessionMode === 'recorded') {
 			isListening = false;
 			isTranscribing = true;
+			lifecycleState = 'transcribing';
 			recordedSttService.stopListening();
 		} else if (sessionMode === 'web-speech') {
 			isListening = false;
+			lifecycleState = 'transcribing';
 			webSpeechService.stopListening();
 		}
 	}
@@ -220,9 +264,12 @@ function createSttStore() {
 		}
 		isListening = false;
 		isTranscribing = false;
+		lifecycleState = mode ? 'cancelled' : 'idle';
 		transcript = '';
 		interimTranscript = '';
 		audioLevel = 0;
+		diagnostics = null;
+		lastSessionResult = null;
 	}
 
 	function isSupported(): boolean {
@@ -266,6 +313,9 @@ function createSttStore() {
 		get isTranscribing() {
 			return isTranscribing;
 		},
+		get state() {
+			return lifecycleState;
+		},
 		get transcript() {
 			return transcript;
 		},
@@ -281,6 +331,12 @@ function createSttStore() {
 		},
 		get audioLevel() {
 			return audioLevel;
+		},
+		get diagnostics() {
+			return diagnostics;
+		},
+		get lastSessionResult() {
+			return lastSessionResult;
 		},
 		startListening,
 		stopListening,

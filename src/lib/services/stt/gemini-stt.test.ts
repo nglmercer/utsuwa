@@ -91,10 +91,12 @@ test('uploads, transcribes, and deletes the Gemini file on success', async () =>
 	const mock = createMockClient(' Hello from Gemini! ');
 	const transport = new GeminiSttTransport({ apiKey: 'test-key' }, () => mock.client);
 	const controller = new AbortController();
+	const stages: string[] = [];
 
 	const result = await transport.transcribe(audio, {
 		filename: 'recording.webm',
-		signal: controller.signal
+		signal: controller.signal,
+		onStage: (stage) => stages.push(stage)
 	});
 
 	assert.equal(result, 'Hello from Gemini!');
@@ -106,6 +108,12 @@ test('uploads, transcribes, and deletes the Gemini file on success', async () =>
 	assert.equal(mock.requests[0].model, 'gemini-3.5-transcribe');
 	assert.equal(mock.requestSignals[0], controller.signal);
 	assert.deepEqual(mock.deletions, ['files/recording-123']);
+	assert.deepEqual(stages, [
+		'upload-start',
+		'upload-success',
+		'transcription-start',
+		'transcription-success'
+	]);
 });
 
 test('deletes the uploaded file when transcription fails', async () => {

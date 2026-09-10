@@ -24,7 +24,7 @@ test('classifies standard media capture errors by device-independent category', 
 test('formats microphone and camera messages from the same categories', () => {
 	assert.equal(
 		getMediaErrorMessage('microphone', { name: 'NotAllowedError' }),
-		'Microphone access denied. Check system permissions.'
+		'Microphone access was denied.'
 	);
 	assert.equal(
 		getMediaErrorMessage('camera', { name: 'NotFoundError' }),
@@ -76,7 +76,7 @@ test('includes page and API capability details in a media diagnostic', () => {
 				hasMediaDevices: true,
 				hasGetUserMedia: true,
 				category: 'permission-denied',
-				userMessage: 'Microphone access denied. Check system permissions.'
+				userMessage: 'Microphone access was denied.'
 			}
 	);
 });

@@ -92,7 +92,7 @@ export function getMediaErrorMessage(device: MediaDeviceKind, error: unknown): s
 
 	switch (classifyMediaError(error)) {
 		case 'permission-denied':
-			return `${label} access denied. Check system permissions.`;
+			return `${label} access was denied.`;
 		case 'not-found':
 			return `No ${deviceName} found. Please connect a ${deviceName}.`;
 		case 'busy':
