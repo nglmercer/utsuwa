@@ -190,9 +190,9 @@ fn configure_builder(
             }
             allowed
         });
-    builder = builder.with_new_window_req_handler(|url| {
+    builder = builder.with_new_window_req_handler(|url, _features| {
         tracing::warn!(%url, "blocked new-window request (needs host.open_external_url)");
-        false
+        wry::NewWindowResponse::Deny
     });
     if let Some(server) = asset_server {
         builder = builder.with_custom_protocol(protocol::APP_SCHEME.to_string(), move |_, req| {
@@ -402,7 +402,7 @@ fn run_winit(
     reply_rx: Receiver<String>,
     event_loop: EventLoop<()>,
 ) {
-    let app = HostApp {
+    let mut app = HostApp {
         proxy: event_loop.create_proxy(),
         dispatcher,
         config,
