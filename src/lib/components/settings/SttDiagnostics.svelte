@@ -68,7 +68,7 @@
 	function getMicrophoneStatus(): string {
 		switch (microphoneState) {
 			case 'requesting':
-				return 'Requesting microphone permission…';
+				return 'Starting microphone test…';
 			case 'monitoring':
 				return hasLevelMeter ? 'Microphone is active' : 'Microphone access works';
 			case 'error':
@@ -84,7 +84,7 @@
 
 	async function toggleMicrophoneMonitor(): Promise<void> {
 		if (microphoneState === 'monitoring') {
-			microphoneMonitor.stop();
+			await microphoneMonitor.stop();
 			return;
 		}
 		if (microphoneState === 'requesting') return;
@@ -163,7 +163,7 @@
 			return;
 		}
 
-		microphoneMonitor.stop();
+		await microphoneMonitor.stop();
 		const sessionId = ++sttTestSessionId;
 		sttTestTranscript = '';
 		sttTestError = null;
@@ -248,7 +248,7 @@
 	}
 
 	onDestroy(() => {
-		microphoneMonitor.stop();
+		void microphoneMonitor.stop();
 		if (
 			sttTestState === 'starting' ||
 			sttTestState === 'listening' ||
@@ -274,7 +274,7 @@
 			<div class="diagnostic-card-header">
 				<div>
 					<h3 id="microphone-test-heading">Microphone access</h3>
-					<p>Checks WebView permission, OS access, and live input level.</p>
+					<p>Checks native or browser microphone access and live input level.</p>
 				</div>
 				<span
 					class="state-dot"
@@ -343,7 +343,7 @@
 				disabled={microphoneState === 'requesting'}
 			>
 				{#if microphoneState === 'requesting'}
-					<Icon name="loader" size={13} /> Requesting permission…
+					<Icon name="loader" size={13} /> Starting microphone test…
 				{:else if microphoneState === 'monitoring'}
 					<Icon name="stop" size={12} /> Stop microphone test
 				{:else}

@@ -8,6 +8,9 @@ pub struct AudioCaptureConfig {
     pub silence_duration_ms: u64,
     pub max_duration_ms: u64,
     pub sample_rate: Option<u32>,
+    /// Keep PCM samples for WAV output. Disable this for level-only monitoring
+    /// so a long-lived monitor does not grow an in-memory recording.
+    pub retain_audio: bool,
 }
 
 impl Default for AudioCaptureConfig {
@@ -17,6 +20,7 @@ impl Default for AudioCaptureConfig {
             silence_duration_ms: 1_000,
             max_duration_ms: 45_000,
             sample_rate: None,
+            retain_audio: true,
         }
     }
 }

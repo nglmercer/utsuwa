@@ -2,6 +2,10 @@ import {
 	getMediaAccessErrorDetails,
 	type MediaAccessErrorDetails
 } from './media-errors.ts';
+import {
+	isNativeAudioCaptureAvailable,
+	NativeAudioCaptureBackend
+} from '../audio/audio-capture.ts';
 import { calculateRms } from './voice-activity.ts';
 
 export type MicrophoneMonitorState = 'idle' | 'requesting' | 'monitoring' | 'error';
@@ -20,6 +24,8 @@ export interface MicrophoneMonitorCallbacks {
 	onError?: (error: MicrophoneMonitorError) => void;
 }
 
+const NATIVE_MONITOR_MAX_DURATION_MS = 24 * 60 * 60 * 1_000;
+
 /** Convert microphone RMS into a useful 0–1 display value. */
 export function normalizeMicrophoneLevel(rms: number): number {
 	if (!Number.isFinite(rms)) return 0;
@@ -27,8 +33,9 @@ export function normalizeMicrophoneLevel(rms: number): number {
 }
 
 /**
- * Captures a microphone only for diagnostics. It never creates a MediaRecorder
- * and never sends audio to an STT provider.
+ * Captures a microphone only for diagnostics. Native hosts use CPAL directly;
+ * browsers use getUserMedia and Web Audio. It never sends audio to an STT
+ * provider.
  */
 export class MicrophoneMonitor {
 	private readonly callbacks: MicrophoneMonitorCallbacks;
@@ -38,6 +45,8 @@ export class MicrophoneMonitor {
 	private stream: MediaStream | null = null;
 	private audioContext: AudioContext | null = null;
 	private analyser: AnalyserNode | null = null;
+	private nativeBackend: NativeAudioCaptureBackend | null = null;
+	private nativeCancelPromise: Promise<void> | null = null;
 	private animationFrameId: number | null = null;
 	private sessionId = 0;
 	private currentRms = 0;
@@ -48,7 +57,8 @@ export class MicrophoneMonitor {
 	}
 
 	isSupported(): boolean {
-		return typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia;
+		return isNativeAudioCaptureAvailable() ||
+			(typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia);
 	}
 
 	getState(): MicrophoneMonitorState {
@@ -72,19 +82,26 @@ export class MicrophoneMonitor {
 	}
 
 	getHasLevelMeter(): boolean {
-		return this.analyser !== null;
+		return this.analyser !== null || this.nativeBackend !== null;
 	}
 
 	async start(): Promise<boolean> {
 		if (this.state === 'monitoring') return true;
 		if (this.state === 'requesting') return false;
 
-		this.stop();
-		const sessionId = ++this.sessionId;
+		const pendingStop = this.stop();
+		const expectedSessionAfterStop = this.sessionId;
 		this.error = null;
 		this.setLevel(0);
 		this.resetMetrics();
 		this.setState('requesting');
+		await pendingStop;
+		if (this.sessionId !== expectedSessionAfterStop) return false;
+		const sessionId = ++this.sessionId;
+
+		if (isNativeAudioCaptureAvailable()) {
+			return this.startNative(sessionId);
+		}
 
 		if (!this.isSupported()) {
 			this.fail({ name: 'NotSupportedError', message: 'navigator.mediaDevices.getUserMedia is unavailable' });
@@ -124,14 +141,16 @@ export class MicrophoneMonitor {
 		return true;
 	}
 
-	stop(): void {
+	async stop(): Promise<void> {
 		this.sessionId++;
 		this.stopLevelMonitoring();
+		const pendingNativeCancel = this.releaseNativeCapture();
 		this.releaseMedia();
 		this.error = null;
 		this.setLevel(0);
 		this.resetMetrics();
 		this.setState('idle');
+		if (pendingNativeCancel) await pendingNativeCancel;
 	}
 
 	private setState(state: MicrophoneMonitorState): void {
@@ -139,14 +158,56 @@ export class MicrophoneMonitor {
 		this.callbacks.onStateChange?.(state);
 	}
 
+	private async startNative(sessionId: number): Promise<boolean> {
+		const backend = new NativeAudioCaptureBackend();
+		this.nativeBackend = backend;
+		try {
+			await backend.start({
+				autoStop: false,
+				maxDurationMs: NATIVE_MONITOR_MAX_DURATION_MS,
+				retainAudio: false,
+				onAudioLevel: (rms, peakRms) => {
+					if (sessionId !== this.sessionId || this.state === 'idle') return;
+					this.setMetrics(rms, peakRms);
+					this.setLevel(normalizeMicrophoneLevel(rms));
+				},
+				onStopped: (reason) => {
+					if (sessionId !== this.sessionId) return;
+					if (reason === 'error') {
+						this.fail(new Error('Native microphone capture stopped unexpectedly.'));
+						return;
+					}
+					this.releaseNativeCapture();
+					this.setLevel(0);
+					this.resetMetrics();
+					this.setState('idle');
+				}
+			});
+		} catch (error) {
+			if (sessionId !== this.sessionId) return false;
+			const message = error instanceof Error ? error.message : 'Native microphone capture failed.';
+			this.fail(error, `Native microphone error: ${message}`);
+			if (this.nativeCancelPromise) await this.nativeCancelPromise;
+			return false;
+		}
+
+		if (sessionId !== this.sessionId) {
+			this.releaseNativeCapture();
+			return false;
+		}
+		console.debug('[MicrophoneMonitor] native-cpal microphone-granted');
+		this.setState('monitoring');
+		return true;
+	}
+
 	private setLevel(level: number): void {
 		this.level = level;
 		this.callbacks.onLevel?.(level);
 	}
 
-	private setMetrics(currentRms: number): void {
+	private setMetrics(currentRms: number, peakRms = currentRms): void {
 		this.currentRms = currentRms;
-		this.peakRms = Math.max(this.peakRms, currentRms);
+		this.peakRms = Math.max(this.peakRms, currentRms, peakRms);
 		this.callbacks.onMetrics?.({ currentRms: this.currentRms, peakRms: this.peakRms });
 	}
 
@@ -158,6 +219,7 @@ export class MicrophoneMonitor {
 
 	private fail(error: unknown, userMessage?: string): void {
 		this.stopLevelMonitoring();
+		this.releaseNativeCapture();
 		this.releaseMedia();
 		const details = getMediaAccessErrorDetails('microphone', error);
 		console.warn('[MicrophoneMonitor] microphone-error', details);
@@ -207,6 +269,21 @@ export class MicrophoneMonitor {
 			cancelAnimationFrame(this.animationFrameId);
 		}
 		this.animationFrameId = null;
+	}
+
+	private releaseNativeCapture(): Promise<void> | null {
+		const backend = this.nativeBackend;
+		this.nativeBackend = null;
+		if (!backend) return this.nativeCancelPromise;
+
+		const cancellation = backend.cancel().catch((error) => {
+			console.debug('[MicrophoneMonitor] native-cancel-failed', error);
+		});
+		this.nativeCancelPromise = cancellation;
+		void cancellation.finally(() => {
+			if (this.nativeCancelPromise === cancellation) this.nativeCancelPromise = null;
+		});
+		return cancellation;
 	}
 
 	private releaseMedia(): void {

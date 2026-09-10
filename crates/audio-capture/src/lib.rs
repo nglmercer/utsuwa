@@ -41,4 +41,9 @@ mod tests {
         assert!((calculate_rms(&[i16::MAX, i16::MAX]) - 1.0).abs() < 0.001);
         assert!((calculate_rms(&[16_384, -16_384]) - 0.5).abs() < 0.001);
     }
+
+    #[test]
+    fn capture_retains_audio_by_default() {
+        assert!(AudioCaptureConfig::default().retain_audio);
+    }
 }

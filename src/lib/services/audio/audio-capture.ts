@@ -62,6 +62,8 @@ export interface CaptureOptions {
 	silenceDurationMs?: number;
 	maxDurationMs?: number;
 	sampleRate?: number;
+	/** Disable PCM/WAV retention for long-lived native level monitoring. */
+	retainAudio?: boolean;
 	onAudioLevel?: (rms: number, peakRms: number) => void;
 	onDiagnostics?: (diagnostics: AudioCaptureDiagnostics) => void;
 	onStopped?: (reason: AudioCaptureStopReason) => void;
@@ -187,14 +189,16 @@ export class NativeAudioCaptureBackend implements AudioCaptureBackend {
 		window.addEventListener(HOST_EVENT, this.eventListener);
 
 		try {
+			const config: Record<string, unknown> = {
+				auto_stop: options.autoStop !== false,
+				silence_duration_ms: options.silenceDurationMs ?? DEFAULT_SPEECH_END_SILENCE_MS,
+				max_duration_ms: options.maxDurationMs ?? DEFAULT_MAX_RECORDING_MS,
+				sample_rate: options.sampleRate ?? null
+			};
+			if (options.retainAudio === false) config.retain_audio = false;
 			const result = asRecord(
 				await bridge.invoke('audio_capture.start', {
-					config: {
-						auto_stop: options.autoStop !== false,
-						silence_duration_ms: options.silenceDurationMs ?? DEFAULT_SPEECH_END_SILENCE_MS,
-						max_duration_ms: options.maxDurationMs ?? DEFAULT_MAX_RECORDING_MS,
-						sample_rate: options.sampleRate ?? null
-					}
+					config
 				})
 			);
 			const captureId = asString(result?.capture_id);
