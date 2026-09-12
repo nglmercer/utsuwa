@@ -3,6 +3,7 @@
 //! The agent owns conversation state, streams text, and runs the bounded
 //! model → tool → model loop behind the policy/capability boundary.
 
+use artifact_core::ContentPart;
 use audit_core::{AuditOutcome, AuditRecord, AuditSink};
 use capability_core::{AgentId, CapabilityRequest, CapabilityTicket, InvocationId, Principal};
 use futures_util::StreamExt;
@@ -30,7 +31,20 @@ pub struct AgentLimits {
     /// Maximum tool executions per turn.
     pub max_tool_calls: usize,
     /// Maximum serialized bytes kept per tool result.
+    ///
+    /// Kept as a compatibility alias for callers that configured the
+    /// original single-string limit. The effective text limit is the lower
+    /// of this and `max_tool_text_output_bytes`.
     pub max_tool_output_bytes: usize,
+    /// Maximum UTF-8 text/JSON bytes sent back to a provider for one tool.
+    pub max_tool_text_output_bytes: usize,
+    /// Maximum number of artifact parts sent for one tool result.
+    pub max_tool_artifacts: usize,
+    /// Maximum declared size of one artifact accepted by the agent loop.
+    pub max_artifact_bytes: u64,
+    /// Maximum dimensions accepted for an image artifact.
+    pub max_image_width: u32,
+    pub max_image_height: u32,
 }
 
 impl Default for AgentLimits {
@@ -41,6 +55,11 @@ impl Default for AgentLimits {
             max_iterations: 8,
             max_tool_calls: 16,
             max_tool_output_bytes: 16 * 1024,
+            max_tool_text_output_bytes: 16 * 1024,
+            max_tool_artifacts: 4,
+            max_artifact_bytes: 8 * 1024 * 1024,
+            max_image_width: 4096,
+            max_image_height: 4096,
         }
     }
 }
@@ -84,6 +103,13 @@ pub enum AgentEvent {
 }
 
 pub type AgentEventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
+/// Host-provided hook used to increase desktop observation cadence after a
+/// control action. The agent core does not know how captures are managed; it
+/// only invokes this after a desktop-control tool has had a chance to touch
+/// the OS, including when the backend reports a failure after a partial act.
+pub type DesktopActionNotifier =
+    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// Task-scoped replay cache for tools with external effects. When approval
 /// suspends a later model call, the host resumes with the transcript that
@@ -135,6 +161,24 @@ fn is_side_effecting(metadata: &tool_core::ToolMetadata) -> bool {
         .effects
         .iter()
         .any(|effect| !matches!(effect, tool_core::ToolEffect::ReadOnly))
+}
+
+fn is_desktop_control(metadata: &tool_core::ToolMetadata) -> bool {
+    metadata
+        .effects
+        .iter()
+        .any(|effect| matches!(effect, tool_core::ToolEffect::DesktopControl))
+}
+
+fn is_desktop_observation(name: &str) -> bool {
+    matches!(
+        name,
+        "desktop.observe"
+            | "desktop.screenshot"
+            | "desktop.capture_frame"
+            | "desktop.accessibility_tree"
+            | "desktop.inspect"
+    )
 }
 
 /// Stable enough for a repeated model call: object keys are sorted so a
@@ -209,7 +253,9 @@ pub struct Agent {
     limits: AgentLimits,
     audit: Option<Arc<dyn AuditSink>>,
     event_sink: Option<AgentEventSink>,
+    desktop_action_notifier: Option<DesktopActionNotifier>,
     replay_cache: Option<Arc<ToolReplayCache>>,
+    artifact_store: Option<Arc<dyn artifact_core::ArtifactStore>>,
 }
 
 impl Agent {
@@ -221,7 +267,9 @@ impl Agent {
             limits: AgentLimits::default(),
             audit: None,
             event_sink: None,
+            desktop_action_notifier: None,
             replay_cache: None,
+            artifact_store: None,
         }
     }
 
@@ -253,11 +301,26 @@ impl Agent {
         self
     }
 
+    /// Attach the host's capture-sampling hook. This is deliberately a
+    /// callback rather than a capture-manager dependency so `agent-core`
+    /// remains platform-neutral and the existing registry stays authoritative.
+    pub fn with_desktop_action_notifier(mut self, notifier: DesktopActionNotifier) -> Self {
+        self.desktop_action_notifier = Some(notifier);
+        self
+    }
+
     /// Reuse successful side-effect results for the lifetime of one host
     /// task. The cache is intentionally supplied by the host so it survives
     /// an approval suspension but never survives task cancellation/restart.
     pub fn with_replay_cache(mut self, cache: Arc<ToolReplayCache>) -> Self {
         self.replay_cache = Some(cache);
+        self
+    }
+
+    /// Attach the per-host expiring artifact store. The handle is carried in
+    /// each model request but never enters transcript state or provider JSON.
+    pub fn with_artifact_store(mut self, store: Arc<dyn artifact_core::ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
         self
     }
 
@@ -281,6 +344,7 @@ impl Agent {
         }
         let mut request = ModelRequest::new(messages);
         request.max_tokens = Some(1024);
+        request.artifact_store = self.artifact_store.clone();
         let (text, _calls, truncated) = self.stream_turn(request).await?;
         Ok(AgentTurn {
             invocation_id: InvocationId::fresh(),
@@ -363,11 +427,18 @@ impl Agent {
         // can still recover by changing the target, reading the file, or
         // selecting the create tool.
         let mut blocked_retries: HashMap<String, String> = HashMap::new();
+        // Computer-use actions are intentionally serialized across model
+        // observations. The first action also requires an observation; one
+        // assistant response may perform at most one desktop-control action,
+        // and the next action requires a fresh observation result so the
+        // model cannot accidentally emit a blind coordinate macro.
+        let mut desktop_observation_required = true;
 
         for _ in 0..self.limits.max_iterations {
             let mut request = ModelRequest::new(messages.clone());
             request.max_tokens = Some(1024);
             request.tools = tool_defs.clone();
+            request.artifact_store = self.artifact_store.clone();
             debug_assert_eq!(request.tools.len(), tool_defs.len());
             tracing::debug!(
                 tool_count = request.tools.len(),
@@ -420,18 +491,53 @@ impl Agent {
                     messages: messages.clone(),
                 });
             }
+            let response_has_desktop_observation =
+                calls.iter().any(|call| is_desktop_observation(&call.name));
             // Preflight every call before invoking any of them. A later
             // approval request therefore cannot arrive after an earlier
             // side effect has already happened.
             let available = self.limits.max_tool_calls.saturating_sub(executed.len());
             let mut prepared = Vec::new();
             let mut results = Vec::new();
+            let mut desktop_control_reserved_in_response = false;
             for call in calls.iter().take(available) {
                 tracing::debug!(
                     tool_call_id = %call.id,
                     tool_name = %call.name,
                     "model requested native tool"
                 );
+                let is_desktop_control_call = registry
+                    .resolve(&call.name)
+                    .ok()
+                    .is_some_and(|tool| is_desktop_control(&tool.metadata()));
+                if is_desktop_control_call
+                    && (desktop_control_reserved_in_response
+                        || desktop_observation_required
+                        || response_has_desktop_observation)
+                {
+                    let message = if desktop_observation_required {
+                        "desktop control is paused until the model receives a fresh desktop observation; call desktop.observe, desktop.screenshot, desktop.capture_frame, or desktop.accessibility_tree first".to_string()
+                    } else if response_has_desktop_observation {
+                        "desktop observation and desktop control cannot be issued in the same model response; observe first, then act on the next response".to_string()
+                    } else {
+                        "only one desktop-control action is allowed per model response; observe the changed state before issuing another action".to_string()
+                    };
+                    tool_steps.push(ToolStep::failure(
+                        call,
+                        ToolStepStatus::Failed,
+                        message.clone(),
+                    ));
+                    results.push(ModelMessage::tool_result(ToolResult {
+                        tool_call_id: call.id.clone(),
+                        content: message.clone(),
+                        parts: vec![model_core::ModelContentPart::Text(message)],
+                        is_error: true,
+                    }));
+                    continue;
+                }
+                if is_desktop_control_call {
+                    desktop_control_reserved_in_response = true;
+                }
                 if let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.arguments) {
                     let key = replay_key(&call.name, &args);
                     if let Some(message) = blocked_retries.get(&key) {
@@ -443,23 +549,28 @@ impl Agent {
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call.id.clone(),
                             content: message.clone(),
+                            parts: vec![model_core::ModelContentPart::Text(message.clone())],
                             is_error: true,
                         }));
                         continue;
                     }
                 }
                 if let Some(output) = self.replayed_output(registry, call) {
+                    if is_desktop_control_call {
+                        desktop_observation_required = true;
+                    }
                     executed.push(ExecutedTool {
                         id: call.id.clone(),
                         name: call.name.clone(),
                         output: output.clone(),
                     });
                     tool_steps.push(ToolStep::success(call, &output));
-                    results.push(ModelMessage::tool_result(ToolResult {
-                        tool_call_id: call.id.clone(),
-                        content: truncate_json(&output.content, self.limits.max_tool_output_bytes),
-                        is_error: false,
-                    }));
+                    results.push(ModelMessage::tool_result(tool_result_from_output(
+                        &call.id,
+                        &output,
+                        &self.limits,
+                        false,
+                    )));
                     continue;
                 }
                 match self.prepare_call(registry, authorizer, call) {
@@ -479,7 +590,8 @@ impl Agent {
                         tool_steps.push(ToolStep::failure(call, status, message.clone()));
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call.id.clone(),
-                            content: message,
+                            content: message.clone(),
+                            parts: vec![model_core::ModelContentPart::Text(message.clone())],
                             is_error: true,
                         }));
                     }
@@ -490,6 +602,13 @@ impl Agent {
                 let call_name = prepared_call.call.name.clone();
                 let step_call = prepared_call.call.clone();
                 let retry_key = replay_key(&call_name, &prepared_call.args);
+                let is_desktop_control_call = is_desktop_control(&prepared_call.tool.metadata());
+                if is_desktop_control_call {
+                    // Mark before invoking: a backend may partially perform
+                    // an input operation before returning an error, so the
+                    // next model step must still re-observe the desktop.
+                    desktop_observation_required = true;
+                }
                 match self.execute_prepared(authorizer, prepared_call).await {
                     Ok(output) => {
                         executed.push(ExecutedTool {
@@ -498,14 +617,15 @@ impl Agent {
                             output: output.clone(),
                         });
                         tool_steps.push(ToolStep::success(&step_call, &output));
-                        results.push(ModelMessage::tool_result(ToolResult {
-                            tool_call_id: call_id,
-                            content: truncate_json(
-                                &output.content,
-                                self.limits.max_tool_output_bytes,
-                            ),
-                            is_error: false,
-                        }));
+                        results.push(ModelMessage::tool_result(tool_result_from_output(
+                            &call_id,
+                            &output,
+                            &self.limits,
+                            false,
+                        )));
+                        if is_desktop_observation(&call_name) {
+                            desktop_observation_required = false;
+                        }
                     }
                     Err(PendingOrFailed::Failed { message, status }) => {
                         if should_block_same_tool_retry(&call_name, status, &message) {
@@ -517,7 +637,8 @@ impl Agent {
                         tool_steps.push(ToolStep::failure(&step_call, status, message.clone()));
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call_id.clone(),
-                            content: message,
+                            content: message.clone(),
+                            parts: vec![model_core::ModelContentPart::Text(message.clone())],
                             is_error: true,
                         }));
                     }
@@ -533,6 +654,9 @@ impl Agent {
                         results.push(ModelMessage::tool_result(ToolResult {
                             tool_call_id: call_id,
                             content: "authorization changed during execution".to_string(),
+                            parts: vec![model_core::ModelContentPart::Text(
+                                "authorization changed during execution".to_string(),
+                            )],
                             is_error: true,
                         }));
                     }
@@ -570,6 +694,9 @@ impl Agent {
                 | "desktop.inspect"
                 | "desktop.status"
                 | "desktop.screenshot"
+                | "desktop.list_displays"
+                | "desktop.observe"
+                | "desktop.capture_frame"
         )
     }
 
@@ -670,9 +797,9 @@ impl Agent {
         // A policy Allow mints a ticket scoped to exactly the requested
         // resource (least privilege) and bound to this invocation. Brokers
         // re-validate it; the ticket — never the decision — opens the OS.
-        let requirement = tool.required_capability(&args);
-        let mut ticket_ttl = None;
-        if let Some(requirement) = requirement.clone() {
+        let requirements = tool.required_capabilities(&args);
+        let mut ticket_ttls = Vec::with_capacity(requirements.len());
+        for requirement in &requirements {
             let principal = self.principal();
             let request = CapabilityRequest {
                 principal: principal.clone(),
@@ -681,7 +808,7 @@ impl Agent {
             };
             match authorizer.authorize(&principal, &request) {
                 AuthorizationDecision::Allow { ticket_ttl: ttl } => {
-                    ticket_ttl = Some(ttl);
+                    ticket_ttls.push(ttl);
                 }
                 AuthorizationDecision::Deny { reason } => {
                     self.audit(
@@ -704,8 +831,8 @@ impl Agent {
                     );
                     return Err(PendingOrFailed::Pending(PendingApproval {
                         tool_call: call.clone(),
-                        capability: requirement.capability,
-                        resource: requirement.resource,
+                        capability: requirement.capability.clone(),
+                        resource: requirement.resource.clone(),
                         reason,
                     }));
                 }
@@ -715,8 +842,9 @@ impl Agent {
             call: call.clone(),
             tool,
             args,
-            requirement,
-            ticket_ttl,
+            requirement: requirements.first().cloned(),
+            requirements,
+            ticket_ttls,
         })
     }
 
@@ -732,7 +860,8 @@ impl Agent {
             tool,
             args,
             requirement,
-            ticket_ttl,
+            requirements,
+            ticket_ttls,
         } = prepared;
         let metadata = tool.metadata();
         if let Some(cache) = &self.replay_cache {
@@ -756,7 +885,9 @@ impl Agent {
                 return Ok(output);
             }
         }
-        let ticket = if let (Some(requirement), Some(ttl)) = (&requirement, ticket_ttl) {
+        let invocation_id = InvocationId::fresh();
+        let mut tickets = Vec::with_capacity(requirements.len());
+        for (requirement, ttl) in requirements.iter().zip(ticket_ttls.iter().copied()) {
             let principal = self.principal();
             let request = CapabilityRequest {
                 principal: principal.clone(),
@@ -775,29 +906,23 @@ impl Agent {
                     status: ToolStepStatus::Denied,
                 });
             }
-            Some(CapabilityTicket::mint(
+            tickets.push(CapabilityTicket::mint(
                 principal,
                 requirement.capability.clone(),
                 capability_core::ResourceScope::new(vec![requirement.resource.clone()]),
-                InvocationId::fresh(),
+                invocation_id,
                 ttl,
-            ))
-        } else {
-            None
-        };
-        let invocation_id = ticket
-            .as_ref()
-            .map(|t| t.invocation_id)
-            .unwrap_or_else(InvocationId::fresh);
+            ));
+        }
         let mut ctx = ToolContext {
             principal: self.principal(),
             invocation_id,
             ticket: None,
+            tickets: Vec::new(),
         };
-        if let Some(ticket) = ticket {
+        for ticket in tickets {
             // Invocation binding must match the ticket or the broker
             // rejects it; keep both from the same mint.
-            ctx.invocation_id = ticket.invocation_id;
             ctx = ctx.with_ticket(ticket);
         }
         let (capability, resource) = match &requirement {
@@ -816,6 +941,11 @@ impl Agent {
         let span = tracing::info_span!("tool.invoke", tool = %call.name);
         let started = std::time::Instant::now();
         let outcome = tool.invoke(ctx, args.clone()).instrument(span).await;
+        if is_desktop_control(&metadata) {
+            if let Some(notifier) = &self.desktop_action_notifier {
+                notifier().await;
+            }
+        }
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match outcome {
             Ok(output) => {
@@ -916,7 +1046,8 @@ struct PreparedCall {
     tool: Arc<dyn tool_core::Tool>,
     args: serde_json::Value,
     requirement: Option<tool_core::CapabilityRequirement>,
-    ticket_ttl: Option<Duration>,
+    requirements: Vec<tool_core::CapabilityRequirement>,
+    ticket_ttls: Vec<Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -959,6 +1090,9 @@ pub struct ToolStep {
     /// Successful tool output, kept as the model-facing JSON value. Failed
     /// and denied calls carry their message in `error` instead.
     pub output: Option<serde_json::Value>,
+    /// Typed parts (most importantly artifact references) for host activity
+    /// consumers. Bytes are never copied into a tool step.
+    pub parts: Vec<ContentPart>,
     pub error: Option<String>,
 }
 
@@ -970,6 +1104,7 @@ impl ToolStep {
             status: ToolStepStatus::Success,
             ok: true,
             output: Some(output.content.clone()),
+            parts: output.parts.clone(),
             error: None,
         }
     }
@@ -981,6 +1116,7 @@ impl ToolStep {
             status,
             ok: false,
             output: None,
+            parts: Vec::new(),
             error: Some(error),
         }
     }
@@ -1012,11 +1148,135 @@ enum PendingOrFailed {
 }
 
 fn truncate_json(value: &serde_json::Value, max_bytes: usize) -> String {
-    let text = value.to_string();
+    truncate_text(&value.to_string(), max_bytes)
+}
+
+fn effective_tool_text_limit(limits: &AgentLimits) -> usize {
+    limits
+        .max_tool_output_bytes
+        .min(limits.max_tool_text_output_bytes)
+}
+
+fn truncate_text(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
-        text
-    } else {
-        format!("{}…[truncated]", &text[..max_bytes])
+        return text.to_string();
+    }
+    let suffix = "…[truncated]";
+    if max_bytes <= suffix.len() {
+        let mut end = max_bytes;
+        while end > 0 && !suffix.is_char_boundary(end) {
+            end -= 1;
+        }
+        return suffix[..end].to_string();
+    }
+    // Do not split a UTF-8 code point while enforcing the byte limit, and
+    // keep the returned string itself within the requested byte budget.
+    let prefix_limit = max_bytes - suffix.len();
+    let mut end = prefix_limit.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &text[..end], suffix)
+}
+
+fn model_content_parts(
+    output: &ToolOutput,
+    limits: &AgentLimits,
+) -> Vec<model_core::ModelContentPart> {
+    let text_limit = effective_tool_text_limit(limits);
+    let mut result = Vec::new();
+    let mut artifacts = 0usize;
+
+    // Desktop media tools keep their small capture metadata in the legacy
+    // JSON view and their image in a typed part. Preserve both when crossing
+    // into the model representation; otherwise the provider would receive a
+    // useful screenshot with no capture/window/dimension context.
+    let has_image = output
+        .parts
+        .iter()
+        .any(|part| matches!(part, ContentPart::Image(_)));
+    let has_textual_part = output
+        .parts
+        .iter()
+        .any(|part| matches!(part, ContentPart::Text(_) | ContentPart::Json(_)));
+    if has_image && !has_textual_part && !output.content.is_null() {
+        let metadata = output.content.to_string();
+        if metadata.len() <= text_limit {
+            result.push(model_core::ModelContentPart::Json(output.content.clone()));
+        } else {
+            result.push(model_core::ModelContentPart::Text(truncate_text(
+                &metadata, text_limit,
+            )));
+        }
+    }
+
+    for part in &output.parts {
+        match part {
+            ContentPart::Text(text) => result.push(model_core::ModelContentPart::Text(
+                truncate_text(text, text_limit),
+            )),
+            ContentPart::Json(value) => {
+                let text = value.to_string();
+                if text.len() <= text_limit {
+                    result.push(model_core::ModelContentPart::Json(value.clone()));
+                } else {
+                    result.push(model_core::ModelContentPart::Text(truncate_text(
+                        &text, text_limit,
+                    )));
+                }
+            }
+            ContentPart::Image(image) => {
+                let artifact = &image.artifact;
+                if artifacts >= limits.max_tool_artifacts {
+                    continue;
+                }
+                if artifact.size_bytes > limits.max_artifact_bytes
+                    || image.width > limits.max_image_width
+                    || image.height > limits.max_image_height
+                {
+                    result.push(model_core::ModelContentPart::Text(format!(
+                        "[image artifact omitted: {} exceeds the model media limits]",
+                        artifact.id
+                    )));
+                    continue;
+                }
+                artifacts += 1;
+                result.push(model_core::ModelContentPart::Image {
+                    artifact: artifact.clone(),
+                    detail: None,
+                });
+            }
+            ContentPart::Audio(_) | ContentPart::Video(_) => {
+                if artifacts < limits.max_tool_artifacts {
+                    artifacts += 1;
+                    result.push(model_core::ModelContentPart::Text(
+                        "[non-image media artifact is available but this provider adapter does not accept it yet]"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    if result.is_empty() {
+        result.push(model_core::ModelContentPart::Text(truncate_json(
+            &output.content,
+            text_limit,
+        )));
+    }
+    result
+}
+
+fn tool_result_from_output(
+    call_id: &str,
+    output: &ToolOutput,
+    limits: &AgentLimits,
+    is_error: bool,
+) -> ToolResult {
+    ToolResult {
+        tool_call_id: call_id.to_string(),
+        content: truncate_json(&output.content, effective_tool_text_limit(limits)),
+        parts: model_content_parts(output, limits),
+        is_error,
     }
 }
 
@@ -1086,7 +1346,35 @@ fn repeated_tool_call_message(tool: &str, previous_error: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use artifact_core::{ArtifactId, ArtifactRef, ImageArtifactRef};
     use model_core::{FinishReason, ToolCall};
+
+    #[test]
+    fn media_tool_result_retains_metadata_and_image_reference() {
+        let image = ImageArtifactRef::new(
+            ArtifactRef::new(ArtifactId::new("capture-1"), "image/png", 4),
+            2,
+            2,
+        );
+        let metadata = serde_json::json!({
+            "capture_id": "capture-1",
+            "width": 2,
+            "height": 2,
+        });
+        let output =
+            ToolOutput::multipart(metadata.clone(), vec![ContentPart::Image(image.clone())]);
+
+        assert_eq!(
+            model_content_parts(&output, &AgentLimits::default()),
+            vec![
+                model_core::ModelContentPart::Json(metadata),
+                model_core::ModelContentPart::Image {
+                    artifact: image.artifact,
+                    detail: None,
+                },
+            ]
+        );
+    }
 
     struct ScriptedProvider {
         events: Vec<Result<ModelStreamEvent, ModelError>>,
@@ -1543,6 +1831,157 @@ mod tests {
                 .tool_call_id,
             "call-b"
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_actions_require_observation_before_and_between_steps() {
+        struct DesktopAction {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl tool_core::Tool for DesktopAction {
+            fn metadata(&self) -> tool_core::ToolMetadata {
+                tool_core::ToolMetadata {
+                    id: capability_core::ToolId::new("desktop.test_action"),
+                    description: "test desktop action".to_string(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    effects: vec![tool_core::ToolEffect::DesktopControl],
+                }
+            }
+
+            async fn invoke(
+                &self,
+                _ctx: tool_core::ToolContext,
+                _args: serde_json::Value,
+            ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(tool_core::ToolOutput::json(serde_json::json!({"ok":true})))
+            }
+        }
+
+        struct DesktopObservation;
+
+        #[async_trait::async_trait]
+        impl tool_core::Tool for DesktopObservation {
+            fn metadata(&self) -> tool_core::ToolMetadata {
+                tool_core::ToolMetadata {
+                    id: capability_core::ToolId::new("desktop.observe"),
+                    description: "test desktop observation".to_string(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                    effects: vec![tool_core::ToolEffect::ReadOnly],
+                }
+            }
+
+            async fn invoke(
+                &self,
+                _ctx: tool_core::ToolContext,
+                _args: serde_json::Value,
+            ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+                Ok(tool_core::ToolOutput::json(serde_json::json!({
+                    "changed": true
+                })))
+            }
+        }
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut registry = tool_core::ToolRegistry::new();
+        registry
+            .register(Arc::new(DesktopAction {
+                calls: calls.clone(),
+            }))
+            .unwrap();
+        registry.register(Arc::new(DesktopObservation)).unwrap();
+
+        let call = |id: &str| {
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: id.to_string(),
+                name: "desktop.test_action".to_string(),
+                arguments: "{}".to_string(),
+            })
+        };
+        let provider = Arc::new(QueueProvider::new(vec![
+            vec![
+                call("action-1"),
+                call("action-2"),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                ModelStreamEvent::ToolCall(ToolCall {
+                    id: "observation-1".to_string(),
+                    name: "desktop.observe".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                call("action-3"),
+                call("action-4"),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                ModelStreamEvent::ToolCall(ToolCall {
+                    id: "observation-2".to_string(),
+                    name: "desktop.observe".to_string(),
+                    arguments: "{}".to_string(),
+                }),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                call("action-5"),
+                ModelStreamEvent::Done {
+                    finish_reason: FinishReason::ToolCalls,
+                },
+            ],
+            text_turn("done"),
+        ]));
+
+        let outcome = Agent::new(Arc::clone(&provider) as Arc<dyn ModelProvider>)
+            .turn_with_tools(
+                vec![ModelMessage::user("use the desktop")],
+                &registry,
+                &AuthorizationContext::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            outcome
+                .executed
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "desktop.observe",
+                "desktop.test_action",
+                "desktop.observe",
+                "desktop.test_action",
+            ]
+        );
+        let seen = provider.seen.lock().unwrap();
+        assert!(seen[1].messages.iter().any(|message| {
+            message.tool_result.as_ref().is_some_and(|result| {
+                (result.tool_call_id == "action-1" || result.tool_call_id == "action-2")
+                    && result.is_error
+                    && result.content.contains("fresh desktop observation")
+            })
+        }));
+        assert!(seen[3].messages.iter().any(|message| {
+            message.tool_result.as_ref().is_some_and(|result| {
+                result.tool_call_id == "action-4"
+                    && result.is_error
+                    && result.content.contains("one desktop-control action")
+            })
+        }));
     }
 
     #[tokio::test]

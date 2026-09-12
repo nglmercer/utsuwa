@@ -6,6 +6,30 @@
 
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::sync::Arc;
+
+pub use artifact_core::ArtifactRef;
+
+/// Provider-neutral multimodal content. Artifact bytes are resolved only by
+/// a provider adapter immediately before serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ModelContentPart {
+    Text(String),
+    Image {
+        artifact: ArtifactRef,
+        detail: Option<ImageDetail>,
+    },
+    Json(serde_json::Value),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    Low,
+    High,
+    Auto,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelRole {
@@ -28,8 +52,37 @@ pub struct ToolCall {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub tool_call_id: String,
+    /// Backwards-compatible textual/JSON representation used by providers
+    /// that only support string tool results and by existing host code.
     pub content: String,
+    /// Typed content parts. An ordinary string result uses one `Text` part;
+    /// an image result carries an artifact reference instead of base64 data.
+    #[serde(default)]
+    pub parts: Vec<ModelContentPart>,
     pub is_error: bool,
+}
+
+impl ToolResult {
+    pub fn text(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        let content = content.into();
+        Self {
+            tool_call_id: tool_call_id.into(),
+            parts: vec![ModelContentPart::Text(content.clone())],
+            content,
+            is_error: false,
+        }
+    }
+
+    pub fn error(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        let mut result = Self::text(tool_call_id, content);
+        result.is_error = true;
+        result
+    }
+
+    pub fn with_parts(mut self, parts: Vec<ModelContentPart>) -> Self {
+        self.parts = parts;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +93,10 @@ pub struct ModelMessage {
     /// Plain text keeps this as `None`; adapters use this value when it is
     /// present instead of flattening images or other content parts.
     pub content_value: Option<serde_json::Value>,
+    /// Typed content supplied by native tools or a frontend that already
+    /// speaks the provider-neutral model contract. `content_value` remains
+    /// for wire-compatible callers during migration.
+    pub content_parts: Vec<ModelContentPart>,
     pub tool_calls: Vec<ToolCall>,
     pub tool_result: Option<ToolResult>,
 }
@@ -50,6 +107,7 @@ impl ModelMessage {
             role: ModelRole::System,
             content: content.into(),
             content_value: None,
+            content_parts: vec![],
             tool_calls: vec![],
             tool_result: None,
         }
@@ -60,6 +118,7 @@ impl ModelMessage {
             role: ModelRole::User,
             content: content.into(),
             content_value: None,
+            content_parts: vec![],
             tool_calls: vec![],
             tool_result: None,
         }
@@ -70,6 +129,7 @@ impl ModelMessage {
             role: ModelRole::Assistant,
             content: content.into(),
             content_value: None,
+            content_parts: vec![],
             tool_calls,
             tool_result: None,
         }
@@ -77,10 +137,12 @@ impl ModelMessage {
 
     pub fn tool_result(result: ToolResult) -> Self {
         let content = result.content.clone();
+        let content_parts = result.parts.clone();
         Self {
             role: ModelRole::Tool,
             content,
             content_value: None,
+            content_parts,
             tool_calls: vec![],
             tool_result: Some(result),
         }
@@ -103,9 +165,15 @@ impl ModelMessage {
             role,
             content: text,
             content_value: Some(content),
+            content_parts: vec![],
             tool_calls: vec![],
             tool_result: None,
         }
+    }
+
+    pub fn with_content_parts(mut self, parts: Vec<ModelContentPart>) -> Self {
+        self.content_parts = parts;
+        self
     }
 }
 
@@ -127,12 +195,15 @@ impl ToolDefinition {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelRequest {
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Runtime-only artifact resolver. It is deliberately not serialized or
+    /// stored in conversation history.
+    pub artifact_store: Option<Arc<dyn artifact_core::ArtifactStore>>,
 }
 
 impl ModelRequest {
@@ -142,7 +213,13 @@ impl ModelRequest {
             tools: vec![],
             max_tokens: None,
             temperature: None,
+            artifact_store: None,
         }
+    }
+
+    pub fn with_artifact_store(mut self, store: Arc<dyn artifact_core::ArtifactStore>) -> Self {
+        self.artifact_store = Some(store);
+        self
     }
 }
 
@@ -181,6 +258,8 @@ pub enum ModelError {
     Provider { status: u16, message: String },
     #[error("invalid provider response: {0}")]
     InvalidResponse(String),
+    #[error("artifact resolution failed: {0}")]
+    Artifact(String),
     #[error("cancelled")]
     Cancelled,
 }

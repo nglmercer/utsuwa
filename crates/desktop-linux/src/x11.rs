@@ -73,7 +73,8 @@ fn read_exact(stream: &mut UnixStream, mut n: usize, what: &str) -> Result<Vec<u
 }
 
 fn display_number() -> Result<String, XError> {
-    let display = std::env::var("DISPLAY").map_err(|_| XError::Connect("no DISPLAY".to_string()))?;
+    let display =
+        std::env::var("DISPLAY").map_err(|_| XError::Connect("no DISPLAY".to_string()))?;
     let after_colon = display.rsplit(':').next().unwrap_or("");
     Ok(after_colon.split('.').next().unwrap_or("0").to_string())
 }
@@ -100,7 +101,10 @@ fn read_cookie() -> Vec<u8> {
         None => return Vec::new(),
     };
     let data = std::fs::read(path).unwrap_or_default();
-    let display = format!("unix/:{}", display_number().unwrap_or_else(|_| "0".to_string()));
+    let display = format!(
+        "unix/:{}",
+        display_number().unwrap_or_else(|_| "0".to_string())
+    );
     let mut o = 0;
     let get = |o: &mut usize, data: &[u8]| -> Option<Vec<u8>> {
         if *o + 2 > data.len() {
@@ -144,8 +148,8 @@ impl XConn {
         let addr: std::os::unix::net::SocketAddr =
             std::os::unix::net::SocketAddr::from_pathname(&path)
                 .map_err(|e| XError::Connect(e.to_string()))?;
-        let stream = UnixStream::connect_addr(&addr)
-            .map_err(|e| XError::Connect(format!("{path}: {e}")))?;
+        let stream =
+            UnixStream::connect_addr(&addr).map_err(|e| XError::Connect(format!("{path}: {e}")))?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .map_err(|e| XError::Connect(e.to_string()))?;
@@ -188,7 +192,10 @@ impl XConn {
             .map_err(|e| XError::Setup(e.to_string()))?;
         let hdr = read_exact(&mut self.stream, 8, "setup header")?;
         if hdr[0] != 1 {
-            return Err(XError::Setup(format!("server refused setup (status {})", hdr[0])));
+            return Err(XError::Setup(format!(
+                "server refused setup (status {})",
+                hdr[0]
+            )));
         }
         let addl = u16::from_le_bytes([hdr[6], hdr[7]]) as usize;
         let body = read_exact(&mut self.stream, addl * 4, "setup body")?;
@@ -267,12 +274,20 @@ impl XConn {
     /// …): the server sends no reply, so reading one would block until
     /// the socket timeout and desync the stream.
     pub fn request_void(&mut self, opcode: u8, data: u8, payload: &[u8]) -> Result<(), XError> {
-        self.send(opcode, data, payload, "void request")
+        self.send(opcode, data, payload, "void request")?;
+        self.stream
+            .flush()
+            .map_err(|e| XError::Request(format!("void request flush: {e}")))
     }
 
     /// One request, one reply. Replies arrive in order; errors surface as
     /// [`XError::Server`] with the failing major opcode.
-    pub fn request(&mut self, opcode: u8, data: u8, payload: &[u8]) -> Result<(Vec<u8>, Vec<u8>), XError> {
+    pub fn request(
+        &mut self,
+        opcode: u8,
+        data: u8,
+        payload: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), XError> {
         self.send(opcode, data, payload, "request")?;
         let hdr = read_exact(&mut self.stream, 32, "reply header")?;
         if hdr[0] == 0 {
@@ -283,7 +298,10 @@ impl XConn {
             });
         }
         if hdr[0] != 1 {
-            return Err(XError::Protocol(format!("unexpected reply type {}", hdr[0])));
+            return Err(XError::Protocol(format!(
+                "unexpected reply type {}",
+                hdr[0]
+            )));
         }
         let len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
         let extra = read_exact(&mut self.stream, len * 4, "reply body")?;
@@ -309,7 +327,9 @@ impl XConn {
         }
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            out.push(u32::from_le_bytes(extra[i * 4..i * 4 + 4].try_into().unwrap()));
+            out.push(u32::from_le_bytes(
+                extra[i * 4..i * 4 + 4].try_into().unwrap(),
+            ));
         }
         Ok(out)
     }
@@ -417,12 +437,7 @@ impl XConn {
     }
 
     /// XTEST FakeInput key/button event. `is_press` selects press/release.
-    pub fn xtest_fake_key(
-        &mut self,
-        major: u8,
-        keycode: u8,
-        is_press: bool,
-    ) -> Result<(), XError> {
+    pub fn xtest_fake_key(&mut self, major: u8, keycode: u8, is_press: bool) -> Result<(), XError> {
         let mut payload = vec![if is_press { 2 } else { 3 }, keycode, 0, 0];
         payload.extend_from_slice(&0u32.to_le_bytes()); // CurrentTime
         payload.extend_from_slice(&self.root.to_le_bytes());
@@ -447,11 +462,7 @@ impl XConn {
     /// Keycode range + keysyms per keycode (for type_text mapping).
     /// keysyms-per-keycode rides at header byte 1; the keysym list
     /// follows as extra data.
-    pub fn get_keyboard_mapping(
-        &mut self,
-        first: u8,
-        count: u8,
-    ) -> Result<(u8, Vec<u32>), XError> {
+    pub fn get_keyboard_mapping(&mut self, first: u8, count: u8) -> Result<(u8, Vec<u32>), XError> {
         let (hdr, extra) = self.request(101, 0, &[first, count, 0, 0])?;
         let per = hdr[1];
         let mut syms = Vec::new();
@@ -471,6 +482,56 @@ impl XConn {
         payload.extend_from_slice(&[0, 0]);
         payload.extend_from_slice(&0u32.to_le_bytes());
         self.request_void(12, 0, &payload)
+    }
+
+    /// Configure a window's position and/or size. Values are encoded in
+    /// mask order as required by ConfigureWindow (x=1, y=2, width=4,
+    /// height=8). The window manager may subsequently constrain the result.
+    pub fn configure_window(
+        &mut self,
+        window: u32,
+        mask: u16,
+        values: &[u32],
+    ) -> Result<(), XError> {
+        let expected = mask.count_ones() as usize;
+        if values.len() != expected {
+            return Err(XError::Protocol(format!(
+                "ConfigureWindow mask expects {expected} values, got {}",
+                values.len()
+            )));
+        }
+        let mut payload = window.to_le_bytes().to_vec();
+        payload.extend_from_slice(&mask.to_le_bytes());
+        payload.extend_from_slice(&[0, 0]);
+        for value in values {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        self.request_void(12, 0, &payload)
+    }
+
+    /// Send a 32-bit ClientMessage. Window-manager requests are delivered to
+    /// the root with the target window carried in the event's window field;
+    /// regular window messages can use the target for both arguments.
+    pub fn send_client_message(
+        &mut self,
+        destination: u32,
+        event_window: u32,
+        message_type: u32,
+        data: [u32; 5],
+        event_mask: u32,
+    ) -> Result<(), XError> {
+        let mut payload = vec![0u8, 0, 0, 0]; // propagate=false
+        payload.extend_from_slice(&destination.to_le_bytes());
+        payload.extend_from_slice(&event_mask.to_le_bytes());
+        // ClientMessage event: type=33, format=32, sequence=0,
+        // window, message type, five CARD32 data words.
+        payload.extend_from_slice(&[33, 32, 0, 0]);
+        payload.extend_from_slice(&event_window.to_le_bytes());
+        payload.extend_from_slice(&message_type.to_le_bytes());
+        for value in data {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        self.request_void(25, 0, &payload)
     }
 
     /// Allocate a client resource id from the setup base/mask.

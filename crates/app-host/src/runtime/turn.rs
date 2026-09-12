@@ -23,6 +23,12 @@ impl AgentRuntime {
         let mut agent = Agent::new(provider)
             .with_agent_id(self.agent_id.clone())
             .with_limits(AgentLimits::default());
+        agent = agent.with_artifact_store(self.artifacts.clone());
+        let captures = self.computer_sessions.clone();
+        agent = agent.with_desktop_action_notifier(Arc::new(move || {
+            let captures = captures.clone();
+            Box::pin(async move { captures.notify_all_actions().await })
+        }));
         if let Some(prompt) = system_prompt {
             agent = agent.with_system_prompt(prompt);
         }
@@ -301,6 +307,7 @@ impl AgentRuntime {
                                     "id": step.id,
                                     "name": step.name,
                                     "output": step.output.content,
+                                    "content_parts": step.output.parts,
                                 })
                             })
                             .collect();
@@ -366,6 +373,7 @@ fn serialize_tool_step(step: &agent_core::ToolStep) -> serde_json::Value {
         "status": step.status.as_str(),
         "ok": step.ok,
         "output": step.output.clone(),
+        "content_parts": step.parts.clone(),
         "error": step.error.clone(),
     })
 }

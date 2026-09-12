@@ -5,6 +5,7 @@
 //! registry resolves names and calls code; it grants no authority.
 //! Permission checks and capability tickets wrap `invoke` in later tasks.
 
+pub use artifact_core::ContentPart;
 use capability_core::{Capability, CapabilityTicket, InvocationId, Principal, Resource, ToolId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -42,6 +43,11 @@ pub struct ToolContext {
     pub principal: Principal,
     pub invocation_id: InvocationId,
     pub ticket: Option<CapabilityTicket>,
+    /// Additional tickets for tools whose result combines independently
+    /// protected capabilities (for example semantic desktop state plus a
+    /// screen-capture artifact). `ticket` remains the compatibility slot for
+    /// the common one-ticket call path.
+    pub tickets: Vec<CapabilityTicket>,
 }
 
 impl ToolContext {
@@ -50,19 +56,48 @@ impl ToolContext {
             principal,
             invocation_id: InvocationId::fresh(),
             ticket: None,
+            tickets: Vec::new(),
         }
     }
 
     pub fn with_ticket(mut self, ticket: CapabilityTicket) -> Self {
-        self.ticket = Some(ticket);
+        if self.ticket.is_none() {
+            self.ticket = Some(ticket);
+        } else {
+            self.tickets.push(ticket);
+        }
         self
+    }
+
+    /// Check all tickets attached to this invocation against one live
+    /// capability request. Brokers still perform their own checks; this is a
+    /// convenience for compound tools at the final OS boundary.
+    pub fn has_ticket(&self, capability: Capability, resource: Resource) -> bool {
+        let request = capability_core::CapabilityRequest {
+            principal: self.principal.clone(),
+            capability,
+            resource,
+        };
+        self.ticket.iter().chain(self.tickets.iter()).any(|ticket| {
+            ticket
+                .check(&self.principal, &request, &self.invocation_id)
+                .is_ok()
+        })
     }
 }
 
 /// Model-facing tool result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutput {
+    /// Legacy JSON view kept for existing tools, plugins, host events, and
+    /// callers that inspect ordinary results directly. New model plumbing
+    /// consumes [`Self::parts`] instead of serializing this value to one
+    /// string.
     pub content: serde_json::Value,
+    /// Typed result parts. `ToolOutput::json`/`new` populate this with one
+    /// JSON part, so existing tools require no migration. Binary media is
+    /// represented by an artifact reference and never embedded here.
+    pub parts: Vec<ContentPart>,
     /// True when the broker truncated an oversized result (limits, Phase 36).
     pub truncated: bool,
     /// Mutation evidence for the audit log (plan Phase 10): mutating tools
@@ -85,8 +120,55 @@ pub struct MutationEvidence {
 
 impl ToolOutput {
     pub fn new(content: serde_json::Value) -> Self {
+        Self::json(content)
+    }
+
+    pub fn json(content: serde_json::Value) -> Self {
+        Self {
+            parts: vec![ContentPart::Json(content.clone())],
+            content,
+            truncated: false,
+            mutation: None,
+        }
+    }
+
+    pub fn text(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            content: serde_json::Value::String(text.clone()),
+            parts: vec![ContentPart::Text(text)],
+            truncated: false,
+            mutation: None,
+        }
+    }
+
+    pub fn image(image: artifact_core::ImageArtifactRef) -> Self {
+        let content = serde_json::json!({
+            "artifact_id": image.artifact.id,
+            "mime_type": image.artifact.mime_type,
+            "size_bytes": image.artifact.size_bytes,
+            "width": image.width,
+            "height": image.height,
+        });
         Self {
             content,
+            parts: vec![ContentPart::Image(image)],
+            truncated: false,
+            mutation: None,
+        }
+    }
+
+    /// Attach typed parts while retaining a small JSON metadata view for
+    /// legacy host/UI consumers.
+    pub fn with_parts(mut self, parts: Vec<ContentPart>) -> Self {
+        self.parts = parts;
+        self
+    }
+
+    pub fn multipart(content: serde_json::Value, parts: Vec<ContentPart>) -> Self {
+        Self {
+            content,
+            parts,
             truncated: false,
             mutation: None,
         }
@@ -190,6 +272,14 @@ pub trait Tool: Send + Sync {
     /// The default (`None`) is for pure tools with no OS effects.
     fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
         None
+    }
+
+    /// Declare every independently protected capability needed by one call.
+    /// The legacy singular hook remains the source for ordinary tools; a
+    /// compound tool may override this without forcing existing tools or
+    /// plugins to migrate.
+    fn required_capabilities(&self, args: &serde_json::Value) -> Vec<CapabilityRequirement> {
+        self.required_capability(args).into_iter().collect()
     }
 
     async fn invoke(

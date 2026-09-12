@@ -4,13 +4,16 @@
 //! OpenAI-compatible endpoint. Speaks `/chat/completions` with SSE
 //! streaming; converts everything to `model-core` types at this boundary.
 
+use artifact_core::ArtifactStore;
+use base64::Engine as _;
 use futures_util::StreamExt;
 use model_core::{
-    FinishReason, ModelError, ModelMessage, ModelProvider, ModelRequest, ModelRole, ModelStream,
-    ModelStreamEvent, ToolCall,
+    FinishReason, ImageDetail, ModelContentPart, ModelError, ModelMessage, ModelProvider,
+    ModelRequest, ModelRole, ModelStream, ModelStreamEvent, ToolCall,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
@@ -104,7 +107,7 @@ impl OpenAICompatibleClient {
 #[async_trait::async_trait]
 impl ModelProvider for OpenAICompatibleClient {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
-        let body = request_body(&self.model, &request);
+        let body = request_body_with_artifacts(&self.model, &request).await?;
         let mut req = self.http.post(self.url()).json(&body);
         if let Some(key) = self.api_key.as_deref() {
             req = req.bearer_auth(key);
@@ -165,7 +168,7 @@ impl AnthropicClient {
 #[async_trait::async_trait]
 impl ModelProvider for AnthropicClient {
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
-        let body = anthropic_request_body(&self.model, &request);
+        let body = anthropic_request_body_with_artifacts(&self.model, &request).await?;
         let response = self
             .http
             .post(self.url())
@@ -489,6 +492,7 @@ fn map_anthropic_finish_reason(reason: &str) -> FinishReason {
     }
 }
 
+#[cfg(test)]
 fn anthropic_request_body(model: &str, request: &ModelRequest) -> Value {
     let system = request
         .messages
@@ -517,6 +521,38 @@ fn anthropic_request_body(model: &str, request: &ModelRequest) -> Value {
     body
 }
 
+async fn anthropic_request_body_with_artifacts(
+    model: &str,
+    request: &ModelRequest,
+) -> Result<Value, ModelError> {
+    let system = request
+        .messages
+        .iter()
+        .filter(|message| message.role == ModelRole::System)
+        .map(|message| message.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "max_tokens": request.max_tokens.unwrap_or(1024),
+        "messages": anthropic_messages_with_artifacts(&request.messages, request.artifact_store.as_ref()).await?,
+        "tools": request.tools.iter().map(|tool| serde_json::json!({
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.input_schema,
+        })).collect::<Vec<_>>(),
+    });
+    if !system.is_empty() {
+        body["system"] = Value::String(system);
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
 fn anthropic_messages(messages: &[ModelMessage]) -> Vec<Value> {
     let mut output = Vec::new();
     for message in messages {
@@ -550,6 +586,122 @@ fn anthropic_messages(messages: &[ModelMessage]) -> Vec<Value> {
     output
 }
 
+async fn anthropic_messages_with_artifacts(
+    messages: &[ModelMessage],
+    store: Option<&Arc<dyn ArtifactStore>>,
+) -> Result<Vec<Value>, ModelError> {
+    let mut output = Vec::new();
+    for message in messages {
+        match message.role {
+            ModelRole::System => {}
+            ModelRole::User => {
+                let content = if message.content_parts.is_empty() {
+                    anthropic_content(message.content_value.as_ref(), &message.content)
+                } else {
+                    anthropic_typed_parts(&message.content_parts, store).await?
+                };
+                append_anthropic_message(&mut output, "user", content);
+            }
+            ModelRole::Assistant => {
+                let content = if message.tool_calls.is_empty() {
+                    if message.content_parts.is_empty() {
+                        anthropic_content(message.content_value.as_ref(), &message.content)
+                    } else {
+                        anthropic_typed_parts(&message.content_parts, store).await?
+                    }
+                } else {
+                    let mut blocks = if message.content_parts.is_empty() {
+                        if message.content.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![serde_json::json!({
+                                "type": "text",
+                                "text": message.content,
+                            })]
+                        }
+                    } else {
+                        anthropic_typed_blocks(&message.content_parts, store).await?
+                    };
+                    for call in &message.tool_calls {
+                        let input = serde_json::from_str::<Value>(&call.arguments)
+                            .unwrap_or_else(|_| serde_json::json!({}));
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": call.name,
+                            "input": input,
+                        }));
+                    }
+                    Value::Array(blocks)
+                };
+                append_anthropic_message(&mut output, "assistant", content);
+            }
+            ModelRole::Tool => {
+                if let Some(result) = &message.tool_result {
+                    let content = if result.parts.is_empty() {
+                        Value::String(result.content.clone())
+                    } else {
+                        anthropic_typed_parts(&result.parts, store).await?
+                    };
+                    let mut block = serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": result.tool_call_id,
+                        "content": content,
+                    });
+                    if result.is_error {
+                        block["is_error"] = Value::Bool(true);
+                    }
+                    append_anthropic_message(&mut output, "user", Value::Array(vec![block]));
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+async fn anthropic_typed_parts(
+    parts: &[ModelContentPart],
+    store: Option<&Arc<dyn ArtifactStore>>,
+) -> Result<Value, ModelError> {
+    Ok(Value::Array(anthropic_typed_blocks(parts, store).await?))
+}
+
+async fn anthropic_typed_blocks(
+    parts: &[ModelContentPart],
+    store: Option<&Arc<dyn ArtifactStore>>,
+) -> Result<Vec<Value>, ModelError> {
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part {
+            ModelContentPart::Text(text) => blocks.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+            })),
+            ModelContentPart::Json(value) => blocks.push(serde_json::json!({
+                "type": "text",
+                "text": value.to_string(),
+            })),
+            ModelContentPart::Image {
+                artifact,
+                detail: _,
+            } => {
+                let bytes = resolve_artifact(store, artifact).await?;
+                let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                blocks.push(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": artifact.mime_type,
+                        "data": data,
+                    },
+                }));
+            }
+        }
+    }
+    Ok(blocks)
+}
+
+#[cfg(test)]
 fn anthropic_assistant_content(message: &ModelMessage) -> Value {
     if message.tool_calls.is_empty() {
         return anthropic_content(message.content_value.as_ref(), &message.content);
@@ -796,6 +948,7 @@ fn map_finish_reason(reason: &str) -> FinishReason {
     }
 }
 
+#[cfg(test)]
 fn request_body(model: &str, request: &ModelRequest) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -819,6 +972,37 @@ fn request_body(model: &str, request: &ModelRequest) -> serde_json::Value {
     body
 }
 
+async fn request_body_with_artifacts(
+    model: &str,
+    request: &ModelRequest,
+) -> Result<serde_json::Value, ModelError> {
+    let mut messages = Vec::with_capacity(request.messages.len());
+    for message in &request.messages {
+        messages.push(wire_message_with_artifacts(message, request.artifact_store.as_ref()).await?);
+    }
+    let mut body = serde_json::json!({
+        "model": model,
+        "stream": true,
+        "messages": messages,
+        "tools": request.tools.iter().map(|t| serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.input_schema,
+            }
+        })).collect::<Vec<_>>(),
+    });
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    Ok(body)
+}
+
+#[cfg(test)]
 fn wire_message(message: &ModelMessage) -> serde_json::Value {
     let role = match message.role {
         ModelRole::System => "system",
@@ -850,9 +1034,105 @@ fn wire_message(message: &ModelMessage) -> serde_json::Value {
     value
 }
 
+async fn wire_message_with_artifacts(
+    message: &ModelMessage,
+    store: Option<&Arc<dyn ArtifactStore>>,
+) -> Result<serde_json::Value, ModelError> {
+    let role = match message.role {
+        ModelRole::System => "system",
+        ModelRole::User => "user",
+        ModelRole::Assistant => "assistant",
+        ModelRole::Tool => "tool",
+    };
+    let content = if let Some(result) = &message.tool_result {
+        if result.parts.is_empty() {
+            Value::String(result.content.clone())
+        } else {
+            openai_typed_parts(&result.parts, store).await?
+        }
+    } else if message.content_parts.is_empty() {
+        message
+            .content_value
+            .clone()
+            .unwrap_or_else(|| Value::String(message.content.clone()))
+    } else {
+        openai_typed_parts(&message.content_parts, store).await?
+    };
+    let mut value = serde_json::json!({ "role": role, "content": content });
+    if !message.tool_calls.is_empty() {
+        value["tool_calls"] = message
+            .tool_calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": { "name": c.name, "arguments": c.arguments },
+                })
+            })
+            .collect();
+    }
+    if let Some(result) = &message.tool_result {
+        value["tool_call_id"] = result.tool_call_id.clone().into();
+    }
+    Ok(value)
+}
+
+async fn openai_typed_parts(
+    parts: &[ModelContentPart],
+    store: Option<&Arc<dyn ArtifactStore>>,
+) -> Result<Value, ModelError> {
+    let mut blocks = Vec::new();
+    for part in parts {
+        match part {
+            ModelContentPart::Text(text) => blocks.push(serde_json::json!({
+                "type": "text",
+                "text": text,
+            })),
+            ModelContentPart::Json(value) => blocks.push(serde_json::json!({
+                "type": "text",
+                "text": value.to_string(),
+            })),
+            ModelContentPart::Image { artifact, detail } => {
+                let bytes = resolve_artifact(store, artifact).await?;
+                let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                let mut image = serde_json::json!({
+                    "url": format!("data:{};base64,{}", artifact.mime_type, data),
+                });
+                if let Some(detail) = detail {
+                    image["detail"] = Value::String(match detail {
+                        ImageDetail::Low => "low".to_string(),
+                        ImageDetail::High => "high".to_string(),
+                        ImageDetail::Auto => "auto".to_string(),
+                    });
+                }
+                blocks.push(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": image,
+                }));
+            }
+        }
+    }
+    Ok(Value::Array(blocks))
+}
+
+async fn resolve_artifact(
+    store: Option<&Arc<dyn ArtifactStore>>,
+    artifact: &artifact_core::ArtifactRef,
+) -> Result<Vec<u8>, ModelError> {
+    let store = store.ok_or_else(|| {
+        ModelError::Artifact(format!("no artifact store attached for {}", artifact.id))
+    })?;
+    store
+        .get(&artifact.id)
+        .await
+        .map_err(|error| ModelError::Artifact(error.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use artifact_core::{ArtifactStore, InMemoryArtifactStore};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
@@ -1021,6 +1301,7 @@ mod tests {
         let tool = ModelMessage::tool_result(model_core::ToolResult {
             tool_call_id: "call-1".to_string(),
             content: r#"{"ok":true}"#.to_string(),
+            parts: vec![],
             is_error: false,
         });
         let wire = wire_message(&tool);
@@ -1054,6 +1335,7 @@ mod tests {
             ModelMessage::tool_result(model_core::ToolResult {
                 tool_call_id: "call-1".to_string(),
                 content: r#"{"ok":true}"#.to_string(),
+                parts: vec![],
                 is_error: false,
             }),
         ]);
@@ -1069,6 +1351,66 @@ mod tests {
         assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call-1");
+    }
+
+    #[tokio::test]
+    async fn provider_adapters_resolve_image_artifacts_only_at_wire_boundary() {
+        let memory = Arc::new(InMemoryArtifactStore::new());
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let artifact = memory
+            .put("image/png", vec![0x89, b'P', b'N', b'G'])
+            .await
+            .unwrap();
+        let result =
+            model_core::ToolResult::text("capture-1", "capture metadata").with_parts(vec![
+                ModelContentPart::Text("the screen changed".to_string()),
+                ModelContentPart::Image {
+                    artifact: artifact.clone(),
+                    detail: Some(ImageDetail::Low),
+                },
+            ]);
+        let request =
+            ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
+
+        let openai = request_body_with_artifacts("vision-model", &request)
+            .await
+            .unwrap();
+        let openai_content = &openai["messages"][0]["content"];
+        assert_eq!(openai_content[0]["type"], "text");
+        assert_eq!(openai_content[1]["type"], "image_url");
+        assert_eq!(openai_content[1]["image_url"]["detail"], "low");
+        assert!(openai_content[1]["image_url"]["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+
+        let anthropic = anthropic_request_body_with_artifacts("claude-vision", &request)
+            .await
+            .unwrap();
+        let anthropic_content = &anthropic["messages"][0]["content"][0]["content"];
+        assert_eq!(anthropic_content[0]["type"], "text");
+        assert_eq!(anthropic_content[1]["type"], "image");
+        assert_eq!(anthropic_content[1]["source"]["type"], "base64");
+        assert_eq!(anthropic_content[1]["source"]["media_type"], "image/png");
+        assert_eq!(anthropic_content[1]["source"]["data"], "iVBORw==");
+
+        // The provider-specific base64 exists only in the temporary wire
+        // value. The model request still carries the lightweight reference.
+        assert_eq!(
+            request.messages[0]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .parts
+                .len(),
+            2
+        );
+        assert_eq!(
+            request.messages[0].tool_result.as_ref().unwrap().parts[1],
+            ModelContentPart::Image {
+                artifact,
+                detail: Some(ImageDetail::Low),
+            }
+        );
     }
 
     #[test]

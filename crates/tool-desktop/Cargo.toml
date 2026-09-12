@@ -6,12 +6,17 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+artifact-core.workspace = true
 capability-core.workspace = true
+chrono.workspace = true
 serde.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tool-core.workspace = true
 tool-sdk.workspace = true
+uuid.workspace = true
+png.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true

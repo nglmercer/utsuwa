@@ -6,8 +6,9 @@
 //! collects plugins in a [`DesktopPluginRegistry`] and activates at
 //! most one per session; agent tools are built only for the active
 //! plugin's declared capabilities, so the model never sees actions the
-//! platform cannot perform (Linux X11 has no `set_value`, Windows and
-//! macOS have no backend on this host yet).
+//! platform cannot perform. The host wires the platform-specific crates
+//! (`desktop-linux`, `desktop-linux-wayland`, `desktop-windows`, and
+//! `desktop-macos`) into this registry.
 //!
 //! Manifests are `serde` data (TOML-ready) so a future native plugin
 //! loader can discover them from disk; today each backend crate builds
@@ -27,12 +28,42 @@ use super::DesktopBackend;
 #[serde(rename_all = "snake_case")]
 pub enum DesktopCapability {
     ListWindows,
+    ListDisplays,
     AccessibilityTree,
+    Observe,
     InvokeElement,
+    FocusElement,
     SetValue,
+    SelectElement,
+    ExpandElement,
+    CollapseElement,
     Screenshot,
+    CaptureStart,
+    CaptureFrame,
+    CaptureStop,
+    CaptureStatus,
     Click,
+    DoubleClick,
+    MovePointer,
+    MouseDown,
+    MouseUp,
+    Drag,
+    Scroll,
     TypeText,
+    KeyDown,
+    KeyUp,
+    Hotkey,
+    PressKey,
+    FocusWindow,
+    CloseWindow,
+    MoveWindow,
+    ResizeWindow,
+    MinimizeWindow,
+    MaximizeWindow,
+    RestoreWindow,
+    ClipboardRead,
+    ClipboardWrite,
+    LaunchApplication,
 }
 
 impl DesktopCapability {
@@ -40,12 +71,42 @@ impl DesktopCapability {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ListWindows => "list_windows",
+            Self::ListDisplays => "list_displays",
             Self::AccessibilityTree => "accessibility_tree",
+            Self::Observe => "observe",
             Self::InvokeElement => "invoke_element",
+            Self::FocusElement => "focus_element",
             Self::SetValue => "set_value",
+            Self::SelectElement => "select_element",
+            Self::ExpandElement => "expand_element",
+            Self::CollapseElement => "collapse_element",
             Self::Screenshot => "screenshot",
+            Self::CaptureStart => "capture_start",
+            Self::CaptureFrame => "capture_frame",
+            Self::CaptureStop => "capture_stop",
+            Self::CaptureStatus => "capture_status",
             Self::Click => "click",
+            Self::DoubleClick => "double_click",
+            Self::MovePointer => "move_pointer",
+            Self::MouseDown => "mouse_down",
+            Self::MouseUp => "mouse_up",
+            Self::Drag => "drag",
+            Self::Scroll => "scroll",
             Self::TypeText => "type_text",
+            Self::KeyDown => "key_down",
+            Self::KeyUp => "key_up",
+            Self::Hotkey => "hotkey",
+            Self::PressKey => "press_key",
+            Self::FocusWindow => "focus_window",
+            Self::CloseWindow => "close_window",
+            Self::MoveWindow => "move_window",
+            Self::ResizeWindow => "resize_window",
+            Self::MinimizeWindow => "minimize_window",
+            Self::MaximizeWindow => "maximize_window",
+            Self::RestoreWindow => "restore_window",
+            Self::ClipboardRead => "clipboard_read",
+            Self::ClipboardWrite => "clipboard_write",
+            Self::LaunchApplication => "launch_application",
         }
     }
 
@@ -58,14 +119,44 @@ impl DesktopCapability {
 /// Every capability the full multiplatform tool offers. Platform
 /// plugins declare a subset; the registry only builds tools for
 /// declared capabilities.
-pub const FULL_CAPABILITIES: [DesktopCapability; 7] = [
+pub const FULL_CAPABILITIES: [DesktopCapability; 37] = [
     DesktopCapability::ListWindows,
+    DesktopCapability::ListDisplays,
     DesktopCapability::AccessibilityTree,
+    DesktopCapability::Observe,
     DesktopCapability::InvokeElement,
+    DesktopCapability::FocusElement,
     DesktopCapability::SetValue,
+    DesktopCapability::SelectElement,
+    DesktopCapability::ExpandElement,
+    DesktopCapability::CollapseElement,
     DesktopCapability::Screenshot,
+    DesktopCapability::CaptureStart,
+    DesktopCapability::CaptureFrame,
+    DesktopCapability::CaptureStop,
+    DesktopCapability::CaptureStatus,
     DesktopCapability::Click,
+    DesktopCapability::DoubleClick,
+    DesktopCapability::MovePointer,
+    DesktopCapability::MouseDown,
+    DesktopCapability::MouseUp,
+    DesktopCapability::Drag,
+    DesktopCapability::Scroll,
     DesktopCapability::TypeText,
+    DesktopCapability::KeyDown,
+    DesktopCapability::KeyUp,
+    DesktopCapability::Hotkey,
+    DesktopCapability::PressKey,
+    DesktopCapability::FocusWindow,
+    DesktopCapability::CloseWindow,
+    DesktopCapability::MoveWindow,
+    DesktopCapability::ResizeWindow,
+    DesktopCapability::MinimizeWindow,
+    DesktopCapability::MaximizeWindow,
+    DesktopCapability::RestoreWindow,
+    DesktopCapability::ClipboardRead,
+    DesktopCapability::ClipboardWrite,
+    DesktopCapability::LaunchApplication,
 ];
 
 /// The host's view of one desktop backend plugin: identity, platform
@@ -115,7 +206,10 @@ impl DesktopPlugin {
 
     /// True when this plugin serves the running OS.
     pub fn serves_current_platform(&self) -> bool {
-        self.manifest.platforms.iter().any(|p| p == std::env::consts::OS)
+        self.manifest
+            .platforms
+            .iter()
+            .any(|p| p == std::env::consts::OS)
     }
 
     pub fn supports(&self, capability: DesktopCapability) -> bool {
@@ -139,16 +233,11 @@ impl DesktopPlugin {
         )
     }
 
-    /// A declared-but-unimplemented platform backend (Windows UI
-    /// Automation, macOS AX). The manifest states intent and full
-    /// capabilities so a future crate can drop in behind the same id;
-    /// until then it never activates.
-    pub fn unimplemented(
-        id: &str,
-        name: &str,
-        platform: &str,
-        description: &str,
-    ) -> Self {
+    /// A declared-but-unavailable platform backend, useful for manifests
+    /// and tests when a native implementation is not installed or cannot
+    /// run on the current host. It never activates until a real backend
+    /// replaces the placeholder.
+    pub fn unimplemented(id: &str, name: &str, platform: &str, description: &str) -> Self {
         Self::new(
             DesktopPluginManifest {
                 id: id.to_string(),
@@ -201,7 +290,11 @@ mod tests {
     };
     use crate::DesktopBackend;
 
-    fn manifest(id: &str, platforms: &[&str], capabilities: &[DesktopCapability]) -> DesktopPluginManifest {
+    fn manifest(
+        id: &str,
+        platforms: &[&str],
+        capabilities: &[DesktopCapability],
+    ) -> DesktopPluginManifest {
         DesktopPluginManifest {
             id: id.to_string(),
             name: id.to_string(),
@@ -215,7 +308,8 @@ mod tests {
     #[test]
     fn manifest_roundtrips_through_json() {
         let m = manifest("desktop.linux-x11", &["linux"], &FULL_CAPABILITIES);
-        let back: DesktopPluginManifest = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        let back: DesktopPluginManifest =
+            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
         assert_eq!(back, m);
         assert_eq!(DesktopCapability::Click.tool_id(), "desktop.click");
     }
@@ -231,22 +325,41 @@ mod tests {
             async fn list_windows(&self) -> Result<Vec<crate::WindowInfo>, crate::DesktopError> {
                 Err(crate::DesktopError::BackendUnavailable("down".to_string()))
             }
-            async fn accessibility_tree(&self, _w: &str) -> Result<Vec<crate::ElementNode>, crate::DesktopError> {
+            async fn accessibility_tree(
+                &self,
+                _w: &str,
+            ) -> Result<Vec<crate::ElementNode>, crate::DesktopError> {
                 Err(crate::DesktopError::BackendUnavailable("down".to_string()))
             }
             async fn invoke_element(&self, _w: &str, _e: &str) -> Result<(), crate::DesktopError> {
                 Err(crate::DesktopError::BackendUnavailable("down".to_string()))
             }
-            async fn set_value(&self, _w: &str, _e: &str, _v: &str) -> Result<(), crate::DesktopError> {
+            async fn set_value(
+                &self,
+                _w: &str,
+                _e: &str,
+                _v: &str,
+            ) -> Result<(), crate::DesktopError> {
                 Err(crate::DesktopError::BackendUnavailable("down".to_string()))
             }
-            async fn screenshot(&self, _w: Option<&str>) -> Result<crate::Screenshot, crate::DesktopError> {
+            async fn screenshot(
+                &self,
+                _w: Option<&str>,
+            ) -> Result<crate::Screenshot, crate::DesktopError> {
                 Err(crate::DesktopError::BackendUnavailable("down".to_string()))
             }
-            async fn click(&self, _w: Option<&str>, _at: crate::Point) -> Result<(), crate::DesktopError> {
+            async fn click(
+                &self,
+                _w: Option<&str>,
+                _at: crate::Point,
+            ) -> Result<(), crate::DesktopError> {
                 Err(crate::DesktopError::BackendUnavailable("down".to_string()))
             }
-            async fn type_text(&self, _w: Option<&str>, _t: &str) -> Result<(), crate::DesktopError> {
+            async fn type_text(
+                &self,
+                _w: Option<&str>,
+                _t: &str,
+            ) -> Result<(), crate::DesktopError> {
                 Err(crate::DesktopError::BackendUnavailable("down".to_string()))
             }
         }

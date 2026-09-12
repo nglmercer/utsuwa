@@ -80,6 +80,33 @@ pub enum RuntimeError {
     Tools(String),
 }
 
+/// User-visible state for the native Share Screen control. Capture and
+/// control are intentionally separate fields: starting a screen share never
+/// flips `control_enabled`, and control tools remain governed by their own
+/// DesktopControl capability tickets.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ScreenShareStatus {
+    pub available: bool,
+    pub backend: String,
+    pub sharing: bool,
+    pub paused: bool,
+    pub control_enabled: bool,
+    pub session_id: Option<String>,
+    pub target: Option<tool_desktop::CaptureTarget>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub displays: Vec<tool_desktop::DisplayInfo>,
+    pub windows: Vec<tool_desktop::WindowInfo>,
+}
+
+struct ScreenShareState {
+    backend: Arc<dyn tool_desktop::DesktopBackend>,
+    session_id: tool_desktop::CaptureSessionId,
+    target: tool_desktop::CaptureTarget,
+    paused: bool,
+    control_enabled: bool,
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Host-owned agent loop. Construct with [`AgentRuntime::start`], which
 /// returns an `Arc` because worker tasks and the dispatcher share it.
 pub struct AgentRuntime {
@@ -93,6 +120,9 @@ pub struct AgentRuntime {
     plugins: Arc<plugin_wasm::PluginRuntime>,
     memory: Mutex<Arc<memory::MemoryStore>>,
     desktop: Mutex<tool_desktop::plugin::DesktopPlugin>,
+    artifacts: Arc<artifact_core::InMemoryArtifactStore>,
+    computer_sessions: tool_desktop::ComputerSessionManager,
+    screen_share: Mutex<Option<ScreenShareState>>,
     storage: Option<Arc<Mutex<Storage>>>,
     autonomous_full_access: Arc<AtomicBool>,
     file_context: Arc<Mutex<ConversationFileContext>>,
@@ -169,6 +199,9 @@ impl AgentRuntime {
                     .map_err(|e| RuntimeError::Tools(e.to_string()))?,
             )),
             desktop: Mutex::new(Self::desktop_plugin()),
+            artifacts: Arc::new(artifact_core::InMemoryArtifactStore::new()),
+            computer_sessions: tool_desktop::ComputerSessionManager::new(),
+            screen_share: Mutex::new(None),
             storage,
             autonomous_full_access,
             file_context: Arc::new(Mutex::new(ConversationFileContext::default())),
@@ -210,30 +243,31 @@ impl AgentRuntime {
             self.resume_suspended_for_autonomous_access();
         }
     }
-    /// Desktop plugins installed on this host. The Linux X11 plugin
-    /// joins when a display answers; Windows UI Automation and macOS
-    /// AX are declared so their future crates drop in behind the same
-    /// ids (Phases 28–29). Activation picks the first available plugin
-    /// for this OS, else the capability-free stub.
+    /// Desktop plugins installed on this host. Linux prefers the native
+    /// ScreenCast/RemoteDesktop portal when a Wayland session is present;
+    /// its backend keeps Xwayland as an explicit legacy fallback. X11 is
+    /// still registered independently for X11-only sessions. Windows UI
+    /// Automation and macOS AX use the same registry and policy
+    /// boundary.
     fn desktop_plugin() -> tool_desktop::plugin::DesktopPlugin {
         use tool_desktop::plugin::{DesktopPlugin, DesktopPluginRegistry};
         let mut registry = DesktopPluginRegistry::new();
         #[cfg(target_os = "linux")]
+        if let Some(portal) = desktop_linux_wayland::plugin() {
+            registry.register(portal);
+        }
+        #[cfg(target_os = "linux")]
         if let Some(linux) = desktop_linux::plugin() {
             registry.register(linux);
         }
-        registry.register(DesktopPlugin::unimplemented(
-            "desktop.windows-uia",
-            "Windows UI Automation backend",
-            "windows",
-            "Planned Phase 28 backend: UI Automation element actions, Win32 capture, SendInput.",
-        ));
-        registry.register(DesktopPlugin::unimplemented(
-            "desktop.macos-ax",
-            "macOS Accessibility backend",
-            "macos",
-            "Planned Phase 29 backend: AX element actions, ScreenCaptureKit, CGEvent input.",
-        ));
+        #[cfg(target_os = "windows")]
+        if let Some(windows) = desktop_windows::plugin() {
+            registry.register(windows);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(macos) = desktop_macos::plugin() {
+            registry.register(macos);
+        }
         registry.select().unwrap_or_else(DesktopPlugin::stub)
     }
     /// The MCP server manager: configure servers here (or via the
@@ -280,6 +314,289 @@ impl AgentRuntime {
     pub fn set_desktop_plugin(&self, plugin: tool_desktop::plugin::DesktopPlugin) {
         if let Ok(mut slot) = self.desktop.lock() {
             *slot = plugin;
+        }
+    }
+
+    /// Shared expiring media store used by desktop tools and provider
+    /// adapters for this host process. It intentionally does not expose a
+    /// filesystem path or persist captures.
+    pub fn artifact_store(&self) -> Arc<dyn artifact_core::ArtifactStore> {
+        self.artifacts.clone()
+    }
+
+    pub fn computer_sessions(&self) -> tool_desktop::ComputerSessionManager {
+        self.computer_sessions.clone()
+    }
+
+    fn active_desktop_plugin(&self) -> Result<tool_desktop::plugin::DesktopPlugin, RuntimeError> {
+        self.desktop
+            .lock()
+            .map(|plugin| plugin.clone())
+            .map_err(|_| RuntimeError::Tools("desktop plugin lock failed".to_string()))
+    }
+
+    fn record_screen_share_audit(
+        &self,
+        capability: capability_core::Capability,
+        outcome: audit_core::AuditOutcome,
+        target: &tool_desktop::CaptureTarget,
+        detail: &str,
+    ) {
+        if let Some(sink) = &self.audit {
+            sink.record(audit_core::AuditRecord::now(
+                capability_core::Principal::User,
+                Some(capability),
+                Some(target.resource()),
+                outcome,
+                detail,
+            ));
+        }
+    }
+
+    fn emit_screen_share_changed(&self, status: &ScreenShareStatus) {
+        if let Ok(data) = serde_json::to_value(status) {
+            (self.emit)(HostEvent {
+                event: "desktop.share_screen.changed".to_string(),
+                data,
+            });
+        }
+    }
+
+    /// Start a user-initiated screen sharing session. This is the native UI
+    /// entry point; model-facing capture tools still need their own
+    /// ScreenCapture ticket when they request frames.
+    pub fn screen_share_start(
+        &self,
+        config: tool_desktop::CaptureConfig,
+    ) -> Result<ScreenShareStatus, RuntimeError> {
+        {
+            let state = self
+                .screen_share
+                .lock()
+                .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?;
+            if state.is_some() {
+                return Err(RuntimeError::Tools(
+                    "a screen-sharing session is already active".to_string(),
+                ));
+            }
+        }
+        let plugin = self.active_desktop_plugin()?;
+        if !plugin.is_available() {
+            return Err(RuntimeError::Tools(
+                "no available desktop backend can share the screen".to_string(),
+            ));
+        }
+        let target = config.target.clone();
+        let backend = plugin.backend.clone();
+        let session = self
+            .executor
+            .block_on(self.computer_sessions.start_capture(
+                backend.clone(),
+                config,
+                self.artifacts.clone(),
+            ))
+            .map_err(|error| RuntimeError::Tools(error.to_string()))?;
+        if let Err(error) = self.executor.block_on(backend.set_control_enabled(false)) {
+            let _ = self.executor.block_on(
+                self.computer_sessions
+                    .stop_capture(&tool_desktop::CaptureSessionId(session.id.0.clone())),
+            );
+            return Err(RuntimeError::Tools(format!(
+                "could not initialize the control gate: {error}"
+            )));
+        }
+        let started_at = session.started_at;
+        let state = ScreenShareState {
+            backend,
+            session_id: tool_desktop::CaptureSessionId(session.id.0.clone()),
+            target: target.clone(),
+            paused: false,
+            control_enabled: false,
+            started_at,
+        };
+        self.screen_share
+            .lock()
+            .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?
+            .replace(state);
+        self.record_screen_share_audit(
+            capability_core::Capability::ScreenCapture,
+            audit_core::AuditOutcome::Authorized,
+            &target,
+            "user started screen sharing",
+        );
+        let status = self.screen_share_status();
+        self.emit_screen_share_changed(&status);
+        Ok(status)
+    }
+
+    pub fn screen_share_stop(&self) -> Result<ScreenShareStatus, RuntimeError> {
+        let (session_id, target, backend) = {
+            let state = self
+                .screen_share
+                .lock()
+                .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?;
+            let Some(state) = state.as_ref() else {
+                let status = self.screen_share_status();
+                self.emit_screen_share_changed(&status);
+                return Ok(status);
+            };
+            (
+                state.session_id.clone(),
+                state.target.clone(),
+                state.backend.clone(),
+            )
+        };
+        self.executor
+            .block_on(self.computer_sessions.stop_capture(&session_id))
+            .map_err(|error| RuntimeError::Tools(error.to_string()))?;
+        let restore_result = self.executor.block_on(backend.set_control_enabled(true));
+        self.screen_share
+            .lock()
+            .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?
+            .take();
+        if let Err(error) = restore_result {
+            return Err(RuntimeError::Tools(format!(
+                "screen sharing stopped, but restoring desktop control failed: {error}"
+            )));
+        }
+        {
+            self.record_screen_share_audit(
+                capability_core::Capability::ScreenCapture,
+                audit_core::AuditOutcome::Executed,
+                &target,
+                "user stopped screen sharing",
+            );
+        }
+        let status = self.screen_share_status();
+        self.emit_screen_share_changed(&status);
+        Ok(status)
+    }
+
+    pub fn screen_share_pause(&self) -> Result<ScreenShareStatus, RuntimeError> {
+        let session_id = self
+            .screen_share
+            .lock()
+            .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Tools("no active screen-sharing session".to_string()))?
+            .session_id
+            .clone();
+        self.executor
+            .block_on(self.computer_sessions.set_paused(&session_id, true))
+            .map_err(|error| RuntimeError::Tools(error.to_string()))?;
+        if let Ok(mut state) = self.screen_share.lock() {
+            if let Some(state) = state.as_mut() {
+                state.paused = true;
+            }
+        }
+        let status = self.screen_share_status();
+        self.emit_screen_share_changed(&status);
+        Ok(status)
+    }
+
+    pub fn screen_share_resume(&self) -> Result<ScreenShareStatus, RuntimeError> {
+        let session_id = self
+            .screen_share
+            .lock()
+            .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Tools("no active screen-sharing session".to_string()))?
+            .session_id
+            .clone();
+        self.executor
+            .block_on(self.computer_sessions.set_paused(&session_id, false))
+            .map_err(|error| RuntimeError::Tools(error.to_string()))?;
+        if let Ok(mut state) = self.screen_share.lock() {
+            if let Some(state) = state.as_mut() {
+                state.paused = false;
+            }
+        }
+        let status = self.screen_share_status();
+        self.emit_screen_share_changed(&status);
+        Ok(status)
+    }
+
+    pub fn screen_share_set_control(
+        &self,
+        enabled: bool,
+    ) -> Result<ScreenShareStatus, RuntimeError> {
+        let (target, backend, session_id) = {
+            let state = self
+                .screen_share
+                .lock()
+                .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?;
+            let state = state.as_ref().ok_or_else(|| {
+                RuntimeError::Tools("no active screen-sharing session".to_string())
+            })?;
+            (
+                state.target.clone(),
+                state.backend.clone(),
+                state.session_id.clone(),
+            )
+        };
+        self.executor
+            .block_on(backend.set_control_enabled(enabled))
+            .map_err(|error| RuntimeError::Tools(error.to_string()))?;
+        self.executor
+            .block_on(
+                self.computer_sessions
+                    .set_control_enabled(&session_id, enabled),
+            )
+            .map_err(|error| RuntimeError::Tools(error.to_string()))?;
+        self.screen_share
+            .lock()
+            .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?
+            .as_mut()
+            .ok_or_else(|| RuntimeError::Tools("screen-sharing session ended".to_string()))?
+            .control_enabled = enabled;
+        self.record_screen_share_audit(
+            capability_core::Capability::DesktopControl,
+            audit_core::AuditOutcome::Authorized,
+            &target,
+            if enabled {
+                "user enabled desktop control separately from screen sharing"
+            } else {
+                "user disabled desktop control"
+            },
+        );
+        let status = self.screen_share_status();
+        self.emit_screen_share_changed(&status);
+        Ok(status)
+    }
+
+    pub fn screen_share_status(&self) -> ScreenShareStatus {
+        let plugin = self
+            .desktop
+            .lock()
+            .map(|plugin| plugin.clone())
+            .unwrap_or_else(|_| tool_desktop::plugin::DesktopPlugin::stub());
+        let displays = if plugin.is_available() {
+            self.executor
+                .block_on(plugin.backend.list_displays())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let windows = if plugin.is_available() {
+            self.executor
+                .block_on(plugin.backend.list_windows())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let state = self.screen_share.lock().ok();
+        let state = state.as_ref().and_then(|state| state.as_ref());
+        ScreenShareStatus {
+            available: plugin.is_available(),
+            backend: plugin.manifest.id,
+            sharing: state.is_some(),
+            paused: state.is_some_and(|state| state.paused),
+            control_enabled: state.is_some_and(|state| state.control_enabled),
+            session_id: state.map(|state| state.session_id.0.clone()),
+            target: state.map(|state| state.target.clone()),
+            started_at: state.map(|state| state.started_at),
+            displays,
+            windows,
         }
     }
     /// Build the per-turn [`ToolCatalog`]: static packs (system facts,
@@ -329,9 +646,11 @@ impl AgentRuntime {
             None => catalog,
         };
         match desktop {
-            Some(plugin) => catalog.with_pack(tool_desktop::DesktopToolPack::new(
+            Some(plugin) => catalog.with_pack(tool_desktop::DesktopToolPack::new_with_services(
                 plugin,
                 filesystem_desktop,
+                self.artifacts.clone(),
+                self.computer_sessions.clone(),
             )),
             None => catalog,
         }
@@ -1873,6 +2192,16 @@ mod tests {
 
     #[test]
     fn desktop_tools_join_the_turn_behind_policy() {
+        let observe_turn = vec![
+            ModelStreamEvent::ToolCall(ToolCall {
+                id: "o1".to_string(),
+                name: "desktop.accessibility_tree".to_string(),
+                arguments: serde_json::json!({"window_id": "w1"}).to_string(),
+            }),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ];
         let invoke_turn = vec![
             ModelStreamEvent::ToolCall(ToolCall {
                 id: "d1".to_string(),
@@ -1897,8 +2226,18 @@ mod tests {
             None,
             None,
         );
-        let provider = QueueProvider::new(vec![invoke_turn, text_turn("pressed")]);
-        let harness = harness_with(provider, vec![grant]);
+        let observe_grant = policy_core::GrantedScope::new(
+            capability_core::PrincipalKind::Agent,
+            capability_core::Capability::DesktopObserve,
+            capability_core::ResourceScope::new(vec![capability_core::Resource::Window(
+                "w1".to_string(),
+            )]),
+            policy_core::GrantLifetime::Persistent,
+            None,
+            None,
+        );
+        let provider = QueueProvider::new(vec![observe_turn, invoke_turn, text_turn("pressed")]);
+        let harness = harness_with(provider, vec![grant, observe_grant]);
 
         // With the stub backend the model never sees desktop tools; with a
         // backend installed they join the turn like any other tool source.
@@ -1921,9 +2260,10 @@ mod tests {
             .unwrap();
         let done = wait_for(&harness, "agent.turn_done");
         let executed = done.data["executed"].as_array().unwrap();
-        assert_eq!(executed.len(), 1, "{executed:?}");
-        assert_eq!(executed[0]["name"], "desktop.invoke_element");
-        assert_eq!(executed[0]["output"]["ok"], true);
+        assert_eq!(executed.len(), 2, "{executed:?}");
+        assert_eq!(executed[0]["name"], "desktop.accessibility_tree");
+        assert_eq!(executed[1]["name"], "desktop.invoke_element");
+        assert_eq!(executed[1]["output"]["ok"], true);
     }
 
     #[test]

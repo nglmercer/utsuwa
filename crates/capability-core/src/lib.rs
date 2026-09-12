@@ -135,6 +135,10 @@ pub enum Resource {
     },
     Application(String),
     Window(String),
+    /// A display/output selected for screen capture. Display identities are
+    /// matched exactly; a display grant never implicitly covers a window or
+    /// the whole desktop.
+    Display(String),
     /// A tool served by an MCP server. Matched exactly (server + tool):
     /// a grant for one MCP tool never covers another.
     McpTool {
@@ -220,6 +224,7 @@ fn scope_covers(scope: &Resource, resource: &Resource) -> bool {
         }
         (Resource::Application(s), Resource::Application(r)) => s == r,
         (Resource::Window(s), Resource::Window(r)) => s == r,
+        (Resource::Display(s), Resource::Display(r)) => s == r,
         (
             Resource::McpTool {
                 server: ss,

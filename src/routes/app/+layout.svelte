@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onNavigate } from '$app/navigation';
 	import PermissionDialog from '$lib/components/permissions/PermissionDialog.svelte';
+	import ScreenShareControl from '$lib/components/settings/ScreenShareControl.svelte';
 
 	let { children } = $props();
 
@@ -22,6 +23,7 @@
 
 <div class="app">
 	{@render children()}
+	<ScreenShareControl compact />
 	<PermissionDialog />
 </div>
 

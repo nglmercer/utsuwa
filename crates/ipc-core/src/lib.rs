@@ -54,6 +54,22 @@ pub enum IpcMethod {
     AudioCaptureStop,
     #[serde(rename = "audio_capture.cancel")]
     AudioCaptureCancel,
+    /// Explicit user-facing screen sharing controls. These never imply
+    /// DesktopControl; that capability remains independently authorized.
+    #[serde(rename = "desktop.share_screen.start")]
+    DesktopShareScreenStart,
+    #[serde(rename = "desktop.share_screen.pause")]
+    DesktopShareScreenPause,
+    #[serde(rename = "desktop.share_screen.resume")]
+    DesktopShareScreenResume,
+    #[serde(rename = "desktop.share_screen.stop")]
+    DesktopShareScreenStop,
+    #[serde(rename = "desktop.share_screen.status")]
+    DesktopShareScreenStatus,
+    #[serde(rename = "desktop.control.enable")]
+    DesktopControlEnable,
+    #[serde(rename = "desktop.control.disable")]
+    DesktopControlDisable,
     #[serde(rename = "activity.list")]
     ActivityList,
     #[serde(rename = "plugin.list")]

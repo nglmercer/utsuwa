@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+artifact-core.workspace = true
 thiserror.workspace = true
 tool-desktop.workspace = true
 

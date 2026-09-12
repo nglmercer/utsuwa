@@ -477,11 +477,9 @@ impl tool_core::Tool for ReadTool {
                 object.extend(metadata.clone());
             }
         }
-        Ok(ToolOutput {
-            content,
-            truncated: bytes.truncated,
-            mutation: None,
-        })
+        let mut output = ToolOutput::json(content);
+        output.truncated = bytes.truncated;
+        Ok(output)
     }
 }
 
@@ -546,11 +544,9 @@ impl tool_core::Tool for ReadRangeTool {
                 object.extend(metadata.clone());
             }
         }
-        Ok(ToolOutput {
-            content,
-            truncated: bytes.truncated,
-            mutation: None,
-        })
+        let mut output = ToolOutput::json(content);
+        output.truncated = bytes.truncated;
+        Ok(output)
     }
 }
 
@@ -658,15 +654,13 @@ impl tool_core::Tool for SearchTextTool {
         }
         let truncated = matches.len() > max_results;
         matches.truncate(max_results);
-        Ok(ToolOutput {
-            content: serde_json::json!({
-                "root": root.to_string_lossy(),
-                "pattern": pattern,
-                "matches": matches,
-            }),
-            truncated,
-            mutation: None,
-        })
+        let mut output = ToolOutput::json(serde_json::json!({
+            "root": root.to_string_lossy(),
+            "pattern": pattern,
+            "matches": matches,
+        }));
+        output.truncated = truncated;
+        Ok(output)
     }
 }
 
@@ -762,15 +756,13 @@ impl tool_core::Tool for GlobTool {
         paths.dedup();
         let truncated = paths.len() > max_results;
         paths.truncate(max_results);
-        Ok(ToolOutput {
-            content: serde_json::json!({
-                "root": root.to_string_lossy(),
-                "pattern": pattern,
-                "paths": paths,
-            }),
-            truncated,
-            mutation: None,
-        })
+        let mut output = ToolOutput::json(serde_json::json!({
+            "root": root.to_string_lossy(),
+            "pattern": pattern,
+            "paths": paths,
+        }));
+        output.truncated = truncated;
+        Ok(output)
     }
 }
 
@@ -1243,6 +1235,7 @@ mod tests {
                 principal,
                 invocation_id: invocation.clone(),
                 ticket: Some(ticket),
+                tickets: Vec::new(),
             },
             invocation,
         )

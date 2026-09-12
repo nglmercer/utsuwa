@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/agent-core",
+    "crates/artifact-core",
     "crates/app-host",
     "crates/audit-core",
     "crates/audio-capture",
@@ -21,6 +22,9 @@ members = [
     "crates/memory",
     "crates/tool-desktop",
     "crates/desktop-linux",
+    "crates/desktop-linux-wayland",
+    "crates/desktop-windows",
+    "crates/desktop-macos",
     "crates/tool-sdk",
     "crates/host-core",
     "crates/file-target",
@@ -35,12 +39,20 @@ license = "AGPL-3.0-or-later"
 [workspace.dependencies]
 agent-core = { path = "crates/agent-core" }
 async-trait = "0.1"
+artifact-core = { path = "crates/artifact-core" }
+base64 = "0.22"
+ashpd = "0.11.1"
+pipewire = "0.10.1"
+png = "0.18.1"
 audit-core = { path = "crates/audit-core" }
 audio-capture = { path = "crates/audio-capture" }
 desktop-linux = { path = "crates/desktop-linux" }
+desktop-linux-wayland = { path = "crates/desktop-linux-wayland" }
+desktop-windows = { path = "crates/desktop-windows" }
+desktop-macos = { path = "crates/desktop-macos" }
 bytes = "1"
 capability-core = { path = "crates/capability-core" }
-chrono = { version = "0.4", default-features = true }
+chrono = { version = "0.4", default-features = true, features = ["serde"] }
 futures-core = "0.3"
 futures-util = "0.3"
 file-target = { path = "crates/file-target" }
