@@ -10,5 +10,6 @@ atspi.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 tool-desktop.workspace = true
 uuid.workspace = true

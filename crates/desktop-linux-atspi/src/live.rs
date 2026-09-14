@@ -17,6 +17,11 @@ use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::zbus::names::BusName;
 use atspi::{AccessibilityConnection, CoordType, Role, StateSet};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+    Arc,
+};
+use std::time::{Duration, Instant};
 use tool_desktop::Rect;
 
 const ID_SCHEME: &str = "atspi://";
@@ -24,8 +29,193 @@ const ID_SCHEME: &str = "atspi://";
 const MAX_TEXT_READ: i32 = 4096;
 /// Longest action list kept per object.
 const MAX_ACTIONS: usize = 16;
-/// Probe timeout for [`is_available`] so boot never blocks on a dead bus.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Availability discovery is optional. Keep the probe short so a missing
+/// session bus never becomes a startup prerequisite.
+pub const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Cached state of the optional AT-SPI service. `Unknown` and `Probing` are
+/// deliberately unavailable to callers: semantic actions fail closed until
+/// the host has a positive answer from the registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Availability {
+    Unknown,
+    Probing,
+    Available,
+    Unavailable,
+}
+
+impl Availability {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Unknown => 0,
+            Self::Probing => 1,
+            Self::Available => 2,
+            Self::Unavailable => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Probing,
+            2 => Self::Available,
+            3 => Self::Unavailable,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Injectable probe seam. The real implementation is the only code that
+/// knows how to construct a Tokio runtime, and it is run exactly once by the
+/// service's dedicated probe worker. Tests can inject a counting, delayed, or
+/// deterministic implementation without requiring a session bus.
+pub trait AvailabilityProbe: Send + Sync {
+    fn probe(&self) -> bool;
+}
+
+impl<F> AvailabilityProbe for F
+where
+    F: Fn() -> bool + Send + Sync,
+{
+    fn probe(&self) -> bool {
+        self()
+    }
+}
+
+struct RealAvailabilityProbe;
+
+impl AvailabilityProbe for RealAvailabilityProbe {
+    fn probe(&self) -> bool {
+        let Some(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()
+        else {
+            return false;
+        };
+        runtime
+            .block_on(async {
+                tokio::time::timeout(PROBE_TIMEOUT, AccessibilityConnection::new())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            })
+            .is_some()
+    }
+}
+
+/// One host-owned AT-SPI availability service. Construction starts one
+/// bounded background probe; all subsequent `is_available()` calls are
+/// atomic reads and never touch D-Bus, spawn a thread, or create a runtime.
+#[derive(Clone)]
+pub struct AtspiService {
+    state: Arc<AtomicU8>,
+    probe_started: Arc<AtomicBool>,
+    probe: Arc<dyn AvailabilityProbe>,
+    last_probe_ms: Arc<AtomicU64>,
+    changes: tokio::sync::watch::Sender<Availability>,
+}
+
+impl std::fmt::Debug for AtspiService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AtspiService")
+            .field("availability", &self.availability())
+            .field(
+                "last_probe_ms",
+                &self
+                    .last_probe_duration()
+                    .map(|duration| duration.as_millis()),
+            )
+            .finish()
+    }
+}
+
+impl AtspiService {
+    pub fn new() -> Self {
+        let service = Self::with_probe(Arc::new(RealAvailabilityProbe));
+        service.start_probe();
+        service
+    }
+
+    /// Construct a service with an injectable probe. The caller must invoke
+    /// [`Self::start_probe`] explicitly so tests can assert the initial
+    /// `Unknown` state and deterministic probe count.
+    pub fn with_probe(probe: Arc<dyn AvailabilityProbe>) -> Self {
+        let (changes, _) = tokio::sync::watch::channel(Availability::Unknown);
+        Self {
+            state: Arc::new(AtomicU8::new(Availability::Unknown.as_u8())),
+            probe_started: Arc::new(AtomicBool::new(false)),
+            probe,
+            last_probe_ms: Arc::new(AtomicU64::new(0)),
+            changes,
+        }
+    }
+
+    /// Start the one-shot discovery task. Repeated calls are idempotent.
+    pub fn start_probe(&self) {
+        if self
+            .probe_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.state
+            .store(Availability::Probing.as_u8(), Ordering::Release);
+        let state = Arc::clone(&self.state);
+        let probe = Arc::clone(&self.probe);
+        let last_probe_ms = Arc::clone(&self.last_probe_ms);
+        let changes = self.changes.clone();
+        let worker = std::thread::Builder::new()
+            .name("utsuwa-atspi-probe".to_string())
+            .spawn(move || {
+                let started = Instant::now();
+                let availability = if probe.probe() {
+                    Availability::Available
+                } else {
+                    Availability::Unavailable
+                };
+                last_probe_ms.store(
+                    started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Release,
+                );
+                state.store(availability.as_u8(), Ordering::Release);
+                let _ = changes.send(availability);
+                tracing::debug!(
+                    available = availability == Availability::Available,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "AT-SPI availability probe complete"
+                );
+            });
+        if worker.is_err() {
+            self.state
+                .store(Availability::Unavailable.as_u8(), Ordering::Release);
+            let _ = self.changes.send(Availability::Unavailable);
+        }
+    }
+
+    pub fn availability(&self) -> Availability {
+        Availability::from_u8(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.availability() == Availability::Available
+    }
+
+    pub fn last_probe_duration(&self) -> Option<Duration> {
+        let millis = self.last_probe_ms.load(Ordering::Acquire);
+        (millis > 0).then(|| Duration::from_millis(millis))
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<Availability> {
+        self.changes.subscribe()
+    }
+}
+
+impl Default for AtspiService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 fn truncate(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
@@ -73,30 +263,12 @@ async fn proxy_for<'a>(
         .map_err(|detail| AtspiError::bus("proxy build", detail))
 }
 
-/// Cheap probe: true only when a registry answers. Runs on its own
-/// thread with a fresh runtime so sync plugin selection can call it from
-/// any executor context without panicking.
+/// Compatibility view for callers that do not yet carry a host service.
+/// This uses one process-wide cached service and therefore has the same
+/// non-blocking semantics as [`AtspiService::is_available`].
 pub fn is_available() -> bool {
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let reachable = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .ok()
-            .and_then(|runtime| {
-                runtime.block_on(async {
-                    tokio::time::timeout(PROBE_TIMEOUT, AccessibilityConnection::new())
-                        .await
-                        .ok()
-                        .and_then(|result| result.ok())
-                })
-            })
-            .is_some();
-        let _ = done_tx.send(reachable);
-    });
-    done_rx
-        .recv_timeout(PROBE_TIMEOUT + std::time::Duration::from_secs(2))
-        .unwrap_or(false)
+    static SERVICE: std::sync::OnceLock<AtspiService> = std::sync::OnceLock::new();
+    SERVICE.get_or_init(AtspiService::new).is_available()
 }
 
 struct Walker<'a> {
@@ -555,5 +727,60 @@ mod tests {
         assert!(parse_id("0x3400012").is_err());
         assert!(parse_id("atspi://").is_err());
         assert!(parse_id("atspi:///path-only").is_err());
+    }
+
+    #[test]
+    fn unavailable_service_does_not_block_construction() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+        let probe = Arc::new(move || {
+            probe_calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(2_000));
+            false
+        });
+        let service = AtspiService::with_probe(probe);
+        let started = Instant::now();
+        service.start_probe();
+        // Construction + probe kickoff return immediately; the slow probe
+        // runs on the background worker, never on the caller.
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(service.availability(), Availability::Probing);
+        assert!(!service.is_available());
+    }
+
+    #[test]
+    fn repeated_availability_checks_probe_exactly_once() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+        let probe = Arc::new(move || {
+            probe_calls.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+        let service = AtspiService::with_probe(probe);
+        service.start_probe();
+        service.start_probe();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while service.availability() == Availability::Probing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(service.is_available());
+        for _ in 0..100 {
+            let _ = service.is_available();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failing_probe_is_cached_unavailable() {
+        let service = AtspiService::with_probe(Arc::new(|| false));
+        service.start_probe();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while service.availability() == Availability::Probing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(service.availability(), Availability::Unavailable);
+        assert!(!service.is_available());
     }
 }

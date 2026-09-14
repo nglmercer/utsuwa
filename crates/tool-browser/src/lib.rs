@@ -434,6 +434,11 @@ impl CdpBackend {
         &self.endpoint
     }
 
+    /// Availability cache TTL. Repeated `tools()` / snapshot calls within
+    /// the window reuse the last probe instead of TCP-connecting again;
+    /// real browser use invalidates through [`CachedCdpBackend`].
+    pub const AVAILABILITY_TTL: Duration = Duration::from_secs(5);
+
     async fn targets(&self) -> Result<Vec<serde_json::Value>, BrowserError> {
         let response = self
             .http
@@ -2500,6 +2505,179 @@ impl Tool for BrowserCookiesDeleteTool {
 }
 
 /// Static browser tool group.
+/// CDP backend with cached availability. The first `is_available()` call
+/// performs the short TCP probe; later calls within
+/// [`CdpBackend::AVAILABILITY_TTL`] return the cached answer, so per-turn
+/// tool snapshots stay O(1). A successful real operation marks the backend
+/// available; a connection error marks it unavailable until the TTL lapses.
+#[derive(Debug)]
+pub struct CachedCdpBackend {
+    inner: CdpBackend,
+    cached: std::sync::Mutex<Option<(bool, std::time::Instant)>>,
+}
+
+impl CachedCdpBackend {
+    pub fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            inner: CdpBackend::new(endpoint),
+            cached: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        self.inner.endpoint()
+    }
+
+    /// Forget the cached probe so the next check re-probes (for example
+    /// after a connection error or explicit backend refresh).
+    pub fn invalidate(&self) {
+        if let Ok(mut slot) = self.cached.lock() {
+            *slot = None;
+        }
+    }
+
+    /// Record a successful browser operation without probing.
+    pub fn mark_available(&self) {
+        if let Ok(mut slot) = self.cached.lock() {
+            *slot = Some((true, std::time::Instant::now()));
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl BrowserBackend for CachedCdpBackend {
+    fn is_available(&self) -> bool {
+        if let Ok(slot) = self.cached.lock() {
+            if let Some((available, at)) = *slot {
+                if at.elapsed() < CdpBackend::AVAILABILITY_TTL {
+                    return available;
+                }
+            }
+        }
+        let available = self.inner.is_available();
+        if let Ok(mut slot) = self.cached.lock() {
+            *slot = Some((available, std::time::Instant::now()));
+        }
+        available
+    }
+
+    async fn status(&self) -> Result<serde_json::Value, BrowserError> {
+        let status = self.inner.status().await;
+        match &status {
+            Ok(_) => self.mark_available(),
+            Err(BrowserError::BackendUnavailable(_)) => self.invalidate(),
+            Err(_) => {}
+        }
+        status
+    }
+
+    async fn list_tabs(&self) -> Result<Vec<BrowserTab>, BrowserError> {
+        self.inner.list_tabs().await
+    }
+    async fn open(&self, url: &str) -> Result<BrowserTab, BrowserError> {
+        self.inner.open(url).await
+    }
+    async fn close_tab(&self, tab_id: &str) -> Result<(), BrowserError> {
+        self.inner.close_tab(tab_id).await
+    }
+    async fn navigate(&self, tab_id: &str, url: &str) -> Result<(), BrowserError> {
+        self.inner.navigate(tab_id, url).await
+    }
+    async fn back(&self, tab_id: &str) -> Result<(), BrowserError> {
+        self.inner.back(tab_id).await
+    }
+    async fn forward(&self, tab_id: &str) -> Result<(), BrowserError> {
+        self.inner.forward(tab_id).await
+    }
+    async fn reload(&self, tab_id: &str) -> Result<(), BrowserError> {
+        self.inner.reload(tab_id).await
+    }
+    async fn snapshot(
+        &self,
+        tab_id: &str,
+        since: Option<&str>,
+    ) -> Result<BrowserSnapshot, BrowserError> {
+        self.inner.snapshot(tab_id, since).await
+    }
+    async fn query(
+        &self,
+        tab_id: &str,
+        selector: &str,
+        limit: usize,
+    ) -> Result<Vec<BrowserNode>, BrowserError> {
+        self.inner.query(tab_id, selector, limit).await
+    }
+    async fn click(&self, tab_id: &str, node_id: &str) -> Result<(), BrowserError> {
+        self.inner.click(tab_id, node_id).await
+    }
+    async fn type_text(&self, tab_id: &str, node_id: &str, text: &str) -> Result<(), BrowserError> {
+        self.inner.type_text(tab_id, node_id, text).await
+    }
+    async fn set_value(
+        &self,
+        tab_id: &str,
+        node_id: &str,
+        value: &str,
+    ) -> Result<(), BrowserError> {
+        self.inner.set_value(tab_id, node_id, value).await
+    }
+    async fn select(
+        &self,
+        tab_id: &str,
+        node_id: &str,
+        values: &[String],
+    ) -> Result<(), BrowserError> {
+        self.inner.select(tab_id, node_id, values).await
+    }
+    async fn scroll(
+        &self,
+        tab_id: &str,
+        node_id: Option<&str>,
+        dx: i32,
+        dy: i32,
+    ) -> Result<(), BrowserError> {
+        self.inner.scroll(tab_id, node_id, dx, dy).await
+    }
+    async fn get_text(&self, tab_id: &str, node_id: Option<&str>) -> Result<String, BrowserError> {
+        self.inner.get_text(tab_id, node_id).await
+    }
+    async fn get_attribute(
+        &self,
+        tab_id: &str,
+        node_id: &str,
+        name: &str,
+    ) -> Result<Option<String>, BrowserError> {
+        self.inner.get_attribute(tab_id, node_id, name).await
+    }
+    async fn wait_for(
+        &self,
+        tab_id: &str,
+        selector: Option<&str>,
+        text: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<(), BrowserError> {
+        self.inner
+            .wait_for(tab_id, selector, text, timeout_ms)
+            .await
+    }
+    async fn screenshot(
+        &self,
+        tab_id: &str,
+        artifacts: &Arc<dyn ArtifactStore>,
+    ) -> Result<ImageArtifactRef, BrowserError> {
+        self.inner.screenshot(tab_id, artifacts).await
+    }
+    async fn cookies_list(&self, tab_id: &str) -> Result<Vec<BrowserCookie>, BrowserError> {
+        self.inner.cookies_list(tab_id).await
+    }
+    async fn cookies_set(&self, tab_id: &str, cookie: BrowserCookie) -> Result<(), BrowserError> {
+        self.inner.cookies_set(tab_id, cookie).await
+    }
+    async fn cookies_delete(&self, tab_id: &str, name: &str) -> Result<(), BrowserError> {
+        self.inner.cookies_delete(tab_id, name).await
+    }
+}
+
 pub struct BrowserToolPack {
     pub backend: Arc<dyn BrowserBackend>,
     pub artifacts: Arc<dyn ArtifactStore>,

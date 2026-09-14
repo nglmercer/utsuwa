@@ -8,6 +8,12 @@ use serde_json::Value;
 
 impl Dispatcher {
     pub(crate) fn camera_activity_status(&self) -> Result<Value, IpcErrorBody> {
+        if let Some(sensors) = self.sensors.as_ref() {
+            return serde_json::to_value(sensors.camera_status()).map_err(|error| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: error.to_string(),
+            });
+        }
         let runtime = self.agent.as_ref().ok_or_else(|| IpcErrorBody {
             code: ErrorCode::Internal,
             message: "agent runtime is not attached".to_string(),
@@ -19,6 +25,14 @@ impl Dispatcher {
     }
 
     pub(crate) fn microphone_activity_status(&self) -> Result<Value, IpcErrorBody> {
+        if let Some(sensors) = self.sensors.as_ref() {
+            return serde_json::to_value(sensors.microphone_status()).map_err(|error| {
+                IpcErrorBody {
+                    code: ErrorCode::Internal,
+                    message: error.to_string(),
+                }
+            });
+        }
         let runtime = self.agent.as_ref().ok_or_else(|| IpcErrorBody {
             code: ErrorCode::Internal,
             message: "agent runtime is not attached".to_string(),

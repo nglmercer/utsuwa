@@ -447,6 +447,7 @@ fn run_winit(
 /// Shared host startup: storage, audit, approvals, dispatcher, and the
 /// agent runtime. The UI runner (GTK or winit) takes over afterwards.
 fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
+    let boot_started = std::time::Instant::now();
     // SQLite state: settings KV + persistent grants. A host without
     // storage still runs — approvals go in-memory and every launch
     // re-prompts (fail-closed for authority, open for availability).
@@ -516,27 +517,32 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
     }
     let version = env!("CARGO_PKG_VERSION").to_string();
     let secrets = secret_core::system("utsuwa");
+    // Host-owned sensor hub: privacy indicators stay authoritative even if
+    // the agent runtime below fails to initialize (degraded mode). The
+    // runtime constructor attaches event publication on success; attach here
+    // only for the degraded path so events are never duplicated.
+    let sensors = Arc::new(app_host::runtime::SensorActivityHub::new());
     let mut dispatcher = Dispatcher::new(version)
         .with_approvals(Arc::clone(&approvals))
         .with_audit(Arc::clone(&audit))
+        .with_sensors(Arc::clone(&sensors))
         .with_secret_store(Arc::clone(&secrets));
-    let runtime = match app_host::runtime::AgentRuntime::start_with_secrets(
+    let runtime = match app_host::runtime::AgentRuntime::start_with_secrets_and_sensors(
         approvals,
         storage.clone(),
         Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
         Arc::clone(&emit),
         secrets,
+        Arc::clone(&sensors),
     ) {
         Ok(runtime) => Some(runtime),
         Err(err) => {
             tracing::error!(%err, "agent runtime unavailable; agent.* methods will fail");
+            sensors.attach_event_publisher(&emit);
             None
         }
     };
-    let audio_activity = runtime
-        .as_ref()
-        .map(|runtime| runtime.audio_activity_state())
-        .unwrap_or_else(tool_audio::AudioState::new);
+    let audio_activity = sensors.microphone();
     let audio_manager = Arc::new(app_host::audio::AudioCaptureManager::new(
         dispatcher.media_registry(),
         Arc::clone(&emit),
@@ -558,6 +564,10 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
         }
         dispatcher = dispatcher.with_agent(runtime);
     }
+    tracing::debug!(
+        elapsed_ms = boot_started.elapsed().as_millis() as u64,
+        "host.boot.ready"
+    );
     dispatcher
 }
 

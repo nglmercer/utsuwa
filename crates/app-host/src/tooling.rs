@@ -7,20 +7,19 @@
 //!   `system.time`).
 //! - [`ProcessToolPack`]: structured process execution (`process.spawn`,
 //!   `process.status`, `process.kill`).
-//! - Settings synchronization (`sync_mcp_from_settings`,
-//!   `discover_plugins_from_settings`): the composition root reads
-//!   settings into the extension managers. The leaf-crate sources
-//!   (`McpToolSource`, `PluginToolSource`, `MemoryToolPack`,
-//!   `DesktopToolPack`) only collect from already-configured managers —
-//!   app-host never learns how their tools are built.
+//! - Settings synchronization: the composition root reads settings into
+//!   the extension managers once per configuration generation (see
+//!   `AgentRuntime::sync_mcp_cached` / `discover_plugins_cached`). The
+//!   leaf-crate sources (`McpToolSource`, `PluginToolSource`,
+//!   `MemoryToolPack`, `DesktopToolPack`) only collect from
+//!   already-configured managers — app-host never learns how their tools
+//!   are built.
 //!
 //! The host filesystem surface arrives via `tool-filesystem-host`'s pack.
 
-use super::runtime::{SETTING_MCP_SERVERS, SETTING_PLUGIN_DIR};
 use host_core::HostEnvironment;
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
-use storage_core::Storage;
+use std::sync::Arc;
 use tool_sdk::{ToolLoadContext, ToolPack, TypedTool, TypedToolAdapter};
 
 /// Empty argument object shared by the system-fact tools. Deserializing
@@ -179,64 +178,5 @@ impl ToolPack for ProcessToolPack {
                 manager: Arc::clone(&self.manager),
             }),
         ]
-    }
-}
-
-/// Sync the MCP server set from settings into the manager. Runs before
-/// the catalog snapshot so installs take effect without a restart.
-/// Failures warn and keep the previous set; collection itself is the
-/// [`mcp_runtime::McpToolSource`]'s job.
-pub(crate) async fn sync_mcp_from_settings(
-    mcp: &mcp_runtime::McpManager,
-    storage: Option<&Arc<Mutex<Storage>>>,
-) {
-    let Some(storage) = storage else {
-        return;
-    };
-    let configs: Option<Vec<mcp_runtime::McpServerConfig>> = storage
-        .lock()
-        .ok()
-        .and_then(|store| store.get_setting(SETTING_MCP_SERVERS).ok())
-        .flatten()
-        .and_then(|value| {
-            serde_json::from_value(value)
-                .map_err(|e| {
-                    tracing::warn!(%e, "mcp.servers setting is not a server array; ignoring");
-                })
-                .ok()
-        });
-    if let Some(configs) = configs {
-        if let Err(e) = mcp.sync_configs(configs).await {
-            tracing::warn!(%e, "mcp settings sync failed");
-        }
-    }
-}
-
-/// Discover the configured plugin directory into the WASM runtime. Runs
-/// before the snapshot; collection itself is the
-/// [`plugin_wasm::PluginToolSource`]'s job.
-pub(crate) fn discover_plugins_from_settings(
-    plugins: &Arc<plugin_wasm::PluginRuntime>,
-    storage: Option<&Arc<Mutex<Storage>>>,
-) {
-    let Some(storage) = storage else {
-        return;
-    };
-    let dir: Option<String> = storage
-        .lock()
-        .ok()
-        .and_then(|store| store.get_setting(SETTING_PLUGIN_DIR).ok())
-        .flatten()
-        .and_then(|value| {
-            serde_json::from_value(value)
-                .map_err(|e| {
-                    tracing::warn!(%e, "plugin.dir setting is not a path string; ignoring");
-                })
-                .ok()
-        });
-    if let Some(dir) = dir {
-        if let Err(e) = plugins.discover_dir(std::path::Path::new(&dir)) {
-            tracing::warn!(dir = %dir, error = %e, "plugin discovery failed");
-        }
     }
 }

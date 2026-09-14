@@ -34,4 +34,7 @@ pub use snapshot::{
 };
 
 #[cfg(target_os = "linux")]
-pub use backend::plugin;
+pub use backend::{plugin, plugin_with_service};
+
+#[cfg(target_os = "linux")]
+pub use live::{AtspiService, Availability, AvailabilityProbe, PROBE_TIMEOUT};

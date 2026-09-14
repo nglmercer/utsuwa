@@ -22,6 +22,7 @@ pub struct Dispatcher {
     pub(crate) media_registry: Arc<crate::audio::MediaRegistry>,
     pub(crate) approvals: Option<Arc<Mutex<ApprovalQueue>>>,
     pub(crate) agent: Option<Arc<AgentRuntime>>,
+    pub(crate) sensors: Option<Arc<crate::runtime::SensorActivityHub>>,
     pub(crate) storage: Option<Arc<Mutex<storage_core::Storage>>>,
     pub(crate) audit: Option<Arc<audit_core::InMemorySink>>,
     pub(crate) secrets: Option<Arc<dyn secret_core::SecretStore>>,
@@ -35,6 +36,7 @@ impl Clone for Dispatcher {
             media_registry: self.media_registry.clone(),
             approvals: self.approvals.clone(),
             agent: self.agent.clone(),
+            sensors: self.sensors.clone(),
             storage: self.storage.clone(),
             audit: self.audit.clone(),
             secrets: self.secrets.clone(),
@@ -50,6 +52,7 @@ impl Dispatcher {
             media_registry: Arc::new(crate::audio::MediaRegistry::new()),
             approvals: None,
             agent: None,
+            sensors: None,
             storage: None,
             audit: None,
             secrets: None,
@@ -66,6 +69,14 @@ impl Dispatcher {
     /// Attach the live agent runtime (`agent.send_message` / `agent.cancel`).
     pub fn with_agent(mut self, agent: Arc<AgentRuntime>) -> Self {
         self.agent = Some(agent);
+        self
+    }
+
+    /// Attach the host-owned sensor hub. Privacy indicators read from here
+    /// first so they stay authoritative even when the agent runtime failed
+    /// to initialize (degraded mode).
+    pub fn with_sensors(mut self, sensors: Arc<crate::runtime::SensorActivityHub>) -> Self {
+        self.sensors = Some(sensors);
         self
     }
 
@@ -136,21 +147,59 @@ impl Dispatcher {
 
         if request.method == IpcMethod::ProvidersFetchModels {
             let dispatcher = self.clone();
+            let reply_id = request.id.clone();
+            // Run off the UI/IPC callback thread on a dedicated worker so a
+            // slow provider cannot freeze the app. The worker is a plain OS
+            // thread outside every Tokio runtime, so entering an executor
+            // here can never nest inside a Tokio worker.
             std::thread::spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| IpcErrorBody {
-                        code: ipc_core::ErrorCode::Internal,
-                        message: format!("could not start native model fetch: {error}"),
-                    })
-                    .and_then(|runtime| {
-                        runtime.block_on(dispatcher.fetch_provider_models(&request))
-                    });
-                callback(dispatcher.reply_script_for(&request.id, result));
+                let owned = request;
+                let result = dispatcher.block_on_async(move |dispatcher| async move {
+                    dispatcher.fetch_provider_models(&owned).await
+                });
+                callback(dispatcher.reply_script_for(&reply_id, result));
             });
         } else {
             callback(self.reply_script(&request));
+        }
+    }
+
+    /// Drive one async dispatcher future from a synchronous IPC worker
+    /// thread. Prefers the agent executor handle when attached (no extra
+    /// runtime); otherwise builds a throwaway current-thread runtime for
+    /// this thread only. Must only be called from non-Tokio threads — IPC
+    /// workers satisfy that by construction.
+    fn block_on_async<F, Fut>(&self, run: F) -> Result<Value, IpcErrorBody>
+    where
+        F: FnOnce(Self) -> Fut,
+        Fut: std::future::Future<Output = Result<Value, IpcErrorBody>>,
+    {
+        debug_assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "async IPC work must not block a Tokio worker"
+        );
+        let dispatcher = self.clone();
+        if let Some(agent) = &self.agent {
+            agent.executor_handle().block_on(run(dispatcher))
+        } else {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| IpcErrorBody {
+                    code: ipc_core::ErrorCode::Internal,
+                    message: format!("could not start native model fetch: {error}"),
+                })?;
+            runtime.block_on(run(dispatcher))
+        }
+    }
+
+    /// Async dispatch entry point for hosts that already run on an executor.
+    /// Awaits async methods directly instead of bridging through `block_on`,
+    /// so agent-worker callers can reuse this without nesting runtimes.
+    pub async fn dispatch_async(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
+        match request.method {
+            IpcMethod::ProvidersFetchModels => self.fetch_provider_models(request).await,
+            _ => self.dispatch(request),
         }
     }
 
@@ -314,6 +363,22 @@ mod tests {
             .unwrap();
         assert!(script.contains("__resolve(\"3\", false"), "{script}");
         assert!(script.contains("agent runtime is not attached"), "{script}");
+    }
+
+    #[test]
+    fn sensor_status_served_from_host_hub_without_agent_runtime() {
+        // Degraded mode: privacy indicators stay authoritative from the
+        // host-owned hub even when AgentRuntime failed to initialize.
+        let sensors = Arc::new(crate::runtime::SensorActivityHub::new());
+        let dispatcher = dispatcher().with_sensors(sensors);
+        let script = dispatcher
+            .handle_message(r#"{"id":"20","method":"camera.activity.status","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"20\", true"), "{script}");
+        let script = dispatcher
+            .handle_message(r#"{"id":"21","method":"microphone.activity.status","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"21\", true"), "{script}");
     }
 
     #[test]

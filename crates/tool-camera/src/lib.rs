@@ -37,13 +37,24 @@ pub struct CameraActivityState {
     pub started_at: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CameraState {
     active: Arc<std::sync::atomic::AtomicBool>,
     sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, CameraSession>>>,
     activity_sessions: Arc<std::sync::Mutex<BTreeMap<String, CameraActivitySession>>>,
     activity: Arc<std::sync::RwLock<CameraActivityState>>,
     activity_changes: tokio::sync::watch::Sender<CameraActivityState>,
+    listeners: Arc<std::sync::Mutex<Vec<CameraActivityListener>>>,
+}
+
+type CameraActivityListener = Arc<dyn Fn(CameraActivityState) + Send + Sync + 'static>;
+
+impl std::fmt::Debug for CameraState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CameraState")
+            .field("activity", &self.activity_state())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +98,20 @@ impl CameraState {
     /// poll the model-facing `camera.status` tool.
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<CameraActivityState> {
         self.activity_changes.subscribe()
+    }
+
+    /// Register a synchronous host-owned event listener. This is deliberately
+    /// independent of the agent executor: native capture can update privacy
+    /// UI even when AgentRuntime failed to initialize.
+    pub fn add_activity_listener<F>(&self, listener: F)
+    where
+        F: Fn(CameraActivityState) + Send + Sync + 'static,
+    {
+        let listener: CameraActivityListener = Arc::new(listener);
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.push(Arc::clone(&listener));
+        }
+        listener(self.activity_state());
     }
 
     pub fn activity_state(&self) -> CameraActivityState {
@@ -146,7 +171,16 @@ impl CameraState {
         if let Ok(mut current) = self.activity.write() {
             *current = state.clone();
         }
-        let _ = self.activity_changes.send(state);
+        let _ = self.activity_changes.send(state.clone());
+        let listeners = self
+            .listeners
+            .lock()
+            .map(|listeners| listeners.clone())
+            .unwrap_or_default();
+        for listener in listeners {
+            let state = state.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(state)));
+        }
     }
 }
 
@@ -159,6 +193,7 @@ impl Default for CameraState {
             activity_sessions: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             activity: Arc::new(std::sync::RwLock::new(CameraActivityState::default())),
             activity_changes,
+            listeners: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -377,19 +412,22 @@ impl Tool for CameraCapturePhotoTool {
         let photo =
             match tokio::task::spawn_blocking(move || backend.capture_photo(&camera_id, max_width))
                 .await
-                .map_err(|error| {
-                    ToolError::structured(
+            {
+                Ok(Ok(photo)) => photo,
+                Ok(Err(error)) => {
+                    state.end_activity(&activity_id);
+                    return Err(camera_error("camera.capture_photo", error));
+                }
+                Err(join_error) => {
+                    // The blocking worker died or was cancelled: the device
+                    // state is unknown, so clear the activity marker instead
+                    // of leaving a stale privacy indicator.
+                    state.end_activity(&activity_id);
+                    return Err(ToolError::structured(
                         "camera.capture_photo",
                         "action_failed",
-                        error.to_string(),
-                    )
-                })?
-                .map_err(|error| camera_error("camera.capture_photo", error))
-            {
-                Ok(photo) => photo,
-                Err(error) => {
-                    state.end_activity(&activity_id);
-                    return Err(error);
+                        format!("camera worker failed: {join_error}"),
+                    ));
                 }
             };
         // The native snapshot device is closed when the backend call returns;
@@ -533,23 +571,26 @@ impl Tool for CameraCaptureFrameTool {
         let photo =
             match tokio::task::spawn_blocking(move || backend.capture_photo(&camera_id, max_width))
                 .await
-                .map_err(|error| {
-                    ToolError::structured(
-                        "camera.capture_frame",
-                        "action_failed",
-                        error.to_string(),
-                    )
-                })?
-                .map_err(|error| camera_error("camera.capture_frame", error))
             {
-                Ok(photo) => photo,
-                Err(error) => {
+                Ok(Ok(photo)) => photo,
+                Ok(Err(error)) => {
                     // A failed backend capture means the logical camera session
                     // is no longer trustworthy. Tear down exactly this session
                     // so the human indicator cannot remain stale.
                     state.sessions.lock().await.remove(&session_id);
                     state.end_activity(&session_id);
-                    return Err(error);
+                    return Err(camera_error("camera.capture_frame", error));
+                }
+                Err(join_error) => {
+                    // Abnormal worker termination: the device state cannot be
+                    // trusted, so invalidate exactly this logical session.
+                    state.sessions.lock().await.remove(&session_id);
+                    state.end_activity(&session_id);
+                    return Err(ToolError::structured(
+                        "camera.capture_frame",
+                        "action_failed",
+                        format!("camera worker failed: {join_error}"),
+                    ));
                 }
             };
         // Frames belong to their session: stopping this session deletes

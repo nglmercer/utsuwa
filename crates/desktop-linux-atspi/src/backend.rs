@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::live;
+use super::live::{self, AtspiService};
 use super::snapshot::{flatten_window_tree, AtspiError};
 use tool_desktop::plugin::{DesktopCapability, DesktopPlugin, DesktopPluginManifest};
 use tool_desktop::{
@@ -31,18 +31,32 @@ fn describe(error: AtspiError) -> DesktopError {
     }
 }
 
-#[derive(Debug, Default)]
-struct AtspiBackend;
+#[derive(Debug, Clone)]
+struct AtspiBackend {
+    service: AtspiService,
+}
+
+impl AtspiBackend {
+    fn ensure_available(&self, operation: &str) -> Result<(), DesktopError> {
+        if self.service.is_available() {
+            Ok(())
+        } else {
+            Err(DesktopError::BackendUnavailable(format!(
+                "AT-SPI is not available for {operation} (state: {:?})",
+                self.service.availability()
+            )))
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl DesktopBackend for AtspiBackend {
     fn is_available(&self) -> bool {
-        // Cached per call site by the host registry; the probe itself is
-        // a bounded D-Bus handshake on a helper thread.
-        live::is_available()
+        self.service.is_available()
     }
 
     async fn list_windows(&self) -> Result<Vec<WindowInfo>, DesktopError> {
+        self.ensure_available("window enumeration")?;
         let trees = live::collect_window_trees().await.map_err(describe)?;
         Ok(trees
             .iter()
@@ -55,6 +69,7 @@ impl DesktopBackend for AtspiBackend {
     }
 
     async fn accessibility_tree(&self, window_id: &str) -> Result<Vec<ElementNode>, DesktopError> {
+        self.ensure_available("accessibility tree")?;
         let trees = live::collect_window_trees().await.map_err(describe)?;
         let tree = trees
             .iter()
@@ -68,6 +83,7 @@ impl DesktopBackend for AtspiBackend {
         window_id: &str,
         _since: Option<&str>,
     ) -> Result<AccessibilitySnapshot, DesktopError> {
+        self.ensure_available("accessibility snapshot")?;
         let nodes = self.accessibility_tree(window_id).await?;
         let focused = nodes
             .iter()
@@ -84,6 +100,7 @@ impl DesktopBackend for AtspiBackend {
     }
 
     async fn invoke_element(&self, _window_id: &str, element_id: &str) -> Result<(), DesktopError> {
+        self.ensure_available("element invocation")?;
         live::invoke_element(element_id)
             .await
             .map_err(|error| match error {
@@ -93,6 +110,7 @@ impl DesktopBackend for AtspiBackend {
     }
 
     async fn focus_element(&self, _window_id: &str, element_id: &str) -> Result<(), DesktopError> {
+        self.ensure_available("element focus")?;
         live::focus_element(element_id)
             .await
             .map_err(|error| match error {
@@ -107,6 +125,7 @@ impl DesktopBackend for AtspiBackend {
         element_id: &str,
         value: &str,
     ) -> Result<(), DesktopError> {
+        self.ensure_available("semantic value setting")?;
         live::set_value(element_id, value)
             .await
             .map_err(|error| match error {
@@ -116,10 +135,12 @@ impl DesktopBackend for AtspiBackend {
     }
 
     async fn select_element(&self, _window_id: &str, element_id: &str) -> Result<(), DesktopError> {
+        self.ensure_available("semantic selection")?;
         live::select_element(element_id).await.map_err(describe)
     }
 
     async fn expand_element(&self, _window_id: &str, element_id: &str) -> Result<(), DesktopError> {
+        self.ensure_available("semantic expansion")?;
         live::expand_element(element_id, true)
             .await
             .map_err(describe)
@@ -130,12 +151,14 @@ impl DesktopBackend for AtspiBackend {
         _window_id: &str,
         element_id: &str,
     ) -> Result<(), DesktopError> {
+        self.ensure_available("semantic collapse")?;
         live::expand_element(element_id, false)
             .await
             .map_err(describe)
     }
 
     async fn focus_window(&self, window_id: &str) -> Result<(), DesktopError> {
+        self.ensure_available("window focus")?;
         live::focus_element(window_id)
             .await
             .map_err(|error| match error {
@@ -195,14 +218,12 @@ impl DesktopBackend for AtspiBackend {
     }
 }
 
-/// Native AT-SPI semantic plugin, if the session bus answers. Returns
-/// `None` (so the host falls through to X11/portal backends) when no
-/// registry is reachable.
-pub fn plugin() -> Option<DesktopPlugin> {
-    if !live::is_available() {
-        return None;
-    }
-    Some(DesktopPlugin::new(
+/// Build the native AT-SPI semantic plugin over a shared host service. The
+/// plugin is registered while the service is still `Unknown`/`Probing`; its
+/// availability gate stays fail-closed until the one background probe says
+/// the registry answers.
+pub fn plugin_with_service(service: AtspiService) -> DesktopPlugin {
+    DesktopPlugin::new(
         DesktopPluginManifest {
             id: "desktop.linux-atspi".to_string(),
             name: "Linux AT-SPI semantic backend".to_string(),
@@ -223,8 +244,15 @@ pub fn plugin() -> Option<DesktopPlugin> {
             description: "Native AT-SPI2/D-Bus accessibility trees and element actions; capture and raw input stay with the portal backend."
                 .to_string(),
         },
-        Arc::new(AtspiBackend),
-    ))
+        Arc::new(AtspiBackend { service }),
+    )
+}
+
+/// Compatibility constructor for non-host callers. Host composition should
+/// use [`plugin_with_service`] so Wayland and standalone registration share
+/// one probe.
+pub fn plugin() -> Option<DesktopPlugin> {
+    Some(plugin_with_service(AtspiService::new()))
 }
 
 #[cfg(test)]

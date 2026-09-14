@@ -37,7 +37,10 @@ pub struct AudioState {
     activity_sessions: Arc<std::sync::Mutex<BTreeMap<String, ActivitySession>>>,
     activity: Arc<std::sync::RwLock<MicrophoneActivityState>>,
     activity_changes: tokio::sync::watch::Sender<MicrophoneActivityState>,
+    listeners: Arc<std::sync::Mutex<Vec<MicrophoneActivityListener>>>,
 }
+
+type MicrophoneActivityListener = Arc<dyn Fn(MicrophoneActivityState) + Send + Sync + 'static>;
 
 struct AudioSession {
     device: String,
@@ -61,6 +64,7 @@ impl Default for AudioState {
             activity_sessions: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             activity: Arc::new(std::sync::RwLock::new(MicrophoneActivityState::default())),
             activity_changes,
+            listeners: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 }
@@ -76,6 +80,19 @@ impl AudioState {
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<MicrophoneActivityState> {
         self.activity_changes.subscribe()
+    }
+
+    /// Register a synchronous host-owned event listener. Privacy UI does not
+    /// depend on AgentRuntime or on an async publisher task being healthy.
+    pub fn add_activity_listener<F>(&self, listener: F)
+    where
+        F: Fn(MicrophoneActivityState) + Send + Sync + 'static,
+    {
+        let listener: MicrophoneActivityListener = Arc::new(listener);
+        if let Ok(mut listeners) = self.listeners.lock() {
+            listeners.push(Arc::clone(&listener));
+        }
+        listener(self.activity_state());
     }
 
     pub fn activity_state(&self) -> MicrophoneActivityState {
@@ -153,7 +170,16 @@ impl AudioState {
         if let Ok(mut current) = self.activity.write() {
             *current = state.clone();
         }
-        let _ = self.activity_changes.send(state);
+        let _ = self.activity_changes.send(state.clone());
+        let listeners = self
+            .listeners
+            .lock()
+            .map(|listeners| listeners.clone())
+            .unwrap_or_default();
+        for listener in listeners {
+            let state = state.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(state)));
+        }
     }
 
     /// Reap workers that stopped themselves (silence, max duration,

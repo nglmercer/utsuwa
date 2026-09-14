@@ -33,7 +33,11 @@ mod linux {
     /// A portal-backed backend is meaningful only in a Wayland session. The
     /// actual portal is still probed when a capture session is started; a
     /// compositor is allowed to reject the request or require a fresh choice.
-    pub fn plugin() -> Option<DesktopPlugin> {
+    /// The AT-SPI service is supplied by the host so semantic availability is
+    /// discovered once and shared with the standalone semantic plugin.
+    pub fn plugin_with_atspi(
+        atspi_service: desktop_linux_atspi::live::AtspiService,
+    ) -> Option<DesktopPlugin> {
         std::env::var_os("WAYLAND_DISPLAY")?;
 
         let x11_plugin = desktop_linux::plugin();
@@ -41,8 +45,8 @@ mod linux {
         // Native AT-SPI semantics win over Xwayland inference whenever the
         // registry answers; X11 stays as the legacy fallback. Ids carry
         // their backend (`atspi://…` vs hex), so routing stays exact.
-        let atspi_plugin = desktop_linux_atspi::plugin();
-        let atspi = atspi_plugin.as_ref().map(|plugin| plugin.backend.clone());
+        let atspi_plugin = desktop_linux_atspi::plugin_with_service(atspi_service);
+        let atspi = Some(atspi_plugin.backend.clone());
         let mut capabilities = vec![
             DesktopCapability::Screenshot,
             DesktopCapability::CaptureStart,
@@ -61,19 +65,19 @@ mod linux {
             DesktopCapability::Hotkey,
             DesktopCapability::PressKey,
         ];
-        if let Some(x11_plugin) = x11_plugin {
+        if x11_plugin.is_some() {
             capabilities.push(DesktopCapability::ListDisplays);
-            for capability in x11_plugin.manifest.capabilities {
-                if !capabilities.contains(&capability) {
-                    capabilities.push(capability);
+            if let Some(x11_plugin) = &x11_plugin {
+                for capability in &x11_plugin.manifest.capabilities {
+                    if !capabilities.contains(capability) {
+                        capabilities.push(*capability);
+                    }
                 }
             }
         }
-        if let Some(atspi_plugin) = atspi_plugin {
-            for capability in atspi_plugin.manifest.capabilities {
-                if !capabilities.contains(&capability) {
-                    capabilities.push(capability);
-                }
+        for capability in &atspi_plugin.manifest.capabilities {
+            if !capabilities.contains(capability) {
+                capabilities.push(*capability);
             }
         }
 
@@ -93,6 +97,12 @@ mod linux {
                 control_enabled: Arc::new(AtomicBool::new(true)),
             }),
         ))
+    }
+
+    /// Compatibility constructor. The host should prefer
+    /// [`plugin_with_atspi`] to avoid duplicate AT-SPI discovery.
+    pub fn plugin() -> Option<DesktopPlugin> {
+        plugin_with_atspi(desktop_linux_atspi::live::AtspiService::new())
     }
 
     struct PortalRemoteDesktop {
@@ -1342,7 +1352,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::plugin;
+pub use linux::{plugin, plugin_with_atspi};
 
 #[cfg(not(target_os = "linux"))]
 pub fn plugin() -> Option<tool_desktop::plugin::DesktopPlugin> {

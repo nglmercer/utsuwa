@@ -50,6 +50,41 @@ pub(crate) fn read_cdp_endpoint(storage: Option<&Arc<Mutex<Storage>>>) -> String
     endpoint
 }
 
+pub(crate) fn read_mcp_configs(
+    storage: Option<&Arc<Mutex<Storage>>>,
+) -> Option<Vec<mcp_runtime::McpServerConfig>> {
+    let storage = storage?;
+    storage
+        .lock()
+        .ok()
+        .and_then(|store| store.get_setting(SETTING_MCP_SERVERS).ok())
+        .flatten()
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| {
+                    tracing::warn!(%error, "mcp.servers setting is not a server array; ignoring");
+                })
+                .ok()
+        })
+}
+
+pub(crate) fn read_plugin_dir(storage: Option<&Arc<Mutex<Storage>>>) -> Option<Option<String>> {
+    let storage = storage?;
+    let dir: Option<String> = storage
+        .lock()
+        .ok()
+        .and_then(|store| store.get_setting(SETTING_PLUGIN_DIR).ok())
+        .flatten()
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|error| {
+                    tracing::warn!(%error, "plugin.dir setting is not a path string; ignoring");
+                })
+                .ok()
+        });
+    Some(dir)
+}
+
 pub use tool_sdk::ToolProfile;
 
 pub fn tool_profile_for_provider(provider: Option<&str>) -> ToolProfile {

@@ -203,16 +203,32 @@ impl AudioCaptureManager {
             .map_err(|_| AudioError::Worker("audio capture lock poisoned".to_string()))?;
         let info = capture.start(config, callback)?;
         drop(capture);
-        *self
-            .active_id
-            .lock()
-            .map_err(|_| AudioError::Worker("audio capture lock poisoned".to_string()))? =
-            Some(capture_id.clone());
-        self.activity.begin_external_session(
-            capture_id.clone(),
-            info.device.clone(),
-            unix_millis(),
-        );
+        // Transactional registration: the native stream is already open, so
+        // any bookkeeping failure must stop it immediately rather than leave
+        // a live microphone without a privacy marker.
+        let registration = (|| -> Result<(), AudioError> {
+            *self
+                .active_id
+                .lock()
+                .map_err(|_| AudioError::Worker("audio capture lock poisoned".to_string()))? =
+                Some(capture_id.clone());
+            self.activity.begin_external_session(
+                capture_id.clone(),
+                info.device.clone(),
+                unix_millis(),
+            );
+            Ok(())
+        })();
+        if let Err(error) = registration {
+            if let Ok(mut capture) = self.capture.lock() {
+                capture.cancel();
+            }
+            self.activity.end_session(&capture_id);
+            if let Ok(mut active_id) = self.active_id.lock() {
+                *active_id = None;
+            }
+            return Err(error);
+        }
         // A very short native capture can finish between `start` returning
         // and the shared activity registration. Reap once at the boundary
         // so the persistent indicator cannot be left on by that race.
