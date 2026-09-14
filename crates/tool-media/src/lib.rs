@@ -92,10 +92,62 @@ fn require_ffmpeg(tool: &str) -> Result<(), ToolError> {
     }
 }
 
-fn run_ffmpeg(tool: &str, argv: &[&str]) -> Result<Vec<u8>, ToolError> {
-    let mut child = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin"])
+/// Security/performance bounds for one child process. Stdout carries
+/// generated media (frames, waveforms); stderr is diagnostics only.
+const FFMPEG_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const FFMPEG_MAX_STDERR_BYTES: usize = 64 * 1024;
+
+#[derive(Debug)]
+struct ProcessOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DrainError {
+    /// The pipe produced more than the caller's byte limit: fail instead
+    /// of buffering unboundedly.
+    TooLarge,
+    Io(String),
+}
+
+/// Drain one pipe to a hard byte cap. Pure over `Read`, so tests drive it
+/// without spawning processes.
+fn drain_capped<R: std::io::Read>(mut pipe: R, limit: usize) -> Result<Vec<u8>, DrainError> {
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 32 * 1024];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Ok(out),
+            Ok(read) => {
+                if out.len().saturating_add(read) > limit {
+                    return Err(DrainError::TooLarge);
+                }
+                out.extend_from_slice(&buffer[..read]);
+            }
+            Err(error) => return Err(DrainError::Io(error.to_string())),
+        }
+    }
+}
+
+/// Run one child with concurrently drained pipes, a hard timeout, and
+/// hard output caps. Reader threads start BEFORE waiting, so a child
+/// that fills the OS pipe buffer can never deadlock the host; timeout
+/// or overflow kills and reaps the child before returning.
+fn run_process(
+    tool: &str,
+    program: &str,
+    base_args: &[&str],
+    argv: &[&str],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+) -> Result<ProcessOutput, ToolError> {
+    let mut child = std::process::Command::new(program)
+        .args(base_args)
         .args(argv)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -103,21 +155,85 @@ fn run_ffmpeg(tool: &str, argv: &[&str]) -> Result<Vec<u8>, ToolError> {
             failed(
                 tool,
                 "backend_unavailable",
-                format!("cannot run ffmpeg: {error}"),
+                format!("cannot run {program}: {error}"),
             )
         })?;
-    let output = match child.wait_with_output_timeout() {
-        Some(output) => output.map_err(|error| failed(tool, "action_failed", error.to_string()))?,
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_reader =
+        std::thread::spawn(move || stdout.map(|pipe| drain_capped(pipe, max_stdout_bytes)));
+    let stderr_reader =
+        std::thread::spawn(move || stderr.map(|pipe| drain_capped(pipe, max_stderr_bytes)));
+    // Poll for exit; kill and reap on timeout. The readers keep draining
+    // either way, so the child can never wedge on a full pipe.
+    let deadline = std::time::Instant::now() + timeout;
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(exit)) => {
+                status = Some(exit);
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(failed(tool, "action_failed", error.to_string()));
+            }
+        }
+    }
+    let status = match status {
+        Some(status) => status,
         None => {
             let _ = child.kill();
+            // Reap: the thread join below cannot complete while the child
+            // is a zombie, and `wait` reaps it deterministically.
             let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
             return Err(failed(
                 tool,
                 "action_failed",
-                format!("ffmpeg timed out after {}s", FFMPEG_TIMEOUT.as_secs()),
+                format!("{program} timed out after {}s", timeout.as_secs()),
             ));
         }
     };
+    // The child exited; its pipes are at EOF, so these joins terminate.
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| failed(tool, "action_failed", "stdout reader failed".to_string()))?
+        .unwrap_or(Ok(Vec::new()))
+        .map_err(|drain| match drain {
+            DrainError::TooLarge => ToolError::structured_with_details(
+                tool,
+                "response_too_large",
+                format!("{program} output exceeds the {max_stdout_bytes}-byte limit"),
+                serde_json::json!({ "limit_bytes": max_stdout_bytes }),
+            ),
+            DrainError::Io(error) => failed(tool, "action_failed", error),
+        })?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| failed(tool, "action_failed", "stderr reader failed".to_string()))?
+        .unwrap_or(Ok(Vec::new()))
+        .unwrap_or_default();
+    Ok(ProcessOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn run_ffmpeg(tool: &str, argv: &[&str]) -> Result<Vec<u8>, ToolError> {
+    let output = run_process(
+        tool,
+        "ffmpeg",
+        &["-hide_banner", "-loglevel", "error", "-nostdin"],
+        argv,
+        FFMPEG_TIMEOUT,
+        FFMPEG_MAX_STDOUT_BYTES,
+        FFMPEG_MAX_STDERR_BYTES,
+    )?;
     if !output.status.success() {
         return Err(failed(
             tool,
@@ -143,47 +259,7 @@ async fn run_ffmpeg_async(tool: &'static str, argv: Vec<String>) -> Result<Vec<u
     .map_err(|error| failed(tool, "action_failed", error.to_string()))?
 }
 
-trait WaitWithOutputTimeout {
-    fn wait_with_output_timeout(&mut self) -> Option<std::io::Result<std::process::Output>>;
-}
 
-impl WaitWithOutputTimeout for std::process::Child {
-    fn wait_with_output_timeout(&mut self) -> Option<std::io::Result<std::process::Output>> {
-        use std::io::Read as _;
-        let deadline = std::time::Instant::now() + FFMPEG_TIMEOUT;
-        loop {
-            match self.try_wait() {
-                Ok(Some(status)) => {
-                    let mut stdout = Vec::new();
-                    let mut stderr = Vec::new();
-                    let read = (|| -> std::io::Result<()> {
-                        if let Some(mut pipe) = self.stdout.take() {
-                            pipe.read_to_end(&mut stdout)?;
-                        }
-                        if let Some(mut pipe) = self.stderr.take() {
-                            pipe.read_to_end(&mut stderr)?;
-                        }
-                        Ok(())
-                    })();
-                    // Reap the exit status (already exited; returns immediately).
-                    let _ = self.wait();
-                    return Some(read.map(|()| std::process::Output {
-                        status,
-                        stdout,
-                        stderr,
-                    }));
-                }
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        return None;
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => return Some(Err(error)),
-            }
-        }
-    }
-}
 
 /// 64-bit difference hash over an 8x8 luminance sample.
 pub fn dhash(png_bytes: &[u8]) -> Result<u64, ToolError> {
@@ -415,20 +491,28 @@ fn file_metadata(tool: &str, path: &Path) -> Result<serde_json::Value, ToolError
 }
 
 /// Video duration/streams via ffprobe when present; `None` otherwise.
+/// Routed through the same bounded runner as ffmpeg (timeout + output
+/// caps), never an unbounded blocking wait.
 fn probe_video(path: &Path) -> Result<Vec<(String, serde_json::Value)>, ToolError> {
     let path_str = path.to_string_lossy().into_owned();
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration,size:stream=width,height,codec_name,codec_type",
-            "-of",
-            "json",
-            &path_str,
-        ])
-        .output()
-        .map_err(|error| failed("media.metadata", "action_failed", error.to_string()))?;
+    let probe_args = [
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration,size:stream=width,height,codec_name,codec_type",
+        "-of",
+        "json",
+        &path_str,
+    ];
+    let output = run_process(
+        "media.metadata",
+        "ffprobe",
+        &[],
+        &probe_args,
+        FFMPEG_TIMEOUT,
+        1024 * 1024,
+        FFMPEG_MAX_STDERR_BYTES,
+    )?;
     if !output.status.success() {
         return Err(failed(
             "media.metadata",
@@ -1101,6 +1185,99 @@ mod tests {
             .collect::<Vec<_>>();
         ids.sort();
         ids
+    }
+
+    #[test]
+    fn drain_capped_enforces_byte_limits() {
+        use std::io::Cursor;
+        assert_eq!(drain_capped(Cursor::new(b"hello"), 8).unwrap(), b"hello");
+        assert_eq!(drain_capped(Cursor::new(vec![0u8; 1024]), 1024).unwrap().len(), 1024);
+        assert_eq!(
+            drain_capped(Cursor::new(vec![0u8; 1025]), 1024).unwrap_err(),
+            DrainError::TooLarge
+        );
+        assert_eq!(
+            drain_capped(Cursor::new(vec![0u8; 300_000]), 8 * 1024 * 1024)
+                .unwrap()
+                .len(),
+            300_000
+        );
+    }
+
+    /// Process-spawning tests need a POSIX shell, so they run on Unix
+    /// only; the pure `drain_capped` tests above plus `run_process`'s
+    /// structure (readers-before-wait) carry the guarantee elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn large_output_does_not_deadlock() {
+        // `yes` floods the pipe far past the 64 KiB OS buffer: a runner
+        // that waits for exit before draining would wedge here forever.
+        let output = run_process(
+            "media.test",
+            "sh",
+            &["-c"],
+            &["yes | head -c 300000"],
+            Duration::from_secs(20),
+            FFMPEG_MAX_STDOUT_BYTES,
+            FFMPEG_MAX_STDERR_BYTES,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 300_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_stdout_fails_instead_of_buffering_forever() {
+        let err = run_process(
+            "media.test",
+            "sh",
+            &["-c"],
+            &["yes | head -c 300000"],
+            Duration::from_secs(20),
+            1024,
+            FFMPEG_MAX_STDERR_BYTES,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), Some("response_too_large"), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_and_reaps_the_child() {
+        let before = std::time::Instant::now();
+        let err = run_process(
+            "media.test",
+            "sh",
+            &["-c"],
+            &["sleep 30"],
+            Duration::from_secs(2),
+            FFMPEG_MAX_STDOUT_BYTES,
+            FFMPEG_MAX_STDERR_BYTES,
+        )
+        .unwrap_err();
+        // Killed at ~2 s, not 30 s: the child was reaped, not orphaned.
+        assert!(before.elapsed() < Duration::from_secs(15), "{err:?}");
+        assert_eq!(err.code(), Some("action_failed"), "{err:?}");
+        assert!(err.model_message().contains("timed out"), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_is_bounded_while_stdout_flows() {
+        let output = run_process(
+            "media.test",
+            "sh",
+            &["-c"],
+            &["echo out; yes diagnosis 1>&2 | head -c 200000"],
+            Duration::from_secs(20),
+            FFMPEG_MAX_STDOUT_BYTES,
+            FFMPEG_MAX_STDERR_BYTES,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.len() <= FFMPEG_MAX_STDERR_BYTES);
+        assert!(output.stdout.starts_with(b"out\n"));
     }
 
     #[test]
