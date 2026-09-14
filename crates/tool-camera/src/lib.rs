@@ -8,7 +8,7 @@
 //! Frames land in [`artifact_core`] as expiring sensitive artifacts and are
 //! never persisted automatically.
 
-use artifact_core::{ArtifactSource, ArtifactStore, ContentPart, ImageArtifactRef};
+use artifact_core::{ArtifactOwner, ArtifactSource, ArtifactStore, ContentPart, ImageArtifactRef};
 use camera_capture::{CameraBackend, CameraDevice};
 use capability_core::{Capability, Resource};
 use std::sync::Arc;
@@ -18,6 +18,15 @@ use tool_core::{
 
 /// Frontend-visible camera indicator. Cloneable handle shared between the
 /// tools and the host state publisher.
+///
+/// Honest lifecycle note: a camera "session" is a logical grouping owned
+/// by these tools — it scopes permission checks (`capture_frame` must
+/// present a ticket for the session's device), the `Camera: ON`
+/// indicator, and exact-session artifact cleanup. The underlying
+/// [`camera_capture::CameraBackend`] only supports snapshots, so each
+/// frame opens the device independently; `capture_start` does NOT hold
+/// the camera open continuously. If a backend ever offers true streaming
+/// sessions, this is where the handle would live.
 #[derive(Clone, Default, Debug)]
 pub struct CameraState {
     active: Arc<std::sync::atomic::AtomicBool>,
@@ -298,7 +307,7 @@ impl Tool for CameraCaptureStartTool {
         ToolMetadata {
             id: capability_core::ToolId::new("camera.capture_start"),
             description:
-                "Start a camera frame session. The frontend must show Camera: ON while it runs."
+                "Start a camera frame session (logical grouping: scopes permission checks, the Camera: ON indicator, and per-session frame cleanup; each frame still opens the device independently). The frontend must show Camera: ON while it runs."
                     .to_string(),
             input_schema: serde_json::json!({
                 "type": "object", "additionalProperties": false,
@@ -418,8 +427,16 @@ impl Tool for CameraCaptureFrameTool {
                     )
                 })?
                 .map_err(|error| camera_error("camera.capture_frame", error))?;
+        // Frames belong to their session: stopping this session deletes
+        // exactly these artifacts, never another session's frames.
         let artifact = artifacts
-            .put_with_source("image/png", photo.png_bytes, ArtifactSource::Camera, true)
+            .put_with_owner(
+                "image/png",
+                photo.png_bytes,
+                ArtifactSource::Camera,
+                true,
+                Some(ArtifactOwner::CameraSession(session_id.clone())),
+            )
             .await
             .map_err(|error| {
                 ToolError::structured("camera.capture_frame", "action_failed", error.to_string())
@@ -473,9 +490,12 @@ impl Tool for CameraCaptureStopTool {
             state
                 .active
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            // Deterministic cleanup: camera frames never outlive capture.
-            artifacts.delete_source(ArtifactSource::Camera).await;
         }
+        // Deterministic exact-session cleanup: this session's frames are
+        // deleted; concurrent sessions' frames always survive.
+        artifacts
+            .delete_owner(&ArtifactOwner::CameraSession(session_id.clone()))
+            .await;
         Ok(ToolOutput::json(
             serde_json::json!({ "ok": true, "session_id": session_id }),
         ))
@@ -693,6 +713,62 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("invalid_target"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn stopping_one_session_keeps_other_session_frames() {
+        use artifact_core::ArtifactId;
+        let pack = pack();
+        let start = find(&pack, "camera.capture_start");
+        let frame = find(&pack, "camera.capture_frame");
+        let stop = find(&pack, "camera.capture_stop");
+        let ctx = || ctx_for_camera("cam-0");
+        let session = |out: &ToolOutput| {
+            out.content["session_id"].as_str().unwrap().to_string()
+        };
+        let s1 = session(
+            &start
+                .invoke(ctx(), serde_json::json!({"camera_id": "cam-0"}))
+                .await
+                .unwrap(),
+        );
+        let s2 = session(
+            &start
+                .invoke(ctx(), serde_json::json!({"camera_id": "cam-0"}))
+                .await
+                .unwrap(),
+        );
+        let frame_id = |out: &ToolOutput| {
+            ArtifactId::new(out.content["artifact_id"].as_str().unwrap().to_string())
+        };
+        let f1 = frame_id(
+            &frame
+                .invoke(ctx(), serde_json::json!({"session_id": s1}))
+                .await
+                .unwrap(),
+        );
+        let f2 = frame_id(
+            &frame
+                .invoke(ctx(), serde_json::json!({"session_id": s2}))
+                .await
+                .unwrap(),
+        );
+        // Stopping session A deletes exactly A's frame.
+        stop.invoke(ctx(), serde_json::json!({"session_id": s1}))
+            .await
+            .unwrap();
+        assert!(pack.artifacts.get(&f1).await.is_err(), "stopped session frame must be gone");
+        assert!(
+            pack.artifacts.get(&f2).await.is_ok(),
+            "concurrent session frame must survive"
+        );
+        assert!(pack.state.is_active());
+        // Stopping B cleans up its own frame and clears the indicator.
+        stop.invoke(ctx(), serde_json::json!({"session_id": s2}))
+            .await
+            .unwrap();
+        assert!(pack.artifacts.get(&f2).await.is_err());
+        assert!(!pack.state.is_active());
     }
 
     #[test]

@@ -436,6 +436,12 @@ impl AgentRuntime {
             .lock()
             .map_err(|_| RuntimeError::Tools("screen-share lock failed".to_string()))?
             .replace(state);
+        // Approvals for session-derived authority (screen capture,
+        // desktop observation/control) granted from here on are bound to
+        // this share and die with it; unrelated grants stay unbound.
+        if let Ok(queue) = self.approvals.lock() {
+            queue.set_active_sharing_session(Some(session.id.0.clone()));
+        }
         self.record_screen_share_audit(
             capability_core::Capability::ScreenCapture,
             audit_core::AuditOutcome::Authorized,
@@ -467,6 +473,25 @@ impl AgentRuntime {
         self.executor
             .block_on(self.computer_sessions.stop_capture(&session_id))
             .map_err(|error| RuntimeError::Tools(error.to_string()))?;
+        // Deterministic teardown: capture stops above; here the session's
+        // derived authority is revoked (capture/observe/control grants
+        // bound to this share) while unrelated grants survive.
+        let revoked = self
+            .approvals
+            .lock()
+            .map(|queue| queue.revoke_sharing_session(&session_id.0))
+            .unwrap_or(0);
+        if let Some(sink) = &self.audit {
+            sink.record(audit_core::AuditRecord::now(
+                capability_core::Principal::User,
+                Some(capability_core::Capability::ScreenCapture),
+                Some(target.resource()),
+                audit_core::AuditOutcome::Blocked,
+                format!(
+                    "stopped screen sharing: revoked {revoked} session-bound grant(s), capture artifacts deleted, control disabled"
+                ),
+            ));
+        }
         let restore_result = self.executor.block_on(backend.set_control_enabled(true));
         self.screen_share
             .lock()

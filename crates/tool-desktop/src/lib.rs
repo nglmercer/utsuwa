@@ -852,9 +852,12 @@ impl ComputerSessionManager {
     }
 
     /// Reject a window-targeted action when the owning application is
-    /// outside the allowlist. Windows that cannot be attributed (unknown
-    /// id, backend listing failure) are left to the backend's honest
-    /// error rather than failing closed here.
+    /// outside the allowlist. Fail CLOSED while an allowlist is active:
+    /// a window that cannot be attributed — unknown id, or a backend
+    /// listing failure — is rejected with
+    /// `application_identity_unverified`, never passed to the backend on
+    /// the hope that it errors honestly. An empty allowlist keeps the
+    /// legacy behavior (no attribution requirement).
     pub async fn check_window_allowed(
         &self,
         backend: &Arc<dyn DesktopBackend>,
@@ -864,11 +867,21 @@ impl ComputerSessionManager {
         if self.allowed_applications().is_empty() {
             return Ok(());
         }
-        let Ok(windows) = backend.list_windows().await else {
-            return Ok(());
-        };
+        let windows = backend.list_windows().await.map_err(|_| {
+            tool_core::ToolError::structured_with_details(
+                tool,
+                "application_identity_unverified",
+                "the window owner could not be verified against the active application allowlist",
+                serde_json::json!({ "window_id": window_id }),
+            )
+        })?;
         let Some(window) = windows.iter().find(|window| window.id == window_id) else {
-            return Ok(());
+            return Err(tool_core::ToolError::structured_with_details(
+                tool,
+                "application_identity_unverified",
+                "the window owner could not be verified against the active application allowlist",
+                serde_json::json!({ "window_id": window_id }),
+            ));
         };
         self.check_application_allowed(tool, &window.app)
     }
@@ -3769,6 +3782,7 @@ pub struct FakeBackend {
     pub typed: std::sync::Mutex<Vec<(Option<String>, String)>>,
     pub capture_frames: std::sync::Mutex<Vec<Vec<u8>>>,
     pub stale_window: Option<String>,
+    pub fail_list_windows: bool,
 }
 
 #[cfg(test)]
@@ -3788,6 +3802,7 @@ impl FakeBackend {
                 b"frame-two".to_vec(),
             ]),
             stale_window: None,
+            fail_list_windows: false,
         }
     }
 }
@@ -3840,6 +3855,11 @@ impl CaptureSession for FakeCaptureSession {
 #[async_trait::async_trait]
 impl DesktopBackend for FakeBackend {
     async fn list_windows(&self) -> Result<Vec<WindowInfo>, DesktopError> {
+        if self.fail_list_windows {
+            return Err(DesktopError::BackendUnavailable(
+                "fake window listing failed".to_string(),
+            ));
+        }
         Ok(self.windows.clone())
     }
     async fn accessibility_tree(&self, window_id: &str) -> Result<Vec<ElementNode>, DesktopError> {
@@ -4700,11 +4720,19 @@ mod tests {
             err.model_message()
         );
 
-        // Unknown windows stay the backend's honest error, not a policy lie.
-        manager
+        // Fail closed: an unknown window cannot be attributed to the
+        // allowlist, so it is rejected here instead of reaching the
+        // backend on the hope that it errors honestly.
+        let err = manager
             .check_window_allowed(&backend, "desktop.click", "ghost")
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(err.code(), Some("application_identity_unverified"), "{err:?}");
+        assert!(
+            err.model_message().contains("\"window_id\":\"ghost\""),
+            "{}",
+            err.model_message()
+        );
 
         // Launch enforcement end to end through the tool.
         let launch = LaunchApplicationTool {
@@ -4735,6 +4763,39 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("backend_unavailable"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn allowlist_empty_keeps_legacy_behavior() {
+        // No allowlist: even unattributable windows reach the backend —
+        // the restriction only exists once the user scopes sharing.
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
+        let manager = super::ComputerSessionManager::new();
+        assert!(manager.allowed_applications().is_empty());
+        manager
+            .check_window_allowed(&backend, "desktop.click", "ghost")
+            .await
+            .unwrap();
+        manager
+            .check_window_allowed(&backend, "desktop.click", "w1")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowlist_denies_when_window_listing_fails() {
+        // Active allowlist + backend enumeration failure: the action is
+        // rejected instead of proceeding unattributed.
+        let mut fake = FakeBackend::new();
+        fake.fail_list_windows = true;
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(fake);
+        let manager = super::ComputerSessionManager::new();
+        manager.set_allowed_applications(vec!["notes".to_string()]);
+        let err = manager
+            .check_window_allowed(&backend, "desktop.click", "w1")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("application_identity_unverified"), "{err:?}");
     }
 
     #[tokio::test]
