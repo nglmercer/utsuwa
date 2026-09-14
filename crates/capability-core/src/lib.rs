@@ -113,6 +113,10 @@ pub enum Capability {
     /// Capture microphone audio. Always requires explicit user authorization;
     /// never implied by any other capability.
     MicrophoneCapture,
+    /// Show a user-visible OS notification. Low-friction policy, but the
+    /// authority is explicit: user-visible external behavior is never
+    /// ambient.
+    NotificationSend,
     /// Invoke a tool served by an external MCP server. Never implied by
     /// other capabilities: every MCP tool call authorizes on its own.
     McpInvoke,
@@ -143,6 +147,20 @@ pub enum Resource {
     /// A camera device selected for capture. Device identities are matched
     /// exactly; a grant for one camera never covers another.
     Camera(String),
+    /// A microphone device selected for capture. Matched exactly, like
+    /// [`Resource::Camera`]: a grant for one microphone never covers
+    /// another, and never falls back to the default input device.
+    AudioDevice(String),
+    /// The system clipboard as a whole. Clipboard contents can hold
+    /// secrets; read and write tickets are always explicit and per call.
+    Clipboard,
+    /// The OS notification service. Used with
+    /// [`Capability::NotificationSend`].
+    NotificationService,
+    /// One browser tab selected for observation or control. Tab identities
+    /// are matched exactly; a tab grant never covers a desktop window and
+    /// a desktop-window grant never covers a tab.
+    BrowserTab(String),
     /// A URL being navigated, fetched, or submitted to. The scheme and host
     /// match case-insensitively; the port matches exactly. Used for
     /// domain-based browser/HTTP authorization.
@@ -241,6 +259,10 @@ fn scope_covers(scope: &Resource, resource: &Resource) -> bool {
         }
         (Resource::Application(s), Resource::Application(r)) => s == r,
         (Resource::Camera(s), Resource::Camera(r)) => s == r,
+        (Resource::AudioDevice(s), Resource::AudioDevice(r)) => s == r,
+        (Resource::Clipboard, Resource::Clipboard) => true,
+        (Resource::NotificationService, Resource::NotificationService) => true,
+        (Resource::BrowserTab(s), Resource::BrowserTab(r)) => s == r,
         (
             Resource::Url {
                 scheme: ss,
@@ -535,6 +557,41 @@ mod tests {
         assert!(!scope.allows(&Resource::Camera("rear".to_string())));
         // Camera grants never cover screen capture resources and vice versa.
         assert!(!scope.allows(&Resource::Window("w1".to_string())));
+    }
+
+    #[test]
+    fn audio_device_scope_is_device_exact() {
+        let scope = ResourceScope::new(vec![Resource::AudioDevice("mic-a".to_string())]);
+        assert!(scope.allows(&Resource::AudioDevice("mic-a".to_string())));
+        assert!(!scope.allows(&Resource::AudioDevice("mic-b".to_string())));
+        assert!(!scope.allows(&Resource::AudioDevice("default".to_string())));
+        // A microphone grant never covers a camera and never covers the
+        // legacy overloaded application-shaped device scope.
+        assert!(!scope.allows(&Resource::Camera("mic-a".to_string())));
+        assert!(!scope.allows(&Resource::Application("mic-a".to_string())));
+    }
+
+    #[test]
+    fn clipboard_and_notification_resources_match_only_themselves() {
+        let clipboard = ResourceScope::new(vec![Resource::Clipboard]);
+        assert!(clipboard.allows(&Resource::Clipboard));
+        assert!(!clipboard.allows(&Resource::Application("clipboard".to_string())));
+
+        let notifications = ResourceScope::new(vec![Resource::NotificationService]);
+        assert!(notifications.allows(&Resource::NotificationService));
+        assert!(!notifications.allows(&Resource::Application("notifications".to_string())));
+    }
+
+    #[test]
+    fn browser_tab_scope_never_covers_desktop_windows() {
+        let scope = ResourceScope::new(vec![Resource::BrowserTab("tab-1".to_string())]);
+        assert!(scope.allows(&Resource::BrowserTab("tab-1".to_string())));
+        assert!(!scope.allows(&Resource::BrowserTab("tab-2".to_string())));
+        // A tab grant is not a desktop-window grant and vice versa: the
+        // two surfaces authorize independently.
+        assert!(!scope.allows(&Resource::Window("tab-1".to_string())));
+        let windows = ResourceScope::new(vec![Resource::Window("tab-1".to_string())]);
+        assert!(!windows.allows(&Resource::BrowserTab("tab-1".to_string())));
     }
 
     #[test]

@@ -151,34 +151,181 @@ fn requirement(destination: &Destination) -> CapabilityRequirement {
     }
 }
 
-fn require_network(
+fn client_for(limits: &HttpLimits) -> Result<reqwest::Client, ToolError> {
+    // Redirects are NEVER automatic: every redirect target must independently
+    // pass scheme validation, SSRF validation, and capability authorization
+    // (see `fetch_with_redirects`). An automatic policy would let a public
+    // URL bounce to 127.0.0.1 / metadata endpoints on the initial ticket.
+    reqwest::Client::builder()
+        .timeout(limits.timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| ToolError::structured("http.request", "network_denied", error.to_string()))
+}
+
+/// Authorize one hop of a request chain: parse the URL, require a
+/// `NetworkConnect` ticket for exactly that host/port, then run the SSRF
+/// guard. The initial URL reports a plain `permission_required`; redirect
+/// targets report a retriable `redirect_authorization_required` carrying
+/// the new host/port so the agent can authorize and retry — authority is
+/// never silently widened to a new origin.
+async fn authorize_hop(
     tool: &str,
     ctx: &ToolContext,
-    destination: &Destination,
-) -> Result<(), ToolError> {
-    let requirement = requirement(destination);
-    if ctx.has_ticket(requirement.capability.clone(), requirement.resource.clone()) {
-        Ok(())
-    } else {
-        Err(ToolError::structured_with_details(
+    url: &url::Url,
+    allow_private: bool,
+    is_initial: bool,
+) -> Result<Destination, ToolError> {
+    let (_, destination) = parse_destination(url.as_str(), tool)?;
+    let requirement = requirement(&destination);
+    if !ctx.has_ticket(requirement.capability.clone(), requirement.resource.clone()) {
+        if is_initial {
+            return Err(ToolError::structured_with_details(
+                tool,
+                "permission_required",
+                "no NetworkConnect ticket authorizes this destination",
+                serde_json::json!({
+                    "capability": "NetworkConnect",
+                    "host": destination.host,
+                    "port": destination.port,
+                }),
+            ));
+        }
+        return Err(ToolError::structured_with_details(
             tool,
-            "permission_required",
-            "no NetworkConnect ticket authorizes this destination",
+            "redirect_authorization_required",
+            "redirect target needs its own NetworkConnect ticket; the original ticket does not cover a new origin",
             serde_json::json!({
                 "capability": "NetworkConnect",
+                "redirect_url": url.as_str(),
                 "host": destination.host,
                 "port": destination.port,
             }),
-        ))
+        ));
     }
+    check_destination(tool, &destination, allow_private).await?;
+    Ok(destination)
 }
 
-fn client_for(limits: &HttpLimits) -> Result<reqwest::Client, ToolError> {
-    reqwest::Client::builder()
-        .timeout(limits.timeout)
-        .redirect(reqwest::redirect::Policy::limited(limits.max_redirects))
-        .build()
-        .map_err(|error| ToolError::structured("http.request", "network_denied", error.to_string()))
+/// Resolve a `Location` header against the current URL and validate its
+/// shape (absolute or relative). Scheme/host rules are enforced by
+/// [`parse_destination`]; SSRF and capability checks happen per hop in
+/// [`authorize_hop`], never here, so this stays pure and unit-testable.
+fn resolve_redirect_target(
+    tool: &str,
+    current: &url::Url,
+    location: &str,
+) -> Result<url::Url, ToolError> {
+    if location.trim().is_empty() {
+        return Err(ToolError::structured(
+            tool,
+            "action_failed",
+            "redirect response is missing a usable Location header",
+        ));
+    }
+    let target = current.join(location).map_err(|error| {
+        ToolError::structured(tool, "invalid_target", format!("bad redirect target: {error}"))
+    })?;
+    // Enforce http(s) before anything else touches the target.
+    parse_destination(target.as_str(), tool)?;
+    Ok(target)
+}
+
+fn is_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        301 | 302 | 303 | 307 | 308
+    )
+}
+
+/// Follow redirects explicitly, authorizing every hop. Returns the final
+/// non-redirect response plus the final URL.
+async fn fetch_with_redirects(
+    tool: &str,
+    client: &reqwest::Client,
+    ctx: &ToolContext,
+    initial: url::Url,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    limits: &HttpLimits,
+) -> Result<(reqwest::Response, url::Url), ToolError> {
+    let mut current = initial;
+    let mut method = method.to_string();
+    let mut body = body.map(str::to_string);
+    // Credentials must never leak across origins on redirect.
+    let mut headers: Vec<(String, String)> = headers.to_vec();
+    let mut visited: Vec<url::Url> = vec![current.clone()];
+    let mut hops = 0usize;
+    loop {
+        let is_initial = hops == 0;
+        authorize_hop(tool, ctx, &current, limits.allow_private_targets, is_initial).await?;
+        let mut request = client.request(
+            method
+                .parse()
+                .map_err(|_| invalid(tool, "invalid HTTP method"))?,
+            current.clone(),
+        );
+        for (name, value) in &headers {
+            request = request.header(name.as_str(), value.as_str());
+        }
+        if let Some(body) = &body {
+            request = request.body(body.clone());
+        }
+        let response = request.send().await.map_err(|error| {
+            ToolError::structured(tool, "network_denied", format!("request failed: {error}"))
+        })?;
+        let status = response.status();
+        let location = if is_redirect(status) {
+            response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let Some(location) = location else {
+            return Ok((response, current));
+        };
+        hops += 1;
+        if hops > limits.max_redirects {
+            return Err(ToolError::structured(
+                tool,
+                "action_failed",
+                format!(
+                    "too many redirects (limit {}); possible redirect loop",
+                    limits.max_redirects
+                ),
+            ));
+        }
+        let target = resolve_redirect_target(tool, &current, &location)?;
+        if visited.contains(&target) {
+            return Err(ToolError::structured(
+                tool,
+                "action_failed",
+                format!("redirect loop detected at {}", target.as_str()),
+            ));
+        }
+        // 301/302/303 convert non-GET/HEAD hops to GET (matching browser
+        // and reqwest semantics); 307/308 preserve method and body.
+        if matches!(status.as_u16(), 303)
+            || (matches!(status.as_u16(), 301 | 302) && method != "GET" && method != "HEAD")
+        {
+            method = "GET".to_string();
+            body = None;
+        }
+        if target.origin() != current.origin() {
+            headers.retain(|(name, _)| {
+                !matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "authorization" | "proxy-authorization" | "cookie"
+                )
+            });
+        }
+        visited.push(target.clone());
+        current = target;
+    }
 }
 
 /// Read at most `limit` bytes; anything larger is an explicit error, never
@@ -320,14 +467,7 @@ impl Tool for HttpRequestTool {
             .get("url")
             .and_then(|value| value.as_str())
             .ok_or_else(|| invalid(self.tool_id, "missing string 'url'"))?;
-        let (parsed, destination) = parse_destination(url, self.tool_id)?;
-        require_network(self.tool_id, &ctx, &destination)?;
-        check_destination(
-            self.tool_id,
-            &destination,
-            self.limits.allow_private_targets,
-        )
-        .await?;
+        let (parsed, _) = parse_destination(url, self.tool_id)?;
 
         let max_bytes = args
             .get("max_bytes")
@@ -352,35 +492,42 @@ impl Tool for HttpRequestTool {
             self.method
         };
         let client = client_for(&self.limits)?;
-        let mut request = client.request(
-            method
-                .parse()
-                .map_err(|_| invalid(self.tool_id, "invalid HTTP method"))?,
-            parsed,
-        );
-        if let Some(headers) = args.get("headers").and_then(|value| value.as_object()) {
-            for (name, value) in headers {
+        let mut headers: Vec<(String, String)> = Vec::new();
+        if let Some(object) = args.get("headers").and_then(|value| value.as_object()) {
+            for (name, value) in object {
                 let value = value
                     .as_str()
                     .ok_or_else(|| invalid(self.tool_id, "header values must be strings"))?;
-                request = request.header(name.as_str(), value);
+                headers.push((name.clone(), value.to_string()));
             }
         }
-        if self.tool_id == "http.request" {
-            if let Some(body) = args.get("body").and_then(|value| value.as_str()) {
-                if body.len() > self.limits.max_response_bytes {
-                    return Err(invalid(self.tool_id, "request body exceeds the size limit"));
+        let body = if self.tool_id == "http.request" {
+            match args.get("body").and_then(|value| value.as_str()) {
+                Some(body) => {
+                    if body.len() > self.limits.max_response_bytes {
+                        return Err(invalid(self.tool_id, "request body exceeds the size limit"));
+                    }
+                    Some(body)
                 }
-                request = request.body(body.to_string());
+                None => None,
             }
-        }
-        let response = request.send().await.map_err(|error| {
-            ToolError::structured(
-                self.tool_id,
-                "network_denied",
-                format!("request failed: {error}"),
-            )
-        })?;
+        } else {
+            None
+        };
+        // Every hop — initial URL and each redirect target — passes
+        // capability and SSRF validation inside `fetch_with_redirects`.
+        let (response, final_url) = fetch_with_redirects(
+            self.tool_id,
+            &client,
+            &ctx,
+            parsed,
+            method,
+            &headers,
+            body,
+            &self.limits,
+        )
+        .await?;
+        let final_url = final_url.as_str().to_string();
         let status = response.status();
         let headers = response
             .headers()
@@ -404,7 +551,7 @@ impl Tool for HttpRequestTool {
         }
         if self.method == "HEAD" && !self.download {
             return Ok(ToolOutput::json(serde_json::json!({
-                "url": url,
+                "url": final_url,
                 "status": status.as_u16(),
                 "headers": headers,
             })));
@@ -418,7 +565,7 @@ impl Tool for HttpRequestTool {
                     "no artifact store configured",
                 )
             })?;
-            let mime = mime_guess(url);
+            let mime = mime_guess(&final_url);
             let artifact: ArtifactRef = store
                 .put_with_source(&mime, bytes, ArtifactSource::Download, false)
                 .await
@@ -427,7 +574,7 @@ impl Tool for HttpRequestTool {
                 })?;
             let metadata = serde_json::json!({
                 "artifact_id": artifact.id,
-                "filename": filename_guess(url),
+                "filename": filename_guess(&final_url),
                 "mime_type": artifact.mime_type,
                 "size_bytes": artifact.size_bytes,
                 "status": status.as_u16(),
@@ -439,7 +586,7 @@ impl Tool for HttpRequestTool {
         }
         match String::from_utf8(bytes) {
             Ok(text) => Ok(ToolOutput::json(serde_json::json!({
-                "url": url,
+                "url": final_url,
                 "status": status.as_u16(),
                 "headers": headers,
                 "body": text,
@@ -554,7 +701,9 @@ impl tool_sdk::ToolPack for HttpToolPack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capability_core::{AgentId, Principal};
+    use capability_core::{AgentId, Principal, ResourceScope};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tool_sdk::ToolPack as _;
 
     #[test]
@@ -613,6 +762,423 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+    }
+
+    // --- Redirect SSRF regression tests ---------------------------------
+    //
+    // A hand-rolled HTTP server (no extra dev-dependencies): routes by
+    // path, parses the request line plus headers, and answers canned
+    // redirects. Server B stands in for "another origin" (different port
+    // means a different NetworkConnect ticket).
+
+    fn ticket_ctx(host: &str, port: u16) -> ToolContext {
+        ctx_with_tickets(&[(host, port)])
+    }
+
+    fn ctx_with_tickets(hosts: &[(&str, u16)]) -> ToolContext {
+        let ctx = ToolContext::new(Principal::Agent(AgentId::new("test")));
+        let mut ctx = ctx;
+        for (host, port) in hosts {
+            let ticket = capability_core::CapabilityTicket::mint(
+                ctx.principal.clone(),
+                Capability::NetworkConnect,
+                ResourceScope::new(vec![Resource::HostPort {
+                    host: host.to_string(),
+                    port: *port,
+                }]),
+                ctx.invocation_id,
+                Duration::from_secs(120),
+            );
+            ctx = ctx.with_ticket(ticket);
+        }
+        ctx
+    }
+
+    fn get_tool_for_tests(max_redirects: usize) -> HttpRequestTool {
+        HttpRequestTool {
+            limits: HttpLimits {
+                allow_private_targets: true,
+                max_redirects,
+                ..HttpLimits::default()
+            },
+            method: "GET",
+            tool_id: "http.get",
+            artifacts: None,
+            download: false,
+        }
+    }
+
+    fn request_tool_for_tests() -> HttpRequestTool {
+        HttpRequestTool {
+            limits: HttpLimits {
+                allow_private_targets: true,
+                ..HttpLimits::default()
+            },
+            method: "GET",
+            tool_id: "http.request",
+            artifacts: None,
+            download: false,
+        }
+    }
+
+    /// Serve one connection: parse `METHOD path` plus headers, route, reply.
+    async fn serve_one(
+        mut stream: tokio::net::TcpStream,
+        own: std::net::SocketAddr,
+        other_port: u16,
+    ) {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    raw.extend_from_slice(&buf[..n]);
+                    if raw.len() > 64 * 1024 || raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+        let head = String::from_utf8_lossy(&raw).into_owned();
+        let mut lines = head.split("\r\n");
+        let request_line = lines.next().unwrap_or_default().to_string();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("GET").to_string();
+        let path = parts.next().unwrap_or("/").to_string();
+        let mut headers = std::collections::HashMap::new();
+        for line in lines {
+            if line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        let (status, location, body) = match path.as_str() {
+            "/ok" => (200, None, "hello".to_string()),
+            "/same" => (302, Some("/ok".to_string()), String::new()),
+            "/rel" => (302, Some("ok".to_string()), String::new()),
+            "/other" => (
+                302,
+                Some(format!("http://127.0.0.1:{other_port}/ok")),
+                String::new(),
+            ),
+            "/private" => (302, Some("http://10.0.0.1/".to_string()), String::new()),
+            "/loop" => (302, Some("/loop".to_string()), String::new()),
+            "/chain" => (302, Some("/chain2".to_string()), String::new()),
+            "/chain2" => (302, Some("/ok".to_string()), String::new()),
+            "/echo-method" => (200, None, method),
+            "/preserve" => (307, Some("/echo-method".to_string()), String::new()),
+            "/convert" => (302, Some("/echo-method".to_string()), String::new()),
+            "/leak-same" => (302, Some("/show".to_string()), String::new()),
+            "/leak-other" => (
+                302,
+                Some(format!("http://127.0.0.1:{other_port}/show")),
+                String::new(),
+            ),
+            "/show" => (
+                200,
+                None,
+                headers.get("authorization").cloned().unwrap_or_default(),
+            ),
+            _ => (404, None, "not found".to_string()),
+        };
+        let _ = own;
+        let mut response = format!(
+            "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            if status == 200 { "OK" } else { "Redirect" },
+            body.len()
+        );
+        if let Some(location) = location {
+            response.push_str(&format!("Location: {location}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(&body);
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
+    async fn spawn_server(
+        other_port: u16,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                serve_one(stream, addr, other_port).await;
+            }
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn same_host_redirect_is_followed() {
+        let (addr, handle) = spawn_server(0).await;
+        let tool = get_tool_for_tests(5);
+        let out = tool
+            .invoke(
+                ticket_ctx("127.0.0.1", addr.port()),
+                serde_json::json!({"url": format!("http://127.0.0.1:{}/same", addr.port())}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["body"], "hello");
+        assert!(out.content["url"].as_str().unwrap().ends_with("/ok"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn relative_location_redirect_is_followed() {
+        let (addr, handle) = spawn_server(0).await;
+        let tool = get_tool_for_tests(5);
+        let out = tool
+            .invoke(
+                ticket_ctx("127.0.0.1", addr.port()),
+                serde_json::json!({"url": format!("http://127.0.0.1:{}/rel", addr.port())}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["body"], "hello");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_without_second_ticket_is_retriable() {
+        let (addr_b, handle_b) = spawn_server(0).await;
+        let (addr_a, handle_a) = spawn_server(addr_b.port()).await;
+        let tool = get_tool_for_tests(5);
+        let err = tool
+            .invoke(
+                ticket_ctx("127.0.0.1", addr_a.port()),
+                serde_json::json!({"url": format!("http://127.0.0.1:{}/other", addr_a.port())}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("redirect_authorization_required"), "{err:?}");
+        let details = err.model_message();
+        assert!(details.contains(&addr_b.port().to_string()), "{details}");
+        handle_a.abort();
+        handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_with_second_ticket_is_followed() {
+        let (addr_b, handle_b) = spawn_server(0).await;
+        let (addr_a, handle_a) = spawn_server(addr_b.port()).await;
+        let tool = get_tool_for_tests(5);
+        let out = tool
+            .invoke(
+                ctx_with_tickets(&[
+                    ("127.0.0.1", addr_a.port()),
+                    ("127.0.0.1", addr_b.port()),
+                ]),
+                serde_json::json!({"url": format!("http://127.0.0.1:{}/other", addr_a.port())}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["body"], "hello");
+        handle_a.abort();
+        handle_b.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_cannot_reach_private_target_without_ssrf_opt_in() {
+        // Direct hop-level proof: even WITH a ticket, a redirect to a
+        // private/metadata address fails the SSRF guard when the host has
+        // not opted in. The invoke loop runs this same check per hop.
+        for target in [
+            "http://10.0.0.1/",
+            "http://192.168.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1/",
+        ] {
+            let url = url::Url::parse(target).unwrap();
+            // Ticket-first ordering still ends at the SSRF guard: with a
+            // matching ticket attached, only the guard can stop the hop.
+            let host = url.host_str().unwrap().to_string();
+            let port = url.port_or_known_default().unwrap_or(80);
+            let err = authorize_hop("http.get", &ticket_ctx(&host, port), &url, false, false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Some("network_denied"), "{target}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn live_redirect_to_private_target_is_denied() {
+        // End-to-end: the loop really does re-check the target. The other
+        // port here stands in for an unreachable private address only in
+        // shape — the SSRF decision itself is proven above; this proves
+        // the loop routes through it by denying a hop with no ticket.
+        let (addr, handle) = spawn_server(0).await;
+        let tool = get_tool_for_tests(5);
+        let err = tool
+            .invoke(
+                ticket_ctx("127.0.0.1", addr.port()),
+                serde_json::json!({"url": format!("http://127.0.0.1:{}/private", addr.port())}),
+            )
+            .await
+            .unwrap_err();
+        // allow_private_targets=true for the loopback harness, so the
+        // private target passes SSRF here — but the new origin still has
+        // no ticket and must not be reached.
+        assert_eq!(err.code(), Some("redirect_authorization_required"), "{err:?}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_loop_is_detected() {
+        let (addr, handle) = spawn_server(0).await;
+        let tool = get_tool_for_tests(5);
+        let err = tool
+            .invoke(
+                ticket_ctx("127.0.0.1", addr.port()),
+                serde_json::json!({"url": format!("http://127.0.0.1:{}/loop", addr.port())}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("action_failed"), "{err:?}");
+        assert!(err.model_message().contains("loop"), "{err:?}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_limit_is_enforced() {
+        let (addr, handle) = spawn_server(0).await;
+        let tool = get_tool_for_tests(1);
+        let err = tool
+            .invoke(
+                ticket_ctx("127.0.0.1", addr.port()),
+                serde_json::json!({"url": format!("http://127.0.0.1:{}/chain", addr.port())}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("action_failed"), "{err:?}");
+        assert!(err.model_message().contains("too many redirects"), "{err:?}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn redirect_preserves_method_on_307_and_converts_on_302() {
+        let (addr, handle) = spawn_server(0).await;
+        let tool = request_tool_for_tests();
+        let ctx = || ticket_ctx("127.0.0.1", addr.port());
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let out = tool
+            .invoke(
+                ctx(),
+                serde_json::json!({"method": "POST", "url": format!("{base}/preserve"), "body": "x"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["body"], "POST");
+        let out = tool
+            .invoke(
+                ctx(),
+                serde_json::json!({"method": "POST", "url": format!("{base}/convert"), "body": "x"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["body"], "GET");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn credentials_are_stripped_on_cross_origin_redirect() {
+        let (addr_b, handle_b) = spawn_server(0).await;
+        let (addr_a, handle_a) = spawn_server(addr_b.port()).await;
+        let tool = get_tool_for_tests(5);
+        let ctx = || {
+            ctx_with_tickets(&[
+                ("127.0.0.1", addr_a.port()),
+                ("127.0.0.1", addr_b.port()),
+            ])
+        };
+        let base_a = format!("http://127.0.0.1:{}", addr_a.port());
+        // Same-origin redirect keeps the credential header.
+        let out = tool
+            .invoke(
+                ctx(),
+                serde_json::json!({
+                    "url": format!("{base_a}/leak-same"),
+                    "headers": {"authorization": "secret"},
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["body"], "secret");
+        // Cross-origin redirect strips it before the second hop.
+        let out = tool
+            .invoke(
+                ctx(),
+                serde_json::json!({
+                    "url": format!("{base_a}/leak-other"),
+                    "headers": {"authorization": "secret"},
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["body"], "");
+        handle_a.abort();
+        handle_b.abort();
+    }
+
+    #[test]
+    fn redirect_target_resolution_rejects_bad_schemes() {
+        let current = url::Url::parse("https://public.example/start").unwrap();
+        // Relative and same-origin targets resolve.
+        assert_eq!(
+            resolve_redirect_target("http.get", &current, "/next")
+                .unwrap()
+                .as_str(),
+            "https://public.example/next"
+        );
+        // HTTPS -> HTTP downgrade resolves here; the per-hop ticket + SSRF
+        // check still gates it before any socket opens.
+        let downgrade =
+            resolve_redirect_target("http.get", &current, "http://public.example/plain").unwrap();
+        assert_eq!(downgrade.scheme(), "http");
+        // Non-http(s) schemes never resolve.
+        for bad in ["ftp://public.example/x", "file:///etc/passwd", "gopher://x/"] {
+            let err = resolve_redirect_target("http.get", &current, bad).unwrap_err();
+            assert_eq!(err.code(), Some("invalid_target"), "{bad}: {err:?}");
+        }
+        assert!(resolve_redirect_target("http.get", &current, "   ")
+            .unwrap_err()
+            .code()
+            == Some("action_failed"));
+    }
+
+    #[tokio::test]
+    async fn hop_authorization_rechecks_scheme_and_ticket() {
+        // HTTPS target with a ticket for exactly that origin passes the
+        // hop check (no connection is opened by the check itself).
+        let url = url::Url::parse("https://public.example:443/x").unwrap();
+        // allow_private=true keeps this DNS-free (literal-IP SSRF cases
+        // are covered by `redirect_cannot_reach_private_target_*`).
+        let dest = authorize_hop(
+            "http.get",
+            &ticket_ctx("public.example", 443),
+            &url,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(dest.port, 443);
+        // HTTP downgrade to port 80 needs its own ticket.
+        let plain = url::Url::parse("http://public.example/x").unwrap();
+        let err = authorize_hop("http.get", &ticket_ctx("public.example", 443), &plain, true, false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("redirect_authorization_required"), "{err:?}");
     }
 
     #[test]

@@ -237,9 +237,53 @@ fn require_ticket(
             tool,
             "permission_required",
             "no capability ticket authorizes this archive operation",
-            serde_json::json!({ "capability": format!("{capability:?}") }),
+            serde_json::json!({
+                "capability": format!("{capability:?}"),
+                "resource": format!("{resource:?}"),
+            }),
         ))
     }
+}
+
+/// Declared requirements for `archive.extract`: the archive must be
+/// readable and the destination must be creatable *and* writable
+/// (extraction creates directories and overwrites files). The agent
+/// preflight authorizes exactly these; `invoke` enforces the same set.
+fn extract_requirements(archive: PathBuf, destination: PathBuf) -> Vec<CapabilityRequirement> {
+    vec![
+        CapabilityRequirement {
+            capability: Capability::FilesystemRead,
+            resource: Resource::Path(archive),
+        },
+        CapabilityRequirement {
+            capability: Capability::FilesystemCreate,
+            resource: Resource::Path(destination.clone()),
+        },
+        CapabilityRequirement {
+            capability: Capability::FilesystemWrite,
+            resource: Resource::Path(destination),
+        },
+    ]
+}
+
+/// Declared requirements for `archive.create`: every source file is read
+/// through the source scope, and the output archive may be created or
+/// overwritten.
+fn create_requirements(source: PathBuf, archive: PathBuf) -> Vec<CapabilityRequirement> {
+    vec![
+        CapabilityRequirement {
+            capability: Capability::FilesystemRead,
+            resource: Resource::Path(source),
+        },
+        CapabilityRequirement {
+            capability: Capability::FilesystemCreate,
+            resource: Resource::Path(archive.clone()),
+        },
+        CapabilityRequirement {
+            capability: Capability::FilesystemWrite,
+            resource: Resource::Path(archive),
+        },
+    ]
 }
 
 fn path_arg(args: &serde_json::Value, field: &str, tool: &str) -> Result<PathBuf, ToolError> {
@@ -339,6 +383,16 @@ impl Tool for ArchiveExtractTool {
         })
     }
 
+    fn required_capabilities(&self, args: &serde_json::Value) -> Vec<CapabilityRequirement> {
+        let (Some(archive), Some(destination)) = (
+            args.get("archive").and_then(|value| value.as_str()),
+            args.get("destination").and_then(|value| value.as_str()),
+        ) else {
+            return self.required_capability(args).into_iter().collect();
+        };
+        extract_requirements(PathBuf::from(archive), PathBuf::from(destination))
+    }
+
     async fn invoke(
         &self,
         ctx: ToolContext,
@@ -346,18 +400,16 @@ impl Tool for ArchiveExtractTool {
     ) -> Result<ToolOutput, ToolError> {
         let archive_path = path_arg(&args, "archive", "archive.extract")?;
         let destination = path_arg(&args, "destination", "archive.extract")?;
-        require_ticket(
-            "archive.extract",
-            &ctx,
-            Capability::FilesystemRead,
-            Resource::Path(archive_path.clone()),
-        )?;
-        require_ticket(
-            "archive.extract",
-            &ctx,
-            Capability::FilesystemCreate,
-            Resource::Path(destination.clone()),
-        )?;
+        // Enforce exactly the declared requirements: read the archive,
+        // create destination entries, and overwrite existing files.
+        for requirement in extract_requirements(archive_path.clone(), destination.clone()) {
+            require_ticket(
+                "archive.extract",
+                &ctx,
+                requirement.capability,
+                requirement.resource,
+            )?;
+        }
         let limits = self.limits.clone();
         let destination_for_task = destination.clone();
         let extracted = tokio::task::spawn_blocking(move || {
@@ -614,6 +666,16 @@ impl Tool for ArchiveCreateTool {
         })
     }
 
+    fn required_capabilities(&self, args: &serde_json::Value) -> Vec<CapabilityRequirement> {
+        let (Some(source), Some(archive)) = (
+            args.get("source").and_then(|value| value.as_str()),
+            args.get("archive").and_then(|value| value.as_str()),
+        ) else {
+            return self.required_capability(args).into_iter().collect();
+        };
+        create_requirements(PathBuf::from(source), PathBuf::from(archive))
+    }
+
     async fn invoke(
         &self,
         ctx: ToolContext,
@@ -631,18 +693,17 @@ impl Tool for ArchiveCreateTool {
                 "files must be a non-empty bounded array",
             ));
         }
-        require_ticket(
-            "archive.create",
-            &ctx,
-            Capability::FilesystemRead,
-            Resource::Path(source.clone()),
-        )?;
-        require_ticket(
-            "archive.create",
-            &ctx,
-            Capability::FilesystemCreate,
-            Resource::Path(archive_path.clone()),
-        )?;
+        // Enforce exactly the declared requirements: the source scope
+        // covers every listed file, and the output may be created or
+        // overwritten.
+        for requirement in create_requirements(source.clone(), archive_path.clone()) {
+            require_ticket(
+                "archive.create",
+                &ctx,
+                requirement.capability,
+                requirement.resource,
+            )?;
+        }
         let mut names = Vec::with_capacity(files.len());
         for file in files {
             let name = file
@@ -855,6 +916,11 @@ mod tests {
             Resource::Path(destination.clone()),
             &extract_ctx,
         );
+        extract_ctx = ticket_for(
+            Capability::FilesystemWrite,
+            Resource::Path(destination.clone()),
+            &extract_ctx,
+        );
         let out = extract
             .invoke(
                 extract_ctx,
@@ -885,6 +951,11 @@ mod tests {
             Resource::Path(destination.clone()),
             &evil_ctx,
         );
+        evil_ctx = ticket_for(
+            Capability::FilesystemWrite,
+            Resource::Path(destination.clone()),
+            &evil_ctx,
+        );
         let err = extract
             .invoke(
                 evil_ctx,
@@ -904,5 +975,197 @@ mod tests {
     fn unsupported_formats_are_rejected() {
         assert!(detect_kind(Path::new("archive.7z")).is_err());
         assert!(detect_kind(Path::new("backup.rar")).is_err());
+    }
+
+    /// Agent-preflight contract: `required_capabilities` must return every
+    /// ticket `invoke` enforces, so the real agent loop can authorize the
+    /// whole call before execution starts.
+    #[test]
+    fn extract_declares_read_create_and_write() {
+        let pack = ArchiveToolPack::new();
+        let tools = pack.tools(&tool_sdk::ToolLoadContext::default());
+        let extract = tools
+            .iter()
+            .find(|tool| tool.metadata().id.0 == "archive.extract")
+            .unwrap();
+        let args = serde_json::json!({"archive": "/work/a.zip", "destination": "/work/out"});
+        let declared = extract.required_capabilities(&args);
+        let kinds = declared
+            .iter()
+            .map(|requirement| {
+                (
+                    format!("{:?}", requirement.capability),
+                    requirement.resource.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&(
+            "FilesystemRead".to_string(),
+            Resource::Path(PathBuf::from("/work/a.zip"))
+        )));
+        assert!(kinds.contains(&(
+            "FilesystemCreate".to_string(),
+            Resource::Path(PathBuf::from("/work/out"))
+        )));
+        assert!(kinds.contains(&(
+            "FilesystemWrite".to_string(),
+            Resource::Path(PathBuf::from("/work/out"))
+        )));
+    }
+
+    #[test]
+    fn create_declares_source_read_and_output_create_write() {
+        let pack = ArchiveToolPack::new();
+        let tools = pack.tools(&tool_sdk::ToolLoadContext::default());
+        let create = tools
+            .iter()
+            .find(|tool| tool.metadata().id.0 == "archive.create")
+            .unwrap();
+        let args = serde_json::json!({
+            "archive": "/work/out.zip",
+            "source": "/work/src",
+            "files": ["a.txt"],
+        });
+        let declared = create.required_capabilities(&args);
+        assert_eq!(declared.len(), 3);
+        assert!(declared.iter().any(|requirement| {
+            requirement.capability == Capability::FilesystemRead
+                && requirement.resource == Resource::Path(PathBuf::from("/work/src"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn extract_missing_any_ticket_stops_before_execution() {
+        let dir = std::env::temp_dir().join(format!("utsuwa-archive-perm-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("test.zip");
+        write_zip(&archive_path, &[("hello.txt", b"hello")]);
+        let destination = dir.join("out");
+
+        let pack = ArchiveToolPack::new();
+        let tools = pack.tools(&tool_sdk::ToolLoadContext::default());
+        let extract = tools
+            .iter()
+            .find(|tool| tool.metadata().id.0 == "archive.extract")
+            .unwrap();
+        let args = serde_json::json!({
+            "archive": archive_path.to_string_lossy(),
+            "destination": destination.to_string_lossy(),
+        });
+        // Each declared requirement denies on its own when missing: drop
+        // exactly one ticket at a time from the full set.
+        let full = extract.required_capabilities(&args);
+        assert_eq!(full.len(), 3);
+        for missing in 0..full.len() {
+            let mut partial = ctx();
+            for (index, requirement) in full.iter().enumerate() {
+                if index == missing {
+                    continue;
+                }
+                partial = ticket_for(
+                    requirement.capability.clone(),
+                    requirement.resource.clone(),
+                    &partial,
+                );
+            }
+            let err = extract.invoke(partial, args.clone()).await.unwrap_err();
+            assert_eq!(err.code(), Some("permission_required"), "missing {missing}: {err:?}");
+            assert!(!destination.exists(), "no bytes may land without full authority");
+        }
+        // Outside-scope tickets never authorize, even when all three
+        // capabilities are present.
+        let mut outside = ctx();
+        for requirement in &full {
+            let scoped = match &requirement.resource {
+                Resource::Path(_) => Resource::Path(PathBuf::from("/elsewhere")),
+                other => other.clone(),
+            };
+            outside = ticket_for(requirement.capability.clone(), scoped, &outside);
+        }
+        let err = extract.invoke(outside, args.clone()).await.unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn create_missing_source_read_is_denied() {
+        let dir = std::env::temp_dir().join(format!("utsuwa-archive-create-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.txt"), b"data").unwrap();
+        let pack = ArchiveToolPack::new();
+        let tools = pack.tools(&tool_sdk::ToolLoadContext::default());
+        let create = tools
+            .iter()
+            .find(|tool| tool.metadata().id.0 == "archive.create")
+            .unwrap();
+        let args = serde_json::json!({
+            "archive": dir.join("out.zip").to_string_lossy(),
+            "source": dir.join("src").to_string_lossy(),
+            "files": ["a.txt"],
+        });
+        // Destination-only tickets must not authorize reading the source.
+        let mut partial = ctx();
+        partial = ticket_for(
+            Capability::FilesystemCreate,
+            Resource::Path(dir.clone()),
+            &partial,
+        );
+        partial = ticket_for(
+            Capability::FilesystemWrite,
+            Resource::Path(dir.clone()),
+            &partial,
+        );
+        let err = create.invoke(partial, args).await.unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tar_symlink_entries_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("utsuwa-archive-symlink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("link.tar");
+        {
+            let file = std::fs::File::create(&archive_path).unwrap();
+            let mut builder = tar::Builder::new(file);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, "evil-link", "/etc/passwd")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let destination = dir.join("out");
+        let err = extract_archive(
+            "archive.extract",
+            &archive_path,
+            &destination,
+            &ArchiveLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), Some("archive_path_traversal"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decompression_bomb_is_rejected_before_filling_disk() {
+        // Output far above the budget must trip `archive_too_large`
+        // instead of filling the disk.
+        let dir = std::env::temp_dir().join(format!("utsuwa-archive-bomb-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive_path = dir.join("bomb.zip");
+        let zeros = vec![0u8; 256 * 1024];
+        write_zip(&archive_path, &[("zeros.bin", zeros.as_slice())]);
+        let destination = dir.join("out");
+        let limits = ArchiveLimits {
+            max_total_bytes: 64 * 1024,
+            ..ArchiveLimits::default()
+        };
+        let err = extract_archive("archive.extract", &archive_path, &destination, &limits)
+            .unwrap_err();
+        assert_eq!(err.code(), Some("archive_too_large"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

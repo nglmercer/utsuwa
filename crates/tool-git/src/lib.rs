@@ -50,7 +50,7 @@ fn specs() -> Vec<GitSpec> {
         GitSpec { id: "git.show", description: "Show one commit or revision.", risk: GitRisk::Read, extra_schema: serde_json::json!({"properties": {"revision": {"type": "string"}}, "required": ["revision"]}) },
         GitSpec { id: "git.branch.list", description: "List local branches.", risk: GitRisk::Read, extra_schema: serde_json::json!({}) },
         GitSpec { id: "git.branch.create", description: "Create a branch at HEAD (or a given start point).", risk: GitRisk::Mutate, extra_schema: serde_json::json!({"properties": {"name": {"type": "string"}, "start_point": {"type": "string"}}, "required": ["name"]}) },
-        GitSpec { id: "git.checkout", description: "Checkout a branch or revision (no --force; use git.restore to discard changes).", risk: GitRisk::Mutate, extra_schema: serde_json::json!({"properties": {"target": {"type": "string"}}, "required": ["target"]}) },
+        GitSpec { id: "git.checkout", description: "Switch to a branch (git switch) or detach at a tag/commit SHA (git checkout <revision>). File paths are rejected: a target that is not a branch, tag, or commit fails instead of restoring a same-named file. No --force.", risk: GitRisk::Mutate, extra_schema: serde_json::json!({"properties": {"target": {"type": "string"}}, "required": ["target"]}) },
         GitSpec { id: "git.add", description: "Stage paths (must be inside the repository).", risk: GitRisk::Mutate, extra_schema: serde_json::json!({"properties": {"paths": {"type": "array", "items": {"type": "string"}}}, "required": ["paths"]}) },
         GitSpec { id: "git.commit", description: "Create a commit from staged changes. Never pushes.", risk: GitRisk::Mutate, extra_schema: serde_json::json!({"properties": {"message": {"type": "string"}}, "required": ["message"]}) },
         GitSpec { id: "git.restore", description: "Restore working-tree paths (discards local changes to those paths).", risk: GitRisk::Destructive, extra_schema: serde_json::json!({"properties": {"paths": {"type": "array", "items": {"type": "string"}}}, "required": ["paths"]}) },
@@ -123,7 +123,45 @@ fn require_ticket(
             tool,
             "permission_required",
             "no capability ticket authorizes this git operation",
-            serde_json::json!({ "capability": format!("{capability:?}") }),
+            serde_json::json!({
+                "capability": format!("{capability:?}"),
+                "resource": format!("{resource:?}"),
+            }),
+        ))
+    }
+}
+
+/// Require a `NetworkConnect` ticket for one remote host/port. The remote
+/// is resolved from the repository's own config at invoke time, so the
+/// agent preflight cannot declare it statically: this error is the
+/// structured retriable result (`permission_required` + host/port) the
+/// agent uses to authorize and retry. A ticket for one remote never
+/// covers another.
+fn require_remote_ticket(
+    tool: &str,
+    ctx: &ToolContext,
+    host: &str,
+    port: u16,
+) -> Result<(), ToolError> {
+    if ctx.has_ticket(
+        Capability::NetworkConnect,
+        Resource::HostPort {
+            host: host.to_string(),
+            port,
+        },
+    ) {
+        Ok(())
+    } else {
+        Err(ToolError::structured_with_details(
+            tool,
+            "permission_required",
+            format!("git remote '{host}:{port}' needs its own NetworkConnect ticket"),
+            serde_json::json!({
+                "capability": "NetworkConnect",
+                "host": host,
+                "port": port,
+                "retry_after_authorization": true,
+            }),
         ))
     }
 }
@@ -179,8 +217,32 @@ impl Tool for GitTool {
         })
     }
 
+    /// Every statically knowable ticket `invoke` enforces. Reads declare
+    /// the repository read; mutations declare read *and* write (the agent
+    /// loop mints both before execution). Network remotes are resolved
+    /// from repository config at invoke time and enforced there with a
+    /// retriable `permission_required` carrying the exact host/port — see
+    /// [`require_remote_ticket`].
     fn required_capabilities(&self, args: &serde_json::Value) -> Vec<CapabilityRequirement> {
-        self.required_capability(args).into_iter().collect()
+        let Some(repo) = args.get("repo").and_then(|value| value.as_str()) else {
+            return self.required_capability(args).into_iter().collect();
+        };
+        match self.spec().risk {
+            GitRisk::Read => vec![CapabilityRequirement {
+                capability: Capability::FilesystemRead,
+                resource: Resource::Path(PathBuf::from(repo)),
+            }],
+            GitRisk::Mutate | GitRisk::Network | GitRisk::Destructive => vec![
+                CapabilityRequirement {
+                    capability: Capability::FilesystemRead,
+                    resource: Resource::Path(PathBuf::from(repo)),
+                },
+                CapabilityRequirement {
+                    capability: Capability::FilesystemWrite,
+                    resource: Resource::Path(PathBuf::from(repo)),
+                },
+            ],
+        }
     }
 
     async fn invoke(
@@ -218,17 +280,13 @@ impl Tool for GitTool {
                     format!("cannot parse remote URL for '{remote}'"),
                 )
             })?;
-            require_ticket(
-                tool,
-                &ctx,
-                Capability::NetworkConnect,
-                Resource::HostPort {
-                    host: destination.0,
-                    port: destination.1,
-                },
-            )?;
+            require_remote_ticket(tool, &ctx, &destination.0, destination.1)?;
         }
-        let argv = build_argv(tool, &args)?;
+        let argv = if tool == "git.checkout" {
+            build_checkout_argv(&repo, &args).await?
+        } else {
+            build_argv(tool, &args)?
+        };
         let output = run_git(&repo, &argv).await?;
         Ok(ToolOutput::json(serde_json::json!({
             "tool": tool,
@@ -310,9 +368,12 @@ fn build_argv(tool: &str, args: &serde_json::Value) -> Result<Vec<String>, ToolE
             argv
         }
         "git.checkout" => {
-            let target =
-                str_field("target")?.ok_or_else(|| invalid(tool, "missing string 'target'"))?;
-            vec!["checkout".to_string(), "--".to_string(), target]
+            // Unreachable: `invoke` routes checkout through
+            // `build_checkout_argv`, which resolves branch-vs-revision
+            // without the `--` pathspec boundary. Kept out of the argv
+            // table so no caller can accidentally restore a same-named
+            // file path instead of switching branches.
+            return Err(invalid(tool, "use the checkout path, not the argv table"));
         }
         "git.add" => {
             let paths = paths_field(tool, args, "paths")?;
@@ -390,6 +451,53 @@ fn build_argv(tool: &str, args: &serde_json::Value) -> Result<Vec<String>, ToolE
         _ => return Err(invalid(tool, "unknown git tool")),
     };
     Ok(argv)
+}
+
+/// Build a safe checkout argv without the `--` pathspec boundary.
+/// Resolution order is deliberate:
+/// 1. `refs/heads/<target>` exists → `git switch <target>` (branch).
+/// 2. `<target>` is otherwise rev-parseable (tag, SHA, `HEAD~2`, …) →
+///    `git checkout <target>` (detached revision).
+/// 3. Anything else — including file paths — is `invalid_target`: with no
+///    `--` in the final argv, git would otherwise silently restore a
+///    same-named working-tree file instead of switching anything.
+async fn build_checkout_argv(
+    repo: &Path,
+    args: &serde_json::Value,
+) -> Result<Vec<String>, ToolError> {
+    let tool = "git.checkout";
+    let target = args
+        .get("target")
+        .and_then(|value| value.as_str())
+        .map(|value| {
+            validate_token(tool, "target", value)?;
+            Ok::<_, ToolError>(value.to_string())
+        })
+        .transpose()?
+        .ok_or_else(|| invalid(tool, "missing string 'target'"))?;
+    if ref_exists(repo, &format!("refs/heads/{target}")).await {
+        return Ok(vec!["switch".to_string(), target]);
+    }
+    if ref_exists(repo, &target).await {
+        return Ok(vec!["checkout".to_string(), target]);
+    }
+    Err(ToolError::structured_with_details(
+        tool,
+        "invalid_target",
+        format!("'{target}' is not a branch, tag, or commit in this repository"),
+        serde_json::json!({ "target": target }),
+    ))
+}
+
+/// Quiet existence probe: success flag only, never parsed output.
+async fn ref_exists(repo: &Path, reference: &str) -> bool {
+    let argv = vec![
+        "rev-parse".to_string(),
+        "--verify".to_string(),
+        "--quiet".to_string(),
+        reference.to_string(),
+    ];
+    run_git(repo, &argv).await.map(|output| output.0).unwrap_or(false)
 }
 
 fn paths_field(
@@ -580,5 +688,401 @@ mod tests {
         assert!(success);
         assert!(stdout.contains("file.txt"), "{stdout}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Capability matrix + checkout regression tests --------------------
+
+    fn tool_by_id(id: &str) -> Arc<dyn Tool> {
+        GitToolPack
+            .tools(&tool_sdk::ToolLoadContext::default())
+            .into_iter()
+            .find(|tool| tool.metadata().id.0 == id)
+            .unwrap()
+    }
+
+    fn ctx_with(caps: &[(Capability, Resource)]) -> ToolContext {
+        let ctx = ToolContext::new(capability_core::Principal::Agent(
+            capability_core::AgentId::new("test"),
+        ));
+        let mut ctx = ctx;
+        for (capability, resource) in caps {
+            let ticket = capability_core::CapabilityTicket::mint(
+                ctx.principal.clone(),
+                capability.clone(),
+                capability_core::ResourceScope::new(vec![resource.clone()]),
+                ctx.invocation_id,
+                std::time::Duration::from_secs(120),
+            );
+            ctx = ctx.with_ticket(ticket);
+        }
+        ctx
+    }
+
+    fn repo_args(dir: &Path, extra: serde_json::Value) -> serde_json::Value {
+        let mut object = extra.as_object().cloned().unwrap_or_default();
+        object.insert(
+            "repo".to_string(),
+            serde_json::Value::String(dir.to_string_lossy().into_owned()),
+        );
+        serde_json::Value::Object(object)
+    }
+
+    async fn init_repo_with_commit() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("utsuwa-git-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for argv in [
+            vec!["init"],
+            vec!["config", "user.email", "test@example.com"],
+            vec!["config", "user.name", "test"],
+            vec!["config", "commit.gpgsign", "false"],
+        ] {
+            let args = argv.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert!(run_git(&dir, &args).await.unwrap().0, "{args:?}");
+        }
+        std::fs::write(dir.join("file.txt"), "v1").unwrap();
+        assert!(
+            run_git(&dir, &[("add".to_string()), ("file.txt".to_string())])
+                .await
+                .unwrap()
+                .0
+        );
+        assert!(
+            run_git(&dir, &[("commit".to_string()), ("-m".to_string()), ("init".to_string())])
+                .await
+                .unwrap()
+                .0
+        );
+        dir
+    }
+
+    fn head_ref(dir: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["symbolic-ref", "--quiet", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn head_sha(dir: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Declared preflight must match invoke enforcement for every tool:
+    /// reads need read, everything else needs read + write.
+    #[test]
+    fn capability_matrix_declares_every_enforced_ticket() {
+        for read_only in [
+            "git.status",
+            "git.diff",
+            "git.log",
+            "git.show",
+            "git.branch.list",
+            "git.remote.list",
+        ] {
+            let declared = tool_by_id(read_only)
+                .required_capabilities(&serde_json::json!({"repo": "/work", "revision": "HEAD"}));
+            assert_eq!(declared.len(), 1, "{read_only}");
+            assert_eq!(declared[0].capability, Capability::FilesystemRead);
+        }
+        for mutation in [
+            "git.branch.create",
+            "git.checkout",
+            "git.add",
+            "git.commit",
+            "git.restore",
+            "git.fetch",
+            "git.pull",
+            "git.push",
+            "git.reset",
+            "git.clean",
+        ] {
+            let mut args = serde_json::json!({"repo": "/work"});
+            if mutation == "git.checkout" {
+                args["target"] = serde_json::json!("main");
+            }
+            let declared = tool_by_id(mutation).required_capabilities(&args);
+            assert_eq!(declared.len(), 2, "{mutation}");
+            assert!(declared.iter().any(|requirement| {
+                requirement.capability == Capability::FilesystemRead
+            }));
+            assert!(declared.iter().any(|requirement| {
+                requirement.capability == Capability::FilesystemWrite
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_without_write_ticket_is_denied_before_git_runs() {
+        let dir = init_repo_with_commit().await;
+        let commit = tool_by_id("git.commit");
+        let args = repo_args(&dir, serde_json::json!({"message": "x"}));
+        // Read-only context: the write half of the declared pair denies.
+        let read_only = ctx_with(&[(
+            Capability::FilesystemRead,
+            Resource::Path(dir.clone()),
+        )]);
+        let err = commit.invoke(read_only, args.clone()).await.unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        // No ticket at all: the read half denies first.
+        let none = ctx_with(&[]);
+        let err = commit.invoke(none, args).await.unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn checkout_switches_branches_and_detaches_at_revisions() {
+        let dir = init_repo_with_commit().await;
+        let checkout = tool_by_id("git.checkout");
+        let rw = || {
+            ctx_with(&[
+                (
+                    Capability::FilesystemRead,
+                    Resource::Path(dir.clone()),
+                ),
+                (
+                    Capability::FilesystemWrite,
+                    Resource::Path(dir.clone()),
+                ),
+            ])
+        };
+        let first_sha = head_sha(&dir);
+
+        // Create a branch through the tool, then switch to it: HEAD must
+        // track the new branch (no `--` pathspec in the executed argv).
+        let create = tool_by_id("git.branch.create");
+        let out = create
+            .invoke(
+                rw(),
+                repo_args(&dir, serde_json::json!({"name": "feature"})),
+            )
+            .await
+            .unwrap();
+        assert!(out.content["success"].as_bool().unwrap(), "{out:?}");
+        let out = checkout
+            .invoke(rw(), repo_args(&dir, serde_json::json!({"target": "feature"})))
+            .await
+            .unwrap();
+        assert!(out.content["success"].as_bool().unwrap(), "{out:?}");
+        assert!(!out.content["argv"].as_array().unwrap().contains(&serde_json::json!("--")));
+        assert_eq!(head_ref(&dir), "refs/heads/feature");
+
+        // Detach at the earlier commit SHA: HEAD equals that SHA.
+        let out = checkout
+            .invoke(
+                rw(),
+                repo_args(&dir, serde_json::json!({"target": first_sha})),
+            )
+            .await
+            .unwrap();
+        assert!(out.content["success"].as_bool().unwrap(), "{out:?}");
+        assert_eq!(head_sha(&dir), first_sha);
+
+        // A file path that is not a revision is rejected — never restored.
+        std::fs::write(dir.join("file.txt"), "dirty").unwrap();
+        let err = checkout
+            .invoke(rw(), repo_args(&dir, serde_json::json!({"target": "file.txt"})))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("invalid_target"), "{err:?}");
+        assert_eq!(std::fs::read(dir.join("file.txt")).unwrap(), b"dirty");
+
+        // Option-shaped targets are rejected before git runs.
+        let err = checkout
+            .invoke(rw(), repo_args(&dir, serde_json::json!({"target": "--force"})))
+            .await
+            .unwrap_err();
+        assert!(err.code().is_none(), "{err:?}");
+
+        // Unknown revisions fail honestly.
+        let err = checkout
+            .invoke(
+                rw(),
+                repo_args(&dir, serde_json::json!({"target": "no-such-branch-xyz"})),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("invalid_target"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn checkout_conflicts_surface_honestly_without_force() {
+        let dir = init_repo_with_commit().await;
+        let rw = || {
+            ctx_with(&[
+                (
+                    Capability::FilesystemRead,
+                    Resource::Path(dir.clone()),
+                ),
+                (
+                    Capability::FilesystemWrite,
+                    Resource::Path(dir.clone()),
+                ),
+            ])
+        };
+        let checkout = tool_by_id("git.checkout");
+        // Record the starting branch, diverge a second branch, then dirty
+        // the tree: switching back must refuse (not force) and report
+        // the conflict honestly.
+        let first_branch = {
+            let (success, stdout, _) = run_git(
+                &dir,
+                &["branch".to_string(), "--show-current".to_string()],
+            )
+            .await
+            .unwrap();
+            assert!(success);
+            stdout.trim().to_string()
+        };
+        assert!(
+            run_git(&dir, &["checkout".to_string(), "-b".to_string(), "other".to_string()])
+                .await
+                .unwrap()
+                .0
+        );
+        std::fs::write(dir.join("file.txt"), "v2").unwrap();
+        assert!(
+            run_git(
+                &dir,
+                &["commit".to_string(), "-am".to_string(), "v2".to_string()]
+            )
+            .await
+            .unwrap()
+            .0
+        );
+        std::fs::write(dir.join("file.txt"), "dirty").unwrap();
+        let out = checkout
+            .invoke(
+                rw(),
+                repo_args(&dir, serde_json::json!({"target": first_branch})),
+            )
+            .await
+            .unwrap();
+        assert!(!out.content["argv"].as_array().unwrap().contains(&serde_json::json!("--force")));
+        assert!(
+            !out.content["success"].as_bool().unwrap(),
+            "conflicting checkout must fail, not force: {out:?}"
+        );
+        assert_eq!(std::fs::read(dir.join("file.txt")).unwrap(), b"dirty");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fetch_needs_a_ticket_for_the_resolved_remote() {
+        let dir = init_repo_with_commit().await;
+        assert!(
+            run_git(
+                &dir,
+                &[
+                    "remote".to_string(),
+                    "add".to_string(),
+                    "origin".to_string(),
+                    "https://127.0.0.1:9/repo.git".to_string(),
+                ],
+            )
+            .await
+            .unwrap()
+            .0
+        );
+        let fetch = tool_by_id("git.fetch");
+        let args = repo_args(&dir, serde_json::json!({}));
+        let rw = vec![
+            (
+                Capability::FilesystemRead,
+                Resource::Path(dir.clone()),
+            ),
+            (
+                Capability::FilesystemWrite,
+                Resource::Path(dir.clone()),
+            ),
+        ];
+        // Declared preflight covers the filesystem pair only…
+        assert_eq!(fetch.required_capabilities(&args).len(), 2);
+        // …so the remote ticket gates at invoke with a retriable error
+        // naming the exact host/port.
+        let err = fetch.invoke(ctx_with(&rw), args.clone()).await.unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        let details = err.model_message();
+        assert!(details.contains("127.0.0.1"), "{details}");
+        // A ticket for a different remote does not authorize this one.
+        let mut wrong = rw.clone();
+        wrong.push((
+            Capability::NetworkConnect,
+            Resource::HostPort {
+                host: "github.com".to_string(),
+                port: 443,
+            },
+        ));
+        let err = fetch.invoke(ctx_with(&wrong), args.clone()).await.unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        // The exact remote ticket lets git run (which then fails honestly
+        // against the dead endpoint — no network in tests).
+        let mut right = rw.clone();
+        // Explicit ports are preserved: the URL names port 9, so the
+        // port-443 ticket must NOT authorize it (proves exact matching).
+        right.push((
+            Capability::NetworkConnect,
+            Resource::HostPort {
+                host: "127.0.0.1".to_string(),
+                port: 9,
+            },
+        ));
+        let out = fetch.invoke(ctx_with(&right), args).await.unwrap();
+        assert!(!out.content["success"].as_bool().unwrap(), "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn scp_like_remote_resolves_to_ssh_port() {
+        let dir = init_repo_with_commit().await;
+        assert!(
+            run_git(
+                &dir,
+                &[
+                    "remote".to_string(),
+                    "add".to_string(),
+                    "origin".to_string(),
+                    "git@github.com:org/repo.git".to_string(),
+                ],
+            )
+            .await
+            .unwrap()
+            .0
+        );
+        let fetch = tool_by_id("git.fetch");
+        let args = repo_args(&dir, serde_json::json!({}));
+        let rw = vec![
+            (
+                Capability::FilesystemRead,
+                Resource::Path(dir.clone()),
+            ),
+            (
+                Capability::FilesystemWrite,
+                Resource::Path(dir.clone()),
+            ),
+        ];
+        let err = fetch.invoke(ctx_with(&rw), args).await.unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        let details = err.model_message();
+        assert!(details.contains("github.com"), "{details}");
+        assert!(details.contains("22"), "{details}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ssh_remote_url_defaults_to_port_22() {
+        assert_eq!(
+            host_port_of("ssh://git@github.com/org/repo.git"),
+            Some(("github.com".to_string(), 22))
+        );
     }
 }

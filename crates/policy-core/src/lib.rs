@@ -48,6 +48,13 @@ pub struct AuthorizationContext {
     /// The model turn currently being authorized. Once grants are also
     /// bound to this identity and are consumed atomically before execution.
     pub turn_id: Option<String>,
+    /// The live screen-sharing session, when the user is sharing. Grants
+    /// bound to a sharing session (see
+    /// [`GrantedScope::sharing_session_id`]) authorize only while this
+    /// matches; stopping the share clears it, which deterministically
+    /// deactivates session-derived authority without touching unrelated
+    /// persistent grants.
+    pub active_sharing_session: Option<String>,
 }
 
 /// A standing grant previously approved by the user.
@@ -60,6 +67,11 @@ pub struct GrantedScope {
     pub capability: Capability,
     pub scope: capability_core::ResourceScope,
     pub lifetime: GrantLifetime,
+    /// Screen-sharing session this grant is bound to, when it was approved
+    /// while the user was sharing. Stopping that session revokes exactly
+    /// these grants; unrelated grants never carry a binding.
+    #[serde(default)]
+    pub sharing_session_id: Option<String>,
     #[serde(default)]
     pub task_id: Option<String>,
     #[serde(default)]
@@ -91,12 +103,24 @@ impl GrantedScope {
             capability,
             scope,
             lifetime,
+            sharing_session_id: None,
             task_id: bound.then_some(task_id).flatten(),
             turn_id: bound.then_some(turn_id).flatten(),
             created_at: unix_millis(),
             expires_at: None,
             uses_remaining: (lifetime == GrantLifetime::Once).then_some(1),
         }
+    }
+
+    /// Bind this grant to a screen-sharing session. A bound grant
+    /// authorizes only while the context's active sharing session matches,
+    /// and [`ApprovalQueue::revoke_sharing_session`] removes it when that
+    /// session stops. Only session-derived authority (screen capture,
+    /// desktop observation/control approved while sharing) is ever bound;
+    /// unrelated grants stay unbound and survive share teardown.
+    pub fn with_sharing_session(mut self, session_id: impl Into<String>) -> Self {
+        self.sharing_session_id = Some(session_id.into());
+        self
     }
 
     /// Whether this grant is valid for the current authorization context.
@@ -117,6 +141,15 @@ impl GrantedScope {
         }
         if let Some(turn_id) = &self.turn_id {
             if context.turn_id.as_ref() != Some(turn_id) {
+                return false;
+            }
+        }
+        // Session-bound grants die with their session: after the user
+        // stops sharing, the host clears the active session (and revokes
+        // the grants outright), so even a stale snapshot cannot mint
+        // tickets from them. Fail closed on mismatch.
+        if let Some(session_id) = &self.sharing_session_id {
+            if context.active_sharing_session.as_ref() != Some(session_id) {
                 return false;
             }
         }
@@ -157,6 +190,7 @@ fn is_mutation_or_control(cap: &Capability) -> bool {
             | ApplicationLaunch
             | CameraObserve
             | MicrophoneCapture
+            | NotificationSend
             | McpInvoke
             | PluginInvoke
     )
@@ -347,6 +381,22 @@ struct QueueInner {
     next_id: u64,
     pending: std::collections::HashMap<String, PendingRequest>,
     grants: Vec<GrantedScope>,
+    /// Screen-sharing session currently live on the host, if any. New
+    /// session-derived approvals are bound to it; stopping the share
+    /// clears it (see [`ApprovalQueue::revoke_sharing_session`]).
+    active_sharing_session: Option<String>,
+}
+
+/// Capabilities that count as session-derived authority while the user is
+/// sharing: capture, observation, and control of the shared screen. Only
+/// these are ever bound to a sharing session; every other approval
+/// (filesystem, network, camera, microphone, …) stays unbound so share
+/// teardown cannot revoke unrelated grants.
+fn is_session_sharing_capability(capability: &Capability) -> bool {
+    matches!(
+        capability,
+        Capability::ScreenCapture | Capability::DesktopObserve | Capability::DesktopControl
+    )
 }
 
 /// Thread-safe queue bridging the agent runtime, the permission dialog,
@@ -379,6 +429,7 @@ impl ApprovalQueue {
                 next_id: 1,
                 pending: std::collections::HashMap::new(),
                 grants: Vec::new(),
+                active_sharing_session: None,
             }),
             sink: None,
             persist: None,
@@ -537,14 +588,26 @@ impl ApprovalQueue {
                 } else {
                     lifetime
                 };
-                GrantedScope::new(
+                let grant = GrantedScope::new(
                     request.principal.kind(),
                     request.capability.clone(),
                     capability_core::ResourceScope::new(vec![request.resource.clone()]),
                     lifetime,
                     request.task_id.clone(),
                     request.turn_id.clone(),
-                )
+                );
+                // Approvals for session-derived authority while sharing
+                // die with the share. Every other approval stays unbound
+                // so teardown cannot revoke unrelated grants.
+                if is_session_sharing_capability(&request.capability) {
+                    if let Some(session_id) = &inner.active_sharing_session {
+                        grant.with_sharing_session(session_id.clone())
+                    } else {
+                        grant
+                    }
+                } else {
+                    grant
+                }
             })
         };
         // Phase 2: durable write first (outside the queue lock — the hook
@@ -667,6 +730,46 @@ impl ApprovalQueue {
         before - inner.grants.len()
     }
 
+    /// Record which screen-sharing session is live on the host. While set,
+    /// new approvals for session-derived authority (screen capture,
+    /// desktop observation/control) are bound to it; stopping the share
+    /// must call [`ApprovalQueue::revoke_sharing_session`], which also
+    /// clears this back to `None`.
+    pub fn set_active_sharing_session(&self, session_id: Option<String>) {
+        self.inner
+            .lock()
+            .expect("approval queue lock")
+            .active_sharing_session = session_id;
+    }
+
+    /// Drop every grant bound to one stopped screen-sharing session and
+    /// clear the active session marker. Returns how many grants were
+    /// removed. Unbound grants — including unrelated persistent and
+    /// session approvals — always survive. The host audit-logs the count.
+    pub fn revoke_sharing_session(&self, session_id: &str) -> usize {
+        let mut inner = self.inner.lock().expect("approval queue lock");
+        let before = inner.grants.len();
+        inner.grants.retain(|grant| {
+            grant.sharing_session_id.as_deref() != Some(session_id)
+        });
+        if inner.active_sharing_session.as_deref() == Some(session_id) {
+            inner.active_sharing_session = None;
+        }
+        let removed = before - inner.grants.len();
+        if removed > 0 {
+            if let Some(sink) = &self.sink {
+                sink.record(audit_core::AuditRecord::now(
+                    Principal::User,
+                    None,
+                    None,
+                    audit_core::AuditOutcome::Blocked,
+                    format!("stopped screen-sharing session '{session_id}': revoked {removed} session-bound grant(s)"),
+                ));
+            }
+        }
+        removed
+    }
+
     /// Snapshot of standing grants (seed + approvals) for agent turns.
     pub fn context(&self) -> AuthorizationContext {
         self.context_for(None, None)
@@ -683,6 +786,7 @@ impl ApprovalQueue {
             grants: inner.grants.clone(),
             task_id,
             turn_id,
+            active_sharing_session: inner.active_sharing_session.clone(),
         }
     }
 
@@ -711,12 +815,13 @@ impl ApprovalQueue {
         if *principal == Principal::User {
             return true;
         }
+        let mut inner = self.inner.lock().expect("approval queue lock");
         let context = AuthorizationContext {
             grants: Vec::new(),
             task_id: task_id.map(str::to_string),
             turn_id: turn_id.map(str::to_string),
+            active_sharing_session: inner.active_sharing_session.clone(),
         };
-        let mut inner = self.inner.lock().expect("approval queue lock");
         let Some(index) = inner.grants.iter().position(|grant| {
             grant.principal_kind == principal.kind()
                 && grant.capability == request.capability
@@ -817,10 +922,114 @@ mod tests {
             }],
             task_id: Some("task-1".to_string()),
             turn_id: Some("turn-1".to_string()),
+            ..AuthorizationContext::default()
         };
         // read_req targets /work/main.rs — inside the granted tree.
         let d = authorize(&r.principal, &r, &granting);
         assert!(matches!(d, AuthorizationDecision::Allow { .. }));
+    }
+
+    #[test]
+    fn session_bound_grant_dies_with_its_session() {
+        let principal = Principal::Agent(AgentId::new("a"));
+        let request = CapabilityRequest {
+            principal: principal.clone(),
+            capability: Capability::ScreenCapture,
+            resource: Resource::Display("display-0".to_string()),
+        };
+        let grant = GrantedScope::new(
+            PrincipalKind::Agent,
+            Capability::ScreenCapture,
+            ResourceScope::new(vec![Resource::Display("display-0".to_string())]),
+            GrantLifetime::Session,
+            None,
+            None,
+        )
+        .with_sharing_session("share-1");
+        // Live session: the grant authorizes.
+        let live = AuthorizationContext {
+            grants: vec![grant.clone()],
+            active_sharing_session: Some("share-1".to_string()),
+            ..AuthorizationContext::default()
+        };
+        assert!(matches!(
+            authorize(&principal, &request, &live),
+            AuthorizationDecision::Allow { .. }
+        ));
+        // After the share stops, the same grant no longer authorizes —
+        // even though it has not expired.
+        let stopped = AuthorizationContext {
+            grants: vec![grant.clone()],
+            active_sharing_session: None,
+            ..AuthorizationContext::default()
+        };
+        assert!(matches!(
+            authorize(&principal, &request, &stopped),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+        // A different session id does not reactivate it either.
+        let other = AuthorizationContext {
+            grants: vec![grant],
+            active_sharing_session: Some("share-2".to_string()),
+            ..AuthorizationContext::default()
+        };
+        assert!(matches!(
+            authorize(&principal, &request, &other),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn share_stop_revokes_only_session_bound_grants() {
+        let queue = ApprovalQueue::new();
+        queue.set_active_sharing_session(Some("share-1".to_string()));
+        // Screen-capture approval while sharing binds to the session.
+        let capture = queue.submit(
+            Principal::Agent(AgentId::new("a")),
+            Capability::ScreenCapture,
+            Resource::Display("display-0".to_string()),
+            "share screen".to_string(),
+        );
+        // A filesystem approval while sharing stays unbound.
+        let files = queue.submit(
+            Principal::Agent(AgentId::new("a")),
+            Capability::FilesystemRead,
+            Resource::Path(PathBuf::from("/work")),
+            "read project".to_string(),
+        );
+        assert!(queue.decide(&capture.id, Some(GrantLifetime::Session)).unwrap());
+        assert!(queue.decide(&files.id, Some(GrantLifetime::Session)).unwrap());
+        assert_eq!(queue.grants_snapshot().len(), 2);
+
+        let removed = queue.revoke_sharing_session("share-1");
+        assert_eq!(removed, 1);
+        let remaining = queue.grants_snapshot();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].capability, Capability::FilesystemRead);
+        assert!(remaining[0].sharing_session_id.is_none());
+
+        // The stopped session id can no longer authorize, while the
+        // unrelated filesystem grant still does.
+        let context = queue.context();
+        assert!(context.active_sharing_session.is_none());
+        let capture_req = CapabilityRequest {
+            principal: Principal::Agent(AgentId::new("a")),
+            capability: Capability::ScreenCapture,
+            resource: Resource::Display("display-0".to_string()),
+        };
+        assert!(matches!(
+            authorize(&capture_req.principal, &capture_req, &context),
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+        let files_req = CapabilityRequest {
+            principal: Principal::Agent(AgentId::new("a")),
+            capability: Capability::FilesystemRead,
+            resource: Resource::Path(PathBuf::from("/work/main.rs")),
+        };
+        assert!(matches!(
+            authorize(&files_req.principal, &files_req, &context),
+            AuthorizationDecision::Allow { .. }
+        ));
     }
 
     #[test]
@@ -871,6 +1080,7 @@ mod tests {
             }],
             task_id: Some("task-1".to_string()),
             turn_id: Some("turn-1".to_string()),
+            ..AuthorizationContext::default()
         };
         assert!(matches!(
             authorize(&principal, &r, &granting),
