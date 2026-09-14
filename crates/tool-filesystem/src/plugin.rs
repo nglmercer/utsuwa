@@ -172,7 +172,9 @@ pub fn tools_for_plugin(plugin: &FsPlugin) -> Vec<Arc<dyn tool_core::Tool>> {
         out.push(Arc::new(super::ReadRangeTool { limits: fs.clone() }));
     }
     if plugin.supports(FsCapability::SearchText) {
-        out.push(Arc::new(super::SearchTextTool { limits: search.clone() }));
+        out.push(Arc::new(super::SearchTextTool {
+            limits: search.clone(),
+        }));
     }
     if plugin.supports(FsCapability::Glob) {
         out.push(Arc::new(super::GlobTool { limits: search }));

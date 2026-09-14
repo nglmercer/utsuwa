@@ -218,7 +218,8 @@ pub trait ArtifactStore: Send + Sync {
         sensitive: bool,
         _owner: Option<ArtifactOwner>,
     ) -> Result<ArtifactRef, ArtifactError> {
-        self.put_with_source(mime_type, bytes, source, sensitive).await
+        self.put_with_source(mime_type, bytes, source, sensitive)
+            .await
     }
 
     async fn get(&self, id: &ArtifactId) -> Result<Vec<u8>, ArtifactError>;
@@ -466,7 +467,8 @@ impl ArtifactStore for InMemoryArtifactStore {
         source: ArtifactSource,
         sensitive: bool,
     ) -> Result<ArtifactRef, ArtifactError> {
-        self.put_inner(mime_type, bytes, source, sensitive, None).await
+        self.put_inner(mime_type, bytes, source, sensitive, None)
+            .await
     }
 
     async fn put_with_owner(
@@ -477,7 +479,8 @@ impl ArtifactStore for InMemoryArtifactStore {
         sensitive: bool,
         owner: Option<ArtifactOwner>,
     ) -> Result<ArtifactRef, ArtifactError> {
-        self.put_inner(mime_type, bytes, source, sensitive, owner).await
+        self.put_inner(mime_type, bytes, source, sensitive, owner)
+            .await
     }
 
     async fn get(&self, id: &ArtifactId) -> Result<Vec<u8>, ArtifactError> {

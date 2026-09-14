@@ -369,7 +369,11 @@ mod tests {
             AuditOutcome::Blocked,
             "denied with Bearer abcDEF1234567890 present",
         );
-        assert!(!record.detail.contains("abcDEF1234567890"), "{}", record.detail);
+        assert!(
+            !record.detail.contains("abcDEF1234567890"),
+            "{}",
+            record.detail
+        );
     }
 
     #[test]

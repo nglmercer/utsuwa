@@ -1036,7 +1036,8 @@ mod tests {
 
     #[tokio::test]
     async fn extract_missing_any_ticket_stops_before_execution() {
-        let dir = std::env::temp_dir().join(format!("utsuwa-archive-perm-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-archive-perm-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let archive_path = dir.join("test.zip");
         write_zip(&archive_path, &[("hello.txt", b"hello")]);
@@ -1069,8 +1070,15 @@ mod tests {
                 );
             }
             let err = extract.invoke(partial, args.clone()).await.unwrap_err();
-            assert_eq!(err.code(), Some("permission_required"), "missing {missing}: {err:?}");
-            assert!(!destination.exists(), "no bytes may land without full authority");
+            assert_eq!(
+                err.code(),
+                Some("permission_required"),
+                "missing {missing}: {err:?}"
+            );
+            assert!(
+                !destination.exists(),
+                "no bytes may land without full authority"
+            );
         }
         // Outside-scope tickets never authorize, even when all three
         // capabilities are present.
@@ -1089,7 +1097,8 @@ mod tests {
 
     #[tokio::test]
     async fn create_missing_source_read_is_denied() {
-        let dir = std::env::temp_dir().join(format!("utsuwa-archive-create-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-archive-create-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/a.txt"), b"data").unwrap();
         let pack = ArchiveToolPack::new();
@@ -1122,7 +1131,8 @@ mod tests {
 
     #[test]
     fn tar_symlink_entries_are_rejected() {
-        let dir = std::env::temp_dir().join(format!("utsuwa-archive-symlink-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-archive-symlink-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let archive_path = dir.join("link.tar");
         {
@@ -1153,7 +1163,8 @@ mod tests {
     fn decompression_bomb_is_rejected_before_filling_disk() {
         // Output far above the budget must trip `archive_too_large`
         // instead of filling the disk.
-        let dir = std::env::temp_dir().join(format!("utsuwa-archive-bomb-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-archive-bomb-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let archive_path = dir.join("bomb.zip");
         let zeros = vec![0u8; 256 * 1024];
@@ -1163,8 +1174,8 @@ mod tests {
             max_total_bytes: 64 * 1024,
             ..ArchiveLimits::default()
         };
-        let err = extract_archive("archive.extract", &archive_path, &destination, &limits)
-            .unwrap_err();
+        let err =
+            extract_archive("archive.extract", &archive_path, &destination, &limits).unwrap_err();
         assert_eq!(err.code(), Some("archive_too_large"), "{err:?}");
         std::fs::remove_dir_all(&dir).ok();
     }

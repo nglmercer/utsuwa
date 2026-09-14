@@ -195,7 +195,10 @@ mod tests {
             .required_capabilities(&args)
             .pop()
             .expect("one requirement");
-        assert_eq!(declared.capability, capability_core::Capability::NotificationSend);
+        assert_eq!(
+            declared.capability,
+            capability_core::Capability::NotificationSend
+        );
         assert_eq!(
             declared.resource,
             capability_core::Resource::NotificationService

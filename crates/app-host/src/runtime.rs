@@ -1584,10 +1584,7 @@ mod tests {
                 &serde_json::json!("http://127.0.0.1:9333"),
             )
             .unwrap();
-        assert_eq!(
-            read_cdp_endpoint(Some(&storage)),
-            "http://127.0.0.1:9333"
-        );
+        assert_eq!(read_cdp_endpoint(Some(&storage)), "http://127.0.0.1:9333");
         // Remote endpoint: fails closed to the default, never honored.
         storage
             .lock()
@@ -1737,7 +1734,6 @@ mod tests {
                 "{control} must track CDP availability"
             );
         }
-        use camera_capture::CameraBackend as _;
         use tool_browser::BrowserBackend as _;
         let camera_available = AgentRuntime::camera_backend().is_available();
         assert_eq!(

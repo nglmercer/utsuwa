@@ -2866,10 +2866,7 @@ mod tests {
 
     #[test]
     fn cdp_endpoint_config_is_loopback_only() {
-        assert_eq!(
-            sanitize_cdp_endpoint(None),
-            "http://localhost:9222"
-        );
+        assert_eq!(sanitize_cdp_endpoint(None), "http://localhost:9222");
         assert_eq!(
             sanitize_cdp_endpoint(Some("http://127.0.0.1:9333/")),
             "http://127.0.0.1:9333"
@@ -3048,7 +3045,11 @@ mod tests {
             }))
             .unwrap();
             assert!(node.sensitive, "{name}");
-            assert_eq!(node.value.as_deref(), Some(BROWSER_SENSITIVE_MASK), "{name}");
+            assert_eq!(
+                node.value.as_deref(),
+                Some(BROWSER_SENSITIVE_MASK),
+                "{name}"
+            );
         }
         for name in ["Save", "Search", "Username", "Product title"] {
             let node = ax_node_to_browser(&serde_json::json!({
@@ -3104,28 +3105,24 @@ mod tests {
             requirement.capability == Capability::DesktopControl
                 && requirement.resource == Resource::BrowserTab("tab-1".to_string())
         }));
-        assert!(declared.iter().any(|requirement| {
-            requirement.capability == Capability::NetworkConnect
-        }));
-        let ctx_with =
-            |capability: Capability, resource: Resource| -> ToolContext {
-                let ctx = ToolContext::new(Principal::Agent(AgentId::new("t")));
-                let ticket = capability_core::CapabilityTicket::mint(
-                    ctx.principal.clone(),
-                    capability,
-                    ResourceScope::new(vec![resource]),
-                    ctx.invocation_id,
-                    Duration::from_secs(120),
-                );
-                ctx.with_ticket(ticket)
-            };
+        assert!(declared
+            .iter()
+            .any(|requirement| { requirement.capability == Capability::NetworkConnect }));
+        let ctx_with = |capability: Capability, resource: Resource| -> ToolContext {
+            let ctx = ToolContext::new(Principal::Agent(AgentId::new("t")));
+            let ticket = capability_core::CapabilityTicket::mint(
+                ctx.principal.clone(),
+                capability,
+                ResourceScope::new(vec![resource]),
+                ctx.invocation_id,
+                Duration::from_secs(120),
+            );
+            ctx.with_ticket(ticket)
+        };
         let network = url_resource("https://example.com/").unwrap();
         // Network ticket alone must not steer the tab.
         let err = navigate
-            .invoke(
-                ctx_with(Capability::NetworkConnect, network),
-                args.clone(),
-            )
+            .invoke(ctx_with(Capability::NetworkConnect, network), args.clone())
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("permission_required"), "{err:?}");

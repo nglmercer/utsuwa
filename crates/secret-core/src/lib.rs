@@ -49,8 +49,7 @@ impl KeyringStore {
         if account.is_empty() || account.len() > 256 || account.contains('\0') {
             return Err(SecretError::Backend("invalid secret account".to_string()));
         }
-        keyring::Entry::new(&self.service, account)
-            .map_err(|e| SecretError::Backend(e.to_string()))
+        keyring::Entry::new(&self.service, account).map_err(|e| SecretError::Backend(e.to_string()))
     }
 
     /// Probe whether the platform store actually works here (headless
@@ -109,7 +108,12 @@ pub struct MemoryStore {
 
 impl SecretStore for MemoryStore {
     fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
-        Ok(self.inner.lock().map_err(|_| SecretError::Backend("lock failed".to_string()))?.get(account).cloned())
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| SecretError::Backend("lock failed".to_string()))?
+            .get(account)
+            .cloned())
     }
 
     fn set(&self, account: &str, secret: &str) -> Result<(), SecretError> {
@@ -150,7 +154,10 @@ mod tests {
         let store = MemoryStore::default();
         assert_eq!(store.get("model.api_key").unwrap(), None);
         store.set("model.api_key", "sk-test").unwrap();
-        assert_eq!(store.get("model.api_key").unwrap(), Some("sk-test".to_string()));
+        assert_eq!(
+            store.get("model.api_key").unwrap(),
+            Some("sk-test".to_string())
+        );
         store.delete("model.api_key").unwrap();
         assert_eq!(store.get("model.api_key").unwrap(), None);
         // Deleting a missing secret is a no-op, not an error.

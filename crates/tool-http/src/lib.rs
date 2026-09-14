@@ -154,7 +154,7 @@ fn requirement(destination: &Destination) -> CapabilityRequirement {
 fn client_for(limits: &HttpLimits) -> Result<reqwest::Client, ToolError> {
     // Redirects are NEVER automatic: every redirect target must independently
     // pass scheme validation, SSRF validation, and capability authorization
-    // (see `fetch_with_redirects`). An automatic policy would let a public
+    // (see `FetchChain::run`). An automatic policy would let a public
     // URL bounce to 127.0.0.1 / metadata endpoints on the initial ticket.
     reqwest::Client::builder()
         .timeout(limits.timeout)
@@ -224,7 +224,11 @@ fn resolve_redirect_target(
         ));
     }
     let target = current.join(location).map_err(|error| {
-        ToolError::structured(tool, "invalid_target", format!("bad redirect target: {error}"))
+        ToolError::structured(
+            tool,
+            "invalid_target",
+            format!("bad redirect target: {error}"),
+        )
     })?;
     // Enforce http(s) before anything else touches the target.
     parse_destination(target.as_str(), tool)?;
@@ -232,99 +236,108 @@ fn resolve_redirect_target(
 }
 
 fn is_redirect(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status.as_u16(),
-        301 | 302 | 303 | 307 | 308
-    )
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
 }
 
-/// Follow redirects explicitly, authorizing every hop. Returns the final
-/// non-redirect response plus the final URL.
-async fn fetch_with_redirects(
-    tool: &str,
-    client: &reqwest::Client,
-    ctx: &ToolContext,
-    initial: url::Url,
-    method: &str,
-    headers: &[(String, String)],
-    body: Option<&str>,
-    limits: &HttpLimits,
-) -> Result<(reqwest::Response, url::Url), ToolError> {
-    let mut current = initial;
-    let mut method = method.to_string();
-    let mut body = body.map(str::to_string);
-    // Credentials must never leak across origins on redirect.
-    let mut headers: Vec<(String, String)> = headers.to_vec();
-    let mut visited: Vec<url::Url> = vec![current.clone()];
-    let mut hops = 0usize;
-    loop {
-        let is_initial = hops == 0;
-        authorize_hop(tool, ctx, &current, limits.allow_private_targets, is_initial).await?;
-        let mut request = client.request(
-            method
-                .parse()
-                .map_err(|_| invalid(tool, "invalid HTTP method"))?,
-            current.clone(),
-        );
-        for (name, value) in &headers {
-            request = request.header(name.as_str(), value.as_str());
-        }
-        if let Some(body) = &body {
-            request = request.body(body.clone());
-        }
-        let response = request.send().await.map_err(|error| {
-            ToolError::structured(tool, "network_denied", format!("request failed: {error}"))
-        })?;
-        let status = response.status();
-        let location = if is_redirect(status) {
-            response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        } else {
-            None
-        };
-        let Some(location) = location else {
-            return Ok((response, current));
-        };
-        hops += 1;
-        if hops > limits.max_redirects {
-            return Err(ToolError::structured(
-                tool,
-                "action_failed",
-                format!(
-                    "too many redirects (limit {}); possible redirect loop",
-                    limits.max_redirects
-                ),
-            ));
-        }
-        let target = resolve_redirect_target(tool, &current, &location)?;
-        if visited.contains(&target) {
-            return Err(ToolError::structured(
-                tool,
-                "action_failed",
-                format!("redirect loop detected at {}", target.as_str()),
-            ));
-        }
-        // 301/302/303 convert non-GET/HEAD hops to GET (matching browser
-        // and reqwest semantics); 307/308 preserve method and body.
-        if matches!(status.as_u16(), 303)
-            || (matches!(status.as_u16(), 301 | 302) && method != "GET" && method != "HEAD")
-        {
-            method = "GET".to_string();
-            body = None;
-        }
-        if target.origin() != current.origin() {
-            headers.retain(|(name, _)| {
-                !matches!(
-                    name.to_ascii_lowercase().as_str(),
-                    "authorization" | "proxy-authorization" | "cookie"
+/// One request chain: the initial URL plus redirect-following policy.
+/// Bundled so the hop loop takes one argument (see `run`).
+struct FetchChain<'a> {
+    tool: &'a str,
+    client: &'a reqwest::Client,
+    ctx: &'a ToolContext,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+    limits: &'a HttpLimits,
+}
+
+impl FetchChain<'_> {
+    async fn run(mut self, initial: url::Url) -> Result<(reqwest::Response, url::Url), ToolError> {
+        let mut current = initial;
+        let mut visited: Vec<url::Url> = vec![current.clone()];
+        let mut hops = 0usize;
+        loop {
+            let is_initial = hops == 0;
+            authorize_hop(
+                self.tool,
+                self.ctx,
+                &current,
+                self.limits.allow_private_targets,
+                is_initial,
+            )
+            .await?;
+            let mut request = self.client.request(
+                self.method
+                    .parse()
+                    .map_err(|_| invalid(self.tool, "invalid HTTP method"))?,
+                current.clone(),
+            );
+            for (name, value) in &self.headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+            if let Some(body) = &self.body {
+                request = request.body(body.clone());
+            }
+            let response = request.send().await.map_err(|error| {
+                ToolError::structured(
+                    self.tool,
+                    "network_denied",
+                    format!("request failed: {error}"),
                 )
-            });
+            })?;
+            let status = response.status();
+            let location = if is_redirect(status) {
+                response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+            let Some(location) = location else {
+                return Ok((response, current));
+            };
+            hops += 1;
+            if hops > self.limits.max_redirects {
+                return Err(ToolError::structured(
+                    self.tool,
+                    "action_failed",
+                    format!(
+                        "too many redirects (limit {}); possible redirect loop",
+                        self.limits.max_redirects
+                    ),
+                ));
+            }
+            let target = resolve_redirect_target(self.tool, &current, &location)?;
+            if visited.contains(&target) {
+                return Err(ToolError::structured(
+                    self.tool,
+                    "action_failed",
+                    format!("redirect loop detected at {}", target.as_str()),
+                ));
+            }
+            // 301/302/303 convert non-GET/HEAD hops to GET (matching browser
+            // and reqwest semantics); 307/308 preserve method and body.
+            if matches!(status.as_u16(), 303)
+                || (matches!(status.as_u16(), 301 | 302)
+                    && self.method != "GET"
+                    && self.method != "HEAD")
+            {
+                self.method = "GET".to_string();
+                self.body = None;
+            }
+            if target.origin() != current.origin() {
+                self.headers.retain(|(name, _)| {
+                    !matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "authorization" | "proxy-authorization" | "cookie"
+                    )
+                });
+            }
+            visited.push(target.clone());
+            current = target;
         }
-        visited.push(target.clone());
-        current = target;
     }
 }
 
@@ -515,17 +528,18 @@ impl Tool for HttpRequestTool {
             None
         };
         // Every hop — initial URL and each redirect target — passes
-        // capability and SSRF validation inside `fetch_with_redirects`.
-        let (response, final_url) = fetch_with_redirects(
-            self.tool_id,
-            &client,
-            &ctx,
-            parsed,
-            method,
-            &headers,
-            body,
-            &self.limits,
-        )
+        // capability and SSRF validation inside the chain runner.
+        let (response, final_url) = FetchChain {
+            tool: self.tool_id,
+            client: &client,
+            ctx: &ctx,
+            method: method.to_string(),
+            // Credentials must never leak across origins on redirect.
+            headers,
+            body: body.map(str::to_string),
+            limits: &self.limits,
+        }
+        .run(parsed)
         .await?;
         let final_url = final_url.as_str().to_string();
         let status = response.status();
@@ -899,12 +913,7 @@ mod tests {
         let _ = stream.write_all(response.as_bytes()).await;
     }
 
-    async fn spawn_server(
-        other_port: u16,
-    ) -> (
-        std::net::SocketAddr,
-        tokio::task::JoinHandle<()>,
-    ) {
+    async fn spawn_server(other_port: u16) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -961,7 +970,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert_eq!(err.code(), Some("redirect_authorization_required"), "{err:?}");
+        assert_eq!(
+            err.code(),
+            Some("redirect_authorization_required"),
+            "{err:?}"
+        );
         let details = err.model_message();
         assert!(details.contains(&addr_b.port().to_string()), "{details}");
         handle_a.abort();
@@ -975,10 +988,7 @@ mod tests {
         let tool = get_tool_for_tests(5);
         let out = tool
             .invoke(
-                ctx_with_tickets(&[
-                    ("127.0.0.1", addr_a.port()),
-                    ("127.0.0.1", addr_b.port()),
-                ]),
+                ctx_with_tickets(&[("127.0.0.1", addr_a.port()), ("127.0.0.1", addr_b.port())]),
                 serde_json::json!({"url": format!("http://127.0.0.1:{}/other", addr_a.port())}),
             )
             .await
@@ -1029,7 +1039,11 @@ mod tests {
         // allow_private_targets=true for the loopback harness, so the
         // private target passes SSRF here — but the new origin still has
         // no ticket and must not be reached.
-        assert_eq!(err.code(), Some("redirect_authorization_required"), "{err:?}");
+        assert_eq!(
+            err.code(),
+            Some("redirect_authorization_required"),
+            "{err:?}"
+        );
         handle.abort();
     }
 
@@ -1061,7 +1075,10 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("action_failed"), "{err:?}");
-        assert!(err.model_message().contains("too many redirects"), "{err:?}");
+        assert!(
+            err.model_message().contains("too many redirects"),
+            "{err:?}"
+        );
         handle.abort();
     }
 
@@ -1095,12 +1112,8 @@ mod tests {
         let (addr_b, handle_b) = spawn_server(0).await;
         let (addr_a, handle_a) = spawn_server(addr_b.port()).await;
         let tool = get_tool_for_tests(5);
-        let ctx = || {
-            ctx_with_tickets(&[
-                ("127.0.0.1", addr_a.port()),
-                ("127.0.0.1", addr_b.port()),
-            ])
-        };
+        let ctx =
+            || ctx_with_tickets(&[("127.0.0.1", addr_a.port()), ("127.0.0.1", addr_b.port())]);
         let base_a = format!("http://127.0.0.1:{}", addr_a.port());
         // Same-origin redirect keeps the credential header.
         let out = tool
@@ -1146,14 +1159,20 @@ mod tests {
             resolve_redirect_target("http.get", &current, "http://public.example/plain").unwrap();
         assert_eq!(downgrade.scheme(), "http");
         // Non-http(s) schemes never resolve.
-        for bad in ["ftp://public.example/x", "file:///etc/passwd", "gopher://x/"] {
+        for bad in [
+            "ftp://public.example/x",
+            "file:///etc/passwd",
+            "gopher://x/",
+        ] {
             let err = resolve_redirect_target("http.get", &current, bad).unwrap_err();
             assert_eq!(err.code(), Some("invalid_target"), "{bad}: {err:?}");
         }
-        assert!(resolve_redirect_target("http.get", &current, "   ")
-            .unwrap_err()
-            .code()
-            == Some("action_failed"));
+        assert!(
+            resolve_redirect_target("http.get", &current, "   ")
+                .unwrap_err()
+                .code()
+                == Some("action_failed")
+        );
     }
 
     #[tokio::test]
@@ -1175,10 +1194,20 @@ mod tests {
         assert_eq!(dest.port, 443);
         // HTTP downgrade to port 80 needs its own ticket.
         let plain = url::Url::parse("http://public.example/x").unwrap();
-        let err = authorize_hop("http.get", &ticket_ctx("public.example", 443), &plain, true, false)
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), Some("redirect_authorization_required"), "{err:?}");
+        let err = authorize_hop(
+            "http.get",
+            &ticket_ctx("public.example", 443),
+            &plain,
+            true,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some("redirect_authorization_required"),
+            "{err:?}"
+        );
     }
 
     #[test]

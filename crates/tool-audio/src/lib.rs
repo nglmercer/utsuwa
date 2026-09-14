@@ -9,7 +9,9 @@
 //! or plugin consumes the artifact instead).
 
 use artifact_core::{ArtifactOwner, ArtifactSource, ArtifactStore, ContentPart};
-use audio_capture::{AudioCapture, AudioCaptureConfig, AudioError, FinishedCaptureView, RecordedAudio};
+use audio_capture::{
+    AudioCapture, AudioCaptureConfig, AudioError, FinishedCaptureView, RecordedAudio,
+};
 use capability_core::{Capability, Resource};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -263,10 +265,7 @@ impl Tool for AudioStatusTool {
     ) -> Result<ToolOutput, ToolError> {
         let snapshots = snapshot_sessions(&self.deps.state).await;
         let live = snapshots.iter().filter(|snapshot| snapshot.live).count();
-        let detail = snapshots
-            .iter()
-            .map(snapshot_json)
-            .collect::<Vec<_>>();
+        let detail = snapshots.iter().map(snapshot_json).collect::<Vec<_>>();
         Ok(ToolOutput::json(serde_json::json!({
             "microphone_on": live > 0,
             "sessions": detail.len(),
@@ -719,14 +718,14 @@ mod tests {
         // default input as a silent fallback. Hardware-independent: no
         // host has this device, so no real capture ever starts.
         let err = start
-            .invoke(
-                ctx_for("mic-a"),
-                serde_json::json!({"device": "mic-a"}),
-            )
+            .invoke(ctx_for("mic-a"), serde_json::json!({"device": "mic-a"}))
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("invalid_target"), "{err:?}");
-        assert!(err.model_message().contains("audio.list_devices"), "{err:?}");
+        assert!(
+            err.model_message().contains("audio.list_devices"),
+            "{err:?}"
+        );
         // Ticket for mic-a + request for mic-b: denied before any device
         // is touched.
         let err = start
@@ -777,32 +776,28 @@ mod tests {
     }
 
     fn inject_auto_stop(session: &AudioSession) {
-        session
-            .capture
-            .lock()
-            .unwrap()
-            .inject_finished_for_tests(
-                audio_capture::RecordedAudio {
-                    wav_data: vec![7, 7, 7],
-                    sample_rate: 16_000,
-                    channels: 1,
-                    duration_ms: 250,
-                    bytes: 3,
-                },
-                audio_capture::CaptureStats {
-                    current_rms: 0.0,
-                    peak_rms: 0.0,
-                    noise_floor: 0.0,
-                    speech_threshold: 0.05,
-                    speech_candidate_active: false,
-                    speech_detected: false,
-                    silence_duration_ms: 1_000,
-                    duration_ms: 250,
-                    chunk_count: 5,
-                    dropped_chunks: 0,
-                },
-                audio_capture::StopReason::MaximumDuration,
-            );
+        session.capture.lock().unwrap().inject_finished_for_tests(
+            audio_capture::RecordedAudio {
+                wav_data: vec![7, 7, 7],
+                sample_rate: 16_000,
+                channels: 1,
+                duration_ms: 250,
+                bytes: 3,
+            },
+            audio_capture::CaptureStats {
+                current_rms: 0.0,
+                peak_rms: 0.0,
+                noise_floor: 0.0,
+                speech_threshold: 0.05,
+                speech_candidate_active: false,
+                speech_detected: false,
+                silence_duration_ms: 1_000,
+                duration_ms: 250,
+                chunk_count: 5,
+                dropped_chunks: 0,
+            },
+            audio_capture::StopReason::MaximumDuration,
+        );
     }
 
     #[tokio::test]
@@ -870,10 +865,7 @@ mod tests {
         assert!(out.content["artifact_id"].is_string(), "{out:?}");
         // Session A's teardown deleted only A's artifacts.
         assert!(
-            deps.artifacts
-                .get(&survivor.id)
-                .await
-                .is_ok(),
+            deps.artifacts.get(&survivor.id).await.is_ok(),
             "concurrent session artifact must survive"
         );
         let global = AudioStatusTool { deps };

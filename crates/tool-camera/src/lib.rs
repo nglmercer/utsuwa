@@ -732,9 +732,7 @@ mod tests {
         let frame = find(&pack, "camera.capture_frame");
         let stop = find(&pack, "camera.capture_stop");
         let ctx = || ctx_for_camera("cam-0");
-        let session = |out: &ToolOutput| {
-            out.content["session_id"].as_str().unwrap().to_string()
-        };
+        let session = |out: &ToolOutput| out.content["session_id"].as_str().unwrap().to_string();
         let s1 = session(
             &start
                 .invoke(ctx(), serde_json::json!({"camera_id": "cam-0"}))
@@ -766,7 +764,10 @@ mod tests {
         stop.invoke(ctx(), serde_json::json!({"session_id": s1}))
             .await
             .unwrap();
-        assert!(pack.artifacts.get(&f1).await.is_err(), "stopped session frame must be gone");
+        assert!(
+            pack.artifacts.get(&f1).await.is_err(),
+            "stopped session frame must be gone"
+        );
         assert!(
             pack.artifacts.get(&f2).await.is_ok(),
             "concurrent session frame must survive"

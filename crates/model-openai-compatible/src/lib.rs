@@ -1927,12 +1927,11 @@ mod tests {
             "image/png",
             10,
         );
-        let result = model_core::ToolResult::text("call-1", "x").with_parts(vec![
-            ModelContentPart::Image {
+        let result =
+            model_core::ToolResult::text("call-1", "x").with_parts(vec![ModelContentPart::Image {
                 artifact: ghost,
                 detail: None,
-            },
-        ]);
+            }]);
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
         let err = request_body_with_artifacts("vision-model", &request)
@@ -1949,15 +1948,17 @@ mod tests {
             1024,
             std::time::Duration::from_millis(1),
         ));
-        let artifact = memory.put("image/png", vec![0x89, b'P', b'N', b'G']).await.unwrap();
+        let artifact = memory
+            .put("image/png", vec![0x89, b'P', b'N', b'G'])
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let store: Arc<dyn ArtifactStore> = memory.clone();
-        let result = model_core::ToolResult::text("call-1", "x").with_parts(vec![
-            ModelContentPart::Image {
+        let result =
+            model_core::ToolResult::text("call-1", "x").with_parts(vec![ModelContentPart::Image {
                 artifact,
                 detail: None,
-            },
-        ]);
+            }]);
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
         let err = request_body_with_artifacts("vision-model", &request)
@@ -1977,12 +1978,11 @@ mod tests {
         let big = vec![0u8; MAX_WIRE_IMAGE_BYTES + 1];
         let artifact = memory.put("image/png", big).await.unwrap();
         let store: Arc<dyn ArtifactStore> = memory.clone();
-        let result = model_core::ToolResult::text("call-1", "x").with_parts(vec![
-            ModelContentPart::Image {
+        let result =
+            model_core::ToolResult::text("call-1", "x").with_parts(vec![ModelContentPart::Image {
                 artifact,
                 detail: None,
-            },
-        ]);
+            }]);
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
         let err = request_body_with_artifacts("vision-model", &request)
@@ -2010,9 +2010,10 @@ mod tests {
             tool_result: None,
         };
         let store: Arc<dyn ArtifactStore> = memory.clone();
-        let request =
-            ModelRequest::new(vec![message]).with_artifact_store(store);
-        let body = request_body_with_artifacts("chat-model", &request).await.unwrap();
+        let request = ModelRequest::new(vec![message]).with_artifact_store(store);
+        let body = request_body_with_artifacts("chat-model", &request)
+            .await
+            .unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert!(content[0]["text"].as_str().unwrap().contains(&audio.id.0));

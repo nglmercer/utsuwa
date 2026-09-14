@@ -497,7 +497,10 @@ async fn ref_exists(repo: &Path, reference: &str) -> bool {
         "--quiet".to_string(),
         reference.to_string(),
     ];
-    run_git(repo, &argv).await.map(|output| output.0).unwrap_or(false)
+    run_git(repo, &argv)
+        .await
+        .map(|output| output.0)
+        .unwrap_or(false)
 }
 
 fn paths_field(
@@ -747,10 +750,17 @@ mod tests {
                 .0
         );
         assert!(
-            run_git(&dir, &[("commit".to_string()), ("-m".to_string()), ("init".to_string())])
-                .await
-                .unwrap()
-                .0
+            run_git(
+                &dir,
+                &[
+                    ("commit".to_string()),
+                    ("-m".to_string()),
+                    ("init".to_string())
+                ]
+            )
+            .await
+            .unwrap()
+            .0
         );
         dir
     }
@@ -810,12 +820,12 @@ mod tests {
             }
             let declared = tool_by_id(mutation).required_capabilities(&args);
             assert_eq!(declared.len(), 2, "{mutation}");
-            assert!(declared.iter().any(|requirement| {
-                requirement.capability == Capability::FilesystemRead
-            }));
-            assert!(declared.iter().any(|requirement| {
-                requirement.capability == Capability::FilesystemWrite
-            }));
+            assert!(declared
+                .iter()
+                .any(|requirement| { requirement.capability == Capability::FilesystemRead }));
+            assert!(declared
+                .iter()
+                .any(|requirement| { requirement.capability == Capability::FilesystemWrite }));
         }
     }
 
@@ -825,10 +835,7 @@ mod tests {
         let commit = tool_by_id("git.commit");
         let args = repo_args(&dir, serde_json::json!({"message": "x"}));
         // Read-only context: the write half of the declared pair denies.
-        let read_only = ctx_with(&[(
-            Capability::FilesystemRead,
-            Resource::Path(dir.clone()),
-        )]);
+        let read_only = ctx_with(&[(Capability::FilesystemRead, Resource::Path(dir.clone()))]);
         let err = commit.invoke(read_only, args.clone()).await.unwrap_err();
         assert_eq!(err.code(), Some("permission_required"), "{err:?}");
         // No ticket at all: the read half denies first.
@@ -844,14 +851,8 @@ mod tests {
         let checkout = tool_by_id("git.checkout");
         let rw = || {
             ctx_with(&[
-                (
-                    Capability::FilesystemRead,
-                    Resource::Path(dir.clone()),
-                ),
-                (
-                    Capability::FilesystemWrite,
-                    Resource::Path(dir.clone()),
-                ),
+                (Capability::FilesystemRead, Resource::Path(dir.clone())),
+                (Capability::FilesystemWrite, Resource::Path(dir.clone())),
             ])
         };
         let first_sha = head_sha(&dir);
@@ -868,11 +869,17 @@ mod tests {
             .unwrap();
         assert!(out.content["success"].as_bool().unwrap(), "{out:?}");
         let out = checkout
-            .invoke(rw(), repo_args(&dir, serde_json::json!({"target": "feature"})))
+            .invoke(
+                rw(),
+                repo_args(&dir, serde_json::json!({"target": "feature"})),
+            )
             .await
             .unwrap();
         assert!(out.content["success"].as_bool().unwrap(), "{out:?}");
-        assert!(!out.content["argv"].as_array().unwrap().contains(&serde_json::json!("--")));
+        assert!(!out.content["argv"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("--")));
         assert_eq!(head_ref(&dir), "refs/heads/feature");
 
         // Detach at the earlier commit SHA: HEAD equals that SHA.
@@ -889,7 +896,10 @@ mod tests {
         // A file path that is not a revision is rejected — never restored.
         std::fs::write(dir.join("file.txt"), "dirty").unwrap();
         let err = checkout
-            .invoke(rw(), repo_args(&dir, serde_json::json!({"target": "file.txt"})))
+            .invoke(
+                rw(),
+                repo_args(&dir, serde_json::json!({"target": "file.txt"})),
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("invalid_target"), "{err:?}");
@@ -897,7 +907,10 @@ mod tests {
 
         // Option-shaped targets are rejected before git runs.
         let err = checkout
-            .invoke(rw(), repo_args(&dir, serde_json::json!({"target": "--force"})))
+            .invoke(
+                rw(),
+                repo_args(&dir, serde_json::json!({"target": "--force"})),
+            )
             .await
             .unwrap_err();
         assert!(err.code().is_none(), "{err:?}");
@@ -919,14 +932,8 @@ mod tests {
         let dir = init_repo_with_commit().await;
         let rw = || {
             ctx_with(&[
-                (
-                    Capability::FilesystemRead,
-                    Resource::Path(dir.clone()),
-                ),
-                (
-                    Capability::FilesystemWrite,
-                    Resource::Path(dir.clone()),
-                ),
+                (Capability::FilesystemRead, Resource::Path(dir.clone())),
+                (Capability::FilesystemWrite, Resource::Path(dir.clone())),
             ])
         };
         let checkout = tool_by_id("git.checkout");
@@ -934,20 +941,25 @@ mod tests {
         // the tree: switching back must refuse (not force) and report
         // the conflict honestly.
         let first_branch = {
-            let (success, stdout, _) = run_git(
-                &dir,
-                &["branch".to_string(), "--show-current".to_string()],
-            )
-            .await
-            .unwrap();
+            let (success, stdout, _) =
+                run_git(&dir, &["branch".to_string(), "--show-current".to_string()])
+                    .await
+                    .unwrap();
             assert!(success);
             stdout.trim().to_string()
         };
         assert!(
-            run_git(&dir, &["checkout".to_string(), "-b".to_string(), "other".to_string()])
-                .await
-                .unwrap()
-                .0
+            run_git(
+                &dir,
+                &[
+                    "checkout".to_string(),
+                    "-b".to_string(),
+                    "other".to_string()
+                ]
+            )
+            .await
+            .unwrap()
+            .0
         );
         std::fs::write(dir.join("file.txt"), "v2").unwrap();
         assert!(
@@ -967,7 +979,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!out.content["argv"].as_array().unwrap().contains(&serde_json::json!("--force")));
+        assert!(!out.content["argv"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("--force")));
         assert!(
             !out.content["success"].as_bool().unwrap(),
             "conflicting checkout must fail, not force: {out:?}"
@@ -996,14 +1011,8 @@ mod tests {
         let fetch = tool_by_id("git.fetch");
         let args = repo_args(&dir, serde_json::json!({}));
         let rw = vec![
-            (
-                Capability::FilesystemRead,
-                Resource::Path(dir.clone()),
-            ),
-            (
-                Capability::FilesystemWrite,
-                Resource::Path(dir.clone()),
-            ),
+            (Capability::FilesystemRead, Resource::Path(dir.clone())),
+            (Capability::FilesystemWrite, Resource::Path(dir.clone())),
         ];
         // Declared preflight covers the filesystem pair only…
         assert_eq!(fetch.required_capabilities(&args).len(), 2);
@@ -1022,7 +1031,10 @@ mod tests {
                 port: 443,
             },
         ));
-        let err = fetch.invoke(ctx_with(&wrong), args.clone()).await.unwrap_err();
+        let err = fetch
+            .invoke(ctx_with(&wrong), args.clone())
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Some("permission_required"), "{err:?}");
         // The exact remote ticket lets git run (which then fails honestly
         // against the dead endpoint — no network in tests).
@@ -1061,14 +1073,8 @@ mod tests {
         let fetch = tool_by_id("git.fetch");
         let args = repo_args(&dir, serde_json::json!({}));
         let rw = vec![
-            (
-                Capability::FilesystemRead,
-                Resource::Path(dir.clone()),
-            ),
-            (
-                Capability::FilesystemWrite,
-                Resource::Path(dir.clone()),
-            ),
+            (Capability::FilesystemRead, Resource::Path(dir.clone())),
+            (Capability::FilesystemWrite, Resource::Path(dir.clone())),
         ];
         let err = fetch.invoke(ctx_with(&rw), args).await.unwrap_err();
         assert_eq!(err.code(), Some("permission_required"), "{err:?}");

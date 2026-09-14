@@ -589,18 +589,16 @@ mod tests {
         assert!(rewritten.parts.contains(&image));
         assert!(!rewritten.parts.contains(&audio));
         assert!(!rewritten.parts.contains(&video));
-        assert!(
-            rewritten
-                .parts
-                .iter()
-                .filter_map(|part| match part {
-                    ModelContentPart::Text(text) => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-                .contains("a1"),
-        );
+        assert!(rewritten
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                ModelContentPart::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .contains("a1"),);
     }
 
     #[test]

@@ -259,8 +259,6 @@ async fn run_ffmpeg_async(tool: &'static str, argv: Vec<String>) -> Result<Vec<u
     .map_err(|error| failed(tool, "action_failed", error.to_string()))?
 }
 
-
-
 /// 64-bit difference hash over an 8x8 luminance sample.
 pub fn dhash(png_bytes: &[u8]) -> Result<u64, ToolError> {
     let image = image::load_from_memory(png_bytes)
@@ -1191,7 +1189,12 @@ mod tests {
     fn drain_capped_enforces_byte_limits() {
         use std::io::Cursor;
         assert_eq!(drain_capped(Cursor::new(b"hello"), 8).unwrap(), b"hello");
-        assert_eq!(drain_capped(Cursor::new(vec![0u8; 1024]), 1024).unwrap().len(), 1024);
+        assert_eq!(
+            drain_capped(Cursor::new(vec![0u8; 1024]), 1024)
+                .unwrap()
+                .len(),
+            1024
+        );
         assert_eq!(
             drain_capped(Cursor::new(vec![0u8; 1025]), 1024).unwrap_err(),
             DrainError::TooLarge

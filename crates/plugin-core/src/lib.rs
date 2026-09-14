@@ -327,7 +327,9 @@ impl PluginRegistry {
     /// Failures are recorded as `Failed`, never raised: one broken plugin
     /// must not hide the rest.
     pub fn discover_dir(&mut self, dir: &Path) {
-        let entries = std::fs::read_dir(dir).map(|it| it.collect::<Vec<_>>()).unwrap_or_default();
+        let entries = std::fs::read_dir(dir)
+            .map(|it| it.collect::<Vec<_>>())
+            .unwrap_or_default();
         for entry in entries {
             let Ok(entry) = entry else { continue };
             let path = entry.path();
@@ -391,12 +393,20 @@ impl PluginRegistry {
         ids
     }
 
-    fn transition(&mut self, id: &str, to: PluginState, from: &[PluginState]) -> Result<(), PluginError> {
+    fn transition(
+        &mut self,
+        id: &str,
+        to: PluginState,
+        from: &[PluginState],
+    ) -> Result<(), PluginError> {
         let record = self
             .plugins
             .get_mut(id)
             .ok_or_else(|| PluginError::Unknown(id.to_string()))?;
-        if !from.iter().any(|s| std::mem::discriminant(s) == std::mem::discriminant(&record.state)) {
+        if !from
+            .iter()
+            .any(|s| std::mem::discriminant(s) == std::mem::discriminant(&record.state))
+        {
             return Err(PluginError::Transition(
                 record.state.as_str().to_string(),
                 to.as_str().to_string(),
@@ -526,7 +536,8 @@ fn load_plugin_dir(dir: &Path) -> Result<PluginRecord, PluginError> {
             }
             if bytes.len() >= 4 && bytes[..4] == WASM_MAGIC {
                 return Err(PluginError::Module(
-                    "native module holds WebAssembly bytes: use runtime.type = \"wasm\"".to_string(),
+                    "native module holds WebAssembly bytes: use runtime.type = \"wasm\""
+                        .to_string(),
                 ));
             }
         }
@@ -598,8 +609,7 @@ description = "Summarize text"
             "[plugin]\nid = \"bad id\"\nname = \"x\"\nversion = \"1\"\napi = 1\n[runtime]\ntype = \"wasm\"\n"
         )
         .is_err());
-        let dupe = MANIFEST.to_string()
-            + "\n[[tools]]\nname = \"summarize\"\n";
+        let dupe = MANIFEST.to_string() + "\n[[tools]]\nname = \"summarize\"\n";
         assert!(PluginManifest::parse_toml(&dupe).is_err());
     }
 
@@ -626,7 +636,8 @@ description = "Summarize text"
     }
 
     fn plugin_dir(tag: &str, manifest: &str, module: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("utsuwa-plugin-test-{}-{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-plugin-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let plug = dir.join("dev.example.demo");
         std::fs::create_dir_all(&plug).unwrap();
@@ -665,10 +676,8 @@ description = "Summarize text"
 
     #[test]
     fn broken_plugins_fail_loudly_without_hiding_siblings() {
-        let dir = std::env::temp_dir().join(format!(
-            "utsuwa-plugin-test-{}-broken",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-plugin-test-{}-broken", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bad = dir.join("bad.plugin");
         std::fs::create_dir_all(&bad).unwrap();
@@ -748,7 +757,8 @@ type = "native"
     }
 
     fn native_dir(tag: &str, manifest: &str, module: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("utsuwa-native-test-{}-{tag}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-native-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let plug = dir.join("dev.example.native");
         std::fs::create_dir_all(&plug).unwrap();
@@ -773,7 +783,9 @@ type = "native"
         // fails with a dedicated error, not a lifecycle error.
         assert_eq!(
             registry.enable("dev.example.native"),
-            Err(PluginError::NativeNotAllowed("dev.example.native".to_string()))
+            Err(PluginError::NativeNotAllowed(
+                "dev.example.native".to_string()
+            ))
         );
         // Explicit user approval unlocks the transition…
         registry.allow_native("dev.example.native");

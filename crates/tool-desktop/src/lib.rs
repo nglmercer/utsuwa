@@ -4727,7 +4727,11 @@ mod tests {
             .check_window_allowed(&backend, "desktop.click", "ghost")
             .await
             .unwrap_err();
-        assert_eq!(err.code(), Some("application_identity_unverified"), "{err:?}");
+        assert_eq!(
+            err.code(),
+            Some("application_identity_unverified"),
+            "{err:?}"
+        );
         assert!(
             err.model_message().contains("\"window_id\":\"ghost\""),
             "{}",
@@ -4795,7 +4799,11 @@ mod tests {
             .check_window_allowed(&backend, "desktop.click", "w1")
             .await
             .unwrap_err();
-        assert_eq!(err.code(), Some("application_identity_unverified"), "{err:?}");
+        assert_eq!(
+            err.code(),
+            Some("application_identity_unverified"),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

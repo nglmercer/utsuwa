@@ -35,17 +35,24 @@ jobs:
         run: pnpm build
 
   rust:
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
 
       - name: Rust cache
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -59,5 +66,15 @@ jobs:
       - name: Stub frontend dist
         run: mkdir -p build
 
-      - name: Cargo check
-        run: UTSUWA_SKIP_WEB_BUILD=1 cargo check --workspace --all-targets
+      - name: Rust format
+        run: cargo fmt --all -- --check
+
+      # Native integration tests are conditional: hardware/device paths
+      # (camera, microphone, screen capture, accessibility) run through
+      # fake backends and compile checks here; real devices need manual
+      # validation (see docs/computer-use.md).
+      - name: Rust clippy
+        run: UTSUWA_SKIP_WEB_BUILD=1 cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Rust tests
+        run: UTSUWA_SKIP_WEB_BUILD=1 cargo test --workspace --locked

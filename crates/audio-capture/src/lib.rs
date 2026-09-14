@@ -50,11 +50,20 @@ mod tests {
 
     #[test]
     fn device_matching_is_byte_exact() {
-        assert!(match_device_name("Built-in Microphone", "Built-in Microphone"));
-        assert!(!match_device_name("Built-in Microphone", "built-in microphone"));
+        assert!(match_device_name(
+            "Built-in Microphone",
+            "Built-in Microphone"
+        ));
+        assert!(!match_device_name(
+            "Built-in Microphone",
+            "built-in microphone"
+        ));
         assert!(!match_device_name("Built-in Microphone", "Built-in"));
         assert!(!match_device_name("Built-in Microphone", "Microphone"));
-        assert!(!match_device_name("Built-in Microphone", "Built-in Microphone "));
+        assert!(!match_device_name(
+            "Built-in Microphone",
+            "Built-in Microphone "
+        ));
         assert!(!match_device_name("Mic A", "Mic B"));
     }
 
@@ -68,7 +77,10 @@ mod tests {
             Err(AudioError::UnknownDevice(_)) => "unknown-device",
             Err(other) => panic!("unexpected selection error: {other}"),
         };
-        assert_eq!(kind, "unknown-device", "missing device must not open a fallback");
+        assert_eq!(
+            kind, "unknown-device",
+            "missing device must not open a fallback"
+        );
         if let Err(AudioError::UnknownDevice(name)) = result {
             assert_eq!(name, "utsuwa-no-such-device-xyz");
         }

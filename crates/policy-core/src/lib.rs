@@ -749,9 +749,9 @@ impl ApprovalQueue {
     pub fn revoke_sharing_session(&self, session_id: &str) -> usize {
         let mut inner = self.inner.lock().expect("approval queue lock");
         let before = inner.grants.len();
-        inner.grants.retain(|grant| {
-            grant.sharing_session_id.as_deref() != Some(session_id)
-        });
+        inner
+            .grants
+            .retain(|grant| grant.sharing_session_id.as_deref() != Some(session_id));
         if inner.active_sharing_session.as_deref() == Some(session_id) {
             inner.active_sharing_session = None;
         }
@@ -997,8 +997,12 @@ mod tests {
             Resource::Path(PathBuf::from("/work")),
             "read project".to_string(),
         );
-        assert!(queue.decide(&capture.id, Some(GrantLifetime::Session)).unwrap());
-        assert!(queue.decide(&files.id, Some(GrantLifetime::Session)).unwrap());
+        assert!(queue
+            .decide(&capture.id, Some(GrantLifetime::Session))
+            .unwrap());
+        assert!(queue
+            .decide(&files.id, Some(GrantLifetime::Session))
+            .unwrap());
         assert_eq!(queue.grants_snapshot().len(), 2);
 
         let removed = queue.revoke_sharing_session("share-1");
