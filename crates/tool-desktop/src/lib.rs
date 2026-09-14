@@ -1341,7 +1341,7 @@ pub mod tools {
             ),
             DesktopError::UnknownElement(element_id) => ToolError::structured_with_details(
                 tool,
-                "stale_element",
+                "element_not_found",
                 format!("unknown element '{element_id}'"),
                 serde_json::json!({
                     "element_id": element_id,

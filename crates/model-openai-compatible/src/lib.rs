@@ -716,7 +716,7 @@ async fn anthropic_typed_blocks(
                 artifact,
                 detail: _,
             } => {
-                let bytes = resolve_artifact(store, artifact).await?;
+                let bytes = resolve_image_bytes(store, artifact).await?;
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes);
                 blocks.push(serde_json::json!({
                     "type": "image",
@@ -1145,7 +1145,7 @@ async fn openai_typed_parts(
                 "text": value.to_string(),
             })),
             ModelContentPart::Image { artifact, detail } => {
-                let bytes = resolve_artifact(store, artifact).await?;
+                let bytes = resolve_image_bytes(store, artifact).await?;
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes);
                 let mut image = serde_json::json!({
                     "url": format!("data:{};base64,{}", artifact.mime_type, data),
@@ -1201,6 +1201,28 @@ async fn resolve_artifact(
         .get(&artifact.id)
         .await
         .map_err(|error| ModelError::Artifact(error.to_string()))
+}
+
+/// Wire cap for inline base64 images: a provider request must not balloon
+/// on a giant artifact (the media tools already bound sizes; this is
+/// belt-and-braces at the exact wire boundary). Missing/expired artifacts
+/// surface as [`ModelError::Artifact`] — never a silent drop, never a
+/// placeholder that pretends the media is there.
+const MAX_WIRE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+async fn resolve_image_bytes(
+    store: Option<&Arc<dyn ArtifactStore>>,
+    artifact: &artifact_core::ArtifactRef,
+) -> Result<Vec<u8>, ModelError> {
+    let bytes = resolve_artifact(store, artifact).await?;
+    if bytes.len() > MAX_WIRE_IMAGE_BYTES {
+        return Err(ModelError::Artifact(format!(
+            "image artifact {} is {} bytes, over the 20 MiB wire limit",
+            artifact.id,
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -1838,5 +1860,191 @@ mod tests {
             "unexpected: {err:?}"
         );
         server.await.unwrap();
+    }
+
+    // --- Multimodal wire contract tests ---------------------------------
+
+    async fn media_result(store: &Arc<InMemoryArtifactStore>) -> model_core::ToolResult {
+        let image = store
+            .put("image/png", vec![0x89, b'P', b'N', b'G'])
+            .await
+            .unwrap();
+        let audio = store.put("audio/wav", vec![1, 2, 3]).await.unwrap();
+        let video = store.put("video/mp4", vec![4, 5, 6]).await.unwrap();
+        model_core::ToolResult::text("call-media", "captured").with_parts(vec![
+            ModelContentPart::Text("captured".to_string()),
+            ModelContentPart::Image {
+                artifact: image,
+                detail: None,
+            },
+            ModelContentPart::Audio {
+                artifact: audio,
+                format: model_core::AudioFormat::Wav,
+            },
+            ModelContentPart::Video {
+                artifact: video,
+                format: model_core::VideoFormat::Mp4,
+            },
+        ])
+    }
+
+    #[tokio::test]
+    async fn wire_mixed_media_resolves_images_and_marks_the_rest() {
+        let memory = Arc::new(InMemoryArtifactStore::new());
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let request =
+            ModelRequest::new(vec![ModelMessage::tool_result(media_result(&memory).await)])
+                .with_artifact_store(store);
+        let body = request_body_with_artifacts("vision-model", &request)
+            .await
+            .unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        // Four parts in, four blocks out: nothing silently dropped.
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+        // Audio/video degrade to explicit metadata text on this path.
+        for (block, kind) in [(2usize, "audio"), (3usize, "video")] {
+            assert_eq!(content[block]["type"], "text", "{kind}");
+            let text = content[block]["text"].as_str().unwrap();
+            assert!(text.contains("omitted"), "{text}");
+            assert!(text.contains(kind), "{text}");
+        }
+        // role=tool image content uses the exact supported wire shape.
+        assert_eq!(body["messages"][0]["role"], "tool");
+        assert_eq!(body["messages"][0]["tool_call_id"], "call-media");
+    }
+
+    #[tokio::test]
+    async fn wire_missing_artifact_is_an_honest_error() {
+        let memory = Arc::new(InMemoryArtifactStore::new());
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let ghost = artifact_core::ArtifactRef::new(
+            artifact_core::ArtifactId::new("gone"),
+            "image/png",
+            10,
+        );
+        let result = model_core::ToolResult::text("call-1", "x").with_parts(vec![
+            ModelContentPart::Image {
+                artifact: ghost,
+                detail: None,
+            },
+        ]);
+        let request =
+            ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
+        let err = request_body_with_artifacts("vision-model", &request)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ModelError::Artifact(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn wire_expired_artifact_is_an_honest_error() {
+        let memory = Arc::new(InMemoryArtifactStore::with_limits(
+            16,
+            1024,
+            1024,
+            std::time::Duration::from_millis(1),
+        ));
+        let artifact = memory.put("image/png", vec![0x89, b'P', b'N', b'G']).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let result = model_core::ToolResult::text("call-1", "x").with_parts(vec![
+            ModelContentPart::Image {
+                artifact,
+                detail: None,
+            },
+        ]);
+        let request =
+            ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
+        let err = request_body_with_artifacts("vision-model", &request)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ModelError::Artifact(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn wire_oversized_image_is_rejected_before_base64() {
+        let memory = Arc::new(InMemoryArtifactStore::with_limits(
+            64,
+            64 * 1024 * 1024,
+            64 * 1024 * 1024,
+            std::time::Duration::from_secs(60),
+        ));
+        let big = vec![0u8; MAX_WIRE_IMAGE_BYTES + 1];
+        let artifact = memory.put("image/png", big).await.unwrap();
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let result = model_core::ToolResult::text("call-1", "x").with_parts(vec![
+            ModelContentPart::Image {
+                artifact,
+                detail: None,
+            },
+        ]);
+        let request =
+            ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
+        let err = request_body_with_artifacts("vision-model", &request)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ModelError::Artifact(_)) && err.to_string().contains("wire limit"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wire_user_audio_video_degrade_without_dropping() {
+        let memory = Arc::new(InMemoryArtifactStore::new());
+        let audio = memory.put("audio/wav", vec![1]).await.unwrap();
+        let message = ModelMessage {
+            role: ModelRole::User,
+            content: String::new(),
+            content_value: None,
+            content_parts: vec![ModelContentPart::Audio {
+                artifact: audio.clone(),
+                format: model_core::AudioFormat::Wav,
+            }],
+            tool_calls: Vec::new(),
+            tool_result: None,
+        };
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let request =
+            ModelRequest::new(vec![message]).with_artifact_store(store);
+        let body = request_body_with_artifacts("chat-model", &request).await.unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert!(content[0]["text"].as_str().unwrap().contains(&audio.id.0));
+    }
+
+    #[tokio::test]
+    async fn transcript_state_never_holds_wire_base64() {
+        let memory = Arc::new(InMemoryArtifactStore::new());
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let request =
+            ModelRequest::new(vec![ModelMessage::tool_result(media_result(&memory).await)])
+                .with_artifact_store(store);
+        let _ = request_body_with_artifacts("vision-model", &request)
+            .await
+            .unwrap();
+        // The long-lived request still carries artifact references only:
+        // no text part embeds base64, and the media parts still name
+        // their artifacts instead of inline bytes.
+        let result = request.messages[0].tool_result.as_ref().unwrap();
+        assert_eq!(result.tool_call_id, "call-media");
+        let mut saw_image = false;
+        for part in &result.parts {
+            match part {
+                ModelContentPart::Text(text) => assert!(!text.contains(";base64,"), "{text}"),
+                ModelContentPart::Image { artifact, .. } => {
+                    saw_image = true;
+                    assert!(!artifact.mime_type.is_empty());
+                }
+                ModelContentPart::Audio { .. } | ModelContentPart::Video { .. } => {}
+                ModelContentPart::Json(_) => {}
+            }
+        }
+        assert!(saw_image);
     }
 }

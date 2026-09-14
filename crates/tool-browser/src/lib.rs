@@ -1293,7 +1293,7 @@ fn backend_error(tool: &str, error: BrowserError) -> ToolError {
         ),
         BrowserError::UnknownNode(node_id) => ToolError::structured_with_details(
             tool,
-            "stale_element",
+            "element_not_found",
             format!("unknown node '{node_id}'"),
             serde_json::json!({"node_id": node_id, "next_tool": "browser.snapshot"}),
         ),
@@ -2703,6 +2703,10 @@ mod tests {
             Ok(Vec::new())
         }
         async fn click(&self, tab_id: &str, node_id: &str) -> Result<(), BrowserError> {
+            // Mirror the real backend: only snapshot nodes exist.
+            if node_id != "ax-1" {
+                return Err(BrowserError::UnknownNode(node_id.to_string()));
+            }
             self.clicked
                 .lock()
                 .unwrap()
@@ -2987,6 +2991,24 @@ mod tests {
         assert!(!is_safe_attribute("srcdoc"));
         assert!(is_safe_attribute("href"));
         assert!(is_safe_attribute("alt"));
+    }
+
+    #[tokio::test]
+    async fn unknown_nodes_report_element_not_found() {
+        let backend: Arc<dyn BrowserBackend> = Arc::new(FakeBrowser::new());
+        let click = BrowserClickTool { backend };
+        let err = click
+            .invoke(
+                ctx_for(
+                    Capability::DesktopControl,
+                    Resource::BrowserTab("tab-1".to_string()),
+                ),
+                serde_json::json!({"tab_id": "tab-1", "node_id": "ax-999"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("element_not_found"), "{err:?}");
+        assert!(err.model_message().contains("ax-999"), "{err:?}");
     }
 
     #[test]

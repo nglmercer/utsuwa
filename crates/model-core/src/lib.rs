@@ -541,6 +541,69 @@ mod tests {
     }
 
     #[test]
+    fn fallback_matrix_covers_audio_video_and_mixed_media() {
+        let image = ModelContentPart::Image {
+            artifact: ArtifactRef::new(artifact_core::ArtifactId::new("shot-1"), "image/png", 100),
+            detail: None,
+        };
+        let audio = ModelContentPart::Audio {
+            artifact: ArtifactRef::new(artifact_core::ArtifactId::new("a1"), "audio/wav", 200),
+            format: AudioFormat::Wav,
+        };
+        let video = ModelContentPart::Video {
+            artifact: ArtifactRef::new(artifact_core::ArtifactId::new("v1"), "video/mp4", 300),
+            format: VideoFormat::Mp4,
+        };
+        let mixed = ToolResult::text("call-9", "observe").with_parts(vec![
+            ModelContentPart::Text("observe".to_string()),
+            image.clone(),
+            audio.clone(),
+            video.clone(),
+        ]);
+        // Default caps: every media part becomes explicit omitted-text
+        // carrying its artifact id — nothing is silently dropped.
+        let rewritten = ModelCapabilities::default().apply_tool_result_fallback(&mixed);
+        assert_eq!(rewritten.parts.len(), 4);
+        let texts = rewritten
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                ModelContentPart::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for id in ["shot-1", "a1", "v1"] {
+            assert!(texts.contains(id), "{texts}");
+        }
+        assert!(texts.contains("observe"), "{texts}");
+        // Full caps: the request passes through untouched.
+        assert_eq!(
+            ModelCapabilities::full().apply_tool_result_fallback(&mixed),
+            mixed
+        );
+        // Image-only caps: the image survives, audio/video still degrade
+        // to explicit metadata.
+        let partial = ModelCapabilities::default().with_image_tool_results(true);
+        let rewritten = partial.apply_tool_result_fallback(&mixed);
+        assert!(rewritten.parts.contains(&image));
+        assert!(!rewritten.parts.contains(&audio));
+        assert!(!rewritten.parts.contains(&video));
+        assert!(
+            rewritten
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    ModelContentPart::Text(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .contains("a1"),
+        );
+    }
+
+    #[test]
     fn audio_video_parts_carry_format_metadata() {
         let audio = ModelContentPart::Audio {
             artifact: ArtifactRef::new(artifact_core::ArtifactId::new("a1"), "audio/wav", 100),

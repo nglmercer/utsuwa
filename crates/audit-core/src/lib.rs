@@ -163,6 +163,13 @@ fn secret_prefix_len(rest: &str) -> usize {
             return prefix.len();
         }
     }
+    // Authorization header values and session-cookie pairs: cookie values
+    // and bearer tokens are credentials even without a vendor prefix.
+    for prefix in ["bearer ", "Bearer ", "sessionid=", "session="] {
+        if rest.starts_with(prefix) {
+            return prefix.len();
+        }
+    }
     0
 }
 
@@ -340,6 +347,29 @@ mod tests {
             sink.outcomes(),
             vec![AuditOutcome::Blocked, AuditOutcome::Denied]
         );
+    }
+
+    #[test]
+    fn bearer_and_session_cookie_values_are_masked() {
+        let redacted = redact_detail("header Bearer abcDEF1234567890 ok");
+        assert!(!redacted.contains("abcDEF1234567890"), "{redacted}");
+        assert!(redacted.contains("[redacted]"), "{redacted}");
+        assert!(redacted.contains("ok"), "{redacted}");
+
+        let redacted = redact_detail("Cookie: sessionid=abcDEF123456; Path=/");
+        assert!(!redacted.contains("abcDEF123456"), "{redacted}");
+        assert!(redacted.contains("Path=/"), "{redacted}");
+
+        // End to end: a record built with credential-shaped detail stores
+        // only the masked form.
+        let record = AuditRecord::now(
+            principal(),
+            Some(Capability::DesktopObserve),
+            None,
+            AuditOutcome::Blocked,
+            "denied with Bearer abcDEF1234567890 present",
+        );
+        assert!(!record.detail.contains("abcDEF1234567890"), "{}", record.detail);
     }
 
     #[test]
