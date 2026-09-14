@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tool-core.workspace = true
 tool-sdk.workspace = true
+uuid.workspace = true
 
 
 [dev-dependencies]

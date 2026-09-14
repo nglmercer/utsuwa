@@ -264,6 +264,13 @@ impl AgentRuntime {
         if let Some(portal) = desktop_linux_wayland::plugin() {
             registry.register(portal);
         }
+        // Native AT-SPI semantics stay available as their own plugin for
+        // sessions without a portal (the portal backend above already
+        // prefers AT-SPI for semantic calls when both are present).
+        #[cfg(target_os = "linux")]
+        if let Some(atspi) = desktop_linux_atspi::plugin() {
+            registry.register(atspi);
+        }
         #[cfg(target_os = "linux")]
         if let Some(linux) = desktop_linux::plugin() {
             registry.register(linux);
@@ -1745,6 +1752,11 @@ mod tests {
             ids.iter().any(|id| id == "media.video_keyframes"),
             tool_media::ffmpeg_available(),
             "media.video_keyframes must track ffmpeg availability"
+        );
+        assert_eq!(
+            ids.iter().any(|id| id == "pdf.page_image"),
+            tool_system::pdftoppm_available(),
+            "pdf.page_image must track pdftoppm availability"
         );
     }
 

@@ -142,8 +142,9 @@ kills/reaps the child on timeout or overflow.
 
 Native capture/control uses the XDG ScreenCast portal (PipeWire) and
 XDG RemoteDesktop — never X11 calls on a Wayland session. Semantic accessibility (roles, names, trees, element actions)
-currently goes through X11/XWayland; native AT-SPI2/D-Bus
-accessibility is planned work (`docs/` tracks status). Capture,
+prefers native AT-SPI2/D-Bus (`desktop.linux-atspi`: `atspi://…` ids,
+bounded walks, explicit `BackendUnavailable` with no registry) and
+falls back to XWayland only for non-AT-SPI ids. Capture,
 control, and accessibility are three separate layers: portal
 permission does not imply XWayland presence.
 

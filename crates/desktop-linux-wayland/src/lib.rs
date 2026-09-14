@@ -2,8 +2,9 @@
 //!
 //! Screen visibility is obtained through the XDG ScreenCast portal and the
 //! selected PipeWire node is consumed in a dedicated native capture thread.
-//! Xwayland remains a separate fallback for window hierarchy and input; it is
-//! never used to infer that a portal screen-sharing approval granted control.
+//! Semantic accessibility prefers native AT-SPI2/D-Bus and falls back to
+//! Xwayland only for non-AT-SPI ids; Xwayland is never used to infer that
+//! a portal screen-sharing approval granted control.
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -37,6 +38,11 @@ mod linux {
 
         let x11_plugin = desktop_linux::plugin();
         let x11 = x11_plugin.as_ref().map(|plugin| plugin.backend.clone());
+        // Native AT-SPI semantics win over Xwayland inference whenever the
+        // registry answers; X11 stays as the legacy fallback. Ids carry
+        // their backend (`atspi://…` vs hex), so routing stays exact.
+        let atspi_plugin = desktop_linux_atspi::plugin();
+        let atspi = atspi_plugin.as_ref().map(|plugin| plugin.backend.clone());
         let mut capabilities = vec![
             DesktopCapability::Screenshot,
             DesktopCapability::CaptureStart,
@@ -63,6 +69,13 @@ mod linux {
                 }
             }
         }
+        if let Some(atspi_plugin) = atspi_plugin {
+            for capability in atspi_plugin.manifest.capabilities {
+                if !capabilities.contains(&capability) {
+                    capabilities.push(capability);
+                }
+            }
+        }
 
         Some(DesktopPlugin::new(
             DesktopPluginManifest {
@@ -75,6 +88,7 @@ mod linux {
             },
             Arc::new(WaylandBackend {
                 x11,
+                atspi,
                 remote: Arc::new(tokio::sync::Mutex::new(None)),
                 control_enabled: Arc::new(AtomicBool::new(true)),
             }),
@@ -89,6 +103,8 @@ mod linux {
     #[derive(Clone)]
     struct WaylandBackend {
         x11: Option<Arc<dyn DesktopBackend>>,
+        /// Native semantic backend, preferred over Xwayland below.
+        atspi: Option<Arc<dyn DesktopBackend>>,
         remote: Arc<tokio::sync::Mutex<Option<PortalRemoteDesktop>>>,
         control_enabled: Arc<AtomicBool>,
     }
@@ -310,6 +326,24 @@ mod linux {
             let backend = self.x11.clone().ok_or_else(|| Self::no_x11(operation))?;
             call(backend).await
         }
+
+        /// Semantic backend for one id: `atspi://…` ids always go native,
+        /// everything else goes to Xwayland. Native wins only for its own
+        /// ids — never by guessing.
+        fn semantic_for(
+            &self,
+            operation: &str,
+            id: &str,
+        ) -> Result<Arc<dyn DesktopBackend>, DesktopError> {
+            if id.starts_with("atspi://") {
+                return self.atspi.clone().ok_or_else(|| {
+                    DesktopError::BackendUnavailable(format!(
+                        "{operation} targets an AT-SPI object but the registry is unreachable"
+                    ))
+                });
+            }
+            self.x11.clone().ok_or_else(|| Self::no_x11(operation))
+        }
     }
 
     #[async_trait]
@@ -319,10 +353,19 @@ mod linux {
         }
 
         async fn list_windows(&self) -> Result<Vec<WindowInfo>, DesktopError> {
-            self.x11("window enumeration", |backend| async move {
-                backend.list_windows().await
-            })
-            .await
+            // Native first, Xwayland legacy second. Id schemes keep the two
+            // worlds apart downstream, so concatenation cannot alias.
+            let mut windows = Vec::new();
+            if let Some(atspi) = &self.atspi {
+                windows.extend(atspi.list_windows().await?);
+            }
+            if let Some(x11) = &self.x11 {
+                windows.extend(x11.list_windows().await?);
+            }
+            if self.atspi.is_none() && self.x11.is_none() {
+                return Err(Self::no_x11("window enumeration"));
+            }
+            Ok(windows)
         }
 
         async fn list_displays(&self) -> Result<Vec<DisplayInfo>, DesktopError> {
@@ -336,11 +379,8 @@ mod linux {
             &self,
             window_id: &str,
         ) -> Result<Vec<ElementNode>, DesktopError> {
-            self.x11("accessibility tree", |backend| {
-                let window_id = window_id.to_string();
-                async move { backend.accessibility_tree(&window_id).await }
-            })
-            .await
+            let backend = self.semantic_for("accessibility tree", window_id)?;
+            backend.accessibility_tree(window_id).await
         }
 
         async fn accessibility_snapshot(
@@ -348,16 +388,8 @@ mod linux {
             window_id: &str,
             since: Option<&str>,
         ) -> Result<AccessibilitySnapshot, DesktopError> {
-            self.x11("accessibility snapshot", |backend| {
-                let window_id = window_id.to_string();
-                let since = since.map(str::to_string);
-                async move {
-                    backend
-                        .accessibility_snapshot(&window_id, since.as_deref())
-                        .await
-                }
-            })
-            .await
+            let backend = self.semantic_for("accessibility snapshot", window_id)?;
+            backend.accessibility_snapshot(window_id, since).await
         }
 
         async fn invoke_element(
@@ -366,12 +398,18 @@ mod linux {
             element_id: &str,
         ) -> Result<(), DesktopError> {
             self.ensure_control_enabled()?;
-            self.x11("element invocation", |backend| {
-                let window_id = window_id.to_string();
-                let element_id = element_id.to_string();
-                async move { backend.invoke_element(&window_id, &element_id).await }
-            })
-            .await
+            let backend = self.semantic_for("element invocation", element_id)?;
+            backend.invoke_element(window_id, element_id).await
+        }
+
+        async fn focus_element(
+            &self,
+            window_id: &str,
+            element_id: &str,
+        ) -> Result<(), DesktopError> {
+            self.ensure_control_enabled()?;
+            let backend = self.semantic_for("element focus", element_id)?;
+            backend.focus_element(window_id, element_id).await
         }
 
         async fn set_value(
@@ -381,13 +419,38 @@ mod linux {
             value: &str,
         ) -> Result<(), DesktopError> {
             self.ensure_control_enabled()?;
-            self.x11("semantic value setting", |backend| {
-                let window_id = window_id.to_string();
-                let element_id = element_id.to_string();
-                let value = value.to_string();
-                async move { backend.set_value(&window_id, &element_id, &value).await }
-            })
-            .await
+            let backend = self.semantic_for("semantic value setting", element_id)?;
+            backend.set_value(window_id, element_id, value).await
+        }
+
+        async fn select_element(
+            &self,
+            window_id: &str,
+            element_id: &str,
+        ) -> Result<(), DesktopError> {
+            self.ensure_control_enabled()?;
+            let backend = self.semantic_for("semantic selection", element_id)?;
+            backend.select_element(window_id, element_id).await
+        }
+
+        async fn expand_element(
+            &self,
+            window_id: &str,
+            element_id: &str,
+        ) -> Result<(), DesktopError> {
+            self.ensure_control_enabled()?;
+            let backend = self.semantic_for("semantic expansion", element_id)?;
+            backend.expand_element(window_id, element_id).await
+        }
+
+        async fn collapse_element(
+            &self,
+            window_id: &str,
+            element_id: &str,
+        ) -> Result<(), DesktopError> {
+            self.ensure_control_enabled()?;
+            let backend = self.semantic_for("semantic collapse", element_id)?;
+            backend.collapse_element(window_id, element_id).await
         }
 
         async fn screenshot(&self, window_id: Option<&str>) -> Result<Screenshot, DesktopError> {
@@ -476,11 +539,8 @@ mod linux {
 
         async fn focus_window(&self, window_id: &str) -> Result<(), DesktopError> {
             self.ensure_control_enabled()?;
-            self.x11("window focus", |backend| {
-                let window_id = window_id.to_string();
-                async move { backend.focus_window(&window_id).await }
-            })
-            .await
+            let backend = self.semantic_for("window focus", window_id)?;
+            backend.focus_window(window_id).await
         }
 
         async fn close_window(&self, window_id: &str) -> Result<(), DesktopError> {

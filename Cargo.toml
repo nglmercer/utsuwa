@@ -32,6 +32,7 @@ members = [
     "crates/memory",
     "crates/tool-desktop",
     "crates/desktop-linux",
+    "crates/desktop-linux-atspi",
     "crates/desktop-linux-wayland",
     "crates/desktop-windows",
     "crates/desktop-macos",
@@ -52,11 +53,13 @@ async-trait = "0.1"
 artifact-core = { path = "crates/artifact-core" }
 base64 = "0.22"
 ashpd = "0.11.1"
+atspi = { version = "0.29", features = ["tokio"] }
 pipewire = "0.10.1"
 png = "0.18.1"
 audit-core = { path = "crates/audit-core" }
 audio-capture = { path = "crates/audio-capture" }
 desktop-linux = { path = "crates/desktop-linux" }
+desktop-linux-atspi = { path = "crates/desktop-linux-atspi" }
 desktop-linux-wayland = { path = "crates/desktop-linux-wayland" }
 desktop-windows = { path = "crates/desktop-windows" }
 desktop-macos = { path = "crates/desktop-macos" }

@@ -19,5 +19,5 @@ pub mod system;
 
 pub use application::ApplicationToolPack;
 pub use clipboard::ClipboardToolPack;
-pub use document::DocumentToolPack;
+pub use document::{pdftoppm_available, DocumentToolPack};
 pub use system::SystemToolPack;

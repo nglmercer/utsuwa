@@ -80,6 +80,9 @@ fn mime_guess(path: &std::path::Path) -> String {
 pub struct DocumentMetadataTool;
 pub struct DocumentExtractTextTool;
 pub struct PdfExtractTextTool;
+pub struct PdfPageImageTool {
+    pub artifacts: Arc<dyn ArtifactStore>,
+}
 pub struct ImageMetadataTool;
 pub struct ImageResizeTool {
     pub artifacts: Arc<dyn ArtifactStore>,
@@ -441,6 +444,273 @@ impl Tool for ImageResizeTool {
     }
 }
 
+/// Whether `pdftoppm` (poppler) can render PDF pages. Checked per call
+/// (cheap `exec`) rather than cached, so installs during a session take
+/// effect.
+pub fn pdftoppm_available() -> bool {
+    std::process::Command::new("pdftoppm")
+        .arg("-v")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Render one PDF page to PNG bytes via `pdftoppm -singlefile`: bounded
+/// input size, hard timeout, bounded stderr diagnostics. Pure over the
+/// filesystem (no tickets involved); the caller owns authorization.
+fn render_pdf_page(
+    tool: &str,
+    path: &std::path::Path,
+    page: u32,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, ToolError> {
+    const PDF_MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+    const PDF_MAX_PNG_BYTES: u64 = 32 * 1024 * 1024;
+    const RENDER_DPI: u32 = 150;
+
+    let size = std::fs::metadata(path)
+        .map_err(|error| failed(tool, "action_failed", error.to_string()))?
+        .len();
+    if size > PDF_MAX_INPUT_BYTES {
+        return Err(ToolError::structured_with_details(
+            tool,
+            "response_too_large",
+            format!("PDF is {size} bytes (limit {PDF_MAX_INPUT_BYTES})"),
+            serde_json::json!({ "size_bytes": size }),
+        ));
+    }
+    if !pdftoppm_available() {
+        return Err(failed(
+            tool,
+            "backend_unavailable",
+            "page rendering needs a `pdftoppm` (poppler) binary on PATH, which is not installed"
+                .to_string(),
+        ));
+    }
+    let dir = std::env::temp_dir().join(format!("utsuwa-pdf-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| failed(tool, "action_failed", error.to_string()))?;
+    let prefix = dir.join("page");
+    let page_arg = page.to_string();
+    let dpi_arg = RENDER_DPI.to_string();
+    let mut child = std::process::Command::new("pdftoppm")
+        .args([
+            "-png",
+            "-r",
+            &dpi_arg,
+            "-f",
+            &page_arg,
+            "-l",
+            &page_arg,
+            "-singlefile",
+        ])
+        .arg(path)
+        .arg(&prefix)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            failed(
+                tool,
+                "backend_unavailable",
+                format!("cannot run pdftoppm: {error}"),
+            )
+        })?;
+    let deadline = std::time::Instant::now() + timeout;
+    let mut status = None;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(exit)) => {
+                status = Some(exit);
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                std::fs::remove_dir_all(&dir).ok();
+                return Err(failed(tool, "action_failed", error.to_string()));
+            }
+        }
+    }
+    // The child has exited (or was just reaped), so reading stderr to EOF
+    // cannot block; cap it anyway.
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read as _;
+        let mut chunk = [0u8; 8192];
+        loop {
+            if stderr.len() >= 64 * 1024 {
+                break;
+            }
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => stderr.extend_from_slice(&chunk[..read]),
+                Err(_) => break,
+            }
+        }
+    }
+    let status = match status {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            std::fs::remove_dir_all(&dir).ok();
+            return Err(failed(
+                tool,
+                "action_failed",
+                format!("pdftoppm timed out after {}s", timeout.as_secs()),
+            ));
+        }
+    };
+    let diagnostics: String = String::from_utf8_lossy(&stderr).chars().take(500).collect();
+    if !status.success() {
+        std::fs::remove_dir_all(&dir).ok();
+        let lowered = diagnostics.to_lowercase();
+        if lowered.contains("encrypt") || lowered.contains("password") {
+            return Err(failed(
+                tool,
+                "unsupported_operation",
+                "encrypted PDFs are not supported".to_string(),
+            ));
+        }
+        if lowered.contains("page") || lowered.contains("pages") {
+            return Err(failed(
+                tool,
+                "invalid_target",
+                format!("page {page} is not renderable: {diagnostics}"),
+            ));
+        }
+        return Err(failed(
+            tool,
+            "action_failed",
+            format!("pdftoppm failed: {diagnostics}"),
+        ));
+    }
+    let png_path = prefix.with_extension("png");
+    let png_size = std::fs::metadata(&png_path)
+        .map_err(|error| {
+            std::fs::remove_dir_all(&dir).ok();
+            failed(
+                tool,
+                "action_failed",
+                format!("pdftoppm produced no output: {error}"),
+            )
+        })?
+        .len();
+    if png_size > PDF_MAX_PNG_BYTES {
+        std::fs::remove_dir_all(&dir).ok();
+        return Err(ToolError::structured_with_details(
+            tool,
+            "response_too_large",
+            format!("rendered page is {png_size} bytes (limit {PDF_MAX_PNG_BYTES})"),
+            serde_json::json!({ "size_bytes": png_size }),
+        ));
+    }
+    let bytes =
+        std::fs::read(&png_path).map_err(|error| failed(tool, "action_failed", error.to_string()));
+    std::fs::remove_dir_all(&dir).ok();
+    bytes
+}
+
+#[async_trait::async_trait]
+impl Tool for PdfPageImageTool {
+    fn metadata(&self) -> ToolMetadata {
+        ToolMetadata {
+            id: capability_core::ToolId::new("pdf.page_image"),
+            description: "Render one PDF page to a PNG image artifact (poppler pdftoppm, bounded). Requires a filesystem-read ticket for the file.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                    "path": {"type": "string"},
+                    "page": {"type": "integer", "minimum": 1},
+                    "max_width": {"type": "integer", "minimum": 1, "maximum": 4096},
+                },
+                "required": ["path"],
+            }),
+            effects: vec![ToolEffect::ReadOnly],
+        }
+    }
+
+    fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
+        read_capability(args)
+    }
+
+    async fn invoke(
+        &self,
+        ctx: ToolContext,
+        args: serde_json::Value,
+    ) -> Result<ToolOutput, ToolError> {
+        const TOOL: &str = "pdf.page_image";
+        let path = path_arg(&args, TOOL)?;
+        let page = match args.get("page") {
+            None => 1,
+            Some(value) => value
+                .as_u64()
+                .and_then(|page| u32::try_from(page).ok())
+                .filter(|page| *page >= 1)
+                .ok_or_else(|| invalid(TOOL, "page must be an integer >= 1"))?,
+        };
+        let max_width = match args.get("max_width") {
+            None => 1600,
+            Some(value) => value
+                .as_u64()
+                .and_then(|width| u32::try_from(width).ok())
+                .filter(|width| (1..=4096).contains(width))
+                .ok_or_else(|| invalid(TOOL, "max_width must be between 1 and 4096"))?,
+        };
+        require_read(TOOL, &ctx, &path)?;
+        let path_for_task = path.clone();
+        let png_bytes = tokio::task::spawn_blocking(move || {
+            render_pdf_page(
+                TOOL,
+                &path_for_task,
+                page,
+                std::time::Duration::from_secs(60),
+            )
+        })
+        .await
+        .map_err(|error| failed(TOOL, "action_failed", error.to_string()))??;
+        let decoded = image::load_from_memory(&png_bytes)
+            .map_err(|error| failed(TOOL, "action_failed", error.to_string()))?;
+        let resized = if decoded.width() > max_width {
+            let height = ((decoded.height() as f32 * max_width as f32 / decoded.width() as f32)
+                .round() as u32)
+                .max(1);
+            decoded.resize(max_width, height, image::imageops::FilterType::Triangle)
+        } else {
+            decoded
+        };
+        let mut out_bytes = Vec::new();
+        resized
+            .write_to(
+                &mut std::io::Cursor::new(&mut out_bytes),
+                image::ImageFormat::Png,
+            )
+            .map_err(|error| failed(TOOL, "action_failed", error.to_string()))?;
+        let (width, height) = (resized.width(), resized.height());
+        let artifact = self
+            .artifacts
+            .put_with_source("image/png", out_bytes, ArtifactSource::Generated, false)
+            .await
+            .map_err(|error| failed(TOOL, "action_failed", error.to_string()))?;
+        let image = ImageArtifactRef::new(artifact.clone(), width, height);
+        Ok(ToolOutput::multipart(
+            serde_json::json!({
+                "path": path.to_string_lossy(),
+                "page": page,
+                "artifact_id": artifact.id,
+                "width": width,
+                "height": height,
+            }),
+            vec![ContentPart::Image(image)],
+        ))
+    }
+}
+
 /// Static document/image tool group.
 pub struct DocumentToolPack {
     pub artifacts: Arc<dyn ArtifactStore>,
@@ -465,8 +735,17 @@ impl tool_sdk::ToolPack for DocumentToolPack {
         "document"
     }
 
+    /// Pure/static tools are always advertised. `pdf.page_image` appears
+    /// only while a `pdftoppm` binary is usable — otherwise the model
+    /// would learn it by trial-and-error `backend_unavailable` failures.
     fn tools(&self, _ctx: &tool_sdk::ToolLoadContext) -> Vec<Arc<dyn Tool>> {
-        vec![
+        self.tools_with_availability(pdftoppm_available())
+    }
+}
+
+impl DocumentToolPack {
+    fn tools_with_availability(&self, renderer_present: bool) -> Vec<Arc<dyn Tool>> {
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(DocumentMetadataTool),
             Arc::new(DocumentExtractTextTool),
             Arc::new(PdfExtractTextTool),
@@ -474,7 +753,13 @@ impl tool_sdk::ToolPack for DocumentToolPack {
             Arc::new(ImageResizeTool {
                 artifacts: self.artifacts.clone(),
             }),
-        ]
+        ];
+        if renderer_present {
+            tools.push(Arc::new(PdfPageImageTool {
+                artifacts: self.artifacts.clone(),
+            }));
+        }
+        tools
     }
 }
 
@@ -531,7 +816,7 @@ mod tests {
     #[test]
     fn pack_registers_document_surface() {
         let mut ids = DocumentToolPack::new()
-            .tools(&tool_sdk::ToolLoadContext::default())
+            .tools_with_availability(true)
             .iter()
             .map(|tool| tool.metadata().id.0.clone())
             .collect::<Vec<_>>();
@@ -544,7 +829,143 @@ mod tests {
                 "image.metadata",
                 "image.resize",
                 "pdf.extract_text",
+                "pdf.page_image",
             ]
         );
+    }
+
+    #[test]
+    fn page_image_tracks_renderer_availability() {
+        let without: Vec<String> = DocumentToolPack::new()
+            .tools_with_availability(false)
+            .iter()
+            .map(|tool| tool.metadata().id.0.clone())
+            .collect();
+        assert!(!without.iter().any(|id| id == "pdf.page_image"));
+        // Static tools stay visible with or without the renderer.
+        for expected in [
+            "document.extract_text",
+            "document.metadata",
+            "image.metadata",
+            "image.resize",
+            "pdf.extract_text",
+        ] {
+            assert!(
+                without.iter().any(|id| id == expected),
+                "missing {expected}"
+            );
+        }
+        assert_eq!(
+            without.len(),
+            DocumentToolPack::new()
+                .tools(&tool_sdk::ToolLoadContext::default())
+                .len()
+                .saturating_sub(usize::from(pdftoppm_available())),
+        );
+    }
+
+    /// Minimal one-page PDF with a correct xref table, built in-test so
+    /// the render path never depends on a fixture file.
+    fn minimal_pdf() -> Vec<u8> {
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+            "<< /Length 44 >>\nstream\nBT /F1 24 Tf 50 150 Td (Hi) Tj ET\nendstream",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", index + 1).as_bytes());
+        }
+        let xref_at = pdf.len();
+        pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+        pdf.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in &offsets {
+            pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        pdf.extend_from_slice(
+            format!(
+                "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n",
+                objects.len() + 1
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    #[tokio::test]
+    async fn page_image_validates_args_before_touching_the_backend() {
+        let dir = std::env::temp_dir().join(format!("utsuwa-pdf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("one.pdf");
+        std::fs::write(&path, minimal_pdf()).unwrap();
+        let tool = PdfPageImageTool {
+            artifacts: Arc::new(artifact_core::InMemoryArtifactStore::new()),
+        };
+        let args = |extra: serde_json::Value| {
+            let mut map = serde_json::json!({"path": path.to_string_lossy()});
+            for (key, value) in extra.as_object().unwrap() {
+                map[key] = value.clone();
+            }
+            map
+        };
+        // page 0 is rejected, not silently coerced to page 1.
+        let error = tool
+            .invoke(ctx_for(&path), args(serde_json::json!({"page": 0})))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+        // max_width outside 1..=4096 is rejected like image.resize.
+        let error = tool
+            .invoke(ctx_for(&path), args(serde_json::json!({"max_width": 0})))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::InvalidArgs { .. }), "{error:?}");
+        // Without a read ticket the renderer never runs.
+        let bare = ToolContext::new(Principal::Agent(AgentId::new("test")));
+        let error = tool
+            .invoke(bare, args(serde_json::json!({})))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("permission_required"),
+            "{error:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn page_image_renders_or_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("utsuwa-pdf-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("one.pdf");
+        std::fs::write(&path, minimal_pdf()).unwrap();
+        let tool = PdfPageImageTool {
+            artifacts: Arc::new(artifact_core::InMemoryArtifactStore::new()),
+        };
+        let result = tool
+            .invoke(
+                ctx_for(&path),
+                serde_json::json!({"path": path.to_string_lossy(), "max_width": 200}),
+            )
+            .await;
+        if pdftoppm_available() {
+            let out = result.unwrap();
+            assert_eq!(out.content["page"], 1);
+            assert_eq!(out.content["width"], 200);
+            assert!(out.content["height"].as_u64().unwrap() > 0);
+            assert!(out.content["artifact_id"].as_str().is_some());
+            assert_eq!(out.parts.len(), 1);
+            assert!(matches!(out.parts[0], ContentPart::Image(_)));
+        } else {
+            // No renderer on PATH (CI/macOS/Windows): honest backend
+            // error naming the missing helper, never a fake image.
+            let error = result.unwrap_err();
+            assert!(format!("{error:?}").contains("pdftoppm"), "{error:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
