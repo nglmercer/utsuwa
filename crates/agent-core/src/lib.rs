@@ -254,6 +254,7 @@ pub struct Agent {
     audit: Option<Arc<dyn AuditSink>>,
     event_sink: Option<AgentEventSink>,
     desktop_action_notifier: Option<DesktopActionNotifier>,
+    application_scope_policy: Option<Arc<dyn tool_core::ApplicationScopePolicy>>,
     replay_cache: Option<Arc<ToolReplayCache>>,
     artifact_store: Option<Arc<dyn artifact_core::ArtifactStore>>,
 }
@@ -268,6 +269,7 @@ impl Agent {
             audit: None,
             event_sink: None,
             desktop_action_notifier: None,
+            application_scope_policy: None,
             replay_cache: None,
             artifact_store: None,
         }
@@ -306,6 +308,18 @@ impl Agent {
     /// remains platform-neutral and the existing registry stays authoritative.
     pub fn with_desktop_action_notifier(mut self, notifier: DesktopActionNotifier) -> Self {
         self.desktop_action_notifier = Some(notifier);
+        self
+    }
+
+    /// Attach the host's live application-scope policy. The policy handle is
+    /// carried into each tool invocation so application restrictions are
+    /// checked against current sharing-session state, including resumed
+    /// turns, instead of a per-turn allowlist snapshot.
+    pub fn with_application_scope_policy(
+        mut self,
+        policy: Arc<dyn tool_core::ApplicationScopePolicy>,
+    ) -> Self {
+        self.application_scope_policy = Some(policy);
         self
     }
 
@@ -919,6 +933,7 @@ impl Agent {
             invocation_id,
             ticket: None,
             tickets: Vec::new(),
+            application_scope_policy: self.application_scope_policy.clone(),
         };
         for ticket in tickets {
             // Invocation binding must match the ticket or the broker
@@ -1002,10 +1017,16 @@ impl Agent {
                     (Some(mode), Some(_)) => format!("{}; authorization_mode={mode}", err),
                     _ => err.to_string(),
                 };
+                let audit_outcome = match err.code() {
+                    Some("application_not_allowed") | Some("application_identity_unverified") => {
+                        AuditOutcome::Denied
+                    }
+                    _ => AuditOutcome::Failed,
+                };
                 self.audit_timed(
                     capability,
                     resource,
-                    AuditOutcome::Failed,
+                    audit_outcome,
                     detail,
                     Some(elapsed_ms),
                     None,

@@ -7,6 +7,28 @@ use ipc_core::{ErrorCode, IpcErrorBody, IpcRequest};
 use serde_json::Value;
 
 impl Dispatcher {
+    pub(crate) fn camera_activity_status(&self) -> Result<Value, IpcErrorBody> {
+        let runtime = self.agent.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "agent runtime is not attached".to_string(),
+        })?;
+        serde_json::to_value(runtime.camera_activity_status()).map_err(|error| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: error.to_string(),
+        })
+    }
+
+    pub(crate) fn microphone_activity_status(&self) -> Result<Value, IpcErrorBody> {
+        let runtime = self.agent.as_ref().ok_or_else(|| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: "agent runtime is not attached".to_string(),
+        })?;
+        serde_json::to_value(runtime.microphone_activity_status()).map_err(|error| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: error.to_string(),
+        })
+    }
+
     pub(crate) fn audio_capture_start(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
         let manager = self.audio_capture.as_ref().ok_or_else(|| IpcErrorBody {
             code: ErrorCode::Internal,

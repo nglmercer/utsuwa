@@ -24,6 +24,7 @@ impl AgentRuntime {
             .with_agent_id(self.agent_id.clone())
             .with_limits(AgentLimits::default());
         agent = agent.with_artifact_store(self.artifacts.clone());
+        agent = agent.with_application_scope_policy(Arc::new(self.computer_sessions.clone()));
         let captures = self.computer_sessions.clone();
         agent = agent.with_desktop_action_notifier(Arc::new(move || {
             let captures = captures.clone();

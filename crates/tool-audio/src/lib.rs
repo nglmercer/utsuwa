@@ -10,26 +10,59 @@
 
 use artifact_core::{ArtifactOwner, ArtifactSource, ArtifactStore, ContentPart};
 use audio_capture::{
-    AudioCapture, AudioCaptureConfig, AudioError, FinishedCaptureView, RecordedAudio,
+    AudioCapture, AudioCaptureConfig, AudioError, CaptureEvent, FinishedCaptureView, RecordedAudio,
 };
 use capability_core::{Capability, Resource};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tool_core::{
     CapabilityRequirement, Tool, ToolContext, ToolEffect, ToolError, ToolMetadata, ToolOutput,
 };
 
+/// Authoritative microphone activity published to the native host and
+/// frontend. `started_at` is Unix milliseconds and is metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct MicrophoneActivityState {
+    pub active: bool,
+    pub session_count: usize,
+    pub device: Option<String>,
+    pub started_at: Option<u64>,
+}
+
 /// Frontend-visible microphone indicator plus session registry.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AudioState {
     active: Arc<std::sync::atomic::AtomicBool>,
     sessions: Arc<tokio::sync::Mutex<HashMap<String, AudioSession>>>,
+    activity_sessions: Arc<std::sync::Mutex<BTreeMap<String, ActivitySession>>>,
+    activity: Arc<std::sync::RwLock<MicrophoneActivityState>>,
+    activity_changes: tokio::sync::watch::Sender<MicrophoneActivityState>,
 }
 
 struct AudioSession {
     device: String,
     started_at_ms: u64,
     capture: Arc<std::sync::Mutex<AudioCapture>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActivitySession {
+    device: String,
+    started_at: u64,
+    tool_owned: bool,
+}
+
+impl Default for AudioState {
+    fn default() -> Self {
+        let (activity_changes, _) = tokio::sync::watch::channel(MicrophoneActivityState::default());
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            activity_sessions: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            activity: Arc::new(std::sync::RwLock::new(MicrophoneActivityState::default())),
+            activity_changes,
+        }
+    }
 }
 
 impl AudioState {
@@ -41,26 +74,126 @@ impl AudioState {
         self.active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<MicrophoneActivityState> {
+        self.activity_changes.subscribe()
+    }
+
+    pub fn activity_state(&self) -> MicrophoneActivityState {
+        self.activity
+            .read()
+            .map(|state| state.clone())
+            .unwrap_or_else(|_| MicrophoneActivityState {
+                active: true,
+                session_count: 0,
+                device: None,
+                started_at: None,
+            })
+    }
+
+    /// Register a model-owned microphone session after its native stream has
+    /// opened. The live stream callback removes it on every worker stop path.
+    pub fn begin_session(&self, session_id: String, device: String, started_at: u64) {
+        self.begin_activity(session_id, device, started_at, true);
+    }
+
+    /// Register the direct frontend/STT capture path in the same authoritative
+    /// state as model-owned audio sessions.
+    pub fn begin_external_session(&self, session_id: String, device: String, started_at: u64) {
+        self.begin_activity(session_id, device, started_at, false);
+    }
+
+    pub fn end_session(&self, session_id: &str) {
+        if let Ok(mut sessions) = self.activity_sessions.lock() {
+            sessions.remove(session_id);
+        }
+        self.publish_activity();
+    }
+
+    fn begin_activity(
+        &self,
+        session_id: String,
+        device: String,
+        started_at: u64,
+        tool_owned: bool,
+    ) {
+        if let Ok(mut sessions) = self.activity_sessions.lock() {
+            sessions.insert(
+                session_id,
+                ActivitySession {
+                    device,
+                    started_at,
+                    tool_owned,
+                },
+            );
+        }
+        self.publish_activity();
+    }
+
+    fn publish_activity(&self) {
+        let state = match self.activity_sessions.lock() {
+            Ok(sessions) => {
+                let first = sessions.values().min_by_key(|session| session.started_at);
+                MicrophoneActivityState {
+                    active: !sessions.is_empty(),
+                    session_count: sessions.len(),
+                    device: first.map(|session| session.device.clone()),
+                    started_at: first.map(|session| session.started_at),
+                }
+            }
+            Err(_) => MicrophoneActivityState {
+                // Unknown native state must remain visible to the human.
+                active: true,
+                session_count: 0,
+                device: None,
+                started_at: None,
+            },
+        };
+        self.active
+            .store(state.active, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut current) = self.activity.write() {
+            *current = state.clone();
+        }
+        let _ = self.activity_changes.send(state);
+    }
+
     /// Reap workers that stopped themselves (silence, max duration,
     /// device error) and recompute the indicator from live streams, so
     /// `Microphone: ON` tracks the real device — not a stale session-map
     /// entry. Returns the number of live sessions.
     pub async fn refresh_indicator(&self) -> usize {
         let mut sessions = self.sessions.lock().await;
-        let mut live = 0;
-        for session in sessions.values_mut() {
+        let mut live_sessions = BTreeMap::new();
+        for (session_id, session) in sessions.iter_mut() {
             if let Ok(mut capture) = session.capture.lock() {
                 // Reap first: an auto-stopped worker must read as
                 // finished here, not as running.
                 let _ = capture.poll_finished();
                 if capture.is_running() {
-                    live += 1;
+                    live_sessions.insert(
+                        session_id.clone(),
+                        ActivitySession {
+                            device: session.device.clone(),
+                            started_at: session.started_at_ms,
+                            tool_owned: true,
+                        },
+                    );
                 }
             }
         }
-        self.active
-            .store(live > 0, std::sync::atomic::Ordering::SeqCst);
-        live
+        if let Ok(mut activity) = self.activity_sessions.lock() {
+            // A terminal callback removes a model session before its worker
+            // result is reaped. Only refresh entries that are still tracked;
+            // otherwise a stop/auto-stop race could briefly (or permanently)
+            // turn the indicator back on.
+            activity.retain(|id, session| !session.tool_owned || live_sessions.contains_key(id));
+            for (id, live) in live_sessions {
+                if let Some(session) = activity.get_mut(&id) {
+                    *session = live;
+                }
+            }
+        }
+        self.publish_activity();
+        self.activity_state().session_count
     }
 }
 
@@ -340,6 +473,9 @@ impl Tool for AudioCaptureStartTool {
         let handle: Arc<std::sync::Mutex<AudioCapture>> =
             Arc::new(std::sync::Mutex::new(AudioCapture::new()));
         let starter = handle.clone();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let callback_state = self.deps.state.clone();
+        let callback_session_id = session_id.clone();
         // The authorized device travels into the capture config: the
         // backend opens exactly this device, never the default as a
         // silent fallback for a missing named device.
@@ -353,26 +489,33 @@ impl Tool for AudioCaptureStartTool {
             starter
                 .lock()
                 .map_err(|_| AudioError::Worker("audio session lock failed".to_string()))?
-                .start(config, |_| {})
+                .start(config, move |event| {
+                    if matches!(event, CaptureEvent::Stopped { .. }) {
+                        callback_state.end_session(&callback_session_id);
+                    }
+                })
         })
         .await
         .map_err(|error| {
             ToolError::structured("audio.capture_start", "action_failed", error.to_string())
         })?
         .map_err(|error| audio_error("audio.capture_start", error))?;
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let started_at_ms = unix_millis();
         self.deps.state.sessions.lock().await.insert(
             session_id.clone(),
             AudioSession {
                 device: device.clone(),
-                started_at_ms: unix_millis(),
+                started_at_ms,
                 capture: handle,
             },
         );
         self.deps
             .state
-            .active
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .begin_session(session_id.clone(), device.clone(), started_at_ms);
+        // Reconcile a worker that reached its limit while the session was
+        // being registered so a very short capture cannot leave a stale ON
+        // indicator behind.
+        self.deps.state.refresh_indicator().await;
         Ok(ToolOutput::json(serde_json::json!({
             "session_id": session_id,
             "device": info.device,
@@ -481,7 +624,7 @@ impl Tool for AudioCaptureStopTool {
         let session_id = session_arg(&args, "audio.capture_stop")?;
         let handle = {
             let mut sessions = self.deps.state.sessions.lock().await;
-            let Some(session) = sessions.remove(&session_id) else {
+            let Some(session) = sessions.get(&session_id) else {
                 return Err(ToolError::structured_with_details(
                     "audio.capture_stop",
                     "session_not_found",
@@ -490,18 +633,20 @@ impl Tool for AudioCaptureStopTool {
                 ));
             };
             require_microphone("audio.capture_stop", &ctx, &session.device)?;
-            // Exact-session cleanup: only this session's artifacts are
-            // removed — a concurrent session's recording always survives.
-            // The new recording is tagged with the same owner below, so
-            // deleting first never removes it.
-            self.deps
-                .artifacts
-                .delete_owner(&ArtifactOwner::AudioSession(session_id.clone()))
-                .await;
+            let session = sessions
+                .remove(&session_id)
+                .expect("audio session was checked while holding the map lock");
             (session.device.clone(), session.capture.clone())
         };
-        self.deps.state.refresh_indicator().await;
         let (device, handle) = handle;
+        // Exact-session cleanup: only this session's artifacts are removed —
+        // a concurrent session's recording always survives. The new
+        // recording is tagged with the same owner below, so deleting first
+        // never removes it.
+        self.deps
+            .artifacts
+            .delete_owner(&ArtifactOwner::AudioSession(session_id.clone()))
+            .await;
         let recorded = tokio::task::spawn_blocking(move || {
             handle
                 .lock()
@@ -510,9 +655,14 @@ impl Tool for AudioCaptureStopTool {
         })
         .await
         .map_err(|error| {
+            self.deps.state.end_session(&session_id);
             ToolError::structured("audio.capture_stop", "action_failed", error.to_string())
         })?
-        .map_err(|error| audio_error("audio.capture_stop", error))?;
+        .map_err(|error| {
+            self.deps.state.end_session(&session_id);
+            audio_error("audio.capture_stop", error)
+        })?;
+        self.deps.state.end_session(&session_id);
         // `stop` hands over an auto-stopped worker's recording instead of
         // erroring, so the mic indicator and the artifact agree even when
         // the native stream ended first (silence, max duration).
@@ -591,10 +741,10 @@ impl Tool for AudioRecordTool {
         let device = device_arg(&args, "audio.record");
         let duration_ms = duration_arg(&args, "audio.record", 5_000, 120_000)?;
         require_microphone("audio.record", &ctx, &device)?;
+        let activity_id = format!("record:{}", uuid::Uuid::new_v4());
         self.deps
             .state
-            .active
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+            .begin_external_session(activity_id.clone(), device.clone(), unix_millis());
         let config = AudioCaptureConfig {
             device: Some(device.clone()),
             max_duration_ms: duration_ms,
@@ -602,17 +752,29 @@ impl Tool for AudioRecordTool {
             retain_audio: true,
             ..AudioCaptureConfig::default()
         };
+        let callback_state = self.deps.state.clone();
+        let callback_activity_id = activity_id.clone();
         let recorded = tokio::task::spawn_blocking(move || {
             let mut capture = AudioCapture::new();
-            capture.start(config, |_| {})?;
+            capture.start(config, move |event| {
+                if matches!(event, CaptureEvent::Stopped { .. }) {
+                    callback_state.end_session(&callback_activity_id);
+                }
+            })?;
             // Block until the worker finishes (auto-stop at max duration).
             // Poll stop(): it joins the worker and returns the recording.
             capture.stop()
         })
         .await
-        .map_err(|error| ToolError::structured("audio.record", "action_failed", error.to_string()))?
-        .map_err(|error| audio_error("audio.record", error))?;
-        self.deps.state.refresh_indicator().await;
+        .map_err(|error| {
+            self.deps.state.end_session(&activity_id);
+            ToolError::structured("audio.record", "action_failed", error.to_string())
+        })?
+        .map_err(|error| {
+            self.deps.state.end_session(&activity_id);
+            audio_error("audio.record", error)
+        })?;
+        self.deps.state.end_session(&activity_id);
         // One-shot recordings belong to no session: they must never be
         // swept by another session's teardown.
         finish_recording(&self.deps.artifacts, &device, "one-shot", None, recorded).await
@@ -836,6 +998,8 @@ mod tests {
             .lock()
             .await
             .insert("s1".to_string(), session);
+        deps.state
+            .begin_session("s1".to_string(), "mic-a".to_string(), unix_millis());
         // A concurrent session's artifact must survive this stop.
         let survivor = deps
             .artifacts
@@ -868,7 +1032,7 @@ mod tests {
             deps.artifacts.get(&survivor.id).await.is_ok(),
             "concurrent session artifact must survive"
         );
-        let global = AudioStatusTool { deps };
+        let global = AudioStatusTool { deps: deps.clone() };
         let out = global
             .invoke(
                 ToolContext::new(Principal::Agent(AgentId::new("t"))),
@@ -877,6 +1041,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.content["microphone_on"], false, "{out:?}");
+        assert!(!deps.state.activity_state().active);
+        assert_eq!(deps.state.activity_state().session_count, 0);
+    }
+
+    #[tokio::test]
+    async fn activity_state_is_reference_counted_across_sessions() {
+        let state = AudioState::new();
+        let mut changes = state.subscribe();
+        state.begin_external_session("a".to_string(), "mic-a".to_string(), 1);
+        changes.changed().await.unwrap();
+        state.begin_external_session("b".to_string(), "mic-b".to_string(), 2);
+        changes.changed().await.unwrap();
+        assert_eq!(state.activity_state().session_count, 2);
+        assert!(state.activity_state().active);
+
+        state.end_session("a");
+        changes.changed().await.unwrap();
+        assert_eq!(state.activity_state().session_count, 1);
+        assert!(state.activity_state().active);
+
+        state.end_session("b");
+        changes.changed().await.unwrap();
+        assert_eq!(state.activity_state().session_count, 0);
+        assert!(!state.activity_state().active);
     }
 
     #[test]

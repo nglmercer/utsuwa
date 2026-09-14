@@ -320,6 +320,7 @@ fn run_capture_thread(
     }
     eprintln!("[audio] capture started");
     callback(CaptureEvent::Started);
+    let failure_callback = Arc::clone(&callback);
     let output = worker_loop(
         config,
         info,
@@ -330,6 +331,14 @@ fn run_capture_thread(
         callback,
         dropped_chunks,
     );
+    if output.is_err() {
+        // A worker can terminate without producing a recording (device
+        // disconnect, callback error, encoding failure). Publish the same
+        // terminal lifecycle event so host indicators clear immediately.
+        failure_callback(CaptureEvent::Stopped {
+            reason: StopReason::Error,
+        });
+    }
     let _ = result_tx.send(output);
 }
 

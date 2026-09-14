@@ -212,6 +212,8 @@ impl Dispatcher {
             IpcMethod::AudioCaptureStart => self.audio_capture_start(request),
             IpcMethod::AudioCaptureStop => self.audio_capture_stop(),
             IpcMethod::AudioCaptureCancel => self.audio_capture_cancel(),
+            IpcMethod::CameraActivityStatus => self.camera_activity_status(),
+            IpcMethod::MicrophoneActivityStatus => self.microphone_activity_status(),
             IpcMethod::DesktopShareScreenStart => self.desktop_share_screen_start(request),
             IpcMethod::DesktopShareScreenPause => self.desktop_share_screen_pause(),
             IpcMethod::DesktopShareScreenResume => self.desktop_share_screen_resume(),

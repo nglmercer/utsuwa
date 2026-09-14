@@ -1,6 +1,9 @@
 //! Application management (`application.*`).
 //!
-//! `application.list` enumerates running applications from process state.
+//! `application.list` enumerates running applications from process state. It
+//! is intentionally read-only and remains unrestricted: the existing privacy
+//! policy allows discovery of process names/pids, while actions on one
+//! application are separately capability- and sharing-scope-gated.
 //! `application.launch` starts one validated application identity — no
 //! shell, no argument strings (launch flags need separate process
 //! authorization). `application.quit` signals by pid with a
@@ -11,7 +14,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tool_core::{
-    CapabilityRequirement, Tool, ToolContext, ToolEffect, ToolError, ToolMetadata, ToolOutput,
+    canonical_application_identity, canonical_process_application_identity, CapabilityRequirement,
+    Tool, ToolContext, ToolEffect, ToolError, ToolMetadata, ToolOutput,
 };
 
 fn invalid(tool: &str, message: impl Into<String>) -> ToolError {
@@ -40,20 +44,45 @@ fn require(
 }
 
 fn validated_application(tool: &str, value: &str) -> Result<String, ToolError> {
-    if value.trim().is_empty() {
-        return Err(invalid(tool, "application must be a non-empty identity"));
-    }
-    if value.chars().any(|ch| {
-        ch.is_whitespace()
-            || ch.is_control()
-            || matches!(ch, ';' | '|' | '&' | '$' | '>' | '<' | '`' | '"' | '\'')
-    }) {
-        return Err(invalid(
-            tool,
-            "application must be one identity, not a shell command or argument string",
-        ));
-    }
+    canonical_application_identity(value).map_err(|error| invalid(tool, error.to_string()))?;
     Ok(value.to_string())
+}
+
+fn application_identity(tool: &str, value: &str) -> Result<String, ToolError> {
+    canonical_application_identity(value).map_err(|error| invalid(tool, error.to_string()))
+}
+
+fn check_scope(tool: &str, ctx: &ToolContext, application: &str) -> Result<(), ToolError> {
+    if let Some(policy) = &ctx.application_scope_policy {
+        policy.check_application_allowed(tool, application)?;
+    }
+    Ok(())
+}
+
+fn identity_unverified(tool: &str, pid: u32) -> ToolError {
+    ToolError::structured_with_details(
+        tool,
+        "application_identity_unverified",
+        "the target application could not be verified against the active application allowlist",
+        serde_json::json!({ "pid": pid }),
+    )
+}
+
+fn process_application_identity(
+    executable: Option<&std::path::Path>,
+    name: &std::ffi::OsStr,
+) -> Option<String> {
+    if let Some(path) = executable {
+        // A host-reported executable path is stronger evidence than the
+        // display name. If it is present but cannot be safely canonicalized,
+        // do not fall back to a weaker value and accidentally authorize an
+        // unverified process.
+        return path
+            .to_str()
+            .and_then(canonical_process_application_identity);
+    }
+    name.to_str()
+        .and_then(canonical_process_application_identity)
 }
 
 pub struct ApplicationListTool;
@@ -136,9 +165,10 @@ impl Tool for ApplicationLaunchTool {
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         let application = args.get("application")?.as_str()?;
+        let identity = application_identity("application.launch", application).ok()?;
         Some(CapabilityRequirement {
             capability: capability_core::Capability::ApplicationLaunch,
-            resource: capability_core::Resource::Application(application.to_string()),
+            resource: capability_core::Resource::Application(identity),
         })
     }
 
@@ -152,15 +182,17 @@ impl Tool for ApplicationLaunchTool {
             .and_then(|value| value.as_str())
             .ok_or_else(|| invalid("application.launch", "missing string 'application'"))?;
         let application = validated_application("application.launch", raw)?;
+        let identity = application_identity("application.launch", &application)?;
         require(
             "application.launch",
             &ctx,
             capability_core::Capability::ApplicationLaunch,
-            capability_core::Resource::Application(application.clone()),
+            capability_core::Resource::Application(identity.clone()),
         )?;
+        check_scope("application.launch", &ctx, &identity)?;
         launch_application(&application).await?;
         Ok(ToolOutput::json(
-            serde_json::json!({ "ok": true, "application": application }),
+            serde_json::json!({ "ok": true, "application": application, "identity": identity }),
         ))
     }
 }
@@ -220,12 +252,22 @@ fn resolve_on_path(name: &str) -> Option<std::path::PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        #[cfg(windows)]
+        let candidate_is_executable = candidate
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+        #[cfg(not(windows))]
+        let candidate_is_executable = true;
+        if candidate.is_file() && candidate_is_executable {
             return Some(candidate);
         }
         #[cfg(windows)]
         {
-            for extension in ["exe", "bat", "cmd"] {
+            // Never resolve batch files: Windows may route them through
+            // cmd.exe, which would violate this tool's argument-free,
+            // shell-free launch contract.
+            for extension in ["exe"] {
                 let candidate = dir.join(format!("{name}.{extension}"));
                 if candidate.is_file() {
                     return Some(candidate);
@@ -252,7 +294,10 @@ impl Tool for ApplicationQuitTool {
     }
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
-        let pid = args.get("pid")?.as_u64()?;
+        let pid = u32::try_from(args.get("pid")?.as_u64()?).ok()?;
+        if pid == 0 {
+            return None;
+        }
         Some(CapabilityRequirement {
             capability: capability_core::Capability::ProcessSignal,
             // Pid-scoped would be ideal; the executable path is unknown
@@ -270,6 +315,14 @@ impl Tool for ApplicationQuitTool {
             .get("pid")
             .and_then(|value| value.as_u64())
             .ok_or_else(|| invalid("application.quit", "missing integer 'pid'"))?;
+        let pid = u32::try_from(pid)
+            .map_err(|_| invalid("application.quit", "'pid' is outside the host pid range"))?;
+        if pid == 0 {
+            return Err(invalid(
+                "application.quit",
+                "'pid' must be greater than zero",
+            ));
+        }
         require(
             "application.quit",
             &ctx,
@@ -278,7 +331,7 @@ impl Tool for ApplicationQuitTool {
         )?;
         let mut system = sysinfo::System::new();
         system.refresh_processes(sysinfo::ProcessesToUpdate::All, false);
-        let pid = sysinfo::Pid::from_u32(pid as u32);
+        let pid = sysinfo::Pid::from_u32(pid);
         let Some(process) = system.process(pid) else {
             return Err(ToolError::structured_with_details(
                 "application.quit",
@@ -287,6 +340,13 @@ impl Tool for ApplicationQuitTool {
                 serde_json::json!({ "pid": pid.as_u32() }),
             ));
         };
+        if let Some(policy) = &ctx.application_scope_policy {
+            if policy.is_restricted() {
+                let application = process_application_identity(process.exe(), process.name())
+                    .ok_or_else(|| identity_unverified("application.quit", pid.as_u32()))?;
+                policy.check_application_allowed("application.quit", &application)?;
+            }
+        }
         if !process.kill() {
             return Err(ToolError::structured(
                 "application.quit",
@@ -317,9 +377,10 @@ impl Tool for ApplicationActivateTool {
 
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         let application = args.get("application")?.as_str()?;
+        let identity = application_identity("application.activate", application).ok()?;
         Some(CapabilityRequirement {
             capability: capability_core::Capability::DesktopControl,
-            resource: capability_core::Resource::Application(application.to_string()),
+            resource: capability_core::Resource::Application(identity),
         })
     }
 
@@ -333,12 +394,14 @@ impl Tool for ApplicationActivateTool {
             .and_then(|value| value.as_str())
             .ok_or_else(|| invalid("application.activate", "missing string 'application'"))?;
         let application = validated_application("application.activate", raw)?;
+        let identity = application_identity("application.activate", &application)?;
         require(
             "application.activate",
             &ctx,
             capability_core::Capability::DesktopControl,
-            capability_core::Resource::Application(application.clone()),
+            capability_core::Resource::Application(identity.clone()),
         )?;
+        check_scope("application.activate", &ctx, &identity)?;
         #[cfg(target_os = "macos")]
         {
             let status = tokio::process::Command::new("open")
@@ -366,7 +429,7 @@ impl Tool for ApplicationActivateTool {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = application;
+            let _ = (application, identity);
             return Err(ToolError::structured(
                 "application.activate",
                 "unsupported_operation",
@@ -397,8 +460,69 @@ impl tool_sdk::ToolPack for ApplicationToolPack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capability_core::{AgentId, Principal};
+    use capability_core::{AgentId, CapabilityTicket, Principal, ResourceScope};
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tool_core::ApplicationScopePolicy;
     use tool_sdk::ToolPack as _;
+
+    struct TestScope {
+        allowed: BTreeSet<String>,
+    }
+
+    impl TestScope {
+        fn new(allowed: &[&str]) -> Arc<Self> {
+            Arc::new(Self {
+                allowed: allowed.iter().map(|value| (*value).to_string()).collect(),
+            })
+        }
+    }
+
+    impl ApplicationScopePolicy for TestScope {
+        fn is_restricted(&self) -> bool {
+            !self.allowed.is_empty()
+        }
+
+        fn check_application_allowed(
+            &self,
+            tool: &str,
+            application: &str,
+        ) -> Result<(), ToolError> {
+            if !self.is_restricted() || self.allowed.contains(application) {
+                return Ok(());
+            }
+            Err(ToolError::structured_with_details(
+                tool,
+                "application_not_allowed",
+                "the target application is outside the active application allowlist",
+                serde_json::json!({ "application": application }),
+            ))
+        }
+    }
+
+    fn ticketed_context_without_scope(
+        capability: capability_core::Capability,
+        resource: capability_core::Resource,
+    ) -> ToolContext {
+        let ctx = ToolContext::new(Principal::Agent(AgentId::new("t")));
+        let ticket = CapabilityTicket::mint(
+            ctx.principal.clone(),
+            capability,
+            ResourceScope::new(vec![resource]),
+            ctx.invocation_id,
+            Duration::from_secs(120),
+        );
+        ctx.with_ticket(ticket)
+    }
+
+    fn ticketed_context(
+        capability: capability_core::Capability,
+        resource: capability_core::Resource,
+        scope: Arc<TestScope>,
+    ) -> ToolContext {
+        ticketed_context_without_scope(capability, resource).with_application_scope_policy(scope)
+    }
 
     #[test]
     fn shell_identities_are_rejected() {
@@ -407,6 +531,113 @@ mod tests {
         assert!(validated_application("application.launch", "a b").is_err());
         assert!(validated_application("application.launch", "").is_err());
         assert!(validated_application("application.launch", "$(evil)").is_err());
+        assert!(validated_application("application.launch", "firefox --private").is_err());
+        assert!(validated_application("application.launch", "../firefox").is_err());
+        assert!(validated_application("application.launch", "C:\\firefox").is_err());
+    }
+
+    #[test]
+    fn application_identity_canonicalization_is_exact_and_platform_aware() {
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        assert_eq!(
+            canonical_application_identity("Firefox").unwrap(),
+            "firefox"
+        );
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        assert_eq!(
+            canonical_application_identity("Firefox").unwrap(),
+            "Firefox"
+        );
+        assert_eq!(
+            canonical_application_identity("firefox").unwrap(),
+            "firefox"
+        );
+        assert_eq!(
+            canonical_application_identity("org.mozilla.firefox").unwrap(),
+            "org.mozilla.firefox"
+        );
+        let bundle_id = if cfg!(any(target_os = "windows", target_os = "macos")) {
+            "com.apple.safari"
+        } else {
+            "com.apple.Safari"
+        };
+        assert_eq!(
+            canonical_application_identity("com.apple.Safari").unwrap(),
+            bundle_id
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            canonical_application_identity("firefox.exe").unwrap(),
+            "firefox"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            canonical_application_identity("Safari.app").unwrap(),
+            "safari"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            canonical_application_identity("firefox.exe").unwrap(),
+            "firefox.exe"
+        );
+        assert!(canonical_application_identity("/usr/bin/firefox").is_err());
+        assert!(canonical_application_identity("../firefox").is_err());
+        assert!(canonical_application_identity("firefox;touch").is_err());
+        assert!(canonical_application_identity("-firefox").is_err());
+        assert_eq!(
+            canonical_process_application_identity("/usr/bin/firefox"),
+            Some("firefox".to_string())
+        );
+        let process_name = if cfg!(any(target_os = "windows", target_os = "macos")) {
+            Some("firefox".to_string())
+        } else {
+            Some("Firefox".to_string())
+        };
+        assert_eq!(
+            canonical_process_application_identity("Firefox"),
+            process_name
+        );
+        assert_eq!(canonical_process_application_identity("../firefox"), None);
+        assert_eq!(
+            canonical_process_application_identity("/tmp/../firefox"),
+            None
+        );
+    }
+
+    #[test]
+    fn application_list_is_read_only_and_unrestricted_by_scope() {
+        assert_eq!(
+            ApplicationListTool.metadata().effects,
+            vec![ToolEffect::ReadOnly]
+        );
+        // `application.list` intentionally has no scope check: it exposes
+        // process metadata for discovery, while actions are separately gated.
+        assert!(application_identity("application.list", "Firefox").is_ok());
+    }
+
+    #[test]
+    fn unknown_pid_identity_has_a_precise_structured_error() {
+        let error = identity_unverified("application.quit", 42);
+        assert_eq!(error.code(), Some("application_identity_unverified"));
+        assert!(error.model_message().contains("\"pid\":42"));
+        assert_eq!(
+            process_application_identity(None, std::ffi::OsStr::new("../firefox")),
+            None
+        );
+        assert_eq!(
+            process_application_identity(
+                Some(std::path::Path::new("/usr/bin/firefox")),
+                std::ffi::OsStr::new("unknown")
+            ),
+            Some("firefox".to_string())
+        );
+        assert_eq!(
+            process_application_identity(
+                Some(std::path::Path::new("../firefox")),
+                std::ffi::OsStr::new("firefox")
+            ),
+            None
+        );
     }
 
     #[tokio::test]
@@ -431,6 +662,88 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_and_allowed_launches_reach_the_argument_free_launcher() {
+        let empty_scope = ticketed_context(
+            capability_core::Capability::ApplicationLaunch,
+            capability_core::Resource::Application("true".to_string()),
+            TestScope::new(&[]),
+        );
+        let out = ApplicationLaunchTool
+            .invoke(empty_scope, serde_json::json!({"application": "true"}))
+            .await
+            .unwrap();
+        assert_eq!(out.content["ok"], true);
+
+        let unrestricted = ticketed_context_without_scope(
+            capability_core::Capability::ApplicationLaunch,
+            capability_core::Resource::Application("true".to_string()),
+        );
+        let out = ApplicationLaunchTool
+            .invoke(unrestricted, serde_json::json!({"application": "true"}))
+            .await
+            .unwrap();
+        assert_eq!(out.content["ok"], true);
+
+        let allowed = ticketed_context(
+            capability_core::Capability::ApplicationLaunch,
+            capability_core::Resource::Application("firefox".to_string()),
+            TestScope::new(&["firefox"]),
+        );
+        assert!(check_scope("application.launch", &allowed, "firefox").is_ok());
+    }
+
+    #[tokio::test]
+    async fn restrictive_scope_denies_launch_and_activation_before_the_backend() {
+        let launch = ApplicationLaunchTool
+            .invoke(
+                ticketed_context(
+                    capability_core::Capability::ApplicationLaunch,
+                    capability_core::Resource::Application("terminal".to_string()),
+                    TestScope::new(&["firefox"]),
+                ),
+                serde_json::json!({"application": "terminal"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(launch.code(), Some("application_not_allowed"), "{launch:?}");
+
+        let activate = ApplicationActivateTool
+            .invoke(
+                ticketed_context(
+                    capability_core::Capability::DesktopControl,
+                    capability_core::Resource::Application("terminal".to_string()),
+                    TestScope::new(&["firefox"]),
+                ),
+                serde_json::json!({"application": "terminal"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            activate.code(),
+            Some("application_not_allowed"),
+            "{activate:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restrictive_scope_resolves_quit_pid_before_signalling() {
+        let pid = std::process::id();
+        let error = ApplicationQuitTool
+            .invoke(
+                ticketed_context(
+                    capability_core::Capability::ProcessSignal,
+                    capability_core::Resource::Application(format!("pid:{pid}")),
+                    TestScope::new(&["firefox"]),
+                ),
+                serde_json::json!({"pid": pid}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some("application_not_allowed"), "{error:?}");
     }
 
     #[test]

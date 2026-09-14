@@ -72,11 +72,29 @@ interrupt-everything path.
 ## Application allowlist
 
 `desktop.capture_start` accepts an `allowed_applications` scope. While
-an allowlist is active, every window-targeted control action must be
-attributable to an allowed application. Unknown windows and backend
-listing failures are rejected with
-`application_identity_unverified` — the gate fails closed, never open.
-With no allowlist, legacy behavior applies.
+an allowlist is active, every window-targeted control action and the
+`application.launch`, `application.activate`, and `application.quit` tools
+must be attributable to an allowed application. Application names are
+validated as bare identities, compared using platform-aware canonical keys,
+and never interpreted as shell commands. A PID used by `application.quit`
+is resolved to its executable identity before the process can be signalled.
+Unknown windows, process identities, and backend listing failures are
+rejected with `application_identity_unverified` — the gate fails closed,
+never open. With no allowlist, legacy capability behavior applies.
+
+`application.list` is intentionally read-only and unrestricted: it reports
+process metadata for discovery, while every application action remains
+capability- and scope-gated. An empty allowlist means unrestricted; a
+non-empty list is an explicit restriction and is never widened implicitly.
+Scope denials are recorded as denied audit decisions with the tool and
+canonical application identity (or PID plus the verification failure),
+without recording application contents or sensor data.
+
+The native host also publishes authoritative camera and microphone activity
+events. Persistent indicators in the app chrome remain visible for the full
+capture lifetime, including multiple simultaneous sessions and automatic or
+abnormal termination; model-facing `camera.status` and `audio.status` calls
+are not required for human visibility.
 
 ## HTTP redirects
 
@@ -165,14 +183,26 @@ class, duration) with secret-shaped values redacted.
 
 ## Validation
 
+Install frontend dependencies once with `pnpm install --frozen-lockfile`,
+then run the canonical local suite:
+
 ```bash
-cargo fmt --all -- --check
-cargo test --workspace
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-npm run check
+./scripts/verify.sh
 ```
 
-GitHub CI runs format, clippy, tests, and the frontend check on Linux,
-Windows, and macOS. Hardware paths (camera, microphone, capture,
-accessibility) are covered by fake-backend unit tests plus compile
-checks; real devices need manual validation.
+On Windows, run the equivalent PowerShell entry point:
+
+```powershell
+.\scripts\verify.ps1
+```
+
+The scripts run formatting, locked workspace check/tests/clippy, and the
+configured frontend check/tests with `UTSUWA_SKIP_WEB_BUILD=1` for the Rust
+commands. Hosted GitHub Actions may not execute while repository billing
+restrictions are active; local verification is the acceptance path for this
+project. Hardware paths (camera, microphone, capture, accessibility) are
+covered by fake-backend tests and platform compile checks; real devices need
+manual validation.
+
+When billing is restored, GitHub CI validates the web build and the Rust
+workspace on Linux, Windows, and macOS.

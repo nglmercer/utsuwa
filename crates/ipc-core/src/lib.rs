@@ -54,6 +54,13 @@ pub enum IpcMethod {
     AudioCaptureStop,
     #[serde(rename = "audio_capture.cancel")]
     AudioCaptureCancel,
+    /// Authoritative host sensor activity snapshots used by persistent
+    /// human-facing indicators. Model-facing `camera.status`/`audio.status`
+    /// tools are not required for UI visibility.
+    #[serde(rename = "camera.activity.status")]
+    CameraActivityStatus,
+    #[serde(rename = "microphone.activity.status")]
+    MicrophoneActivityStatus,
     /// Explicit user-facing screen sharing controls. These never imply
     /// DesktopControl; that capability remains independently authorized.
     #[serde(rename = "desktop.share_screen.start")]
@@ -234,5 +241,21 @@ mod tests {
         };
         let raw = serde_json::to_string(&ev).unwrap();
         assert!(raw.contains("agent.text_delta"));
+    }
+
+    #[test]
+    fn sensor_activity_methods_are_typed_ipc_members() {
+        for (method, expected) in [
+            (IpcMethod::CameraActivityStatus, "camera.activity.status"),
+            (
+                IpcMethod::MicrophoneActivityStatus,
+                "microphone.activity.status",
+            ),
+        ] {
+            let request = IpcRequest::new(method, serde_json::json!({}));
+            let raw = serde_json::to_string(&request).unwrap();
+            assert!(raw.contains(expected), "{raw}");
+            assert_eq!(IpcRequest::parse(&raw).unwrap(), request);
+        }
     }
 }

@@ -9,6 +9,7 @@ pub use artifact_core::ContentPart;
 use capability_core::{Capability, CapabilityTicket, InvocationId, Principal, Resource, ToolId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 /// What a tool can do to the world. Drives policy: reads may pass silently,
@@ -38,7 +39,7 @@ pub struct ToolMetadata {
 /// Ambient facts for one tool call. Carries identity plus the
 /// capability ticket that authorizes this exact call — never blanket
 /// authority. Brokers validate the ticket before touching the OS.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolContext {
     pub principal: Principal,
     pub invocation_id: InvocationId,
@@ -48,6 +49,26 @@ pub struct ToolContext {
     /// screen-capture artifact). `ticket` remains the compatibility slot for
     /// the common one-ticket call path.
     pub tickets: Vec<CapabilityTicket>,
+    /// The current host-owned application scope, when one is available.
+    /// Tools retain the live policy handle, never a copied allowlist, so a
+    /// sharing-session change is observed at invocation time.
+    pub application_scope_policy: Option<Arc<dyn ApplicationScopePolicy>>,
+}
+
+impl fmt::Debug for ToolContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolContext")
+            .field("principal", &self.principal)
+            .field("invocation_id", &self.invocation_id)
+            .field("ticket", &self.ticket)
+            .field("tickets", &self.tickets)
+            .field(
+                "application_scope_policy",
+                &self.application_scope_policy.as_ref().map(|_| "attached"),
+            )
+            .finish()
+    }
 }
 
 impl ToolContext {
@@ -57,6 +78,7 @@ impl ToolContext {
             invocation_id: InvocationId::fresh(),
             ticket: None,
             tickets: Vec::new(),
+            application_scope_policy: None,
         }
     }
 
@@ -66,6 +88,17 @@ impl ToolContext {
         } else {
             self.tickets.push(ticket);
         }
+        self
+    }
+
+    /// Attach a live application-scope policy to this invocation. The policy
+    /// is evaluated by application-aware tools immediately before they touch
+    /// the operating system.
+    pub fn with_application_scope_policy(
+        mut self,
+        policy: Arc<dyn ApplicationScopePolicy>,
+    ) -> Self {
+        self.application_scope_policy = Some(policy);
         self
     }
 
@@ -84,6 +117,110 @@ impl ToolContext {
                 .is_ok()
         })
     }
+}
+
+/// Host-owned application restrictions shared by tools that operate on an
+/// application identity. The interface lives below `tool-system` and
+/// `app-host` so those crates do not depend on one another's internals.
+/// Implementations must consult current state on every call and return a
+/// structured [`ToolError`] for a denied or unverifiable identity.
+pub trait ApplicationScopePolicy: Send + Sync {
+    /// Whether an explicit non-empty application restriction is active.
+    /// Identity resolution for PID-scoped operations is required only in
+    /// this state; an unrestricted session preserves normal capability
+    /// behavior even when process metadata is unavailable.
+    fn is_restricted(&self) -> bool {
+        false
+    }
+
+    fn check_application_allowed(&self, tool: &str, application: &str) -> Result<(), ToolError>;
+}
+
+/// Canonicalize one application identity supplied to a tool. Caller-facing
+/// identities are deliberately not paths or commands: process launching is
+/// argument-free and only resolves a bare name through the platform's normal
+/// application lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplicationIdentityError {
+    Empty,
+    InvalidCharacter,
+    PathOrTraversal,
+    OptionLike,
+}
+
+impl fmt::Display for ApplicationIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Empty => "application must be a non-empty identity",
+            Self::InvalidCharacter => {
+                "application must be one identity, not a shell command or argument string"
+            }
+            Self::PathOrTraversal => "application must be a bare identity, not a path",
+            Self::OptionLike => "application must not begin with an option prefix",
+        };
+        formatter.write_str(message)
+    }
+}
+
+/// Return a stable comparison key for a validated application identity.
+/// Case folding follows the native identity rules: Windows and macOS
+/// application identities are compared case-insensitively, while Linux keeps
+/// executable case significant. Native executable/bundle suffixes are not
+/// part of the Windows/macOS identity.
+pub fn canonical_application_identity(value: &str) -> Result<String, ApplicationIdentityError> {
+    if value.is_empty() {
+        return Err(ApplicationIdentityError::Empty);
+    }
+    if value.trim() != value || value.chars().any(char::is_whitespace) {
+        return Err(ApplicationIdentityError::InvalidCharacter);
+    }
+    if value.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                ';' | '|' | '&' | '$' | '>' | '<' | '`' | '"' | '\'' | ':'
+            )
+    }) {
+        return Err(ApplicationIdentityError::InvalidCharacter);
+    }
+    if value.contains('/') || value.contains('\\') || value == "." || value == ".." {
+        return Err(ApplicationIdentityError::PathOrTraversal);
+    }
+    if value.starts_with('-') {
+        return Err(ApplicationIdentityError::OptionLike);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let mut identity = value.to_ascii_lowercase();
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let identity = value.to_string();
+    #[cfg(windows)]
+    {
+        for extension in [".exe", ".cmd", ".bat", ".com"] {
+            if identity.ends_with(extension) && identity.len() > extension.len() {
+                identity.truncate(identity.len() - extension.len());
+                break;
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if identity.ends_with(".app") && identity.len() > ".app".len() {
+        identity.truncate(identity.len() - ".app".len());
+    }
+    Ok(identity)
+}
+
+/// Canonicalize an executable identity reported by the host for a process.
+/// Native process APIs may report either a bare name or an executable path;
+/// paths are reduced to their final component only after rejecting traversal.
+/// This is intentionally separate from [`canonical_application_identity`],
+/// which rejects paths supplied by callers.
+pub fn canonical_process_application_identity(value: &str) -> Option<String> {
+    if value.is_empty() || value.split(['/', '\\']).any(|part| part == "..") {
+        return None;
+    }
+    let basename = value.rsplit(['/', '\\']).next()?;
+    canonical_application_identity(basename).ok()
 }
 
 /// Model-facing tool result.

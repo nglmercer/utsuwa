@@ -2,6 +2,7 @@
 	import { onNavigate } from '$app/navigation';
 	import PermissionDialog from '$lib/components/permissions/PermissionDialog.svelte';
 	import ScreenShareControl from '$lib/components/settings/ScreenShareControl.svelte';
+	import SensorActivityIndicator from '$lib/components/ui/SensorActivityIndicator.svelte';
 
 	let { children } = $props();
 
@@ -24,6 +25,7 @@
 <div class="app">
 	{@render children()}
 	<ScreenShareControl compact />
+	<SensorActivityIndicator />
 	<PermissionDialog />
 </div>
 

@@ -11,6 +11,7 @@
 use artifact_core::{ArtifactOwner, ArtifactSource, ArtifactStore, ContentPart, ImageArtifactRef};
 use camera_capture::{CameraBackend, CameraDevice};
 use capability_core::{Capability, Resource};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use tool_core::{
     CapabilityRequirement, Tool, ToolContext, ToolEffect, ToolError, ToolMetadata, ToolOutput,
@@ -27,10 +28,28 @@ use tool_core::{
 /// frame opens the device independently; `capture_start` does NOT hold
 /// the camera open continuously. If a backend ever offers true streaming
 /// sessions, this is where the handle would live.
-#[derive(Clone, Default, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct CameraActivityState {
+    pub active: bool,
+    pub session_count: usize,
+    pub device: Option<String>,
+    /// Unix milliseconds. The host and frontend treat this as metadata only.
+    pub started_at: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
 pub struct CameraState {
     active: Arc<std::sync::atomic::AtomicBool>,
     sessions: Arc<tokio::sync::Mutex<std::collections::HashMap<String, CameraSession>>>,
+    activity_sessions: Arc<std::sync::Mutex<BTreeMap<String, CameraActivitySession>>>,
+    activity: Arc<std::sync::RwLock<CameraActivityState>>,
+    activity_changes: tokio::sync::watch::Sender<CameraActivityState>,
+}
+
+#[derive(Debug, Clone)]
+struct CameraActivitySession {
+    camera_id: String,
+    started_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -57,9 +76,90 @@ impl CameraState {
         self.active.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Number of active streaming sessions.
+    /// Number of active logical camera sessions represented by the capture
+    /// state. Snapshot backends open the device for each frame.
     pub async fn session_count(&self) -> usize {
         self.sessions.lock().await.len()
+    }
+
+    /// Subscribe to authoritative camera activity transitions for the host's
+    /// IPC publisher. The receiver is event-driven; callers do not need to
+    /// poll the model-facing `camera.status` tool.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<CameraActivityState> {
+        self.activity_changes.subscribe()
+    }
+
+    pub fn activity_state(&self) -> CameraActivityState {
+        self.activity
+            .read()
+            .map(|state| state.clone())
+            .unwrap_or_else(|_| CameraActivityState {
+                active: true,
+                session_count: 0,
+                device: None,
+                started_at: None,
+            })
+    }
+
+    fn begin_activity(&self, session_id: String, camera_id: String, started_at: u64) {
+        if let Ok(mut sessions) = self.activity_sessions.lock() {
+            sessions.insert(
+                session_id,
+                CameraActivitySession {
+                    camera_id,
+                    started_at,
+                },
+            );
+        }
+        self.publish_activity();
+    }
+
+    fn end_activity(&self, session_id: &str) {
+        if let Ok(mut sessions) = self.activity_sessions.lock() {
+            sessions.remove(session_id);
+        }
+        self.publish_activity();
+    }
+
+    fn publish_activity(&self) {
+        let state = match self.activity_sessions.lock() {
+            Ok(sessions) => {
+                let first = sessions.values().min_by_key(|session| session.started_at);
+                CameraActivityState {
+                    active: !sessions.is_empty(),
+                    session_count: sessions.len(),
+                    device: first.map(|session| session.camera_id.clone()),
+                    started_at: first.map(|session| session.started_at),
+                }
+            }
+            Err(_) => CameraActivityState {
+                // The host cannot prove that the native camera is idle after
+                // a poisoned state lock, so keep the privacy indicator on.
+                active: true,
+                session_count: 0,
+                device: None,
+                started_at: None,
+            },
+        };
+        self.active
+            .store(state.active, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut current) = self.activity.write() {
+            *current = state.clone();
+        }
+        let _ = self.activity_changes.send(state);
+    }
+}
+
+impl Default for CameraState {
+    fn default() -> Self {
+        let (activity_changes, _) = tokio::sync::watch::channel(CameraActivityState::default());
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            activity_sessions: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            activity: Arc::new(std::sync::RwLock::new(CameraActivityState::default())),
+            activity_changes,
+        }
     }
 }
 
@@ -271,8 +371,11 @@ impl Tool for CameraCapturePhotoTool {
         let max_width = max_width_arg(&args, "camera.capture_photo")?;
         require_camera("camera.capture_photo", &ctx, &camera_id)?;
         let (backend, artifacts, _) = self.deps.shared();
+        let state = self.deps.state.clone();
+        let activity_id = format!("photo:{}", uuid::Uuid::new_v4());
+        state.begin_activity(activity_id.clone(), camera_id.clone(), unix_millis());
         let photo =
-            tokio::task::spawn_blocking(move || backend.capture_photo(&camera_id, max_width))
+            match tokio::task::spawn_blocking(move || backend.capture_photo(&camera_id, max_width))
                 .await
                 .map_err(|error| {
                     ToolError::structured(
@@ -281,13 +384,25 @@ impl Tool for CameraCapturePhotoTool {
                         error.to_string(),
                     )
                 })?
-                .map_err(|error| camera_error("camera.capture_photo", error))?;
+                .map_err(|error| camera_error("camera.capture_photo", error))
+            {
+                Ok(photo) => photo,
+                Err(error) => {
+                    state.end_activity(&activity_id);
+                    return Err(error);
+                }
+            };
+        // The native snapshot device is closed when the backend call returns;
+        // artifact persistence is not camera activity and must not delay the
+        // human-facing indicator from clearing.
+        state.end_activity(&activity_id);
         let artifact = artifacts
             .put_with_source("image/png", photo.png_bytes, ArtifactSource::Camera, true)
             .await
             .map_err(|error| {
                 ToolError::structured("camera.capture_photo", "action_failed", error.to_string())
-            })?;
+            });
+        let artifact = artifact?;
         let image = ImageArtifactRef::new(artifact.clone(), photo.width, photo.height);
         Ok(ToolOutput::multipart(
             serde_json::json!({
@@ -350,17 +465,16 @@ impl Tool for CameraCaptureStartTool {
                 )
             })?;
         let session_id = uuid::Uuid::new_v4().to_string();
+        let started_at_ms = unix_millis();
         state.sessions.lock().await.insert(
             session_id.clone(),
             CameraSession {
                 camera_id: camera_id.clone(),
-                started_at_ms: unix_millis(),
+                started_at_ms,
                 frame_count: 0,
             },
         );
-        state
-            .active
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.begin_activity(session_id.clone(), camera_id.clone(), started_at_ms);
         Ok(ToolOutput::json(
             serde_json::json!({ "session_id": session_id, "camera_id": camera_id }),
         ))
@@ -417,7 +531,7 @@ impl Tool for CameraCaptureFrameTool {
         session.frame_count += 1;
         drop(sessions);
         let photo =
-            tokio::task::spawn_blocking(move || backend.capture_photo(&camera_id, max_width))
+            match tokio::task::spawn_blocking(move || backend.capture_photo(&camera_id, max_width))
                 .await
                 .map_err(|error| {
                     ToolError::structured(
@@ -426,10 +540,21 @@ impl Tool for CameraCaptureFrameTool {
                         error.to_string(),
                     )
                 })?
-                .map_err(|error| camera_error("camera.capture_frame", error))?;
+                .map_err(|error| camera_error("camera.capture_frame", error))
+            {
+                Ok(photo) => photo,
+                Err(error) => {
+                    // A failed backend capture means the logical camera session
+                    // is no longer trustworthy. Tear down exactly this session
+                    // so the human indicator cannot remain stale.
+                    state.sessions.lock().await.remove(&session_id);
+                    state.end_activity(&session_id);
+                    return Err(error);
+                }
+            };
         // Frames belong to their session: stopping this session deletes
         // exactly these artifacts, never another session's frames.
-        let artifact = artifacts
+        let artifact = match artifacts
             .put_with_owner(
                 "image/png",
                 photo.png_bytes,
@@ -438,9 +563,19 @@ impl Tool for CameraCaptureFrameTool {
                 Some(ArtifactOwner::CameraSession(session_id.clone())),
             )
             .await
-            .map_err(|error| {
-                ToolError::structured("camera.capture_frame", "action_failed", error.to_string())
-            })?;
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                // Artifact persistence failed after the snapshot completed,
+                // but the logical camera session is still active. Keep its
+                // privacy indicator on until the caller explicitly stops it.
+                return Err(ToolError::structured(
+                    "camera.capture_frame",
+                    "action_failed",
+                    error.to_string(),
+                ));
+            }
+        };
         let image = ImageArtifactRef::new(artifact.clone(), photo.width, photo.height);
         Ok(ToolOutput::multipart(
             serde_json::json!({
@@ -477,7 +612,7 @@ impl Tool for CameraCaptureStopTool {
         let session_id = session_arg(&args, "camera.capture_stop")?;
         let (_, artifacts, state) = self.deps.shared();
         let mut sessions = state.sessions.lock().await;
-        let Some(session) = sessions.remove(&session_id) else {
+        let Some(session) = sessions.get(&session_id) else {
             return Err(ToolError::structured_with_details(
                 "camera.capture_stop",
                 "session_not_found",
@@ -486,16 +621,17 @@ impl Tool for CameraCaptureStopTool {
             ));
         };
         require_camera("camera.capture_stop", &ctx, &session.camera_id)?;
-        if sessions.is_empty() {
-            state
-                .active
-                .store(false, std::sync::atomic::Ordering::SeqCst);
-        }
+        let session = sessions
+            .remove(&session_id)
+            .expect("camera session was checked while holding the map lock");
+        drop(sessions);
         // Deterministic exact-session cleanup: this session's frames are
         // deleted; concurrent sessions' frames always survive.
         artifacts
             .delete_owner(&ArtifactOwner::CameraSession(session_id.clone()))
             .await;
+        let _ = session;
+        state.end_activity(&session_id);
         Ok(ToolOutput::json(
             serde_json::json!({ "ok": true, "session_id": session_id }),
         ))
@@ -575,6 +711,7 @@ mod tests {
 
     struct FakeCamera {
         devices: Vec<CameraDevice>,
+        fail_capture: bool,
     }
 
     impl FakeCamera {
@@ -585,6 +722,14 @@ mod tests {
                     label: "Fake Cam".to_string(),
                     description: "test device".to_string(),
                 }],
+                fail_capture: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail_capture: true,
+                ..Self::new()
             }
         }
     }
@@ -602,6 +747,11 @@ mod tests {
             if camera_id != "cam-0" {
                 return Err(camera_capture::CameraError::UnknownCamera(
                     camera_id.to_string(),
+                ));
+            }
+            if self.fail_capture {
+                return Err(camera_capture::CameraError::CaptureFailed(
+                    "simulated camera disconnect".to_string(),
                 ));
             }
             // Minimal valid 1x1 PNG.
@@ -622,8 +772,12 @@ mod tests {
     }
 
     fn pack() -> CameraToolPack {
+        pack_with_backend(Arc::new(FakeCamera::new()))
+    }
+
+    fn pack_with_backend(backend: Arc<dyn CameraBackend>) -> CameraToolPack {
         CameraToolPack::with_services(
-            Arc::new(FakeCamera::new()),
+            backend,
             Arc::new(artifact_core::InMemoryArtifactStore::new()),
         )
     }
@@ -667,12 +821,14 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(out.parts.first(), Some(ContentPart::Image(_))));
+        assert!(!pack.state.activity_state().active);
     }
 
     #[tokio::test]
     async fn session_lifecycle_drives_the_visible_indicator() {
         let pack = pack();
         assert!(!pack.state.is_active());
+        let mut changes = pack.state.subscribe();
         let start = find(&pack, "camera.capture_start");
         let out = start
             .invoke(
@@ -682,6 +838,8 @@ mod tests {
             .await
             .unwrap();
         assert!(pack.state.is_active());
+        changes.changed().await.unwrap();
+        assert_eq!(pack.state.activity_state().session_count, 1);
         let session_id = out.content["session_id"].as_str().unwrap().to_string();
 
         let status = find(&pack, "camera.status");
@@ -708,6 +866,8 @@ mod tests {
         .await
         .unwrap();
         assert!(!pack.state.is_active());
+        changes.changed().await.unwrap();
+        assert_eq!(pack.state.activity_state().session_count, 0);
     }
 
     #[tokio::test]
@@ -773,12 +933,43 @@ mod tests {
             "concurrent session frame must survive"
         );
         assert!(pack.state.is_active());
+        assert_eq!(pack.state.activity_state().session_count, 1);
         // Stopping B cleans up its own frame and clears the indicator.
         stop.invoke(ctx(), serde_json::json!({"session_id": s2}))
             .await
             .unwrap();
         assert!(pack.artifacts.get(&f2).await.is_err());
         assert!(!pack.state.is_active());
+        assert_eq!(pack.state.activity_state().session_count, 0);
+    }
+
+    #[tokio::test]
+    async fn backend_failure_clears_camera_activity_and_session() {
+        let pack = pack_with_backend(Arc::new(FakeCamera::failing()));
+        let start = find(&pack, "camera.capture_start");
+        let frame = find(&pack, "camera.capture_frame");
+        let session_id = start
+            .invoke(
+                ctx_for_camera("cam-0"),
+                serde_json::json!({"camera_id": "cam-0"}),
+            )
+            .await
+            .unwrap()
+            .content["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let error = frame
+            .invoke(
+                ctx_for_camera("cam-0"),
+                serde_json::json!({"session_id": session_id}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some("action_failed"), "{error:?}");
+        assert!(!pack.state.activity_state().active);
+        assert_eq!(pack.state.activity_state().session_count, 0);
+        assert_eq!(pack.state.session_count().await, 0);
     }
 
     #[test]

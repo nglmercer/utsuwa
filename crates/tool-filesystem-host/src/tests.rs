@@ -53,6 +53,7 @@ fn ticketed_context(path: &Path) -> ToolContext {
         invocation_id: invocation,
         ticket: Some(ticket),
         tickets: Vec::new(),
+        application_scope_policy: None,
     }
 }
 
@@ -71,6 +72,7 @@ fn read_ticketed_context(path: &Path) -> ToolContext {
         invocation_id: invocation,
         ticket: Some(ticket),
         tickets: Vec::new(),
+        application_scope_policy: None,
     }
 }
 

@@ -156,15 +156,21 @@ pub struct AudioCaptureManager {
     active_id: Mutex<Option<String>>,
     media: Arc<MediaRegistry>,
     emit: crate::runtime::EmitFn,
+    activity: tool_audio::AudioState,
 }
 
 impl AudioCaptureManager {
-    pub fn new(media: Arc<MediaRegistry>, emit: crate::runtime::EmitFn) -> Self {
+    pub fn new(
+        media: Arc<MediaRegistry>,
+        emit: crate::runtime::EmitFn,
+        activity: tool_audio::AudioState,
+    ) -> Self {
         Self {
             capture: Mutex::new(AudioCapture::new()),
             active_id: Mutex::new(None),
             media,
             emit,
+            activity,
         }
     }
 
@@ -176,7 +182,11 @@ impl AudioCaptureManager {
         let capture_id = Uuid::new_v4().simple().to_string();
         let event_id = capture_id.clone();
         let emit = Arc::clone(&self.emit);
+        let activity = self.activity.clone();
         let callback = move |event: CaptureEvent| {
+            if matches!(&event, CaptureEvent::Stopped { .. }) {
+                activity.end_session(&event_id);
+            }
             let data = serde_json::json!({
                 "capture_id": event_id,
                 "event": event,
@@ -192,11 +202,33 @@ impl AudioCaptureManager {
             .lock()
             .map_err(|_| AudioError::Worker("audio capture lock poisoned".to_string()))?;
         let info = capture.start(config, callback)?;
+        drop(capture);
         *self
             .active_id
             .lock()
             .map_err(|_| AudioError::Worker("audio capture lock poisoned".to_string()))? =
             Some(capture_id.clone());
+        self.activity.begin_external_session(
+            capture_id.clone(),
+            info.device.clone(),
+            unix_millis(),
+        );
+        // A very short native capture can finish between `start` returning
+        // and the shared activity registration. Reap once at the boundary
+        // so the persistent indicator cannot be left on by that race.
+        let stopped_during_start = self
+            .capture
+            .lock()
+            .map(|mut capture| {
+                let _ = capture.poll_finished();
+                !capture.is_running()
+            })
+            // If the host cannot inspect the capture, retain the indicator:
+            // unknown native state must not be presented as inactive.
+            .unwrap_or(false);
+        if stopped_during_start {
+            self.activity.end_session(&capture_id);
+        }
         Ok(start_payload(capture_id, info))
     }
 
@@ -214,6 +246,7 @@ impl AudioCaptureManager {
         let audio = match capture.stop() {
             Ok(audio) => audio,
             Err(error) => {
+                self.activity.end_session(&capture_id);
                 if let Ok(mut active_id) = self.active_id.lock() {
                     *active_id = None;
                 }
@@ -236,10 +269,12 @@ impl AudioCaptureManager {
         let duration_ms = audio.duration_ms;
         let sample_rate = audio.sample_rate;
         let channels = audio.channels;
-        self.media.insert(capture_id.clone(), audio.wav_data)?;
+        self.activity.end_session(&capture_id);
+        let media_result = self.media.insert(capture_id.clone(), audio.wav_data);
         if let Ok(mut active_id) = self.active_id.lock() {
             *active_id = None;
         }
+        media_result?;
         Ok(serde_json::json!({
             "capture_id": capture_id,
             "media_url": format!(
@@ -258,11 +293,15 @@ impl AudioCaptureManager {
     }
 
     pub fn cancel(&self) -> Result<(), AudioError> {
+        let capture_id = self.active_id.lock().ok().and_then(|id| id.clone());
         let mut capture = self
             .capture
             .lock()
             .map_err(|_| AudioError::Worker("audio capture lock poisoned".to_string()))?;
         capture.cancel();
+        if let Some(capture_id) = capture_id {
+            self.activity.end_session(&capture_id);
+        }
         if let Ok(mut active_id) = self.active_id.lock() {
             *active_id = None;
         }
@@ -272,10 +311,21 @@ impl AudioCaptureManager {
 
 impl Drop for AudioCaptureManager {
     fn drop(&mut self) {
+        let capture_id = self.active_id.get_mut().ok().and_then(|id| id.take());
         if let Ok(capture) = self.capture.get_mut() {
             capture.cancel();
         }
+        if let Some(capture_id) = capture_id {
+            self.activity.end_session(&capture_id);
+        }
     }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn start_payload(capture_id: String, info: CaptureInfo) -> Value {

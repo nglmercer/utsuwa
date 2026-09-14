@@ -1236,6 +1236,7 @@ mod tests {
                 invocation_id: invocation,
                 ticket: Some(ticket),
                 tickets: Vec::new(),
+                application_scope_policy: None,
             },
             invocation,
         )

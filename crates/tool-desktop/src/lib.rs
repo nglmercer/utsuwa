@@ -739,7 +739,15 @@ pub struct ComputerSessionManager {
     /// Controller-wide application allowlist. Empty means unrestricted;
     /// non-empty rejects window/element/screenshot/launch/keyboard-pointer
     /// actions attributed to an application outside the list.
-    enforcement: Arc<std::sync::RwLock<Vec<String>>>,
+    enforcement: Arc<std::sync::RwLock<ApplicationScope>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ApplicationScope {
+    /// Preserve the configured values for session/status output. The
+    /// canonical keys are used for every authorization comparison.
+    configured: Vec<String>,
+    canonical: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -820,7 +828,16 @@ impl ComputerSessionManager {
     /// specific applications.
     pub fn set_allowed_applications(&self, allowed: Vec<String>) {
         if let Ok(mut enforcement) = self.enforcement.write() {
-            *enforcement = allowed;
+            let canonical = allowed
+                .iter()
+                .filter_map(|application| {
+                    tool_core::canonical_application_identity(application).ok()
+                })
+                .collect();
+            *enforcement = ApplicationScope {
+                configured: allowed,
+                canonical,
+            };
         }
     }
 
@@ -828,8 +845,15 @@ impl ComputerSessionManager {
     pub fn allowed_applications(&self) -> Vec<String> {
         self.enforcement
             .read()
-            .map(|list| list.clone())
-            .unwrap_or_default()
+            .map(|scope| scope.configured.clone())
+            .unwrap_or_else(|_| vec!["<policy-unavailable>".to_string()])
+    }
+
+    pub fn application_scope_restricted(&self) -> bool {
+        self.enforcement
+            .read()
+            .map(|scope| !scope.configured.is_empty())
+            .unwrap_or(true)
     }
 
     /// Reject an action attributed to `application` when the allowlist is
@@ -839,14 +863,35 @@ impl ComputerSessionManager {
         tool: &str,
         application: &str,
     ) -> Result<(), tool_core::ToolError> {
-        let allowed = self.allowed_applications();
-        if allowed.is_empty() || allowed.iter().any(|entry| entry == application) {
+        let scope = self
+            .enforcement
+            .read()
+            .map(|scope| scope.clone())
+            .unwrap_or_else(|_| ApplicationScope {
+                // A poisoned policy lock must never turn an active
+                // restriction into unrestricted behavior.
+                configured: vec!["<policy-unavailable>".to_string()],
+                canonical: Vec::new(),
+            });
+        if scope.configured.is_empty() {
+            return Ok(());
+        }
+        let application = tool_core::canonical_application_identity(application).map_err(|_| {
+            tool_core::ToolError::structured(
+                tool,
+                "application_identity_unverified",
+                "the target application could not be verified against the active application allowlist",
+            )
+        })?;
+        if scope.canonical.iter().any(|entry| entry == &application) {
             return Ok(());
         }
         Err(tool_core::ToolError::structured_with_details(
             tool,
             "application_not_allowed",
-            format!("application '{application}' is outside the allowed-applications scope"),
+            format!(
+                "the target application '{application}' is outside the active application allowlist"
+            ),
             serde_json::json!({ "application": application }),
         ))
     }
@@ -864,7 +909,10 @@ impl ComputerSessionManager {
         tool: &str,
         window_id: &str,
     ) -> Result<(), tool_core::ToolError> {
-        if self.allowed_applications().is_empty() {
+        // Use the fail-closed restricted-state query rather than the public
+        // status accessor: a poisoned policy lock must never look like an
+        // empty/unrestricted allowlist at an OS boundary.
+        if !self.application_scope_restricted() {
             return Ok(());
         }
         let windows = backend.list_windows().await.map_err(|_| {
@@ -1226,6 +1274,20 @@ impl ComputerSessionManager {
             removed_node_ids,
             focused_node_id,
         })
+    }
+}
+
+impl tool_core::ApplicationScopePolicy for ComputerSessionManager {
+    fn is_restricted(&self) -> bool {
+        self.application_scope_restricted()
+    }
+
+    fn check_application_allowed(
+        &self,
+        tool: &str,
+        application: &str,
+    ) -> Result<(), tool_core::ToolError> {
+        ComputerSessionManager::check_application_allowed(self, tool, application)
     }
 }
 
@@ -2825,17 +2887,9 @@ pub mod tools {
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| invalid(tool, "missing non-empty string 'application'"))?;
-        if application.chars().any(|ch| {
-            ch.is_whitespace()
-                || ch.is_control()
-                || matches!(ch, ';' | '|' | '&' | '$' | '>' | '<' | '`')
-        }) {
-            return Err(invalid(
-                tool,
-                "application must be one identity, not a shell command or argument string",
-            ));
-        }
-        Ok(application.to_string())
+        let identity = tool_core::canonical_application_identity(application)
+            .map_err(|error| invalid(tool, error.to_string()))?;
+        Ok(identity)
     }
 
     fn capture_config(args: &serde_json::Value, tool: &str) -> Result<CaptureConfig, ToolError> {
@@ -2946,14 +3000,16 @@ pub mod tools {
                         })
                         .and_then(|items| {
                             items
-                                .iter()
+                            .iter()
                                 .map(|item| {
-                                    item.as_str().filter(|text| !text.trim().is_empty()).map(str::to_string).ok_or_else(|| {
+                                    let text = item.as_str().filter(|text| !text.trim().is_empty()).ok_or_else(|| {
                                         invalid(
                                             "desktop.capture_start",
                                             "'allowed_applications' must contain only non-empty strings",
                                         )
-                                    })
+                                    })?;
+                                    tool_core::canonical_application_identity(text)
+                                        .map_err(|error| invalid("desktop.capture_start", error.to_string()))
                                 })
                                 .collect::<Result<Vec<_>, _>>()
                         })
@@ -4784,6 +4840,34 @@ mod tests {
             .check_window_allowed(&backend, "desktop.click", "w1")
             .await
             .unwrap();
+        manager
+            .check_application_allowed("application.launch", "any-application")
+            .unwrap();
+    }
+
+    #[test]
+    fn application_scope_uses_exact_canonical_identities_and_never_widens_invalid_lists() {
+        let manager = super::ComputerSessionManager::new();
+        manager.set_allowed_applications(vec!["Notes".to_string()]);
+        assert!(manager
+            .check_application_allowed("application.launch", "Notes")
+            .is_ok());
+        assert_eq!(
+            manager
+                .check_application_allowed("application.launch", "notes")
+                .err()
+                .and_then(|error| error.code().map(str::to_owned)),
+            if cfg!(any(target_os = "windows", target_os = "macos")) {
+                None
+            } else {
+                Some("application_not_allowed".to_owned())
+            }
+        );
+
+        manager.set_allowed_applications(vec!["../Notes".to_string()]);
+        assert!(manager
+            .check_application_allowed("application.launch", "Notes")
+            .is_err());
     }
 
     #[tokio::test]
@@ -4842,6 +4926,7 @@ mod tests {
 
     #[tokio::test]
     async fn share_state_tracks_control_and_pause() {
+        let _guard = CONTROL_TEST_LOCK.lock().await;
         let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
         let artifacts: Arc<dyn artifact_core::ArtifactStore> =
             Arc::new(artifact_core::InMemoryArtifactStore::new());

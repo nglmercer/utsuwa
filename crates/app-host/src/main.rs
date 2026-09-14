@@ -520,34 +520,43 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
         .with_approvals(Arc::clone(&approvals))
         .with_audit(Arc::clone(&audit))
         .with_secret_store(Arc::clone(&secrets));
+    let runtime = match app_host::runtime::AgentRuntime::start_with_secrets(
+        approvals,
+        storage.clone(),
+        Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
+        Arc::clone(&emit),
+        secrets,
+    ) {
+        Ok(runtime) => Some(runtime),
+        Err(err) => {
+            tracing::error!(%err, "agent runtime unavailable; agent.* methods will fail");
+            None
+        }
+    };
+    let audio_activity = runtime
+        .as_ref()
+        .map(|runtime| runtime.audio_activity_state())
+        .unwrap_or_else(tool_audio::AudioState::new);
     let audio_manager = Arc::new(app_host::audio::AudioCaptureManager::new(
         dispatcher.media_registry(),
         Arc::clone(&emit),
+        audio_activity,
     ));
     dispatcher = dispatcher.with_audio_capture(audio_manager);
     if let Some(store) = &storage {
         dispatcher = dispatcher.with_storage(Arc::clone(store));
     }
-    match app_host::runtime::AgentRuntime::start_with_secrets(
-        approvals,
-        storage,
-        Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
-        emit,
-        secrets,
-    ) {
-        Ok(runtime) => {
-            // Durable memory beside state.db; an unopenable file falls
-            // back to the runtime's isolated in-memory store (logged).
-            let memory_path = storage_core::default_state_dir("utsuwa").join("memory.db");
-            match memory::MemoryStore::open(&memory_path) {
-                Ok(store) => runtime.set_memory_store(Arc::new(store)),
-                Err(err) => {
-                    tracing::error!(%err, "failed to open memory.db; using in-memory memory")
-                }
+    if let Some(runtime) = runtime {
+        // Durable memory beside state.db; an unopenable file falls
+        // back to the runtime's isolated in-memory store (logged).
+        let memory_path = storage_core::default_state_dir("utsuwa").join("memory.db");
+        match memory::MemoryStore::open(&memory_path) {
+            Ok(store) => runtime.set_memory_store(Arc::new(store)),
+            Err(err) => {
+                tracing::error!(%err, "failed to open memory.db; using in-memory memory")
             }
-            dispatcher = dispatcher.with_agent(runtime);
         }
-        Err(err) => tracing::error!(%err, "agent runtime unavailable; agent.* methods will fail"),
+        dispatcher = dispatcher.with_agent(runtime);
     }
     dispatcher
 }

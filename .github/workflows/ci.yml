@@ -35,6 +35,10 @@ jobs:
         run: pnpm build
 
   rust:
+    env:
+      # The native host serves the frontend in production. Rust-only matrix
+      # jobs intentionally skip that bundled build; the web job validates it.
+      UTSUWA_SKIP_WEB_BUILD: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -61,20 +65,18 @@ jobs:
             librsvg2-dev \
             patchelf
 
-      # The host serves the bundled frontend at runtime; check only needs
-      # the directory to exist.
-      - name: Stub frontend dist
-        run: mkdir -p build
-
       - name: Rust format
         run: cargo fmt --all -- --check
+
+      - name: Rust check
+        run: cargo check --workspace --locked
 
       # Native integration tests are conditional: hardware/device paths
       # (camera, microphone, screen capture, accessibility) run through
       # fake backends and compile checks here; real devices need manual
       # validation (see docs/computer-use.md).
       - name: Rust clippy
-        run: UTSUWA_SKIP_WEB_BUILD=1 cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Rust tests
-        run: UTSUWA_SKIP_WEB_BUILD=1 cargo test --workspace --locked
+        run: cargo test --workspace --locked

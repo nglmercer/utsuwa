@@ -188,7 +188,7 @@ impl AgentRuntime {
             .enable_all()
             .build()
             .map_err(|e| RuntimeError::Executor(e.to_string()))?;
-        Ok(Arc::new(Self {
+        let runtime = Arc::new(Self {
             agent_id: AgentId::new(uuid::Uuid::new_v4().to_string()),
             approvals,
             audit,
@@ -224,7 +224,9 @@ impl AgentRuntime {
                 replay_cache: None,
             })),
             executor,
-        }))
+        });
+        runtime.start_sensor_activity_publishers();
+        Ok(runtime)
     }
     /// Whether the explicit native setting is currently enabled in the live
     /// runtime. The persisted value is refreshed when a turn is constructed;
@@ -354,6 +356,51 @@ impl AgentRuntime {
 
     pub fn computer_sessions(&self) -> tool_desktop::ComputerSessionManager {
         self.computer_sessions.clone()
+    }
+
+    /// Shared authoritative microphone activity handle. The native frontend
+    /// capture manager and model-facing `audio.*` tools use this same state,
+    /// so one IPC indicator covers both capture paths.
+    pub fn audio_activity_state(&self) -> tool_audio::AudioState {
+        self.audio_state.clone()
+    }
+
+    pub fn camera_activity_status(&self) -> tool_camera::CameraActivityState {
+        self.camera_state.activity_state()
+    }
+
+    pub fn microphone_activity_status(&self) -> tool_audio::MicrophoneActivityState {
+        self.audio_state.activity_state()
+    }
+
+    fn start_sensor_activity_publishers(self: &Arc<Self>) {
+        let mut camera_changes = self.camera_state.subscribe();
+        let emit = Arc::clone(&self.emit);
+        self.executor.handle().spawn(async move {
+            while camera_changes.changed().await.is_ok() {
+                let data = camera_changes.borrow().clone();
+                if let Ok(data) = serde_json::to_value(data) {
+                    emit(HostEvent {
+                        event: "camera.activity.changed".to_string(),
+                        data,
+                    });
+                }
+            }
+        });
+
+        let mut microphone_changes = self.audio_state.subscribe();
+        let emit = Arc::clone(&self.emit);
+        self.executor.handle().spawn(async move {
+            while microphone_changes.changed().await.is_ok() {
+                let data = microphone_changes.borrow().clone();
+                if let Ok(data) = serde_json::to_value(data) {
+                    emit(HostEvent {
+                        event: "microphone.activity.changed".to_string(),
+                        data,
+                    });
+                }
+            }
+        });
     }
 
     fn active_desktop_plugin(&self) -> Result<tool_desktop::plugin::DesktopPlugin, RuntimeError> {
@@ -1427,6 +1474,44 @@ mod tests {
         panic!("timed out waiting for host event {event}");
     }
 
+    fn wait_for_sensor_state(harness: &Harness, event: &str, active: bool) -> HostEvent {
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if let Some(found) = harness
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|candidate| candidate.event == event && candidate.data["active"] == active)
+                .cloned()
+            {
+                return found;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out waiting for {event} active={active}");
+    }
+
+    #[test]
+    fn microphone_activity_publishes_authoritative_host_events() {
+        let provider = QueueProvider::new(Vec::new());
+        let harness = harness(Arc::clone(&provider));
+        let audio = harness.runtime.audio_activity_state();
+
+        audio.begin_external_session("native-mic".to_string(), "mic-0".to_string(), 123);
+        let started = wait_for_sensor_state(&harness, "microphone.activity.changed", true);
+        assert_eq!(started.data["session_count"], 1);
+        assert_eq!(
+            harness.runtime.microphone_activity_status().device,
+            Some("mic-0".to_string())
+        );
+
+        audio.end_session("native-mic");
+        let stopped = wait_for_sensor_state(&harness, "microphone.activity.changed", false);
+        assert_eq!(stopped.data["session_count"], 0);
+        assert!(!harness.runtime.microphone_activity_status().active);
+    }
+
     fn temp_project(name: &str) -> (std::path::PathBuf, String) {
         let dir =
             std::env::temp_dir().join(format!("utsuwa-runtime-test-{}-{name}", std::process::id()));
@@ -1655,6 +1740,12 @@ mod tests {
         );
         let provider = QueueProvider::new(vec![text_turn("ok")]);
         let harness = harness_with(provider, vec![grant, observe_grant]);
+        // This test exercises policy revocation, not native window probing.
+        // Keep it deterministic on headless hosts where a real portal backend
+        // may block while enumerating windows a second time.
+        harness
+            .runtime
+            .set_desktop_plugin(tool_desktop::plugin::DesktopPlugin::stub());
 
         let status = harness.runtime.desktop_emergency_stop();
         assert!(status.emergency_stopped);
