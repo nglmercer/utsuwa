@@ -37,6 +37,9 @@ pub struct ElementNode {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Current value, if the backend exposes one. Sensitive values are
+    /// masked by [`ElementNode::for_model`] before they reach the model —
+    /// the model may know the field exists, never its contents.
     #[serde(default)]
     pub value: Option<String>,
     #[serde(default)]
@@ -57,6 +60,114 @@ pub struct ElementNode {
     pub child_ids: Vec<String>,
     /// Action names the element supports (`invoke`, `set_value`, …).
     pub actions: Vec<String>,
+    /// True when this element handles secrets. Backends set this from
+    /// native accessibility metadata (secure text fields, password traits);
+    /// the shared [`detect_sensitivity`] heuristic covers the rest.
+    /// Skipped in snapshots when false to keep model context compact.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_sensitive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<ElementSensitivity>,
+}
+
+/// Why an accessibility element is treated as sensitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementSensitivity {
+    Password,
+    Payment,
+    Authentication,
+    PrivateKey,
+    Secret,
+    PersonalData,
+    Unknown,
+}
+
+/// Masked placeholder sent to the model instead of a sensitive value.
+pub const SENSITIVE_VALUE_MASK: &str = "••••••••";
+
+/// Heuristic sensitivity classification from role/name/description text.
+/// Backends prefer native metadata (macOS `AXSecureTextField`, UIA password
+/// traits); this covers backends without such metadata and any node whose
+/// backend did not classify it.
+pub fn detect_sensitivity(
+    role: &str,
+    name: &str,
+    description: Option<&str>,
+) -> Option<ElementSensitivity> {
+    let mut haystack = format!("{} {}", role, name).to_lowercase();
+    if let Some(description) = description {
+        haystack.push(' ');
+        haystack.push_str(&description.to_lowercase());
+    }
+    let contains = |needle: &str| haystack.contains(needle);
+    if contains("password") || contains("passcode") || contains("secure") || contains("pin field") {
+        Some(ElementSensitivity::Password)
+    } else if contains("credit card")
+        || contains("credit-card")
+        || contains("card number")
+        || contains("cvv")
+        || contains("cvc")
+        || contains("iban")
+    {
+        Some(ElementSensitivity::Payment)
+    } else if contains("private key") || contains("secret key") || contains("seed phrase") {
+        Some(ElementSensitivity::PrivateKey)
+    } else if contains("otp")
+        || contains("one-time")
+        || contains("2fa")
+        || contains("two-factor")
+        || contains("authenticator")
+        || contains("login")
+        || contains("sign-in")
+        || contains("signin")
+    {
+        Some(ElementSensitivity::Authentication)
+    } else if contains("api key")
+        || contains("api-key")
+        || contains("apikey")
+        || contains("token")
+        || contains("client secret")
+        || contains("bearer")
+    {
+        Some(ElementSensitivity::Secret)
+    } else if contains("ssn")
+        || contains("social security")
+        || contains("passport")
+        || contains("date of birth")
+    {
+        Some(ElementSensitivity::PersonalData)
+    } else {
+        None
+    }
+}
+
+impl ElementNode {
+    /// Classify this node when the backend did not. Keeps an explicit
+    /// backend classification; otherwise applies [`detect_sensitivity`].
+    pub fn ensure_sensitivity(&mut self) {
+        if self.sensitivity.is_some() {
+            self.is_sensitive = true;
+            return;
+        }
+        if let Some(sensitivity) =
+            detect_sensitivity(&self.role, &self.name, self.description.as_deref())
+        {
+            self.is_sensitive = true;
+            self.sensitivity = Some(sensitivity);
+        }
+    }
+
+    /// Clone safe for model consumption: sensitive values are replaced with
+    /// [`SENSITIVE_VALUE_MASK`]. Callers must route every accessibility
+    /// snapshot through this before serializing to the model.
+    pub fn for_model(mut self) -> Self {
+        self.ensure_sensitivity();
+        if self.is_sensitive {
+            self.value = Some(SENSITIVE_VALUE_MASK.to_string());
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -106,18 +217,13 @@ impl CaptureTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureQuality {
     Draft,
+    #[default]
     Normal,
     High,
-}
-
-impl Default for CaptureQuality {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -188,15 +294,23 @@ pub struct AccessibilitySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerSessionId(pub String);
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ComputerSession {
     pub id: ComputerSessionId,
     pub capture_target: CaptureTarget,
+    #[serde(default)]
+    pub capture_enabled: bool,
     pub control_enabled: bool,
     #[serde(default)]
     pub paused: bool,
     pub allowed_applications: Vec<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub last_activity_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A captured screenshot: raw PNG bytes plus dimensions.
@@ -468,15 +582,75 @@ pub enum MouseButton {
     Right,
 }
 
+/// Process-wide emergency stop. When set, every pointer, keyboard, and
+/// semantic UI action is rejected before reaching the backend while screen
+/// observation stays available. Independent from the model: only an explicit
+/// host/user call clears it.
+static EMERGENCY_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Engage the global emergency stop: mouse, keyboard, and semantic UI
+/// actions are immediately disabled; screen observation stays active.
+/// Returns an audit record the host must persist, and the frontend must
+/// surface the stopped state. Also see
+/// [`ComputerSessionManager::revoke_control`] for per-session control
+/// invalidation.
+pub fn desktop_emergency_stop() -> audit_core::AuditRecord {
+    EMERGENCY_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    audit_core::AuditRecord::now(
+        capability_core::Principal::User,
+        Some(capability_core::Capability::DesktopControl),
+        None,
+        audit_core::AuditOutcome::Blocked,
+        "emergency stop engaged: all pointer, keyboard, and semantic UI actions disabled; observation remains available",
+    )
+}
+
+/// Clear a previously engaged emergency stop. Only the host/user may call
+/// this — never the model.
+pub fn desktop_clear_emergency_stop() -> audit_core::AuditRecord {
+    EMERGENCY_STOP.store(false, std::sync::atomic::Ordering::SeqCst);
+    audit_core::AuditRecord::now(
+        capability_core::Principal::User,
+        Some(capability_core::Capability::DesktopControl),
+        None,
+        audit_core::AuditOutcome::Authorized,
+        "emergency stop cleared by the user; control may be re-authorized per call",
+    )
+}
+
+/// Whether the emergency stop is currently engaged.
+pub fn emergency_stop_active() -> bool {
+    EMERGENCY_STOP.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Frontend-facing share/control indicator. The host emits this whenever
+/// sharing, control, pause, or emergency-stop state changes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ShareState {
+    pub screen_on: bool,
+    pub control_on: bool,
+    pub paused: bool,
+    pub emergency_stopped: bool,
+    pub session_count: usize,
+}
+
 struct ManagedCapture {
     capture: Box<dyn CaptureSession>,
+    backend: Arc<dyn DesktopBackend>,
     artifacts: Arc<dyn ArtifactStore>,
+    /// Artifact ids minted for sampled frames, newest last. Bounded so a
+    /// long session cannot accumulate an unbounded cleanup list; the store
+    /// TTL expires anything that falls off.
+    frame_artifacts: Vec<artifact_core::ArtifactId>,
     last_fingerprint: Option<[u8; 32]>,
     last_observation: Option<Instant>,
     boost_until: Option<Instant>,
     paused: bool,
     session: ComputerSession,
 }
+
+/// Upper bound for per-session tracked frame artifacts pending cleanup.
+const MAX_TRACKED_FRAME_ARTIFACTS: usize = 512;
 
 type ManagedCaptureHandle = Arc<tokio::sync::Mutex<ManagedCapture>>;
 
@@ -562,6 +736,10 @@ fn scaled_png_fingerprint(bytes: &[u8]) -> Option<[u8; 32]> {
 pub struct ComputerSessionManager {
     captures: Arc<tokio::sync::Mutex<HashMap<CaptureSessionId, ManagedCaptureHandle>>>,
     accessibility_snapshots: Arc<tokio::sync::Mutex<HashMap<String, AccessibilitySnapshotRecord>>>,
+    /// Controller-wide application allowlist. Empty means unrestricted;
+    /// non-empty rejects window/element/screenshot/launch/keyboard-pointer
+    /// actions attributed to an application outside the list.
+    enforcement: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -579,8 +757,22 @@ impl ComputerSessionManager {
     pub async fn start_capture(
         &self,
         backend: Arc<dyn DesktopBackend>,
+        config: CaptureConfig,
+        artifacts: Arc<dyn ArtifactStore>,
+    ) -> Result<ComputerSession, DesktopError> {
+        self.start_capture_with_policy(backend, config, artifacts, Vec::new())
+            .await
+    }
+
+    /// Start capture with an application allowlist. The list is stored on
+    /// the session and enforced controller-wide while at least one
+    /// restricted session is active.
+    pub async fn start_capture_with_policy(
+        &self,
+        backend: Arc<dyn DesktopBackend>,
         mut config: CaptureConfig,
         artifacts: Arc<dyn ArtifactStore>,
+        allowed_applications: Vec<String>,
     ) -> Result<ComputerSession, DesktopError> {
         if !backend.is_available() {
             return Err(DesktopError::BackendUnavailable(
@@ -592,19 +784,27 @@ impl ComputerSessionManager {
             .start_capture(config.clone(), artifacts.clone())
             .await?;
         let id = CaptureSessionId::fresh();
+        let now = chrono::Utc::now();
         let session = ComputerSession {
             id: ComputerSessionId(id.0.clone()),
             capture_target: config.target.clone(),
+            capture_enabled: true,
             control_enabled: false,
             paused: false,
-            allowed_applications: Vec::new(),
-            started_at: chrono::Utc::now(),
+            allowed_applications: allowed_applications.clone(),
+            started_at: now,
+            last_activity_at: Some(now),
         };
+        if !allowed_applications.is_empty() {
+            self.set_allowed_applications(allowed_applications);
+        }
         self.captures.lock().await.insert(
             id,
             Arc::new(tokio::sync::Mutex::new(ManagedCapture {
                 capture,
+                backend,
                 artifacts,
+                frame_artifacts: Vec::new(),
                 last_fingerprint: None,
                 last_observation: None,
                 boost_until: None,
@@ -613,6 +813,64 @@ impl ComputerSessionManager {
             })),
         );
         Ok(session)
+    }
+
+    /// Replace the controller-wide application allowlist. Empty disables
+    /// filtering. The host sets this when the user scopes sharing to
+    /// specific applications.
+    pub fn set_allowed_applications(&self, allowed: Vec<String>) {
+        if let Ok(mut enforcement) = self.enforcement.write() {
+            *enforcement = allowed;
+        }
+    }
+
+    /// Current controller-wide application allowlist (empty = unrestricted).
+    pub fn allowed_applications(&self) -> Vec<String> {
+        self.enforcement
+            .read()
+            .map(|list| list.clone())
+            .unwrap_or_default()
+    }
+
+    /// Reject an action attributed to `application` when the allowlist is
+    /// configured and does not contain it.
+    pub fn check_application_allowed(
+        &self,
+        tool: &str,
+        application: &str,
+    ) -> Result<(), tool_core::ToolError> {
+        let allowed = self.allowed_applications();
+        if allowed.is_empty() || allowed.iter().any(|entry| entry == application) {
+            return Ok(());
+        }
+        Err(tool_core::ToolError::structured_with_details(
+            tool,
+            "application_not_allowed",
+            format!("application '{application}' is outside the allowed-applications scope"),
+            serde_json::json!({ "application": application }),
+        ))
+    }
+
+    /// Reject a window-targeted action when the owning application is
+    /// outside the allowlist. Windows that cannot be attributed (unknown
+    /// id, backend listing failure) are left to the backend's honest
+    /// error rather than failing closed here.
+    pub async fn check_window_allowed(
+        &self,
+        backend: &Arc<dyn DesktopBackend>,
+        tool: &str,
+        window_id: &str,
+    ) -> Result<(), tool_core::ToolError> {
+        if self.allowed_applications().is_empty() {
+            return Ok(());
+        }
+        let Ok(windows) = backend.list_windows().await else {
+            return Ok(());
+        };
+        let Some(window) = windows.iter().find(|window| window.id == window_id) else {
+            return Ok(());
+        };
+        self.check_application_allowed(tool, &window.app)
     }
 
     pub async fn next_observation(
@@ -653,6 +911,13 @@ impl ComputerSessionManager {
 
         let frame = managed.capture.next_frame().await?;
         managed.last_observation = Some(now);
+        managed.session.last_activity_at = Some(chrono::Utc::now());
+        managed
+            .frame_artifacts
+            .push(frame.image.artifact.id.clone());
+        if managed.frame_artifacts.len() > MAX_TRACKED_FRAME_ARTIFACTS {
+            managed.frame_artifacts.remove(0);
+        }
         let bytes = managed
             .artifacts
             .get(&frame.image.artifact.id)
@@ -677,6 +942,12 @@ impl ComputerSessionManager {
         })
     }
 
+    /// Stop one session and tear it down deterministically: the native
+    /// stream stops, temporary frame artifacts are deleted best-effort,
+    /// session control is disabled, and the allowlist clears when no
+    /// sessions remain. The host must additionally revoke
+    /// session-specific capability grants, emit audit records, and publish
+    /// frontend state — see [`ShareState`].
     pub async fn stop_capture(&self, id: &CaptureSessionId) -> Result<(), DesktopError> {
         let managed = self
             .captures
@@ -685,7 +956,81 @@ impl ComputerSessionManager {
             .remove(id)
             .ok_or_else(|| DesktopError::UnknownCaptureSession(id.0.clone()))?;
         let mut managed = managed.lock().await;
-        managed.capture.stop().await
+        managed.session.capture_enabled = false;
+        managed.session.control_enabled = false;
+        let stop = managed.capture.stop().await;
+        for artifact_id in std::mem::take(&mut managed.frame_artifacts) {
+            let _ = managed.artifacts.delete(&artifact_id).await;
+        }
+        if self.captures.lock().await.is_empty() {
+            self.set_allowed_applications(Vec::new());
+        }
+        stop
+    }
+
+    /// Stop every active session (user pressed Stop / sharing revoked).
+    /// Returns the number of sessions torn down.
+    pub async fn stop_all_sessions(&self) -> usize {
+        let ids: Vec<CaptureSessionId> = self.captures.lock().await.keys().cloned().collect();
+        let mut stopped = 0;
+        for id in ids {
+            if self.stop_capture(&id).await.is_ok() {
+                stopped += 1;
+            }
+        }
+        stopped
+    }
+
+    /// Disable control on every active session without stopping capture
+    /// (emergency-stop path). Capture keeps running; control flags clear.
+    /// Returns the number of sessions whose control was revoked.
+    pub async fn revoke_control(&self) -> usize {
+        let handles = self
+            .captures
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut revoked = 0;
+        for handle in handles {
+            let mut managed = handle.lock().await;
+            if managed.session.control_enabled {
+                managed.session.control_enabled = false;
+                revoked += 1;
+            }
+            let _ = managed.backend.set_control_enabled(false).await;
+        }
+        revoked
+    }
+
+    /// Frontend-facing indicator: screen on when any session is capturing,
+    /// control on when any session authorizes it and no emergency stop is
+    /// engaged. The host emits this on every share/control/pause/stop
+    /// transition.
+    pub async fn share_state(&self) -> ShareState {
+        let handles = self
+            .captures
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut control_on = false;
+        let mut paused = false;
+        for handle in &handles {
+            let managed = handle.lock().await;
+            control_on = control_on || managed.session.control_enabled;
+            paused = paused || managed.session.paused;
+        }
+        let stopped = emergency_stop_active();
+        ShareState {
+            screen_on: !handles.is_empty(),
+            control_on: control_on && !stopped,
+            paused,
+            emergency_stopped: stopped,
+            session_count: handles.len(),
+        }
     }
 
     pub async fn session(&self, id: &CaptureSessionId) -> Result<ComputerSession, DesktopError> {
@@ -788,6 +1133,10 @@ impl ComputerSessionManager {
         Ok(())
     }
 
+    pub async fn is_empty(&self) -> bool {
+        self.captures.lock().await.is_empty()
+    }
+
     pub async fn len(&self) -> usize {
         self.captures.lock().await.len()
     }
@@ -849,11 +1198,18 @@ impl ComputerSessionManager {
                 nodes,
             },
         );
+        // Deltas compare raw backend nodes; only the model-facing copy is
+        // redacted, so a password value never reaches model context while
+        // change detection still sees the real tree.
+        let nodes = changed_nodes
+            .into_iter()
+            .map(ElementNode::for_model)
+            .collect();
         Ok(AccessibilitySnapshot {
             snapshot_id,
             window_id: window_id.to_string(),
             generation,
-            nodes: changed_nodes,
+            nodes,
             removed_node_ids,
             focused_node_id,
         })
@@ -902,11 +1258,18 @@ pub mod tools {
         failed(tool, format!("artifact store: {error}"))
     }
 
-    fn denied(tool: &str, reason: impl Into<String>) -> ToolError {
-        ToolError::Denied {
-            tool: tool.to_string(),
-            reason: reason.into(),
+    /// Reject a control/mouse/keyboard action while the emergency stop is
+    /// engaged. Observation tools never call this.
+    fn check_emergency_stop(tool: &str) -> Result<(), ToolError> {
+        if super::emergency_stop_active() {
+            return Err(ToolError::structured_with_details(
+                tool,
+                "emergency_stop_active",
+                "emergency stop is engaged: control actions are disabled until the user clears it",
+                serde_json::json!({ "recovery": "ask the user to clear the emergency stop; do not retry control actions" }),
+            ));
         }
+        Ok(())
     }
 
     fn invalid(tool: &str, message: impl Into<String>) -> ToolError {
@@ -922,30 +1285,68 @@ pub mod tools {
         capability: Capability,
         resource: Resource,
     ) -> Result<(), ToolError> {
-        if ctx.has_ticket(capability, resource) {
+        if ctx.has_ticket(capability.clone(), resource.clone()) {
             Ok(())
         } else {
-            Err(denied(
+            Err(ToolError::structured_with_details(
                 tool,
+                "permission_required",
                 "no capability ticket authorizes this desktop call: route access through the agent + policy engine",
+                serde_json::json!({
+                    "capability": format!("{capability:?}"),
+                    "resource": format!("{resource:?}"),
+                }),
             ))
         }
     }
 
     fn backend_error(tool: &str, e: DesktopError) -> ToolError {
         match e {
-            DesktopError::BackendUnavailable(detail) => failed(tool, detail),
-            DesktopError::StaleWindow(window_id) => failed(
+            DesktopError::BackendUnavailable(detail) => ToolError::structured_with_details(
                 tool,
-                serde_json::json!({
-                    "error": "stale_window_id",
-                    "window_id": window_id,
-                    "message": "The window no longer exists.",
-                    "next_tool": "desktop.inspect",
-                })
-                .to_string(),
+                "backend_unavailable",
+                detail.clone(),
+                serde_json::json!({ "detail": detail }),
             ),
-            other => failed(tool, other.to_string()),
+            DesktopError::StaleWindow(window_id) => ToolError::structured_with_details(
+                tool,
+                "stale_window",
+                format!("window '{window_id}' no longer exists"),
+                serde_json::json!({
+                    "window_id": window_id,
+                    "next_tool": "desktop.inspect",
+                }),
+            ),
+            DesktopError::UnknownWindow(window_id) => ToolError::structured_with_details(
+                tool,
+                "invalid_target",
+                format!("unknown window '{window_id}'"),
+                serde_json::json!({
+                    "window_id": window_id,
+                    "next_tool": "desktop.inspect",
+                }),
+            ),
+            DesktopError::UnknownElement(element_id) => ToolError::structured_with_details(
+                tool,
+                "stale_element",
+                format!("unknown element '{element_id}'"),
+                serde_json::json!({
+                    "element_id": element_id,
+                    "next_tool": "desktop.accessibility_tree",
+                }),
+            ),
+            DesktopError::ActionFailed(detail) => ToolError::structured_with_details(
+                tool,
+                "action_failed",
+                detail.clone(),
+                serde_json::json!({ "detail": detail }),
+            ),
+            DesktopError::UnknownCaptureSession(session_id) => ToolError::structured_with_details(
+                tool,
+                "session_not_found",
+                format!("capture session '{session_id}' not found"),
+                serde_json::json!({ "session_id": session_id }),
+            ),
         }
     }
 
@@ -1034,6 +1435,9 @@ pub mod tools {
         ($name:ident, $id:literal, $desc:literal, $effect:expr) => {
             pub struct $name {
                 pub backend: Arc<dyn DesktopBackend>,
+                /// Session policy for allowlist enforcement. Read-only tools
+                /// ignore it; control tools reject out-of-scope targets.
+                pub captures: super::ComputerSessionManager,
             }
             impl $name {
                 const TOOL: &'static str = $id;
@@ -1192,6 +1596,10 @@ pub mod tools {
             .accessibility_tree(&window_id)
             .await
             .map_err(|e| backend_error("desktop.accessibility_tree", e))?;
+        let tree = tree
+            .into_iter()
+            .map(super::ElementNode::for_model)
+            .collect::<Vec<_>>();
         Ok(ToolOutput::new(
             serde_json::json!({ "window_id": window_id, "elements": tree }),
         ))
@@ -1284,12 +1692,16 @@ pub mod tools {
                 .get("element_id")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| invalid(Self::TOOL, "missing string 'element_id'"))?;
+            check_emergency_stop(Self::TOOL)?;
             require_ticket(
                 Self::TOOL,
                 &ctx,
                 Capability::DesktopControl,
                 Resource::Window(window_id.clone()),
             )?;
+            self.captures
+                .check_window_allowed(&self.backend, Self::TOOL, &window_id)
+                .await?;
             self.backend
                 .invoke_element(&window_id, element_id)
                 .await
@@ -1354,12 +1766,16 @@ pub mod tools {
             if value.chars().count() > MAX_TYPE_CHARS {
                 return Err(invalid(Self::TOOL, "value is too long"));
             }
+            check_emergency_stop(Self::TOOL)?;
             require_ticket(
                 Self::TOOL,
                 &ctx,
                 Capability::DesktopControl,
                 Resource::Window(window_id.clone()),
             )?;
+            self.captures
+                .check_window_allowed(&self.backend, Self::TOOL, &window_id)
+                .await?;
             self.backend
                 .set_value(&window_id, element_id, value)
                 .await
@@ -1371,6 +1787,7 @@ pub mod tools {
     pub struct ScreenshotTool {
         pub backend: Arc<dyn DesktopBackend>,
         pub artifacts: Arc<dyn ArtifactStore>,
+        pub captures: super::ComputerSessionManager,
     }
 
     impl ScreenshotTool {
@@ -1436,6 +1853,11 @@ pub mod tools {
                 Capability::ScreenCapture,
                 target.resource(),
             )?;
+            if let CaptureTarget::Window(window_id) = &target {
+                self.captures
+                    .check_window_allowed(&self.backend, Self::TOOL, window_id)
+                    .await?;
+            }
             let shot = self
                 .backend
                 .screenshot_with_config(config)
@@ -1525,12 +1947,18 @@ pub mod tools {
                 i32::try_from(x).map_err(|_| invalid(Self::TOOL, "'x' out of range"))?,
                 i32::try_from(y).map_err(|_| invalid(Self::TOOL, "'y' out of range"))?,
             );
+            check_emergency_stop(Self::TOOL)?;
             require_ticket(
                 Self::TOOL,
                 &ctx,
                 Capability::DesktopControl,
                 Resource::Window(window_id.clone()),
             )?;
+            if !window_id.is_empty() {
+                self.captures
+                    .check_window_allowed(&self.backend, Self::TOOL, &window_id)
+                    .await?;
+            }
             self.backend
                 .click(
                     if window_id.is_empty() {
@@ -1591,12 +2019,18 @@ pub mod tools {
             if text.chars().count() > MAX_TYPE_CHARS {
                 return Err(invalid(Self::TOOL, "text is too long"));
             }
+            check_emergency_stop(Self::TOOL)?;
             require_ticket(
                 Self::TOOL,
                 &ctx,
                 Capability::DesktopControl,
                 Resource::Window(window_id.clone()),
             )?;
+            if !window_id.is_empty() {
+                self.captures
+                    .check_window_allowed(&self.backend, Self::TOOL, &window_id)
+                    .await?;
+            }
             self.backend
                 .type_text(
                     if window_id.is_empty() {
@@ -1697,6 +2131,7 @@ pub mod tools {
     pub struct ElementOperationTool {
         pub backend: Arc<dyn DesktopBackend>,
         pub operation: ElementOperation,
+        pub captures: super::ComputerSessionManager,
     }
 
     #[async_trait::async_trait]
@@ -1738,12 +2173,16 @@ pub mod tools {
                 .get("element_id")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| invalid(tool, "missing string 'element_id'"))?;
+            check_emergency_stop(tool)?;
             require_ticket(
                 tool,
                 &ctx,
                 Capability::DesktopControl,
                 Resource::Window(window_id.clone()),
             )?;
+            self.captures
+                .check_window_allowed(&self.backend, tool, &window_id)
+                .await?;
             let result = match self.operation {
                 ElementOperation::Focus => self.backend.focus_element(&window_id, element_id).await,
                 ElementOperation::Select => {
@@ -1802,6 +2241,7 @@ pub mod tools {
     pub struct PointerTool {
         pub backend: Arc<dyn DesktopBackend>,
         pub operation: PointerOperation,
+        pub captures: super::ComputerSessionManager,
     }
 
     fn point_arg(args: &serde_json::Value, tool: &str, prefix: &str) -> Result<Point, ToolError> {
@@ -1896,9 +2336,15 @@ pub mod tools {
             args: serde_json::Value,
         ) -> Result<ToolOutput, ToolError> {
             let tool = self.operation.tool();
+            check_emergency_stop(tool)?;
             let window_id = checked_opt_window(&args, tool)?;
             let resource = Resource::Window(window_id.clone());
             require_ticket(tool, &ctx, Capability::DesktopControl, resource)?;
+            if !window_id.is_empty() {
+                self.captures
+                    .check_window_allowed(&self.backend, tool, &window_id)
+                    .await?;
+            }
             let window = if window_id.is_empty() {
                 None
             } else {
@@ -1975,6 +2421,7 @@ pub mod tools {
     pub struct KeyboardTool {
         pub backend: Arc<dyn DesktopBackend>,
         pub operation: KeyboardOperation,
+        pub captures: super::ComputerSessionManager,
     }
 
     #[async_trait::async_trait]
@@ -2009,7 +2456,13 @@ pub mod tools {
             args: serde_json::Value,
         ) -> Result<ToolOutput, ToolError> {
             let tool = self.operation.tool();
+            check_emergency_stop(tool)?;
             let window_id = checked_opt_window(&args, tool)?;
+            if !window_id.is_empty() {
+                self.captures
+                    .check_window_allowed(&self.backend, tool, &window_id)
+                    .await?;
+            }
             require_ticket(
                 tool,
                 &ctx,
@@ -2097,6 +2550,7 @@ pub mod tools {
     pub struct WindowOperationTool {
         pub backend: Arc<dyn DesktopBackend>,
         pub operation: WindowOperation,
+        pub captures: super::ComputerSessionManager,
     }
 
     #[async_trait::async_trait]
@@ -2136,12 +2590,16 @@ pub mod tools {
         ) -> Result<ToolOutput, ToolError> {
             let tool = self.operation.tool();
             let window_id = req_window(&args, tool)?;
+            check_emergency_stop(tool)?;
             require_ticket(
                 tool,
                 &ctx,
                 Capability::DesktopControl,
                 Resource::Window(window_id.clone()),
             )?;
+            self.captures
+                .check_window_allowed(&self.backend, tool, &window_id)
+                .await?;
             let result = match self.operation {
                 WindowOperation::Focus => self.backend.focus_window(&window_id).await,
                 WindowOperation::Close => self.backend.close_window(&window_id).await,
@@ -2300,6 +2758,7 @@ pub mod tools {
 
     pub struct LaunchApplicationTool {
         pub backend: Arc<dyn DesktopBackend>,
+        pub captures: super::ComputerSessionManager,
     }
 
     #[async_trait::async_trait]
@@ -2328,12 +2787,15 @@ pub mod tools {
             args: serde_json::Value,
         ) -> Result<ToolOutput, ToolError> {
             let application = validated_application(&args, "desktop.launch_application")?;
+            check_emergency_stop("desktop.launch_application")?;
             require_ticket(
                 "desktop.launch_application",
                 &ctx,
                 Capability::ApplicationLaunch,
                 Resource::Application(application.clone()),
             )?;
+            self.captures
+                .check_application_allowed("desktop.launch_application", &application)?;
             self.backend
                 .launch_application(&application)
                 .await
@@ -2427,7 +2889,8 @@ pub mod tools {
                         "max_fps":{"type":"integer","minimum":1,"maximum":60},
                         "include_cursor":{"type":"boolean"},
                         "max_width":{"type":"integer","minimum":1,"maximum":8192},
-                        "quality":{"enum":["draft","normal","high"]}
+                        "quality":{"enum":["draft","normal","high"]},
+                        "allowed_applications":{"type":"array","items":{"type":"string"},"description":"Optional allowlist: when set, window/element/input/launch actions outside these applications are rejected."}
                     }
                 }),
                 effects: vec![ToolEffect::ReadOnly],
@@ -2455,15 +2918,50 @@ pub mod tools {
                 Capability::ScreenCapture,
                 resource,
             )?;
+            if let super::CaptureTarget::Window(window_id) = &config.target {
+                self.captures
+                    .check_window_allowed(&self.backend, "desktop.capture_start", window_id)
+                    .await?;
+            }
+            let allowed_applications = args
+                .get("allowed_applications")
+                .map(|value| {
+                    value
+                        .as_array()
+                        .ok_or_else(|| {
+                            invalid("desktop.capture_start", "'allowed_applications' must be an array of strings")
+                        })
+                        .and_then(|items| {
+                            items
+                                .iter()
+                                .map(|item| {
+                                    item.as_str().filter(|text| !text.trim().is_empty()).map(str::to_string).ok_or_else(|| {
+                                        invalid(
+                                            "desktop.capture_start",
+                                            "'allowed_applications' must contain only non-empty strings",
+                                        )
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                })
+                .transpose()?
+                .unwrap_or_default();
             let session = self
                 .captures
-                .start_capture(self.backend.clone(), config, self.artifacts.clone())
+                .start_capture_with_policy(
+                    self.backend.clone(),
+                    config,
+                    self.artifacts.clone(),
+                    allowed_applications,
+                )
                 .await
                 .map_err(|error| backend_error("desktop.capture_start", error))?;
             Ok(ToolOutput::json(serde_json::json!({
                 "session_id": session.id.0,
                 "capture_target": session.capture_target,
                 "control_enabled": session.control_enabled,
+                "allowed_applications": session.allowed_applications,
                 "started_at": session.started_at,
             })))
         }
@@ -2996,6 +3494,7 @@ pub mod tools {
         if plugin.supports(DesktopCapability::ListWindows) {
             out.push(Arc::new(ListWindowsTool {
                 backend: backend.clone(),
+                captures: captures.clone(),
             }));
         }
         if plugin.supports(DesktopCapability::ListDisplays) {
@@ -3018,6 +3517,7 @@ pub mod tools {
         if plugin.supports(DesktopCapability::InvokeElement) {
             out.push(Arc::new(InvokeElementTool {
                 backend: backend.clone(),
+                captures: captures.clone(),
             }));
         }
         for (capability, operation) in [
@@ -3033,18 +3533,21 @@ pub mod tools {
                 out.push(Arc::new(ElementOperationTool {
                     backend: backend.clone(),
                     operation,
+                    captures: captures.clone(),
                 }));
             }
         }
         if plugin.supports(DesktopCapability::SetValue) {
             out.push(Arc::new(SetValueTool {
                 backend: backend.clone(),
+                captures: captures.clone(),
             }));
         }
         if plugin.supports(DesktopCapability::Screenshot) {
             out.push(Arc::new(ScreenshotTool {
                 backend: backend.clone(),
                 artifacts: artifacts.clone(),
+                captures: captures.clone(),
             }));
         }
         if plugin.supports(DesktopCapability::CaptureStart) {
@@ -3072,6 +3575,7 @@ pub mod tools {
         if plugin.supports(DesktopCapability::Click) {
             out.push(Arc::new(ClickTool {
                 backend: backend.clone(),
+                captures: captures.clone(),
             }));
         }
         for (capability, operation) in [
@@ -3089,12 +3593,14 @@ pub mod tools {
                 out.push(Arc::new(PointerTool {
                     backend: backend.clone(),
                     operation,
+                    captures: captures.clone(),
                 }));
             }
         }
         if plugin.supports(DesktopCapability::TypeText) {
             out.push(Arc::new(TypeTextTool {
                 backend: backend.clone(),
+                captures: captures.clone(),
             }));
         }
         for (capability, operation) in [
@@ -3107,6 +3613,7 @@ pub mod tools {
                 out.push(Arc::new(KeyboardTool {
                     backend: backend.clone(),
                     operation,
+                    captures: captures.clone(),
                 }));
             }
         }
@@ -3123,6 +3630,7 @@ pub mod tools {
                 out.push(Arc::new(WindowOperationTool {
                     backend: backend.clone(),
                     operation,
+                    captures: captures.clone(),
                 }));
             }
         }
@@ -3137,7 +3645,10 @@ pub mod tools {
             }));
         }
         if plugin.supports(DesktopCapability::LaunchApplication) {
-            out.push(Arc::new(LaunchApplicationTool { backend }));
+            out.push(Arc::new(LaunchApplicationTool {
+                backend,
+                captures: captures.clone(),
+            }));
         }
         out
     }
@@ -3353,6 +3864,8 @@ impl DesktopBackend for FakeBackend {
             parent_id: Some("w1".to_string()),
             child_ids: Vec::new(),
             actions: vec!["invoke".to_string()],
+            is_sensitive: false,
+            sensitivity: None,
         }])
     }
     async fn invoke_element(&self, window_id: &str, element_id: &str) -> Result<(), DesktopError> {
@@ -3428,7 +3941,7 @@ mod tests {
             Principal::User,
             capability,
             ResourceScope::new(vec![resource]),
-            invocation.clone(),
+            *invocation,
             Duration::from_secs(120),
         )
     }
@@ -3443,6 +3956,7 @@ mod tests {
     async fn stub_backend_is_honest() {
         let tool = ListWindowsTool {
             backend: super::stub(),
+            captures: super::ComputerSessionManager::new(),
         };
         let ctx = ctx_for(
             Capability::DesktopObserve,
@@ -3452,24 +3966,21 @@ mod tests {
             .invoke(ctx, serde_json::json!({"app": "notes"}))
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, tool_core::ToolError::Failed { .. }),
-            "{err:?}"
-        );
+        assert_eq!(err.code(), Some("backend_unavailable"), "{err:?}");
     }
 
     #[tokio::test]
     async fn calls_without_tickets_are_denied() {
         let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
-        let tool = ListWindowsTool { backend };
+        let tool = ListWindowsTool {
+            backend,
+            captures: super::ComputerSessionManager::new(),
+        };
         let err = tool
             .invoke(ToolContext::new(Principal::User), serde_json::json!({}))
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, tool_core::ToolError::Denied { .. }),
-            "{err:?}"
-        );
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
     }
 
     #[tokio::test]
@@ -3477,6 +3988,7 @@ mod tests {
         let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
         let list = ListWindowsTool {
             backend: backend.clone(),
+            captures: super::ComputerSessionManager::new(),
         };
         // Unfiltered listing declares the whole-desktop resource.
         let req = list.required_capability(&serde_json::json!({})).unwrap();
@@ -3519,19 +4031,18 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(
-            matches!(err, tool_core::ToolError::Failed { .. }),
-            "{err:?}"
-        );
+        assert_eq!(err.code(), Some("invalid_target"), "{err:?}");
     }
 
     #[tokio::test]
     async fn invoke_click_type_roundtrip() {
+        let _guard = CONTROL_TEST_LOCK.lock().await;
         let fake = Arc::new(FakeBackend::new());
         let backend: Arc<dyn super::DesktopBackend> = fake.clone();
 
         let invoke = InvokeElementTool {
             backend: backend.clone(),
+            captures: super::ComputerSessionManager::new(),
         };
         let out = invoke
             .invoke(
@@ -3547,6 +4058,7 @@ mod tests {
 
         let click = ClickTool {
             backend: backend.clone(),
+            captures: super::ComputerSessionManager::new(),
         };
         click
             .invoke(
@@ -3560,7 +4072,10 @@ mod tests {
             vec![(None, super::Point { x: 10, y: 20 })]
         );
 
-        let type_tool = TypeTextTool { backend };
+        let type_tool = TypeTextTool {
+            backend,
+            captures: super::ComputerSessionManager::new(),
+        };
         type_tool
             .invoke(
                 ctx_for(
@@ -3738,10 +4253,13 @@ mod tests {
             )
             .await
             .unwrap_err();
+        assert_eq!(error.code(), Some("stale_window"), "{error:?}");
         let message = error.to_string();
-        assert!(message.contains("stale_window_id"), "{message}");
         assert!(message.contains("0x123"), "{message}");
-        assert!(message.contains("desktop.inspect"), "{message}");
+        let model_message = error.model_message();
+        assert!(model_message.contains("stale_window"), "{model_message}");
+        assert!(model_message.contains("0x123"), "{model_message}");
+        assert!(model_message.contains("desktop.inspect"), "{model_message}");
         assert!(!message.contains("X11: X error reply"), "{message}");
     }
 
@@ -3770,6 +4288,7 @@ mod tests {
         let shot = ScreenshotTool {
             backend,
             artifacts: Arc::new(artifact_core::InMemoryArtifactStore::new()),
+            captures: super::ComputerSessionManager::new(),
         };
         let out = shot
             .invoke(
@@ -3976,10 +4495,10 @@ mod tests {
 
         let observe_only = ctx_for(Capability::DesktopObserve, Resource::Window(String::new()));
         let denied = tool.invoke(observe_only, args.clone()).await.unwrap_err();
-        assert!(matches!(denied, tool_core::ToolError::Denied { .. }));
+        assert_eq!(denied.code(), Some("permission_required"), "{denied:?}");
 
         let mut ctx = ToolContext::new(Principal::User);
-        let invocation = ctx.invocation_id.clone();
+        let invocation = ctx.invocation_id;
         ctx = ctx.with_ticket(ticket(
             Capability::DesktopObserve,
             Resource::Window(String::new()),
@@ -3996,5 +4515,287 @@ mod tests {
             output.parts.first(),
             Some(artifact_core::ContentPart::Image(_))
         ));
+    }
+
+    /// Serializes control-path tests against the emergency-stop test: the
+    /// stop flag is process-global by design, so a test that engages it
+    /// must not overlap a test driving control tools.
+    static CONTROL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn sensitive_values_are_masked_before_model_output() {
+        let node = super::ElementNode {
+            id: "e9".to_string(),
+            role: "secure text field".to_string(),
+            name: "Password".to_string(),
+            description: None,
+            value: Some("hunter2".to_string()),
+            bounds: None,
+            enabled: Some(true),
+            focused: None,
+            selected: None,
+            checked: None,
+            expanded: None,
+            parent_id: None,
+            child_ids: Vec::new(),
+            actions: vec!["set_value".to_string()],
+            is_sensitive: true,
+            sensitivity: Some(super::ElementSensitivity::Password),
+        };
+        let model = node.for_model();
+        assert!(model.is_sensitive);
+        assert_eq!(model.sensitivity, Some(super::ElementSensitivity::Password));
+        assert_eq!(model.value.as_deref(), Some(super::SENSITIVE_VALUE_MASK));
+        assert!(!serde_json::to_string(&model).unwrap().contains("hunter2"));
+
+        // Heuristic classification applies even when the backend did not
+        // mark the node: the value is still masked.
+        let unmarked = super::ElementNode {
+            id: "e10".to_string(),
+            role: "text field".to_string(),
+            name: "API token".to_string(),
+            description: None,
+            value: Some("sk-abc123".to_string()),
+            bounds: None,
+            enabled: Some(true),
+            focused: None,
+            selected: None,
+            checked: None,
+            expanded: None,
+            parent_id: None,
+            child_ids: Vec::new(),
+            actions: vec!["set_value".to_string()],
+            is_sensitive: false,
+            sensitivity: None,
+        };
+        let model = unmarked.for_model();
+        assert!(model.is_sensitive);
+        assert_eq!(model.sensitivity, Some(super::ElementSensitivity::Secret));
+        assert_eq!(model.value.as_deref(), Some(super::SENSITIVE_VALUE_MASK));
+
+        // Ordinary controls pass through untouched and stay compact.
+        let plain = super::ElementNode {
+            id: "e11".to_string(),
+            role: "button".to_string(),
+            name: "Save".to_string(),
+            description: None,
+            value: None,
+            bounds: None,
+            enabled: Some(true),
+            focused: None,
+            selected: None,
+            checked: None,
+            expanded: None,
+            parent_id: None,
+            child_ids: Vec::new(),
+            actions: vec!["invoke".to_string()],
+            is_sensitive: false,
+            sensitivity: None,
+        };
+        let model = plain.for_model();
+        assert!(!model.is_sensitive);
+        assert_eq!(model.value, None);
+        let serialized = serde_json::to_string(&model).unwrap();
+        assert!(!serialized.contains("is_sensitive"), "{serialized}");
+    }
+
+    #[test]
+    fn detect_sensitivity_classifies_secret_fields() {
+        use super::{detect_sensitivity, ElementSensitivity};
+        assert_eq!(
+            detect_sensitivity("password field", "Current", None),
+            Some(ElementSensitivity::Password)
+        );
+        assert_eq!(
+            detect_sensitivity("text field", "Credit card number", None),
+            Some(ElementSensitivity::Payment)
+        );
+        assert_eq!(
+            detect_sensitivity("text field", "Private key", None),
+            Some(ElementSensitivity::PrivateKey)
+        );
+        assert_eq!(
+            detect_sensitivity("button", "Approve sign-in", None),
+            Some(ElementSensitivity::Authentication)
+        );
+        assert_eq!(detect_sensitivity("button", "Save", None), None);
+    }
+
+    #[tokio::test]
+    async fn emergency_stop_blocks_control_but_not_observation() {
+        let _guard = CONTROL_TEST_LOCK.lock().await;
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
+        let clicks = ClickTool {
+            backend: backend.clone(),
+            captures: super::ComputerSessionManager::new(),
+        };
+        let ctx = ctx_for(Capability::DesktopControl, Resource::Window(String::new()));
+        let audit = super::desktop_emergency_stop();
+        assert!(super::emergency_stop_active());
+        assert_eq!(
+            audit.capability,
+            Some(Capability::DesktopControl),
+            "{audit:?}"
+        );
+        let err = clicks
+            .invoke(ctx, serde_json::json!({"x": 1, "y": 2}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("emergency_stop_active"), "{err:?}");
+
+        // Observation stays available while stopped.
+        let list = ListWindowsTool {
+            backend: backend.clone(),
+            captures: super::ComputerSessionManager::new(),
+        };
+        let out = list
+            .invoke(
+                ctx_for(
+                    Capability::DesktopObserve,
+                    Resource::Application(String::new()),
+                ),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["windows"][0]["title"], "Notes");
+
+        super::desktop_clear_emergency_stop();
+        assert!(!super::emergency_stop_active());
+        // Control works again after the user clears the stop.
+        clicks
+            .invoke(
+                ctx_for(Capability::DesktopControl, Resource::Window(String::new())),
+                serde_json::json!({"x": 1, "y": 2}),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn allowed_applications_reject_out_of_scope_targets() {
+        let _guard = CONTROL_TEST_LOCK.lock().await;
+        let mut fake = FakeBackend::new();
+        fake.windows.push(super::WindowInfo {
+            id: "w2".to_string(),
+            title: "Bank".to_string(),
+            app: "bank".to_string(),
+        });
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(fake);
+        let manager = super::ComputerSessionManager::new();
+        manager.set_allowed_applications(vec!["notes".to_string()]);
+
+        manager
+            .check_window_allowed(&backend, "desktop.click", "w1")
+            .await
+            .unwrap();
+        let err = manager
+            .check_window_allowed(&backend, "desktop.click", "w2")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("application_not_allowed"), "{err:?}");
+        assert!(
+            err.model_message().contains("\"application\":\"bank\""),
+            "{}",
+            err.model_message()
+        );
+
+        // Unknown windows stay the backend's honest error, not a policy lie.
+        manager
+            .check_window_allowed(&backend, "desktop.click", "ghost")
+            .await
+            .unwrap();
+
+        // Launch enforcement end to end through the tool.
+        let launch = LaunchApplicationTool {
+            backend: backend.clone(),
+            captures: manager.clone(),
+        };
+        let err = launch
+            .invoke(
+                ctx_for(
+                    Capability::ApplicationLaunch,
+                    Resource::Application("bank".to_string()),
+                ),
+                serde_json::json!({"application": "bank"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("application_not_allowed"), "{err:?}");
+        // An allowed application passes the gate (the stub backend then
+        // reports honestly that it cannot launch).
+        let err = launch
+            .invoke(
+                ctx_for(
+                    Capability::ApplicationLaunch,
+                    Resource::Application("notes".to_string()),
+                ),
+                serde_json::json!({"application": "notes"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("backend_unavailable"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn session_stop_cleans_up_frames_and_policy() {
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
+        let memory = Arc::new(artifact_core::InMemoryArtifactStore::new());
+        let artifacts: Arc<dyn artifact_core::ArtifactStore> = memory.clone();
+        let manager = super::ComputerSessionManager::new();
+        let session = manager
+            .start_capture_with_policy(
+                backend,
+                CaptureConfig::default(),
+                artifacts,
+                vec!["notes".to_string()],
+            )
+            .await
+            .unwrap();
+        assert!(session.capture_enabled);
+        assert_eq!(session.allowed_applications, vec!["notes".to_string()]);
+        assert_eq!(manager.allowed_applications(), vec!["notes".to_string()]);
+
+        let capture_id = super::CaptureSessionId(session.id.0.clone());
+        let first = manager.next_observation(&capture_id).await.unwrap();
+        assert!(first.changed);
+        assert!(!memory.is_empty());
+
+        manager.stop_capture(&capture_id).await.unwrap();
+        // Temporary frame artifacts are deleted instead of waiting for TTL.
+        assert_eq!(memory.len(), 0);
+        // Policy clears once no session remains.
+        assert!(manager.allowed_applications().is_empty());
+        let state = manager.share_state().await;
+        assert!(!state.screen_on);
+        assert_eq!(state.session_count, 0);
+    }
+
+    #[tokio::test]
+    async fn share_state_tracks_control_and_pause() {
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
+        let artifacts: Arc<dyn artifact_core::ArtifactStore> =
+            Arc::new(artifact_core::InMemoryArtifactStore::new());
+        let manager = super::ComputerSessionManager::new();
+        let session = manager
+            .start_capture(backend, CaptureConfig::default(), artifacts)
+            .await
+            .unwrap();
+        let capture_id = super::CaptureSessionId(session.id.0.clone());
+        manager
+            .set_control_enabled(&capture_id, true)
+            .await
+            .unwrap();
+        let state = manager.share_state().await;
+        assert!(state.screen_on);
+        assert!(state.control_on);
+
+        manager.set_paused(&capture_id, true).await.unwrap();
+        assert!(manager.share_state().await.paused);
+
+        manager.revoke_control().await;
+        let state = manager.share_state().await;
+        assert!(!state.control_on);
+        assert!(state.screen_on, "revoking control must not stop capture");
     }
 }

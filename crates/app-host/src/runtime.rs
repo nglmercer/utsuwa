@@ -91,6 +91,7 @@ pub struct ScreenShareStatus {
     pub sharing: bool,
     pub paused: bool,
     pub control_enabled: bool,
+    pub emergency_stopped: bool,
     pub session_id: Option<String>,
     pub target: Option<tool_desktop::CaptureTarget>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -122,6 +123,8 @@ pub struct AgentRuntime {
     desktop: Mutex<tool_desktop::plugin::DesktopPlugin>,
     artifacts: Arc<artifact_core::InMemoryArtifactStore>,
     computer_sessions: tool_desktop::ComputerSessionManager,
+    camera_state: tool_camera::CameraState,
+    audio_state: tool_audio::AudioState,
     screen_share: Mutex<Option<ScreenShareState>>,
     storage: Option<Arc<Mutex<Storage>>>,
     autonomous_full_access: Arc<AtomicBool>,
@@ -201,6 +204,8 @@ impl AgentRuntime {
             desktop: Mutex::new(Self::desktop_plugin()),
             artifacts: Arc::new(artifact_core::InMemoryArtifactStore::new()),
             computer_sessions: tool_desktop::ComputerSessionManager::new(),
+            camera_state: tool_camera::CameraState::new(),
+            audio_state: tool_audio::AudioState::new(),
             screen_share: Mutex::new(None),
             storage,
             autonomous_full_access,
@@ -307,6 +312,19 @@ impl AgentRuntime {
                 )
             })
     }
+    /// Camera backend for this host: real OS capture where a camera stack
+    /// exists, honest unavailability elsewhere.
+    fn camera_backend() -> Arc<dyn camera_capture::CameraBackend> {
+        #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+        {
+            Arc::new(camera_capture::NokhwaBackend)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+        {
+            Arc::new(camera_capture::StubBackend)
+        }
+    }
+
     /// Install the desktop plugin (boot only, or tests with a fake).
     /// The turn registers `desktop.*` tools only for the active
     /// plugin's declared capabilities — with the stub plugin the model
@@ -564,6 +582,49 @@ impl AgentRuntime {
         Ok(status)
     }
 
+    /// Engage the global emergency stop: pointer, keyboard, and semantic
+    /// UI actions stop immediately (observation stays active), standing
+    /// DesktopControl grants are revoked, and per-session control flags
+    /// clear. Independent from the model — only the user clears it.
+    pub fn desktop_emergency_stop(&self) -> ScreenShareStatus {
+        let audit_record = tool_desktop::desktop_emergency_stop();
+        let revoked = self
+            .approvals
+            .lock()
+            .map(|queue| queue.revoke_capability(&capability_core::Capability::DesktopControl))
+            .unwrap_or(0);
+        let sessions_revoked = self
+            .executor
+            .block_on(self.computer_sessions.revoke_control());
+        if let Some(sink) = &self.audit {
+            sink.record(audit_record);
+            sink.record(audit_core::AuditRecord::now(
+                capability_core::Principal::User,
+                Some(capability_core::Capability::DesktopControl),
+                None,
+                audit_core::AuditOutcome::Blocked,
+                format!(
+                    "emergency stop invalidated {revoked} standing grant(s) and {sessions_revoked} session control flag(s)"
+                ),
+            ));
+        }
+        let status = self.screen_share_status();
+        self.emit_screen_share_changed(&status);
+        status
+    }
+
+    /// Clear a previously engaged emergency stop (user action only — the
+    /// model cannot call this; it is an IPC user control, not a tool).
+    pub fn desktop_clear_emergency_stop(&self) -> ScreenShareStatus {
+        let audit_record = tool_desktop::desktop_clear_emergency_stop();
+        if let Some(sink) = &self.audit {
+            sink.record(audit_record);
+        }
+        let status = self.screen_share_status();
+        self.emit_screen_share_changed(&status);
+        status
+    }
+
     pub fn screen_share_status(&self) -> ScreenShareStatus {
         let plugin = self
             .desktop
@@ -591,7 +652,9 @@ impl AgentRuntime {
             backend: plugin.manifest.id,
             sharing: state.is_some(),
             paused: state.is_some_and(|state| state.paused),
-            control_enabled: state.is_some_and(|state| state.control_enabled),
+            control_enabled: state.is_some_and(|state| state.control_enabled)
+                && !tool_desktop::emergency_stop_active(),
+            emergency_stopped: tool_desktop::emergency_stop_active(),
             session_id: state.map(|state| state.session_id.0.clone()),
             target: state.map(|state| state.target.clone()),
             started_at: state.map(|state| state.started_at),
@@ -637,6 +700,36 @@ impl AgentRuntime {
                 host_environment.clone(),
                 file_context,
             ))
+            // Local-machine packs: each tool enforces its own capability
+            // tickets; the profile only controls model visibility.
+            .with_pack(tool_http::HttpToolPack::with_artifacts(
+                self.artifacts.clone(),
+            ))
+            .with_pack(tool_archive::ArchiveToolPack::new())
+            .with_pack(tool_git::GitToolPack)
+            .with_pack(tool_notification::NotificationToolPack)
+            .with_pack(tool_browser::BrowserToolPack::with_services(
+                Arc::new(tool_browser::CdpBackend::new("http://localhost:9222")),
+                self.artifacts.clone(),
+            ))
+            .with_pack(tool_camera::CameraToolPack {
+                backend: Self::camera_backend(),
+                artifacts: self.artifacts.clone(),
+                state: self.camera_state.clone(),
+            })
+            .with_pack(tool_audio::AudioToolPack {
+                artifacts: self.artifacts.clone(),
+                state: self.audio_state.clone(),
+            })
+            .with_pack(tool_media::MediaToolPack {
+                artifacts: self.artifacts.clone(),
+            })
+            .with_pack(tool_system::SystemToolPack)
+            .with_pack(tool_system::ClipboardToolPack)
+            .with_pack(tool_system::ApplicationToolPack)
+            .with_pack(tool_system::DocumentToolPack {
+                artifacts: self.artifacts.clone(),
+            })
             .with_source(mcp_runtime::McpToolSource::new(Arc::clone(&self.mcp)))
             .with_source(plugin_wasm::PluginToolSource::new(Arc::clone(
                 &self.plugins,
@@ -1457,6 +1550,108 @@ mod tests {
             .unwrap();
         assert_eq!(configured_tool_profile(Some(&storage)), ToolProfile::Full);
         std::fs::remove_dir_all(&storage_dir).ok();
+    }
+
+    #[test]
+    fn emergency_stop_revokes_control_grants_and_reports_state() {
+        let grant = policy_core::GrantedScope::new(
+            capability_core::PrincipalKind::Agent,
+            capability_core::Capability::DesktopControl,
+            capability_core::ResourceScope::new(vec![capability_core::Resource::Window(
+                "w1".to_string(),
+            )]),
+            policy_core::GrantLifetime::Persistent,
+            None,
+            None,
+        );
+        let observe_grant = policy_core::GrantedScope::new(
+            capability_core::PrincipalKind::Agent,
+            capability_core::Capability::DesktopObserve,
+            capability_core::ResourceScope::new(vec![capability_core::Resource::Window(
+                "w1".to_string(),
+            )]),
+            policy_core::GrantLifetime::Persistent,
+            None,
+            None,
+        );
+        let provider = QueueProvider::new(vec![text_turn("ok")]);
+        let harness = harness_with(provider, vec![grant, observe_grant]);
+
+        let status = harness.runtime.desktop_emergency_stop();
+        assert!(status.emergency_stopped);
+        assert!(!status.control_enabled);
+        // DesktopControl grants are gone; unrelated grants survive.
+        let remaining = harness.approvals.lock().unwrap().grants_snapshot();
+        assert!(
+            remaining
+                .iter()
+                .all(|grant| grant.capability != capability_core::Capability::DesktopControl),
+            "{remaining:?}"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|grant| grant.capability == capability_core::Capability::DesktopObserve),
+            "{remaining:?}"
+        );
+
+        let status = harness.runtime.desktop_clear_emergency_stop();
+        assert!(!status.emergency_stopped);
+        assert!(!tool_desktop::emergency_stop_active());
+    }
+
+    #[test]
+    fn live_registry_registers_the_new_local_machine_packs() {
+        // Sync test: the runtime owns an internal executor, which cannot
+        // be driven from inside another async context.
+        let worker = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let provider = QueueProvider::new(vec![text_turn("ok")]);
+        let harness = harness(provider);
+        let registry = worker.block_on(async {
+            let catalog = harness
+                .runtime
+                .tool_catalog(&HostEnvironment::snapshot())
+                .await;
+            catalog
+                .snapshot(&ToolLoadContext::new(ToolProfile::Full))
+                .await
+                .expect("live catalog snapshot must succeed")
+        });
+        let ids: Vec<String> = registry
+            .list()
+            .into_iter()
+            .map(|metadata| metadata.id.0)
+            .collect();
+        for expected in [
+            "http.get",
+            "http.download",
+            "archive.list",
+            "archive.extract",
+            "git.status",
+            "git.push",
+            "notification.show",
+            "browser.status",
+            "browser.snapshot",
+            "browser.cookies.delete",
+            "camera.list",
+            "camera.capture_photo",
+            "audio.list_devices",
+            "audio.record",
+            "media.metadata",
+            "media.video_keyframes",
+            "system.cpu",
+            "system.processes",
+            "clipboard.read",
+            "application.launch",
+            "document.extract_text",
+            "image.resize",
+        ] {
+            assert!(ids.iter().any(|id| id == expected), "missing {expected}");
+        }
     }
 
     #[tokio::test]

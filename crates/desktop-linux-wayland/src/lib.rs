@@ -33,9 +33,7 @@ mod linux {
     /// actual portal is still probed when a capture session is started; a
     /// compositor is allowed to reject the request or require a fresh choice.
     pub fn plugin() -> Option<DesktopPlugin> {
-        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-            return None;
-        }
+        std::env::var_os("WAYLAND_DISPLAY")?;
 
         let x11_plugin = desktop_linux::plugin();
         let x11 = x11_plugin.as_ref().map(|plugin| plugin.backend.clone());
@@ -738,7 +736,7 @@ mod linux {
                 .select_sources(
                     &session,
                     cursor,
-                    (SourceType::Monitor | SourceType::Window).into(),
+                    SourceType::Monitor | SourceType::Window,
                     false,
                     None,
                     PersistMode::DoNot,

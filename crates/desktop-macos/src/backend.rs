@@ -29,11 +29,11 @@ use accessibility_sys::{
     kAXChildrenAttribute, kAXCloseButtonAttribute, kAXDescriptionAttribute, kAXEnabledAttribute,
     kAXErrorSuccess, kAXExpandedAttribute, kAXFocusedAttribute, kAXFrontmostAttribute,
     kAXMinimizedAttribute, kAXPositionAttribute, kAXPressAction, kAXRaiseAction, kAXRoleAttribute,
-    kAXRoleDescriptionAttribute, kAXSelectedAttribute, kAXSizeAttribute, kAXTitleAttribute,
-    kAXValueAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
-    AXUIElementCopyActionNames, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-    AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue, AXValueCreate,
-    AXValueGetType, AXValueGetTypeID, AXValueGetValue,
+    kAXRoleDescriptionAttribute, kAXSelectedAttribute, kAXSizeAttribute, kAXSubroleAttribute,
+    kAXTitleAttribute, kAXValueAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
+    kAXWindowsAttribute, AXUIElementCopyActionNames, AXUIElementCopyAttributeValue,
+    AXUIElementCreateApplication, AXUIElementPerformAction, AXUIElementRef,
+    AXUIElementSetAttributeValue, AXValueCreate, AXValueGetType, AXValueGetTypeID, AXValueGetValue,
 };
 
 const MAX_UI_NODES: usize = 2_048;
@@ -380,6 +380,17 @@ impl MacBackend {
         let selected = element.boolean(kAXSelectedAttribute);
         let expanded = element.boolean(kAXExpandedAttribute);
         let actions = element.semantic_actions();
+        // Native AX metadata: secure text fields carry the AXSecureTextField
+        // subrole (or role). Their values must never leave unmarked.
+        let subrole = element.string(kAXSubroleAttribute).unwrap_or_default();
+        let native_secure = subrole == "AXSecureTextField"
+            || role == "AXSecureTextField"
+            || role.contains("SecureTextField");
+        let (is_sensitive, sensitivity) = if native_secure {
+            (true, Some(tool_desktop::ElementSensitivity::Password))
+        } else {
+            (false, None)
+        };
         ElementNode {
             id,
             role,
@@ -395,6 +406,8 @@ impl MacBackend {
             parent_id,
             child_ids: Vec::new(),
             actions,
+            is_sensitive,
+            sensitivity,
         }
     }
 

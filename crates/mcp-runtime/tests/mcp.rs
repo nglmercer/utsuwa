@@ -5,9 +5,7 @@
 use capability_core::{
     AgentId, Capability, CapabilityTicket, InvocationId, Principal, Resource, ResourceScope,
 };
-use mcp_runtime::{
-    bridge_tool_id, McpManager, McpServerConfig, McpTransport, TrustLevel,
-};
+use mcp_runtime::{bridge_tool_id, McpManager, McpServerConfig, McpTransport, TrustLevel};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tool_core::ToolContext;
@@ -23,7 +21,7 @@ fn server_script(tag: &str) -> PathBuf {
     path
 }
 
-fn config(script: &PathBuf, extra_env: HashMap<String, String>) -> McpServerConfig {
+fn config(script: &std::path::Path, extra_env: HashMap<String, String>) -> McpServerConfig {
     McpServerConfig {
         id: capability_core::ServerId::new("fake"),
         transport: McpTransport::Stdio {
@@ -47,7 +45,7 @@ fn mcp_ticket(server: &str, tool: &str) -> ToolContext {
             server: server.to_string(),
             tool: tool.to_string(),
         }]),
-        invocation.clone(),
+        invocation,
         std::time::Duration::from_secs(120),
     );
     let mut ctx = ToolContext::new(principal).with_ticket(ticket);
@@ -71,14 +69,20 @@ fn config_validation_and_tool_id_mapping() {
     assert!(cfg.validate().is_err());
 
     assert_eq!(bridge_tool_id("srv", "my-tool_2"), "mcp.srv.my-tool_2");
-    assert_eq!(bridge_tool_id("srv", "weird name/x"), "mcp.srv.weird_name_x");
+    assert_eq!(
+        bridge_tool_id("srv", "weird name/x"),
+        "mcp.srv.weird_name_x"
+    );
 }
 
 #[tokio::test]
 async fn discover_register_call_through_policy() {
     let script = server_script("happy");
     let manager = McpManager::new();
-    manager.configure(config(&script, HashMap::new())).await.unwrap();
+    manager
+        .configure(config(&script, HashMap::new()))
+        .await
+        .unwrap();
 
     let mut registry = tool_core::ToolRegistry::new();
     let added = manager.register_into("fake", &mut registry).await.unwrap();
@@ -92,13 +96,8 @@ async fn discover_register_call_through_policy() {
 
     // The bridge always demands a capability decision — never pure.
     let echo = registry.resolve("mcp.fake.echo").unwrap();
-    assert!(echo
-        .required_capability(&serde_json::json!({}))
-        .is_some());
-    assert!(echo
-        .metadata()
-        .description
-        .contains("trust: untrusted"));
+    assert!(echo.required_capability(&serde_json::json!({})).is_some());
+    assert!(echo.metadata().description.contains("trust: untrusted"));
 
     // Without a ticket the broker refuses.
     let plain = ToolContext::new(Principal::Agent(AgentId::new("nobody")));
@@ -117,7 +116,10 @@ async fn discover_register_call_through_policy() {
         .await
         .unwrap();
     assert_eq!(out.content["is_error"], false);
-    assert!(out.content["text"].as_str().unwrap().contains("echo:hello-mcp"));
+    assert!(out.content["text"]
+        .as_str()
+        .unwrap()
+        .contains("echo:hello-mcp"));
 
     // A ticket for another tool does not authorize this one.
     let err = echo
@@ -169,23 +171,23 @@ async fn tool_level_errors_stay_data_and_env_is_default_deny() {
 async fn disable_unregisters_and_unknown_servers_fail() {
     let script = server_script("disable");
     let manager = McpManager::new();
-    manager.configure(config(&script, HashMap::new())).await.unwrap();
+    manager
+        .configure(config(&script, HashMap::new()))
+        .await
+        .unwrap();
     let mut registry = tool_core::ToolRegistry::new();
     manager.register_into("fake", &mut registry).await.unwrap();
     assert!(registry.resolve("mcp.fake.echo").is_ok());
 
-    manager.set_enabled("fake", false, &mut registry).await.unwrap();
+    manager
+        .set_enabled("fake", false, &mut registry)
+        .await
+        .unwrap();
     assert!(registry.resolve("mcp.fake.echo").is_err());
     let status = manager.status().await;
     assert!(!status[0].connected);
     assert_eq!(status[0].tools, 0);
 
-    assert!(manager
-        .register_into("nope", &mut registry)
-        .await
-        .is_err());
-    assert!(manager
-        .remove_from("nope", &mut registry)
-        .await
-        .is_err());
+    assert!(manager.register_into("nope", &mut registry).await.is_err());
+    assert!(manager.remove_from("nope", &mut registry).await.is_err());
 }

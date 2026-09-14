@@ -219,6 +219,8 @@ impl Dispatcher {
             IpcMethod::DesktopShareScreenStatus => self.desktop_share_screen_status(),
             IpcMethod::DesktopControlEnable => self.desktop_control_set(true),
             IpcMethod::DesktopControlDisable => self.desktop_control_set(false),
+            IpcMethod::DesktopEmergencyStop => self.desktop_emergency_stop(),
+            IpcMethod::DesktopEmergencyClear => self.desktop_emergency_clear(),
             IpcMethod::ActivityList => self.activity_list(request),
             IpcMethod::PluginList => self.plugin_list(),
             IpcMethod::PluginEnable => self.plugin_manage(request, PluginOp::Enable),

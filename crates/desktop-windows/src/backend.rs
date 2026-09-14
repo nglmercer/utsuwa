@@ -457,6 +457,14 @@ impl WindowsBackend {
         if element.get_pattern::<UIWindowPattern>().is_ok() {
             actions.push("window".to_string());
         }
+        // Native UIA password metadata: a password field's value must never
+        // leave the backend unmarked. The host masks it before model output.
+        let native_password = element.is_password().unwrap_or(false);
+        let (is_sensitive, sensitivity) = if native_password {
+            (true, Some(tool_desktop::ElementSensitivity::Password))
+        } else {
+            (false, None)
+        };
         ElementNode {
             id,
             role,
@@ -472,6 +480,8 @@ impl WindowsBackend {
             parent_id,
             child_ids: Vec::new(),
             actions,
+            is_sensitive,
+            sensitivity,
         }
     }
 

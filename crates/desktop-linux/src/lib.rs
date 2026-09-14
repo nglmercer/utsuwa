@@ -1024,6 +1024,8 @@ impl DesktopBackend for LinuxBackend {
                 parent_id: Some(window_id.to_string()),
                 child_ids: Vec::new(),
                 actions: vec!["invoke".to_string()],
+                is_sensitive: false,
+                sensitivity: None,
             });
         }
         Ok(out)

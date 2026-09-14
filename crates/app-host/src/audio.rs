@@ -220,7 +220,7 @@ impl AudioCaptureManager {
                 return Err(error);
             }
         };
-        let stats = capture.stats().cloned().unwrap_or_else(|| CaptureStats {
+        let stats = capture.stats().cloned().unwrap_or(CaptureStats {
             current_rms: 0.0,
             peak_rms: 0.0,
             noise_floor: 0.0,

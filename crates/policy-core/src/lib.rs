@@ -155,6 +155,8 @@ fn is_mutation_or_control(cap: &Capability) -> bool {
             | DesktopControl
             | ClipboardWrite
             | ApplicationLaunch
+            | CameraObserve
+            | MicrophoneCapture
             | McpInvoke
             | PluginInvoke
     )
@@ -352,13 +354,16 @@ struct QueueInner {
 /// resumed turn authorizes through the normal `authorize` path — approvals
 /// never bypass policy, they extend it. Submissions and user decisions are
 /// audit-logged when a sink is attached.
+///
+pub type PersistentGrantHook =
+    std::sync::Arc<dyn Fn(&GrantedScope) -> Result<(), String> + Send + Sync>;
 pub struct ApprovalQueue {
     inner: std::sync::Mutex<QueueInner>,
     sink: Option<std::sync::Arc<dyn audit_core::AuditSink>>,
     /// Called with every newly approved `Persistent` grant before it takes
     /// effect. The host installs a `storage-core` writer here; an error
     /// fails the decision and leaves the request pending.
-    persist: Option<std::sync::Arc<dyn Fn(&GrantedScope) -> Result<(), String> + Send + Sync>>,
+    persist: Option<PersistentGrantHook>,
 }
 
 impl Default for ApprovalQueue {
@@ -405,10 +410,7 @@ impl ApprovalQueue {
     }
 
     /// Install the storage writer for new `Persistent` approvals.
-    pub fn on_persistent_grant(
-        mut self,
-        hook: std::sync::Arc<dyn Fn(&GrantedScope) -> Result<(), String> + Send + Sync>,
-    ) -> Self {
+    pub fn on_persistent_grant(mut self, hook: PersistentGrantHook) -> Self {
         self.persist = Some(hook);
         self
     }
@@ -622,6 +624,30 @@ impl ApprovalQueue {
             ));
         }
         Ok(grant)
+    }
+
+    /// Drop every in-memory grant for one capability, regardless of scope.
+    /// Emergency-stop path: after this returns, no standing grant can mint
+    /// a ticket for the capability until the user approves again. Pending
+    /// requests are left alone (the user still sees and resolves them).
+    /// Returns how many grants were removed; the host audit-logs the count.
+    pub fn revoke_capability(&self, capability: &Capability) -> usize {
+        let mut inner = self.inner.lock().expect("approval queue lock");
+        let before = inner.grants.len();
+        inner.grants.retain(|grant| grant.capability != *capability);
+        let removed = before - inner.grants.len();
+        if removed > 0 {
+            if let Some(sink) = &self.sink {
+                sink.record(audit_core::AuditRecord::now(
+                    Principal::User,
+                    Some(capability.clone()),
+                    None,
+                    audit_core::AuditOutcome::Blocked,
+                    format!("revoked {removed} standing grant(s) for {capability:?}"),
+                ));
+            }
+        }
+        removed
     }
 
     /// Drop every in-memory grant matching a capability + scope. Returns

@@ -424,6 +424,7 @@ impl PluginRuntime {
     /// Call a loaded tool: ticket-checked by the caller (bridge), executed
     /// here under fuel with per-call state. Returns raw guest bytes plus
     /// captured logs and file-mutation evidence, in order.
+    #[allow(clippy::type_complexity)]
     fn call_tool(
         &self,
         id: &str,
@@ -532,7 +533,7 @@ impl PluginRuntime {
                     principal.clone(),
                     capability,
                     scope,
-                    invocation.clone(),
+                    invocation,
                     ttl,
                 )
             })
@@ -885,7 +886,7 @@ impl Tool for PluginToolBridge {
                 &self.tool,
                 &ticket,
                 &ctx.principal,
-                ctx.invocation_id.clone(),
+                ctx.invocation_id,
             )
             .map_err(|e| failed(e.to_string()))?;
         let (bytes, logs, mutations) = self

@@ -7,6 +7,16 @@ members = [
     "crates/audit-core",
     "crates/audio-capture",
     "crates/tool-filesystem",
+    "crates/tool-http",
+    "crates/tool-archive",
+    "crates/tool-git",
+    "crates/tool-notification",
+    "crates/tool-browser",
+    "crates/camera-capture",
+    "crates/tool-camera",
+    "crates/tool-system",
+    "crates/tool-audio",
+    "crates/tool-media",
     "crates/capability-core",
     "crates/ipc-core",
     "crates/model-core",
@@ -81,6 +91,16 @@ plugin-wasm = { path = "crates/plugin-wasm" }
 tool-core = { path = "crates/tool-core" }
 tool-desktop = { path = "crates/tool-desktop" }
 tool-filesystem = { path = "crates/tool-filesystem" }
+tool-http = { path = "crates/tool-http" }
+tool-archive = { path = "crates/tool-archive" }
+tool-git = { path = "crates/tool-git" }
+tool-notification = { path = "crates/tool-notification" }
+tool-browser = { path = "crates/tool-browser" }
+camera-capture = { path = "crates/camera-capture" }
+tool-camera = { path = "crates/tool-camera" }
+tool-system = { path = "crates/tool-system" }
+tool-audio = { path = "crates/tool-audio" }
+tool-media = { path = "crates/tool-media" }
 tool-filesystem-host = { path = "crates/tool-filesystem-host" }
 tool-process = { path = "crates/tool-process" }
 tool-sdk = { path = "crates/tool-sdk" }

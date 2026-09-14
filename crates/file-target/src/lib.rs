@@ -894,7 +894,7 @@ mod tests {
             .normalize_absolute_path(&missing, TargetPurpose::Existing)
             .unwrap_err();
         assert_eq!(error.code, FilesystemErrorCode::FileNotFound);
-        assert_eq!(error.retryable, true);
+        assert!(error.retryable);
         assert_eq!(
             error.suggested_target,
             Some(FileTarget {

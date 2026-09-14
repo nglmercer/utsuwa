@@ -70,6 +70,14 @@ pub enum IpcMethod {
     DesktopControlEnable,
     #[serde(rename = "desktop.control.disable")]
     DesktopControlDisable,
+    /// Global emergency stop: immediately disables pointer, keyboard, and
+    /// semantic UI actions (observation stays active) and revokes standing
+    /// DesktopControl grants. Operates independently from the model.
+    #[serde(rename = "desktop.emergency_stop")]
+    DesktopEmergencyStop,
+    /// Clear a previously engaged emergency stop (user action only).
+    #[serde(rename = "desktop.emergency_clear")]
+    DesktopEmergencyClear,
     #[serde(rename = "activity.list")]
     ActivityList,
     #[serde(rename = "plugin.list")]

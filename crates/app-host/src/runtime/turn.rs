@@ -65,6 +65,7 @@ impl AgentRuntime {
         }));
         Ok(agent)
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_turn(
         self: &Arc<Self>,
         transcript: Vec<ModelMessage>,
@@ -92,6 +93,7 @@ impl AgentRuntime {
         self.lock_state()?.running = Some(handle);
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn(
         &self,
         transcript: Vec<ModelMessage>,
@@ -115,6 +117,7 @@ impl AgentRuntime {
         .instrument(span)
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn_inner(
         &self,
         mut transcript: Vec<ModelMessage>,

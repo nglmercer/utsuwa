@@ -55,7 +55,7 @@ impl AssetServer {
         }
         let decoded = percent_decode(uri.path());
         let segments: Vec<&str> = decoded.split('/').filter(|s| !s.is_empty()).collect();
-        if segments.iter().any(|s| *s == "..") {
+        if segments.contains(&"..") {
             return None;
         }
         let mut candidate = self.root.clone();
@@ -72,12 +72,8 @@ impl AssetServer {
             if ancestor == self.root {
                 break;
             }
-            if let Some(name) = ancestor.file_name() {
-                tail.push(name.to_os_string());
-                ancestor.pop();
-            } else {
-                return None;
-            }
+            tail.push(ancestor.file_name()?.to_os_string());
+            ancestor.pop();
         }
         let canonical = ancestor.canonicalize().ok()?;
         if !canonical.starts_with(&self.root) {

@@ -53,6 +53,10 @@ pub(crate) fn configured_tool_profile(storage: Option<&Arc<Mutex<Storage>>>) -> 
             match profile.trim().to_ascii_lowercase().as_str() {
                 "simple" => return ToolProfile::Simple,
                 "full" => return ToolProfile::Full,
+                "minimal" => return ToolProfile::Minimal,
+                "standard" => return ToolProfile::Standard,
+                "developer" => return ToolProfile::Developer,
+                "computeruse" | "computer-use" | "computer_use" => return ToolProfile::ComputerUse,
                 _ => tracing::warn!(
                     profile = %profile,
                     "unknown agent.tool_profile value; inferring from provider"
@@ -254,11 +258,10 @@ pub fn normalize_provider_base_url(provider: &str, base_url: &str) -> String {
         normalized.truncate(normalized.len() - CHAT_SUFFIX.len());
     }
 
-    if matches!(provider, "lmstudio" | "ollama")
+    let needs_v1 = matches!(provider, "lmstudio" | "ollama")
         && !normalized.to_ascii_lowercase().ends_with("/v1")
-    {
-        normalized.push_str("/v1");
-    } else if provider != "anthropic" && is_bare_host_url(&normalized) {
+        || provider != "anthropic" && is_bare_host_url(&normalized);
+    if needs_v1 {
         normalized.push_str("/v1");
     }
     normalized

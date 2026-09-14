@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn downmixes_and_resamples_to_mono_16khz() {
         let mut pcm = PcmBuffer::new(48_000, 2);
-        pcm.append(&vec![1_000, 1_000].repeat(48_000));
+        pcm.append(&[1_000, 1_000].repeat(48_000));
         assert_eq!(pcm.mono_16khz_samples().len(), 16_000);
     }
 }

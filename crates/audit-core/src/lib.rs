@@ -214,6 +214,10 @@ impl InMemorySink {
         self.records.lock().expect("audit lock").len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.records.lock().expect("audit lock").is_empty()
+    }
+
     pub fn outcomes(&self) -> Vec<AuditOutcome> {
         self.records().iter().map(|r| r.outcome).collect()
     }

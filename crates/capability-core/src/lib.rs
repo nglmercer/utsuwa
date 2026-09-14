@@ -107,6 +107,12 @@ pub enum Capability {
     ClipboardRead,
     ClipboardWrite,
     ApplicationLaunch,
+    /// Observe a camera device (still photo or frame stream). Always requires
+    /// explicit user authorization; never implied by screen-capture grants.
+    CameraObserve,
+    /// Capture microphone audio. Always requires explicit user authorization;
+    /// never implied by any other capability.
+    MicrophoneCapture,
     /// Invoke a tool served by an external MCP server. Never implied by
     /// other capabilities: every MCP tool call authorizes on its own.
     McpInvoke,
@@ -134,6 +140,17 @@ pub enum Resource {
         env: Vec<(String, String)>,
     },
     Application(String),
+    /// A camera device selected for capture. Device identities are matched
+    /// exactly; a grant for one camera never covers another.
+    Camera(String),
+    /// A URL being navigated, fetched, or submitted to. The scheme and host
+    /// match case-insensitively; the port matches exactly. Used for
+    /// domain-based browser/HTTP authorization.
+    Url {
+        scheme: String,
+        host: String,
+        port: u16,
+    },
     Window(String),
     /// A display/output selected for screen capture. Display identities are
     /// matched exactly; a display grant never implicitly covers a window or
@@ -223,6 +240,19 @@ fn scope_covers(scope: &Resource, resource: &Resource) -> bool {
             sh.eq_ignore_ascii_case(rh) && sp == rp
         }
         (Resource::Application(s), Resource::Application(r)) => s == r,
+        (Resource::Camera(s), Resource::Camera(r)) => s == r,
+        (
+            Resource::Url {
+                scheme: ss,
+                host: sh,
+                port: sp,
+            },
+            Resource::Url {
+                scheme: rs,
+                host: rh,
+                port: rp,
+            },
+        ) => ss.eq_ignore_ascii_case(rs) && sh.eq_ignore_ascii_case(rh) && sp == rp,
         (Resource::Window(s), Resource::Window(r)) => s == r,
         (Resource::Display(s), Resource::Display(r)) => s == r,
         (
@@ -411,7 +441,7 @@ mod tests {
             principal.clone(),
             Capability::FilesystemRead,
             ResourceScope::new(vec![Resource::Path(PathBuf::from("/home/u/Projects"))]),
-            inv.clone(),
+            inv,
             Duration::from_secs(60),
         );
         let ok = req(
@@ -440,7 +470,7 @@ mod tests {
             principal.clone(),
             Capability::FilesystemRead,
             ResourceScope::new(vec![Resource::Path(PathBuf::from("/work"))]),
-            inv.clone(),
+            inv,
             Duration::from_secs(60),
         );
         let r = |cap| {
@@ -470,6 +500,44 @@ mod tests {
     }
 
     #[test]
+    fn url_scope_matches_host_case_insensitively_and_port_exactly() {
+        let scope = ResourceScope::new(vec![Resource::Url {
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            port: 443,
+        }]);
+        assert!(scope.allows(&Resource::Url {
+            scheme: "HTTPS".to_string(),
+            host: "EXAMPLE.com".to_string(),
+            port: 443,
+        }));
+        assert!(!scope.allows(&Resource::Url {
+            scheme: "https".to_string(),
+            host: "example.com".to_string(),
+            port: 80,
+        }));
+        assert!(!scope.allows(&Resource::Url {
+            scheme: "http".to_string(),
+            host: "example.com".to_string(),
+            port: 443,
+        }));
+        assert!(!scope.allows(&Resource::Url {
+            scheme: "https".to_string(),
+            host: "evil.example.com".to_string(),
+            port: 443,
+        }));
+    }
+
+    #[test]
+    fn camera_scope_is_device_exact() {
+        let scope = ResourceScope::new(vec![Resource::Camera("front".to_string())]);
+        assert!(scope.allows(&Resource::Camera("front".to_string())));
+        assert!(!scope.allows(&Resource::Camera("rear".to_string())));
+        // Camera grants never cover screen capture resources and vice versa.
+        assert!(!scope.allows(&Resource::Window("w1".to_string())));
+    }
+
+    #[test]
     fn zero_ttl_ticket_is_expired() {
         let principal = Principal::User;
         let inv = InvocationId::fresh();
@@ -477,7 +545,7 @@ mod tests {
             principal.clone(),
             Capability::ScreenCapture,
             ResourceScope::new(vec![]),
-            inv.clone(),
+            inv,
             Duration::from_secs(0),
         );
         // Empty scope + immediate expiry: both fail; expiry is checked first.

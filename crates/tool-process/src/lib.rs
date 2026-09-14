@@ -183,13 +183,11 @@ impl ProcessManager {
         )
         .entered();
         let mut inner = self.lock()?;
-        if inner.procs.len() >= self.limits.max_processes {
-            if !Self::evict_finished(&mut inner) {
-                return Err(failed(
-                    "process.spawn",
-                    format!("process table full ({} live)", self.limits.max_processes),
-                ));
-            }
+        if inner.procs.len() >= self.limits.max_processes && !Self::evict_finished(&mut inner) {
+            return Err(failed(
+                "process.spawn",
+                format!("process table full ({} live)", self.limits.max_processes),
+            ));
         }
         let handle = format!("proc-{}-{}", std::process::id(), inner.next_id);
         inner.next_id += 1;

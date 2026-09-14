@@ -21,11 +21,69 @@ export interface ScreenShareStatus {
 	sharing: boolean;
 	paused: boolean;
 	control_enabled: boolean;
+	emergency_stopped: boolean;
 	session_id: string | null;
 	target: unknown;
 	started_at: string | null;
 	displays: ScreenDisplay[];
 	windows: ScreenWindow[];
+}
+
+export interface EmergencyShortcut {
+	key: string;
+	ctrlOrCmd: boolean;
+	alt: boolean;
+	shift: boolean;
+}
+
+const SHORTCUT_STORAGE_KEY = 'utsuwa.emergency-shortcut';
+
+export const DEFAULT_EMERGENCY_SHORTCUT: EmergencyShortcut = {
+	key: 'x',
+	ctrlOrCmd: true,
+	alt: true,
+	shift: true
+};
+
+export function loadEmergencyShortcut(): EmergencyShortcut {
+	try {
+		const raw = localStorage.getItem(SHORTCUT_STORAGE_KEY);
+		if (!raw) return { ...DEFAULT_EMERGENCY_SHORTCUT };
+		const parsed = JSON.parse(raw) as Partial<EmergencyShortcut>;
+		if (typeof parsed.key !== 'string' || parsed.key.length !== 1) {
+			return { ...DEFAULT_EMERGENCY_SHORTCUT };
+		}
+		return {
+			key: parsed.key.toLowerCase(),
+			ctrlOrCmd: parsed.ctrlOrCmd !== false,
+			alt: parsed.alt === true,
+			shift: parsed.shift === true
+		};
+	} catch {
+		return { ...DEFAULT_EMERGENCY_SHORTCUT };
+	}
+}
+
+export function saveEmergencyShortcut(shortcut: EmergencyShortcut): void {
+	localStorage.setItem(SHORTCUT_STORAGE_KEY, JSON.stringify(shortcut));
+}
+
+export function shortcutMatches(event: KeyboardEvent, shortcut: EmergencyShortcut): boolean {
+	const mod = event.ctrlKey || event.metaKey;
+	if (shortcut.ctrlOrCmd && !mod) return false;
+	if (!shortcut.ctrlOrCmd && mod) return false;
+	if (shortcut.alt !== event.altKey) return false;
+	if (shortcut.shift !== event.shiftKey) return false;
+	return event.key.toLowerCase() === shortcut.key;
+}
+
+export function shortcutLabel(shortcut: EmergencyShortcut): string {
+	const parts: string[] = [];
+	if (shortcut.ctrlOrCmd) parts.push('Ctrl/⌘');
+	if (shortcut.alt) parts.push('Alt/⌥');
+	if (shortcut.shift) parts.push('Shift/⇧');
+	parts.push(shortcut.key.toUpperCase());
+	return parts.join(' + ');
 }
 
 let status = $state<ScreenShareStatus | null>(null);
@@ -72,6 +130,7 @@ function parseStatus(value: unknown): ScreenShareStatus | null {
 		sharing: raw.sharing === true,
 		paused: raw.paused === true,
 		control_enabled: raw.control_enabled === true,
+		emergency_stopped: raw.emergency_stopped === true,
 		session_id: typeof raw.session_id === 'string' ? raw.session_id : null,
 		target: raw.target ?? null,
 		started_at: typeof raw.started_at === 'string' ? raw.started_at : null,
@@ -156,6 +215,14 @@ export function stopScreenShare() {
 
 export function setDesktopControl(enabled: boolean) {
 	return update(enabled ? 'desktop.control.enable' : 'desktop.control.disable');
+}
+
+export function triggerEmergencyStop() {
+	return update('desktop.emergency_stop');
+}
+
+export function clearEmergencyStop() {
+	return update('desktop.emergency_clear');
 }
 
 function onHostEvent(event: Event) {

@@ -233,6 +233,7 @@ fn run_capture_thread(
     let _ = result_tx.send(output);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worker_loop(
     config: AudioCaptureConfig,
     info: CaptureInfo,
@@ -375,6 +376,7 @@ fn worker_loop(
     Ok(WorkerOutput { audio, stats })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -490,6 +492,7 @@ fn build_input_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_typed_stream<T, F>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,

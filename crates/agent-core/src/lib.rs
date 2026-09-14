@@ -581,7 +581,7 @@ impl Agent {
                             text,
                             executed,
                             tool_steps,
-                            pending_approval: Some(pending),
+                            pending_approval: Some(*pending),
                             truncated,
                             messages: messages.clone(),
                         });
@@ -829,12 +829,12 @@ impl Agent {
                         AuditOutcome::ApprovalRequested,
                         reason.clone(),
                     );
-                    return Err(PendingOrFailed::Pending(PendingApproval {
+                    return Err(PendingOrFailed::Pending(Box::new(PendingApproval {
                         tool_call: call.clone(),
                         capability: requirement.capability.clone(),
                         resource: requirement.resource.clone(),
                         reason,
-                    }));
+                    })));
                 }
             }
         }
@@ -1140,7 +1140,7 @@ pub struct AgentOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingOrFailed {
-    Pending(PendingApproval),
+    Pending(Box<PendingApproval>),
     Failed {
         message: String,
         status: ToolStepStatus,
@@ -1179,6 +1179,38 @@ fn truncate_text(text: &str, max_bytes: usize) -> String {
     format!("{}{}", &text[..end], suffix)
 }
 
+fn audio_format_for(mime_type: &str) -> model_core::AudioFormat {
+    let mime = mime_type.to_ascii_lowercase();
+    if mime.contains("wav") {
+        model_core::AudioFormat::Wav
+    } else if mime.contains("mpeg") || mime.contains("mp3") {
+        model_core::AudioFormat::Mp3
+    } else if mime.contains("ogg") || mime.contains("opus") {
+        model_core::AudioFormat::Ogg
+    } else if mime.contains("flac") {
+        model_core::AudioFormat::Flac
+    } else if mime.contains("webm") {
+        model_core::AudioFormat::Webm
+    } else {
+        model_core::AudioFormat::Other
+    }
+}
+
+fn video_format_for(mime_type: &str) -> model_core::VideoFormat {
+    let mime = mime_type.to_ascii_lowercase();
+    if mime.contains("mp4") {
+        model_core::VideoFormat::Mp4
+    } else if mime.contains("webm") {
+        model_core::VideoFormat::Webm
+    } else if mime.contains("matroska") {
+        model_core::VideoFormat::Mkv
+    } else if mime.contains("quicktime") || mime.contains("mov") {
+        model_core::VideoFormat::Mov
+    } else {
+        model_core::VideoFormat::Other
+    }
+}
+
 fn model_content_parts(
     output: &ToolOutput,
     limits: &AgentLimits,
@@ -1191,15 +1223,20 @@ fn model_content_parts(
     // JSON view and their image in a typed part. Preserve both when crossing
     // into the model representation; otherwise the provider would receive a
     // useful screenshot with no capture/window/dimension context.
-    let has_image = output
-        .parts
-        .iter()
-        .any(|part| matches!(part, ContentPart::Image(_)));
+    let has_media = output.parts.iter().any(|part| {
+        matches!(
+            part,
+            ContentPart::Image(_)
+                | ContentPart::Audio(_)
+                | ContentPart::Video(_)
+                | ContentPart::Binary(_)
+        )
+    });
     let has_textual_part = output
         .parts
         .iter()
         .any(|part| matches!(part, ContentPart::Text(_) | ContentPart::Json(_)));
-    if has_image && !has_textual_part && !output.content.is_null() {
+    if has_media && !has_textual_part && !output.content.is_null() {
         let metadata = output.content.to_string();
         if metadata.len() <= text_limit {
             result.push(model_core::ModelContentPart::Json(output.content.clone()));
@@ -1246,14 +1283,47 @@ fn model_content_parts(
                     detail: None,
                 });
             }
-            ContentPart::Audio(_) | ContentPart::Video(_) => {
-                if artifacts < limits.max_tool_artifacts {
-                    artifacts += 1;
-                    result.push(model_core::ModelContentPart::Text(
-                        "[non-image media artifact is available but this provider adapter does not accept it yet]"
-                            .to_string(),
-                    ));
+            ContentPart::Audio(artifact) => {
+                if artifacts >= limits.max_tool_artifacts {
+                    continue;
                 }
+                if artifact.size_bytes > limits.max_artifact_bytes {
+                    result.push(model_core::ModelContentPart::Text(format!(
+                        "[audio artifact omitted: {} exceeds the model media limits]",
+                        artifact.id
+                    )));
+                    continue;
+                }
+                artifacts += 1;
+                result.push(model_core::ModelContentPart::Audio {
+                    artifact: artifact.clone(),
+                    format: audio_format_for(&artifact.mime_type),
+                });
+            }
+            ContentPart::Video(artifact) => {
+                if artifacts >= limits.max_tool_artifacts {
+                    continue;
+                }
+                if artifact.size_bytes > limits.max_artifact_bytes {
+                    result.push(model_core::ModelContentPart::Text(format!(
+                        "[video artifact omitted: {} exceeds the model media limits]",
+                        artifact.id
+                    )));
+                    continue;
+                }
+                artifacts += 1;
+                result.push(model_core::ModelContentPart::Video {
+                    artifact: artifact.clone(),
+                    format: video_format_for(&artifact.mime_type),
+                });
+            }
+            ContentPart::Binary(artifact) => {
+                // Opaque bytes never inline: the model gets the reference
+                // metadata and requests a filesystem write to use them.
+                result.push(model_core::ModelContentPart::Text(format!(
+                    "[binary artifact available: artifact_id={} mime_type={} size_bytes={}]",
+                    artifact.id, artifact.mime_type, artifact.size_bytes,
+                )));
             }
         }
     }

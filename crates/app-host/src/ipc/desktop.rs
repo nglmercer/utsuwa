@@ -140,4 +140,16 @@ impl Dispatcher {
             .map_err(runtime_error)?;
         serde_json::to_value(status).map_err(runtime_error)
     }
+
+    pub(crate) fn desktop_emergency_stop(&self) -> Result<Value, IpcErrorBody> {
+        let runtime = self.agent.as_ref().ok_or_else(runtime_missing)?;
+        let status = runtime.desktop_emergency_stop();
+        serde_json::to_value(status).map_err(runtime_error)
+    }
+
+    pub(crate) fn desktop_emergency_clear(&self) -> Result<Value, IpcErrorBody> {
+        let runtime = self.agent.as_ref().ok_or_else(runtime_missing)?;
+        let status = runtime.desktop_clear_emergency_stop();
+        serde_json::to_value(status).map_err(runtime_error)
+    }
 }

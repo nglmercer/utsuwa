@@ -2292,7 +2292,7 @@ async fn host_list_resolves_absolute_directory_and_tags_it() {
         )
         .await
         .unwrap();
-    assert!(output.content["entries"].as_array().unwrap().len() >= 1);
+    assert!(!output.content["entries"].as_array().unwrap().is_empty());
     assert_eq!(output.content["file_ref"], "file:desktop:");
     assert_eq!(output.content["directory"], "desktop");
     std::fs::remove_dir_all(&home).unwrap();

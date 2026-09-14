@@ -8,8 +8,8 @@ use artifact_core::ArtifactStore;
 use base64::Engine as _;
 use futures_util::StreamExt;
 use model_core::{
-    FinishReason, ImageDetail, ModelContentPart, ModelError, ModelMessage, ModelProvider,
-    ModelRequest, ModelRole, ModelStream, ModelStreamEvent, ToolCall,
+    FinishReason, ImageDetail, ModelCapabilities, ModelContentPart, ModelError, ModelMessage,
+    ModelProvider, ModelRequest, ModelRole, ModelStream, ModelStreamEvent, ToolCall,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -26,6 +26,7 @@ pub struct OpenAICompatibleClient {
     base_url: String,
     api_key: Option<String>,
     model: String,
+    capabilities: ModelCapabilities,
 }
 
 impl OpenAICompatibleClient {
@@ -43,7 +44,18 @@ impl OpenAICompatibleClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
             model: model.into(),
+            // Never assume an OpenAI-compatible endpoint accepts multimodal
+            // tool results: image parts degrade to explicit metadata text
+            // unless the caller opts in via `with_capabilities`.
+            capabilities: ModelCapabilities::default(),
         }
+    }
+
+    /// Declare what the target endpoint actually supports (tool calls,
+    /// image/audio/video input, image tool results, streaming).
+    pub fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// Ollama's OpenAI-compatible endpoint (no key needed).
@@ -106,7 +118,12 @@ impl OpenAICompatibleClient {
 
 #[async_trait::async_trait]
 impl ModelProvider for OpenAICompatibleClient {
+    fn capabilities(&self) -> ModelCapabilities {
+        self.capabilities
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+        let request = self.capabilities.apply_to_request(&request);
         let body = request_body_with_artifacts(&self.model, &request).await?;
         let mut req = self.http.post(self.url()).json(&body);
         if let Some(key) = self.api_key.as_deref() {
@@ -144,6 +161,7 @@ pub struct AnthropicClient {
     base_url: String,
     api_key: String,
     model: String,
+    capabilities: ModelCapabilities,
 }
 
 impl AnthropicClient {
@@ -157,7 +175,15 @@ impl AnthropicClient {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             model: model.into(),
+            // Anthropic tool_result blocks natively accept images.
+            capabilities: ModelCapabilities::default().with_image_tool_results(true),
         }
+    }
+
+    /// Declare what the target endpoint actually supports.
+    pub fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     fn url(&self) -> String {
@@ -167,7 +193,12 @@ impl AnthropicClient {
 
 #[async_trait::async_trait]
 impl ModelProvider for AnthropicClient {
+    fn capabilities(&self) -> ModelCapabilities {
+        self.capabilities
+    }
+
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
+        let request = self.capabilities.apply_to_request(&request);
         let body = anthropic_request_body_with_artifacts(&self.model, &request).await?;
         let response = self
             .http
@@ -696,6 +727,26 @@ async fn anthropic_typed_blocks(
                     },
                 }));
             }
+            // No native audio/video input on this path: explicit metadata
+            // text, never a silent drop.
+            ModelContentPart::Audio { artifact, format } => {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!(
+                        "[audio omitted: this endpoint does not accept audio input; artifact_id={} format={format:?} mime_type={} size_bytes={}]",
+                        artifact.id, artifact.mime_type, artifact.size_bytes,
+                    ),
+                }));
+            }
+            ModelContentPart::Video { artifact, format } => {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!(
+                        "[video omitted: this endpoint does not accept video input; send sampled frames instead; artifact_id={} format={format:?} mime_type={} size_bytes={}]",
+                        artifact.id, artifact.mime_type, artifact.size_bytes,
+                    ),
+                }));
+            }
         }
     }
     Ok(blocks)
@@ -1111,6 +1162,29 @@ async fn openai_typed_parts(
                     "image_url": image,
                 }));
             }
+            // This OpenAI-compatible path has no native audio/video input:
+            // degrade to explicit metadata text instead of dropping media
+            // silently. Tool-result media is rewritten earlier via
+            // `ModelCapabilities::apply_to_request`; this arm covers
+            // user-message media parts.
+            ModelContentPart::Audio { artifact, format } => {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!(
+                        "[audio omitted: this endpoint does not accept audio input; artifact_id={} format={format:?} mime_type={} size_bytes={}]",
+                        artifact.id, artifact.mime_type, artifact.size_bytes,
+                    ),
+                }));
+            }
+            ModelContentPart::Video { artifact, format } => {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!(
+                        "[video omitted: this endpoint does not accept video input; send sampled frames instead; artifact_id={} format={format:?} mime_type={} size_bytes={}]",
+                        artifact.id, artifact.mime_type, artifact.size_bytes,
+                    ),
+                }));
+            }
         }
     }
     Ok(Value::Array(blocks))
@@ -1410,6 +1484,57 @@ mod tests {
                 artifact,
                 detail: Some(ImageDetail::Low),
             }
+        );
+    }
+
+    #[test]
+    fn openai_adapter_defaults_to_no_image_tool_results() {
+        let client = OpenAICompatibleClient::new("http://localhost:11434/v1", None, "qwen");
+        assert!(!client.capabilities().image_tool_results);
+        let opted_in = OpenAICompatibleClient::new("https://api.openai.com/v1", None, "gpt")
+            .with_capabilities(ModelCapabilities::full());
+        assert!(opted_in.capabilities().image_tool_results);
+        let anthropic = AnthropicClient::new("https://api.anthropic.com", "key", "claude");
+        assert!(anthropic.capabilities().image_tool_results);
+    }
+
+    #[test]
+    fn capability_fallback_replaces_images_without_dropping_them() {
+        let artifact = artifact_core::ArtifactRef::new(
+            artifact_core::ArtifactId::new("shot-9"),
+            "image/png",
+            512,
+        );
+        let result = model_core::ToolResult::text("call-9", "screenshot").with_parts(vec![
+            ModelContentPart::Image {
+                artifact,
+                detail: None,
+            },
+        ]);
+        let request = ModelRequest::new(vec![ModelMessage::tool_result(result)]);
+        let limited = ModelCapabilities::default().apply_to_request(&request);
+        let content = &limited.messages[0].tool_result.as_ref().unwrap().content;
+        assert!(content.contains("shot-9"), "{content}");
+        assert!(
+            !limited.messages[0]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .parts
+                .iter()
+                .any(|part| matches!(part, ModelContentPart::Image { .. })),
+            "images must not reach providers that cannot render them"
+        );
+        let full = ModelCapabilities::full().apply_to_request(&request);
+        assert!(
+            full.messages[0]
+                .tool_result
+                .as_ref()
+                .unwrap()
+                .parts
+                .iter()
+                .any(|part| matches!(part, ModelContentPart::Image { .. })),
+            "capable providers keep image parts untouched"
         );
     }
 

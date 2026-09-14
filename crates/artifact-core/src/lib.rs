@@ -107,13 +107,19 @@ pub enum ContentPart {
     Image(ImageArtifactRef),
     Audio(ArtifactRef),
     Video(ArtifactRef),
+    /// Opaque bytes (downloads, archives) carried by artifact reference.
+    /// The model receives id/mime/size metadata; bytes stay in the store
+    /// until an authorized filesystem write materializes them.
+    Binary(ArtifactRef),
 }
 
 impl ContentPart {
     pub fn artifact(&self) -> Option<&ArtifactRef> {
         match self {
             Self::Image(image) => Some(&image.artifact),
-            Self::Audio(artifact) | Self::Video(artifact) => Some(artifact),
+            Self::Audio(artifact) | Self::Video(artifact) | Self::Binary(artifact) => {
+                Some(artifact)
+            }
             Self::Text(_) | Self::Json(_) => None,
         }
     }
@@ -136,19 +142,100 @@ pub enum ArtifactError {
     Lock,
 }
 
+/// Where an artifact came from. Drives lifecycle: captures and microphone
+/// recordings expire quickly and are deleted when their session stops;
+/// explicit files and downloads live longer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactSource {
+    ScreenCapture,
+    Camera,
+    AudioCapture,
+    File,
+    Download,
+    Generated,
+    Tool,
+}
+
+/// Lifecycle metadata for one stored artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactMetadata {
+    pub id: ArtifactId,
+    pub kind: ArtifactKind,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    /// Unix millis when the artifact was stored.
+    pub created_at_ms: u64,
+    /// Unix millis when the artifact expires, if bounded.
+    pub expires_at_ms: Option<u64>,
+    pub source: ArtifactSource,
+    /// Sensitive artifacts (screen, camera, microphone, secrets) expire
+    /// sooner and are never written to logs or audit records.
+    pub sensitive: bool,
+}
+
 #[async_trait::async_trait]
 pub trait ArtifactStore: Send + Sync {
     async fn put(&self, mime_type: &str, bytes: Vec<u8>) -> Result<ArtifactRef, ArtifactError>;
 
+    /// Store with lifecycle metadata. The default implementation ignores
+    /// the source/sensitivity (custom stores keep their own policy).
+    async fn put_with_source(
+        &self,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        _source: ArtifactSource,
+        _sensitive: bool,
+    ) -> Result<ArtifactRef, ArtifactError> {
+        self.put(mime_type, bytes).await
+    }
+
     async fn get(&self, id: &ArtifactId) -> Result<Vec<u8>, ArtifactError>;
 
     async fn delete(&self, id: &ArtifactId) -> Result<(), ArtifactError>;
+
+    /// Lifecycle metadata, when the store tracks it.
+    async fn metadata(&self, _id: &ArtifactId) -> Option<ArtifactMetadata> {
+        None
+    }
+
+    /// Delete every artifact from one source (session teardown). Returns
+    /// the number of artifacts removed.
+    async fn delete_source(&self, _source: ArtifactSource) -> usize {
+        0
+    }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// TTL per source. Captures, camera frames, and microphone audio are
+/// sensitive by default and expire quickly; explicit files and downloads
+/// persist for the host session.
+fn ttl_for_source(source: ArtifactSource, sensitive: bool) -> Duration {
+    if sensitive {
+        return Duration::from_secs(5 * 60);
+    }
+    match source {
+        ArtifactSource::ScreenCapture | ArtifactSource::Camera | ArtifactSource::AudioCapture => {
+            Duration::from_secs(10 * 60)
+        }
+        ArtifactSource::Download | ArtifactSource::File => Duration::from_secs(60 * 60),
+        ArtifactSource::Generated | ArtifactSource::Tool => Duration::from_secs(30 * 60),
+    }
 }
 
 struct StoredArtifact {
     reference: ArtifactRef,
     bytes: Vec<u8>,
     expires_at: Instant,
+    created_at_ms: u64,
+    source: ArtifactSource,
+    sensitive: bool,
 }
 
 struct StoreState {
@@ -279,11 +366,14 @@ impl InMemoryArtifactStore {
             }
         }
     }
-}
 
-#[async_trait::async_trait]
-impl ArtifactStore for InMemoryArtifactStore {
-    async fn put(&self, mime_type: &str, bytes: Vec<u8>) -> Result<ArtifactRef, ArtifactError> {
+    async fn put_inner(
+        &self,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        source: ArtifactSource,
+        sensitive: bool,
+    ) -> Result<ArtifactRef, ArtifactError> {
         let mime_type = mime_type.trim();
         if mime_type.is_empty() {
             return Err(ArtifactError::InvalidMimeType);
@@ -302,16 +392,40 @@ impl ArtifactStore for InMemoryArtifactStore {
         }
         let id = ArtifactId::fresh();
         let reference = ArtifactRef::new(id.clone(), mime_type, bytes.len() as u64);
+        // Sensitive artifacts always expire quickly, even when the store
+        // default TTL is longer.
+        let ttl = self.ttl.min(ttl_for_source(source, sensitive));
         state.bytes = state.bytes.saturating_add(bytes.len());
         state.artifacts.insert(
             id,
             StoredArtifact {
                 reference: reference.clone(),
                 bytes,
-                expires_at: Instant::now() + self.ttl,
+                expires_at: Instant::now() + ttl,
+                created_at_ms: unix_millis(),
+                source,
+                sensitive,
             },
         );
         Ok(reference)
+    }
+}
+
+#[async_trait::async_trait]
+impl ArtifactStore for InMemoryArtifactStore {
+    async fn put(&self, mime_type: &str, bytes: Vec<u8>) -> Result<ArtifactRef, ArtifactError> {
+        self.put_inner(mime_type, bytes, ArtifactSource::Tool, false)
+            .await
+    }
+
+    async fn put_with_source(
+        &self,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        source: ArtifactSource,
+        sensitive: bool,
+    ) -> Result<ArtifactRef, ArtifactError> {
+        self.put_inner(mime_type, bytes, source, sensitive).await
     }
 
     async fn get(&self, id: &ArtifactId) -> Result<Vec<u8>, ArtifactError> {
@@ -335,6 +449,46 @@ impl ArtifactStore for InMemoryArtifactStore {
             .bytes
             .saturating_sub(artifact.reference.size_bytes as usize);
         Ok(())
+    }
+
+    async fn metadata(&self, id: &ArtifactId) -> Option<ArtifactMetadata> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        self.sweep_locked(&mut state);
+        state.artifacts.get(id).map(|artifact| ArtifactMetadata {
+            id: artifact.reference.id.clone(),
+            kind: artifact.reference.kind,
+            mime_type: artifact.reference.mime_type.clone(),
+            size_bytes: artifact.reference.size_bytes,
+            created_at_ms: artifact.created_at_ms,
+            expires_at_ms: artifact
+                .expires_at
+                .checked_duration_since(Instant::now())
+                .map(|remaining| unix_millis().saturating_add(remaining.as_millis() as u64)),
+            source: artifact.source,
+            sensitive: artifact.sensitive,
+        })
+    }
+
+    async fn delete_source(&self, source: ArtifactSource) -> usize {
+        let Ok(mut state) = self.state.lock() else {
+            return 0;
+        };
+        self.sweep_locked(&mut state);
+        let ids: Vec<ArtifactId> = state
+            .artifacts
+            .iter()
+            .filter(|(_, artifact)| artifact.source == source)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let removed = ids.len();
+        for id in ids {
+            if let Some(artifact) = state.artifacts.remove(&id) {
+                state.bytes = state.bytes.saturating_sub(artifact.bytes.len());
+            }
+        }
+        removed
     }
 }
 
@@ -375,5 +529,32 @@ mod tests {
             store.put("image/png", vec![1, 2, 3]).await,
             Err(ArtifactError::TooLarge { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn sourced_artifacts_carry_lifecycle_metadata() {
+        let store = InMemoryArtifactStore::with_limits(8, 256, 256, Duration::from_secs(3600));
+        let reference = store
+            .put_with_source("image/png", vec![9, 9], ArtifactSource::ScreenCapture, true)
+            .await
+            .unwrap();
+        let metadata = store.metadata(&reference.id).await.unwrap();
+        assert_eq!(metadata.source, ArtifactSource::ScreenCapture);
+        assert!(metadata.sensitive);
+        assert!(metadata.created_at_ms > 0);
+        // Sensitive captures expire in minutes even with an hour-long store.
+        let ttl_ms = metadata
+            .expires_at_ms
+            .unwrap()
+            .saturating_sub(metadata.created_at_ms);
+        assert!(ttl_ms <= 5 * 60 * 1000, "{ttl_ms}");
+
+        let download = store
+            .put_with_source("application/zip", vec![1], ArtifactSource::Download, false)
+            .await
+            .unwrap();
+        assert_eq!(store.delete_source(ArtifactSource::ScreenCapture).await, 1);
+        assert!(!store.contains(&reference.id));
+        assert!(store.contains(&download.id));
     }
 }

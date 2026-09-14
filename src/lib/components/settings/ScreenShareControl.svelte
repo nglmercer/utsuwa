@@ -2,6 +2,10 @@
 	import { onMount } from 'svelte';
 	import {
 		attachScreenShareListener,
+		clearEmergencyStop,
+		DEFAULT_EMERGENCY_SHORTCUT,
+		loadEmergencyShortcut,
+		saveEmergencyShortcut,
 		screenShareBusy,
 		screenShareError,
 		screenShareStatus,
@@ -9,26 +13,25 @@
 		resumeScreenShare,
 		pauseScreenShare,
 		setDesktopControl,
+		shortcutLabel,
+		shortcutMatches,
 		startScreenShare,
-		stopScreenShare
+		stopScreenShare,
+		triggerEmergencyStop
 	} from '$lib/services/native/screen-share.svelte';
 
 	let { compact = false } = $props<{ compact?: boolean }>();
 	let target = $state('desktop');
+	let shortcut = $state(loadEmergencyShortcut());
+	let shortcutKey = $state(loadEmergencyShortcut().key);
 
 	onMount(() => {
 		attachScreenShareListener();
 		const timer = window.setInterval(() => void refreshScreenShareStatus(), 5000);
 		const emergencyRevoke = (event: KeyboardEvent) => {
-			if (
-				(screenShareStatus()?.sharing ?? false) &&
-				(event.ctrlKey || event.metaKey) &&
-				event.altKey &&
-				event.shiftKey &&
-				event.key.toLowerCase() === 'x'
-			) {
+			if ((screenShareStatus()?.sharing ?? false) && shortcutMatches(event, shortcut)) {
 				event.preventDefault();
-				void setDesktopControl(false);
+				void triggerEmergencyStop();
 			}
 		};
 		window.addEventListener('keydown', emergencyRevoke);
@@ -37,6 +40,23 @@
 			window.removeEventListener('keydown', emergencyRevoke);
 		};
 	});
+
+	function applyShortcutKey() {
+		const key = shortcutKey.trim().toLowerCase();
+		if (!/^[a-z0-9]$/.test(key)) {
+			shortcutKey = shortcut.key;
+			return;
+		}
+		shortcut = { ...shortcut, key };
+		shortcutKey = key;
+		saveEmergencyShortcut(shortcut);
+	}
+
+	function resetShortcut() {
+		shortcut = { ...DEFAULT_EMERGENCY_SHORTCUT };
+		shortcutKey = shortcut.key;
+		saveEmergencyShortcut(shortcut);
+	}
 
 	const status = $derived(screenShareStatus());
 	const busy = $derived(screenShareBusy());
@@ -68,11 +88,18 @@
 
 {#if compact}
 	{#if status?.sharing}
-		<div class="share-indicator" role="status" aria-live="polite">
+		<div class="share-indicator" role="status" aria-live="polite" data-emergency={status.emergency_stopped}>
 			<span class="dot" aria-hidden="true"></span>
 				<span>Sharing {targetLabel(status.target)}</span>
-				<span class="control-state">Control {status.control_enabled ? 'enabled' : 'disabled'}</span>
-			<span class="shortcut" title="Ctrl or Command + Alt or Option + Shift + X">Emergency revoke: ⌘/Ctrl⌥⇧X</span>
+				<span class="control-state">Control {status.emergency_stopped ? 'STOPPED' : status.control_enabled ? 'enabled' : 'disabled'}</span>
+			{#if status.emergency_stopped}
+				<button class="resume-stop" onclick={() => clearEmergencyStop()} disabled={busy}>Clear stop</button>
+			{:else}
+				<button class="estop" onclick={() => triggerEmergencyStop()} disabled={busy} title={`Emergency stop (${shortcutLabel(shortcut)})`}>
+					Stop control
+				</button>
+			{/if}
+			<span class="shortcut" title={shortcutLabel(shortcut)}>Emergency stop: {shortcutLabel(shortcut)}</span>
 			<button onclick={() => (status.paused ? resumeScreenShare() : pauseScreenShare())} disabled={busy}>
 				{status.paused ? 'Resume' : 'Pause'}
 			</button>
@@ -130,8 +157,34 @@
 				<input
 					type="checkbox"
 					checked={status.control_enabled}
+					disabled={status.emergency_stopped}
 					onchange={(event) => setDesktopControl((event.currentTarget as HTMLInputElement).checked)}
 				/>
+			</label>
+			<div class="estop-row">
+				{#if status.emergency_stopped}
+					<p class="estop-active" role="alert">Emergency stop is engaged: all control is disabled. Observation stays on.</p>
+					<button onclick={() => clearEmergencyStop()} disabled={busy}>Clear emergency stop</button>
+				{:else}
+					<button class="estop" onclick={() => triggerEmergencyStop()} disabled={busy}>
+						Emergency stop
+					</button>
+				{/if}
+			</div>
+			<label class="shortcut-row">
+				<span>
+					<strong>Emergency-stop shortcut</strong>
+					<small>Default {shortcutLabel(DEFAULT_EMERGENCY_SHORTCUT)}. Modifiers are fixed (Ctrl/⌘ + Alt/⌥ + Shift); the letter is configurable.</small>
+				</span>
+				<span class="shortcut-edit">
+					<input
+						aria-label="Emergency stop shortcut letter"
+						maxlength={1}
+						bind:value={shortcutKey}
+						onchange={applyShortcutKey}
+					/>
+					<button onclick={resetShortcut} disabled={busy}>Reset</button>
+				</span>
 			</label>
 		{:else}
 			<p class="muted">The native desktop host is not available in this browser session.</p>
@@ -178,6 +231,15 @@
 	.share-indicator { position: fixed; z-index: 1500; top: 0.75rem; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 0.5rem; padding: 0.45rem 0.7rem; border: 1px solid rgba(74, 222, 128, 0.45); border-radius: 999px; background: rgba(12, 30, 22, 0.94); color: #dcfce7; font-size: 0.75rem; box-shadow: 0 0.5rem 1.5rem rgba(0,0,0,0.22); }
 	.share-indicator button { padding: 0.3rem 0.55rem; background: rgba(255,255,255,0.1); }
 	.share-indicator .stop { background: rgba(127, 29, 29, 0.9); }
+	.share-indicator[data-emergency='true'] { border-color: rgba(248, 113, 113, 0.7); }
+	.estop { background: #7f1d1d !important; color: #fee2e2 !important; font-weight: 600; }
+	.resume-stop { background: rgba(34, 197, 94, 0.25) !important; color: #dcfce7 !important; }
+	.estop-row { display: flex; gap: 0.75rem; align-items: center; margin-top: 0.75rem; }
+	.estop-active { color: #fca5a5; font-weight: 600; }
+	.shortcut-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 0.75rem; font-size: 0.8rem; }
+	.shortcut-row span { display: grid; gap: 0.2rem; }
+	.shortcut-edit { display: flex; gap: 0.4rem; align-items: center; }
+	.shortcut-edit input { width: 2.2rem; text-align: center; padding: 0.4rem; border-radius: 0.45rem; border: 1px solid var(--border-light, #2a2e37); background: var(--bg-secondary, #1f232b); color: inherit; }
 	.shortcut { color: #bbf7d0; font-size: 0.68rem; white-space: nowrap; }
 	.dot { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: #4ade80; box-shadow: 0 0 0 0.18rem rgba(74,222,128,0.18); }
 	.control-state { color: #bbf7d0; }

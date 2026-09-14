@@ -1227,13 +1227,13 @@ mod tests {
             principal: principal.clone(),
             capability,
             scope: ResourceScope::new(vec![resource]),
-            invocation_id: invocation.clone(),
+            invocation_id: invocation,
             expires_at: std::time::Instant::now() + Duration::from_secs(60),
         };
         (
             ToolContext {
                 principal,
-                invocation_id: invocation.clone(),
+                invocation_id: invocation,
                 ticket: Some(ticket),
                 tickets: Vec::new(),
             },
@@ -1305,7 +1305,7 @@ mod tests {
             Resource::Path(dir.0.clone()),
         );
         // Invocation binding must match the ticket under test.
-        ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id.clone();
+        ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id;
         let err = read
             .invoke(ctx, serde_json::json!({"path": "/etc/hostname"}))
             .await
@@ -1346,7 +1346,7 @@ mod tests {
             Capability::FilesystemRead,
             Resource::Path(dir.0.clone()),
         );
-        ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id.clone();
+        ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id;
         let err = read
             .invoke(ctx, serde_json::json!({"path": target.to_string_lossy()}))
             .await
@@ -1471,7 +1471,7 @@ mod tests {
             Capability::FilesystemRead,
             Resource::Path(dir.0.join("sub")),
         );
-        ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id.clone();
+        ctx.invocation_id = ctx.ticket.as_ref().unwrap().invocation_id;
         let err = search
             .invoke(
                 ctx,

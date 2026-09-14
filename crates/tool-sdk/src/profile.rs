@@ -11,8 +11,18 @@ use std::sync::Arc;
 /// Which tool subset the model sees this turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToolProfile {
+    /// Smallest surface: clock, environment, and limited reads.
+    Minimal,
     /// Small-model profile: one edit interface, no raw low-level variants.
     Simple,
+    /// Everyday local work: filesystem, HTTP, archives, notifications,
+    /// system facts, clipboard, documents.
+    Standard,
+    /// Standard plus process execution and Git.
+    Developer,
+    /// Desktop control surface: desktop, browser, clipboard, applications,
+    /// camera, audio, media.
+    ComputerUse,
     /// Complete tool surface.
     #[default]
     Full,
@@ -31,7 +41,105 @@ impl ToolProfile {
         match self {
             Self::Full => Arc::new(FullToolPolicy),
             Self::Simple => Arc::new(SimpleToolPolicy),
+            Self::Minimal => Arc::new(PrefixToolPolicy::minimal()),
+            Self::Standard => Arc::new(PrefixToolPolicy::standard()),
+            Self::Developer => Arc::new(PrefixToolPolicy::developer()),
+            Self::ComputerUse => Arc::new(PrefixToolPolicy::computer_use()),
         }
+    }
+}
+
+/// Prefix-based visibility for the named capability profiles. A tool is
+/// visible when any allowed prefix matches and no denied id matches.
+pub struct PrefixToolPolicy {
+    allowed: &'static [&'static str],
+    denied: &'static [&'static str],
+}
+
+impl PrefixToolPolicy {
+    fn minimal() -> Self {
+        Self {
+            allowed: &[
+                "system.time",
+                "system.environment",
+                "system.os",
+                "filesystem.read",
+                "filesystem.stat",
+                "document.metadata",
+            ],
+            denied: &[],
+        }
+    }
+
+    fn standard() -> Self {
+        Self {
+            allowed: &[
+                "system.",
+                "filesystem.",
+                "http.",
+                "archive.",
+                "notification.",
+                "clipboard.",
+                "document.",
+                "image.",
+                "pdf.",
+                "media.metadata",
+                "media.audio_metadata",
+                "media.video_metadata",
+            ],
+            denied: &[
+                "filesystem.patch",
+                "filesystem.edit_user_file",
+                "filesystem.edit_file",
+            ],
+        }
+    }
+
+    fn developer() -> Self {
+        Self {
+            allowed: &[
+                "system.",
+                "filesystem.",
+                "http.",
+                "archive.",
+                "notification.",
+                "process.",
+                "git.",
+                "document.",
+                "image.",
+                "pdf.",
+            ],
+            denied: &[],
+        }
+    }
+
+    fn computer_use() -> Self {
+        Self {
+            allowed: &[
+                "desktop.",
+                "browser.",
+                "clipboard.",
+                "application.",
+                "camera.",
+                "audio.",
+                "media.",
+                "system.time",
+                "system.os",
+                "notification.show",
+            ],
+            denied: &[],
+        }
+    }
+}
+
+impl ToolVisibilityPolicy for PrefixToolPolicy {
+    fn visible(&self, tool_id: &str) -> bool {
+        if self.denied.contains(&tool_id) {
+            return false;
+        }
+        self.allowed
+            .iter()
+            .any(|prefix| tool_id == *prefix || tool_id.starts_with(prefix))
     }
 }
 
@@ -92,6 +200,55 @@ impl ToolVisibilityPolicy for SimpleToolPolicy {
                 | "desktop.minimize_window"
                 | "desktop.maximize_window"
                 | "desktop.restore_window"
+                // Control-heavy and side-effecting local-machine tools stay
+                // out of the small-model profile; their read-only
+                // counterparts remain visible. Every call is ticket-gated.
+                | "http.request"
+                | "http.download"
+                | "archive.extract"
+                | "archive.create"
+                | "git.branch.create"
+                | "git.checkout"
+                | "git.add"
+                | "git.commit"
+                | "git.restore"
+                | "git.fetch"
+                | "git.pull"
+                | "git.push"
+                | "git.reset"
+                | "git.clean"
+                | "notification.show"
+                | "browser.open"
+                | "browser.close_tab"
+                | "browser.navigate"
+                | "browser.back"
+                | "browser.forward"
+                | "browser.reload"
+                | "browser.click"
+                | "browser.type"
+                | "browser.set_value"
+                | "browser.select"
+                | "browser.scroll"
+                | "browser.cookies.set"
+                | "browser.cookies.delete"
+                | "camera.capture_photo"
+                | "camera.capture_start"
+                | "camera.capture_frame"
+                | "camera.capture_stop"
+                | "audio.capture_start"
+                | "audio.capture_stop"
+                | "audio.record"
+                | "media.video_frame"
+                | "media.video_frames"
+                | "media.video_keyframes"
+                | "media.thumbnail"
+                | "media.waveform"
+                | "clipboard.write"
+                | "clipboard.clear"
+                | "application.launch"
+                | "application.quit"
+                | "application.activate"
+                | "image.resize"
         )
     }
 }
@@ -121,5 +278,64 @@ mod tests {
     #[test]
     fn default_profile_is_full() {
         assert_eq!(ToolProfile::default(), ToolProfile::Full);
+    }
+
+    #[test]
+    fn simple_profile_hides_new_control_tools_keeps_reads() {
+        let policy = ToolProfile::Simple.policy();
+        for hidden in [
+            "browser.click",
+            "browser.navigate",
+            "camera.capture_photo",
+            "audio.record",
+            "git.push",
+            "http.download",
+            "archive.extract",
+            "application.launch",
+            "clipboard.write",
+        ] {
+            assert!(!policy.visible(hidden), "{hidden}");
+        }
+        for visible in [
+            "browser.snapshot",
+            "browser.query",
+            "camera.list",
+            "audio.list_devices",
+            "git.status",
+            "http.get",
+            "archive.list",
+            "application.list",
+            "clipboard.read",
+            "system.cpu",
+            "document.metadata",
+            "media.metadata",
+        ] {
+            assert!(policy.visible(visible), "{visible}");
+        }
+    }
+
+    #[test]
+    fn named_profiles_scope_the_visible_surface() {
+        assert!(ToolProfile::Minimal.allows_tool("system.time"));
+        assert!(!ToolProfile::Minimal.allows_tool("desktop.click"));
+        assert!(!ToolProfile::Minimal.allows_tool("http.get"));
+
+        assert!(ToolProfile::Standard.allows_tool("http.get"));
+        assert!(ToolProfile::Standard.allows_tool("archive.extract"));
+        assert!(ToolProfile::Standard.allows_tool("notification.show"));
+        assert!(!ToolProfile::Standard.allows_tool("desktop.click"));
+        assert!(!ToolProfile::Standard.allows_tool("process.spawn"));
+        assert!(!ToolProfile::Standard.allows_tool("git.push"));
+
+        assert!(ToolProfile::Developer.allows_tool("git.status"));
+        assert!(ToolProfile::Developer.allows_tool("process.spawn"));
+        assert!(!ToolProfile::Developer.allows_tool("desktop.click"));
+
+        assert!(ToolProfile::ComputerUse.allows_tool("desktop.screenshot"));
+        assert!(ToolProfile::ComputerUse.allows_tool("browser.snapshot"));
+        assert!(ToolProfile::ComputerUse.allows_tool("clipboard.read"));
+        assert!(ToolProfile::ComputerUse.allows_tool("application.launch"));
+        assert!(!ToolProfile::ComputerUse.allows_tool("git.push"));
+        assert!(!ToolProfile::ComputerUse.allows_tool("filesystem.read"));
     }
 }

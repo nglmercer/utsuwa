@@ -296,9 +296,7 @@ pub fn default_db_path(app_name: &str) -> PathBuf {
 /// shared store: each newly approved `Persistent` grant is written to
 /// SQLite before it takes effect. Failures surface as
 /// [`policy_core::QueueError::Persist`] so the dialog can report them.
-pub fn persistent_grant_hook(
-    store: Arc<Mutex<Storage>>,
-) -> Arc<dyn Fn(&GrantedScope) -> Result<(), String> + Send + Sync> {
+pub fn persistent_grant_hook(store: Arc<Mutex<Storage>>) -> policy_core::PersistentGrantHook {
     Arc::new(move |grant: &GrantedScope| {
         let store = store
             .lock()

@@ -661,14 +661,9 @@ impl McpManager {
             return Err(McpError::Disabled(server_id.to_string()));
         }
         let client = Arc::new(tokio::sync::Mutex::new(McpClient::connect(&config).await?));
-        self.inner
-            .lock()
-            .await
-            .servers
-            .get_mut(server_id)
-            .map(|managed| {
-                managed.client = Some(Arc::clone(&client));
-            });
+        if let Some(managed) = self.inner.lock().await.servers.get_mut(server_id) {
+            managed.client = Some(Arc::clone(&client));
+        }
         Ok(client)
     }
 }

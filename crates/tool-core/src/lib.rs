@@ -215,9 +215,58 @@ pub enum ToolError {
     Failed { tool: String, message: String },
     #[error("tool {0} timed out")]
     Timeout(String),
+    /// Machine-readable structured error. `code` is a stable snake_case
+    /// class (`permission_required`, `backend_unavailable`, `stale_window`,
+    /// `application_not_allowed`, …) so the model can recover
+    /// intelligently; `message` stays human-readable and `details` carries
+    /// extra model-facing fields (never secrets).
+    #[error("tool {tool} error [{code}]: {message}")]
+    Structured {
+        tool: String,
+        code: String,
+        message: String,
+        details: serde_json::Value,
+    },
 }
 
 impl ToolError {
+    /// Build a machine-readable error with optional model-facing details.
+    pub fn structured(
+        tool: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Structured {
+            tool: tool.into(),
+            code: code.into(),
+            message: message.into(),
+            details: serde_json::Value::Null,
+        }
+    }
+
+    /// Build a machine-readable error with extra model-facing fields.
+    pub fn structured_with_details(
+        tool: impl Into<String>,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        details: serde_json::Value,
+    ) -> Self {
+        Self::Structured {
+            tool: tool.into(),
+            code: code.into(),
+            message: message.into(),
+            details,
+        }
+    }
+
+    /// Machine-readable error class, when this error carries one.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Structured { code, .. } => Some(code),
+            _ => None,
+        }
+    }
+
     /// Serialize recoverable validation as a compact JSON object for the
     /// model-facing tool result. Other errors keep their established text
     /// form, while callers can still use `Display` for human/audit detail.
@@ -232,6 +281,28 @@ impl ToolError {
                     serde_json::Value::String(message.clone()),
                 );
                 serde_json::Value::Object(object).to_string()
+            }
+            Self::Structured {
+                code,
+                message,
+                details,
+                ..
+            } => {
+                let mut error = match details {
+                    serde_json::Value::Object(object) => object.clone(),
+                    serde_json::Value::Null => serde_json::Map::new(),
+                    other => {
+                        let mut object = serde_json::Map::new();
+                        object.insert("details".to_string(), other.clone());
+                        object
+                    }
+                };
+                error.insert("error".to_string(), serde_json::Value::String(code.clone()));
+                error.insert(
+                    "message".to_string(),
+                    serde_json::Value::String(message.clone()),
+                );
+                serde_json::Value::Object(error).to_string()
             }
             Self::Filesystem {
                 code,
@@ -460,6 +531,28 @@ mod tests {
                 .await,
             Err(ToolError::InvalidArgs { .. })
         ));
+    }
+
+    #[test]
+    fn structured_errors_serialize_to_machine_readable_json() {
+        let error = ToolError::structured_with_details(
+            "desktop.click",
+            "application_not_allowed",
+            "outside scope",
+            serde_json::json!({ "application": "bank" }),
+        );
+        assert_eq!(error.code(), Some("application_not_allowed"));
+        let message = error.model_message();
+        let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(parsed["error"], "application_not_allowed");
+        assert_eq!(parsed["application"], "bank");
+        assert_eq!(parsed["message"], "outside scope");
+        assert!(ToolError::Failed {
+            tool: "x".to_string(),
+            message: "y".to_string(),
+        }
+        .code()
+        .is_none());
     }
 
     #[test]

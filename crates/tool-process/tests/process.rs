@@ -17,7 +17,7 @@ fn manager() -> std::sync::Arc<ProcessManager> {
 }
 
 /// Context carrying a fresh ticket for one complete `process.spawn` plan.
-fn ticketed_ctx_for(executable: &PathBuf, args: &serde_json::Value) -> ToolContext {
+fn ticketed_ctx_for(executable: &std::path::Path, args: &serde_json::Value) -> ToolContext {
     let call_args = args
         .get("args")
         .and_then(|value| value.as_array())
@@ -56,12 +56,12 @@ fn ticketed_ctx_for(executable: &PathBuf, args: &serde_json::Value) -> ToolConte
         principal.clone(),
         Capability::ProcessSpawn,
         ResourceScope::new(vec![Resource::Process {
-            executable: executable.clone(),
+            executable: executable.to_path_buf(),
             args: call_args,
             cwd,
             env,
         }]),
-        invocation.clone(),
+        invocation,
         Duration::from_secs(120),
     );
     let mut ctx = ToolContext::new(principal).with_ticket(ticket);
@@ -69,7 +69,7 @@ fn ticketed_ctx_for(executable: &PathBuf, args: &serde_json::Value) -> ToolConte
     ctx
 }
 
-fn ticketed_ctx(executable: &PathBuf) -> ToolContext {
+fn ticketed_ctx(executable: &std::path::Path) -> ToolContext {
     ticketed_ctx_for(executable, &serde_json::json!({ "args": [] }))
 }
 

@@ -4,7 +4,9 @@
 //! `plugin.wasm` next to a `plugin.toml`, then driven through the real
 //! path: discover → load → enable → `register_enabled` → ticketed invoke.
 
-use capability_core::{Capability, CapabilityTicket, InvocationId, Principal, Resource, ResourceScope};
+use capability_core::{
+    Capability, CapabilityTicket, InvocationId, Principal, Resource, ResourceScope,
+};
 use plugin_wasm::{bridge_tool_id, PluginRuntime};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -94,7 +96,7 @@ fn invoke_ticket(
             plugin: plugin.to_string(),
             tool: tool.to_string(),
         }]),
-        invocation.clone(),
+        *invocation,
         Duration::from_secs(120),
     )
 }
@@ -109,7 +111,10 @@ fn invoke_ctx(plugin: &str, tool: &str) -> ToolContext {
 fn registered(rt: &Arc<PluginRuntime>, tool_id: &str) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     let added = rt.register_enabled(&mut reg).unwrap();
-    assert!(added.contains(&tool_id.to_string()), "registered: {added:?}");
+    assert!(
+        added.contains(&tool_id.to_string()),
+        "registered: {added:?}"
+    );
     reg
 }
 
@@ -140,7 +145,11 @@ async fn denied_without_ticket() {
     let reg = registered(&rt, &tool_id);
 
     let err = reg
-        .invoke(&tool_id, ToolContext::new(Principal::User), serde_json::json!({}))
+        .invoke(
+            &tool_id,
+            ToolContext::new(Principal::User),
+            serde_json::json!({}),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, ToolError::Denied { .. }), "unexpected: {err}");
@@ -229,7 +238,12 @@ async fn guest_file_read_outside_scope_denied_as_envelope() {
 
     // Manifest grants nothing: the derived plugin ticket cannot exist, so
     // the guest sees a denial envelope — never a trap, never the bytes.
-    let rt = setup(&root, "fsdeny", "", &fs_reader_wat(&outside.to_string_lossy()));
+    let rt = setup(
+        &root,
+        "fsdeny",
+        "",
+        &fs_reader_wat(&outside.to_string_lossy()),
+    );
     let tool_id = bridge_tool_id("fsdeny", "run");
     let reg = registered(&rt, &tool_id);
 
@@ -245,7 +259,10 @@ async fn guest_file_read_outside_scope_denied_as_envelope() {
 }
 
 fn logger_wat(lines: usize) -> String {
-    let calls = (0..lines).map(|_| "    (call $log (i32.const 0) (i32.const 11))").collect::<Vec<_>>().join("\n");
+    let calls = (0..lines)
+        .map(|_| "    (call $log (i32.const 0) (i32.const 11))")
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         r#"(module
   (import "utsuwa" "host.log" (func $log (param i32 i32)))
@@ -280,7 +297,11 @@ async fn guest_file_write_leaves_mutation_evidence() {
     let reg = registered(&rt, &tool_id);
 
     let out = reg
-        .invoke(&tool_id, invoke_ctx("fswrite", "run"), serde_json::json!({}))
+        .invoke(
+            &tool_id,
+            invoke_ctx("fswrite", "run"),
+            serde_json::json!({}),
+        )
         .await
         .unwrap();
     assert_eq!(out.content["ok"], true, "envelope: {}", out.content);
@@ -382,7 +403,11 @@ async fn update_refreshes_serving_plugin_and_survives_bad_disk() {
     rt.update("upd").unwrap();
     let reg2 = registered(&rt, &tool_id);
     let out = reg2
-        .invoke(&tool_id, invoke_ctx("upd", "run"), serde_json::json!({"v": 2}))
+        .invoke(
+            &tool_id,
+            invoke_ctx("upd", "run"),
+            serde_json::json!({"v": 2}),
+        )
         .await
         .unwrap();
     assert_eq!(out.content, serde_json::json!({"v": 2}));
@@ -393,7 +418,11 @@ async fn update_refreshes_serving_plugin_and_survives_bad_disk() {
     assert!(rt.update("upd").is_err());
     let reg3 = registered(&rt, &tool_id);
     let out = reg3
-        .invoke(&tool_id, invoke_ctx("upd", "run"), serde_json::json!({"still": "here"}))
+        .invoke(
+            &tool_id,
+            invoke_ctx("upd", "run"),
+            serde_json::json!({"still": "here"}),
+        )
         .await
         .unwrap();
     assert_eq!(out.content, serde_json::json!({"still": "here"}));
@@ -413,14 +442,21 @@ async fn lifecycle_disable_and_reload() {
     rt.disable("life").unwrap();
     let mut reg2 = ToolRegistry::new();
     let added = rt.register_enabled(&mut reg2).unwrap();
-    assert!(added.is_empty(), "disabled plugin must not register: {added:?}");
+    assert!(
+        added.is_empty(),
+        "disabled plugin must not register: {added:?}"
+    );
 
     // Reload keeps the enabled state (re-enable, then reload).
     rt.enable("life").unwrap();
     rt.reload("life").unwrap();
     let reg3 = registered(&rt, &tool_id);
     let out = reg3
-        .invoke(&tool_id, invoke_ctx("life", "run"), serde_json::json!({"again": true}))
+        .invoke(
+            &tool_id,
+            invoke_ctx("life", "run"),
+            serde_json::json!({"again": true}),
+        )
         .await
         .unwrap();
     assert_eq!(out.content, serde_json::json!({"again": true}));
