@@ -1,4 +1,4 @@
-use crate::device::select_default_input_device;
+use crate::device::select_input_device;
 use crate::error::AudioError;
 use crate::pcm::PcmBuffer;
 use crate::vad::{VadEvent, VoiceActivityDetector};
@@ -26,6 +26,7 @@ enum WorkerCommand {
 struct WorkerOutput {
     audio: RecordedAudio,
     stats: CaptureStats,
+    reason: StopReason,
 }
 
 struct ActiveCapture {
@@ -34,12 +35,27 @@ struct ActiveCapture {
     worker: JoinHandle<()>,
 }
 
+/// Non-consuming view of an auto-finished capture, for status reporting
+/// without stealing the recording that `stop` / `take_finished` returns.
+#[derive(Debug, Clone)]
+pub struct FinishedCaptureView {
+    pub reason: StopReason,
+    pub duration_ms: u64,
+    pub bytes: usize,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
 /// Native microphone capture. The CPAL callback only converts samples into
 /// preallocated PCM chunks and performs a non-blocking channel send. VAD,
 /// buffering, and WAV encoding all run on the dedicated audio thread.
 pub struct AudioCapture {
     active: Option<ActiveCapture>,
     last_stats: Option<CaptureStats>,
+    /// A worker that stopped itself (silence, max duration, device error)
+    /// leaves its output here so status tools see the real device state
+    /// instead of a stale "running" flag.
+    finished: Option<WorkerOutput>,
 }
 
 impl Default for AudioCapture {
@@ -53,6 +69,7 @@ impl AudioCapture {
         Self {
             active: None,
             last_stats: None,
+            finished: None,
         }
     }
 
@@ -116,6 +133,12 @@ impl AudioCapture {
     }
 
     pub fn stop(&mut self) -> Result<RecordedAudio, AudioError> {
+        // An auto-stopped worker already left its recording behind: hand
+        // it over instead of erroring on the idle stream.
+        if let Some(output) = self.finished.take() {
+            self.last_stats = Some(output.stats);
+            return Ok(output.audio);
+        }
         let active = self.active.take().ok_or(AudioError::NotRunning)?;
         let _ = active
             .command_tx
@@ -131,16 +154,91 @@ impl AudioCapture {
     }
 
     pub fn cancel(&mut self) {
-        let Some(active) = self.active.take() else {
-            return;
-        };
-        let _ = active.command_tx.send(WorkerCommand::Cancel);
-        let _ = active.worker.join();
+        if let Some(active) = self.active.take() {
+            let _ = active.command_tx.send(WorkerCommand::Cancel);
+            let _ = active.worker.join();
+        }
+        self.finished = None;
         self.last_stats = None;
+    }
+
+    /// True while the native stream is owned by a live worker. Status
+    /// tools must call [`Self::poll_finished`] first so an auto-stopped
+    /// worker is reaped and this reflects the real device state.
+    pub fn is_running(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// Non-blocking reap of a worker that stopped itself (silence, max
+    /// duration, device error). Joins the finished thread, stashes the
+    /// recording for [`Self::stop`] / [`Self::take_finished`], and
+    /// returns a status view. Returns `None` while the stream runs or
+    /// when the worker failed without a recording.
+    pub fn poll_finished(&mut self) -> Option<FinishedCaptureView> {
+        if let Some(output) = self.finished.as_ref() {
+            return Some(finished_view(output));
+        }
+        let active = self.active.as_ref()?;
+        match active.result_rx.try_recv() {
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                // Worker died without a result: no stream, no recording.
+                let active = self.active.take()?;
+                let _ = active.worker.join();
+                self.last_stats = None;
+                None
+            }
+            Ok(Ok(output)) => {
+                let active = self.active.take()?;
+                let _ = active.worker.join();
+                self.last_stats = Some(output.stats.clone());
+                self.finished = Some(output);
+                self.finished.as_ref().map(finished_view)
+            }
+            Ok(Err(_)) => {
+                let active = self.active.take()?;
+                let _ = active.worker.join();
+                self.last_stats = None;
+                None
+            }
+        }
+    }
+
+    /// Take a stashed auto-stop recording without going through `stop`.
+    pub fn take_finished(&mut self) -> Option<RecordedAudio> {
+        self.finished.take().map(|output| output.audio)
+    }
+
+    /// Test seam: simulate a worker that stopped itself (silence, max
+    /// duration) without microphone hardware. Production code never calls
+    /// this — the worker thread is the only other writer of `finished`.
+    #[doc(hidden)]
+    pub fn inject_finished_for_tests(
+        &mut self,
+        audio: RecordedAudio,
+        stats: CaptureStats,
+        reason: StopReason,
+    ) {
+        self.last_stats = Some(stats.clone());
+        self.finished = Some(WorkerOutput {
+            audio,
+            stats,
+            reason,
+        });
     }
 
     pub fn stats(&self) -> Option<&CaptureStats> {
         self.last_stats.as_ref()
+    }
+}
+
+fn finished_view(output: &WorkerOutput) -> FinishedCaptureView {
+    FinishedCaptureView {
+        reason: output.reason,
+        duration_ms: output.audio.duration_ms,
+        bytes: output.audio.bytes,
+        sample_rate: output.audio.sample_rate,
+        channels: output.audio.channels,
     }
 }
 
@@ -169,7 +267,9 @@ fn run_capture_thread(
     ready_tx: Sender<Result<CaptureInfo, AudioError>>,
     result_tx: Sender<Result<WorkerOutput, AudioError>>,
 ) {
-    let selected = match select_default_input_device(config.sample_rate) {
+    // The configured device (or the OS default) is opened here — the
+    // only device this session ever touches.
+    let selected = match select_input_device(config.device.as_deref(), config.sample_rate) {
         Ok(selected) => selected,
         Err(error) => {
             let _ = ready_tx.send(Err(error));
@@ -373,7 +473,11 @@ fn worker_loop(
     callback(CaptureEvent::Stopped {
         reason: stop_reason,
     });
-    Ok(WorkerOutput { audio, stats })
+    Ok(WorkerOutput {
+        audio,
+        stats,
+        reason: stop_reason,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

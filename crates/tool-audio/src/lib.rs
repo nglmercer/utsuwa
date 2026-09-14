@@ -8,8 +8,8 @@
 //! is intentionally not hardwired to any cloud provider (a model provider
 //! or plugin consumes the artifact instead).
 
-use artifact_core::{ArtifactSource, ArtifactStore, ContentPart};
-use audio_capture::{AudioCapture, AudioCaptureConfig, AudioError, RecordedAudio};
+use artifact_core::{ArtifactOwner, ArtifactSource, ArtifactStore, ContentPart};
+use audio_capture::{AudioCapture, AudioCaptureConfig, AudioError, FinishedCaptureView, RecordedAudio};
 use capability_core::{Capability, Resource};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +28,6 @@ struct AudioSession {
     device: String,
     started_at_ms: u64,
     capture: Arc<std::sync::Mutex<AudioCapture>>,
-    finished: Option<RecordedAudio>,
 }
 
 impl AudioState {
@@ -39,6 +38,74 @@ impl AudioState {
     pub fn is_active(&self) -> bool {
         self.active.load(std::sync::atomic::Ordering::SeqCst)
     }
+
+    /// Reap workers that stopped themselves (silence, max duration,
+    /// device error) and recompute the indicator from live streams, so
+    /// `Microphone: ON` tracks the real device — not a stale session-map
+    /// entry. Returns the number of live sessions.
+    pub async fn refresh_indicator(&self) -> usize {
+        let mut sessions = self.sessions.lock().await;
+        let mut live = 0;
+        for session in sessions.values_mut() {
+            if let Ok(mut capture) = session.capture.lock() {
+                // Reap first: an auto-stopped worker must read as
+                // finished here, not as running.
+                let _ = capture.poll_finished();
+                if capture.is_running() {
+                    live += 1;
+                }
+            }
+        }
+        self.active
+            .store(live > 0, std::sync::atomic::Ordering::SeqCst);
+        live
+    }
+}
+
+/// Point-in-time view of one session for status tools.
+struct SessionSnapshot {
+    id: String,
+    device: String,
+    started_at_ms: u64,
+    live: bool,
+    finished: Option<FinishedCaptureView>,
+}
+
+async fn snapshot_sessions(state: &AudioState) -> Vec<SessionSnapshot> {
+    state.refresh_indicator().await;
+    let sessions = state.sessions.lock().await;
+    let mut out = Vec::with_capacity(sessions.len());
+    for (id, session) in sessions.iter() {
+        let (live, finished) = match session.capture.lock() {
+            Ok(mut capture) => {
+                let finished = capture.poll_finished();
+                (capture.is_running(), finished)
+            }
+            Err(_) => (false, None),
+        };
+        out.push(SessionSnapshot {
+            id: id.clone(),
+            device: session.device.clone(),
+            started_at_ms: session.started_at_ms,
+            live,
+            finished,
+        });
+    }
+    out
+}
+
+fn snapshot_json(snapshot: &SessionSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": snapshot.id,
+        "device": snapshot.device,
+        "started_at_ms": snapshot.started_at_ms,
+        "live": snapshot.live,
+        "finished": snapshot.finished.as_ref().map(|finished| serde_json::json!({
+            "reason": finished.reason,
+            "duration_ms": finished.duration_ms,
+            "bytes": finished.bytes,
+        })),
+    })
 }
 
 fn unix_millis() -> u64 {
@@ -62,6 +129,12 @@ fn audio_error(tool: &str, error: AudioError) -> ToolError {
             "backend_unavailable",
             "no microphone input device found",
         ),
+        AudioError::UnknownDevice(device) => ToolError::structured_with_details(
+            tool,
+            "invalid_target",
+            format!("microphone device '{device}' was not found; no other device was opened"),
+            serde_json::json!({ "device": device, "next_tool": "audio.list_devices" }),
+        ),
         AudioError::AlreadyRunning => ToolError::structured(
             tool,
             "action_failed",
@@ -77,10 +150,7 @@ fn audio_error(tool: &str, error: AudioError) -> ToolError {
 }
 
 fn require_microphone(tool: &str, ctx: &ToolContext, device: &str) -> Result<(), ToolError> {
-    if ctx.has_ticket(
-        Capability::MicrophoneCapture,
-        Resource::Application(device.to_string()),
-    ) {
+    if ctx.has_ticket(Capability::MicrophoneCapture, device_scope(device)) {
         Ok(())
     } else {
         Err(ToolError::structured_with_details(
@@ -93,9 +163,10 @@ fn require_microphone(tool: &str, ctx: &ToolContext, device: &str) -> Result<(),
 }
 
 fn device_scope(device: &str) -> Resource {
-    Resource::Application(device.to_string())
+    Resource::AudioDevice(device.to_string())
 }
 
+#[derive(Clone)]
 pub struct AudioDeps {
     pub artifacts: Arc<dyn ArtifactStore>,
     pub state: AudioState,
@@ -190,20 +261,14 @@ impl Tool for AudioStatusTool {
         _ctx: ToolContext,
         _args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let sessions = self.deps.state.sessions.lock().await;
-        let detail = sessions
+        let snapshots = snapshot_sessions(&self.deps.state).await;
+        let live = snapshots.iter().filter(|snapshot| snapshot.live).count();
+        let detail = snapshots
             .iter()
-            .map(|(id, session)| {
-                serde_json::json!({
-                    "session_id": id,
-                    "device": session.device,
-                    "started_at_ms": session.started_at_ms,
-                    "finished": session.finished.is_some(),
-                })
-            })
+            .map(snapshot_json)
             .collect::<Vec<_>>();
         Ok(ToolOutput::json(serde_json::json!({
-            "microphone_on": self.deps.state.is_active(),
+            "microphone_on": live > 0,
             "sessions": detail.len(),
             "detail": detail,
         })))
@@ -276,8 +341,13 @@ impl Tool for AudioCaptureStartTool {
         let handle: Arc<std::sync::Mutex<AudioCapture>> =
             Arc::new(std::sync::Mutex::new(AudioCapture::new()));
         let starter = handle.clone();
+        // The authorized device travels into the capture config: the
+        // backend opens exactly this device, never the default as a
+        // silent fallback for a missing named device.
+        let configured_device = device.clone();
         let info = tokio::task::spawn_blocking(move || {
             let config = AudioCaptureConfig {
+                device: Some(configured_device),
                 max_duration_ms,
                 ..AudioCaptureConfig::default()
             };
@@ -298,7 +368,6 @@ impl Tool for AudioCaptureStartTool {
                 device: device.clone(),
                 started_at_ms: unix_millis(),
                 capture: handle,
-                finished: None,
             },
         );
         self.deps
@@ -340,22 +409,41 @@ impl Tool for AudioCaptureStatusTool {
             .and_then(|value| value.as_str())
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| invalid("audio.capture_status", "missing string 'session_id'"))?;
-        let sessions = self.deps.state.sessions.lock().await;
-        let Some(session) = sessions.get(session_id) else {
-            return Err(ToolError::structured_with_details(
-                "audio.capture_status",
-                "session_not_found",
-                format!("audio session '{session_id}' not found"),
-                serde_json::json!({ "session_id": session_id }),
-            ));
+        let (device, started_at_ms, live, finished) = {
+            let mut sessions = self.deps.state.sessions.lock().await;
+            let Some(session) = sessions.get_mut(session_id) else {
+                return Err(ToolError::structured_with_details(
+                    "audio.capture_status",
+                    "session_not_found",
+                    format!("audio session '{session_id}' not found"),
+                    serde_json::json!({ "session_id": session_id }),
+                ));
+            };
+            require_microphone("audio.capture_status", &ctx, &session.device)?;
+            // Reap an auto-stopped worker so the status reflects the real
+            // device state, not a stale "running" entry.
+            let (live, finished) = match session.capture.lock() {
+                Ok(mut capture) => {
+                    let finished = capture.poll_finished();
+                    (capture.is_running(), finished)
+                }
+                Err(_) => (false, None),
+            };
+            (
+                session.device.clone(),
+                session.started_at_ms,
+                live,
+                finished,
+            )
         };
-        require_microphone("audio.capture_status", &ctx, &session.device)?;
+        self.deps.state.refresh_indicator().await;
         Ok(ToolOutput::json(serde_json::json!({
             "session_id": session_id,
-            "device": session.device,
-            "started_at_ms": session.started_at_ms,
-            "finished": session.finished.is_some(),
-            "stats": session.finished.as_ref().map(|finished| serde_json::json!({
+            "device": device,
+            "started_at_ms": started_at_ms,
+            "live": live,
+            "finished": finished.as_ref().map(|finished| serde_json::json!({
+                "reason": finished.reason,
                 "duration_ms": finished.duration_ms,
                 "bytes": finished.bytes,
             })),
@@ -403,19 +491,17 @@ impl Tool for AudioCaptureStopTool {
                 ));
             };
             require_microphone("audio.capture_stop", &ctx, &session.device)?;
-            if sessions.is_empty() {
-                self.deps
-                    .state
-                    .active
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-            // Deterministic cleanup: recordings never outlive their session.
+            // Exact-session cleanup: only this session's artifacts are
+            // removed — a concurrent session's recording always survives.
+            // The new recording is tagged with the same owner below, so
+            // deleting first never removes it.
             self.deps
                 .artifacts
-                .delete_source(ArtifactSource::AudioCapture)
+                .delete_owner(&ArtifactOwner::AudioSession(session_id.clone()))
                 .await;
             (session.device.clone(), session.capture.clone())
         };
+        self.deps.state.refresh_indicator().await;
         let (device, handle) = handle;
         let recorded = tokio::task::spawn_blocking(move || {
             handle
@@ -428,7 +514,17 @@ impl Tool for AudioCaptureStopTool {
             ToolError::structured("audio.capture_stop", "action_failed", error.to_string())
         })?
         .map_err(|error| audio_error("audio.capture_stop", error))?;
-        finish_recording(&self.deps.artifacts, &device, &session_id, recorded).await
+        // `stop` hands over an auto-stopped worker's recording instead of
+        // erroring, so the mic indicator and the artifact agree even when
+        // the native stream ended first (silence, max duration).
+        finish_recording(
+            &self.deps.artifacts,
+            &device,
+            &session_id,
+            Some(ArtifactOwner::AudioSession(session_id.clone())),
+            recorded,
+        )
+        .await
     }
 }
 
@@ -436,14 +532,16 @@ async fn finish_recording(
     artifacts: &Arc<dyn ArtifactStore>,
     device: &str,
     session_id: &str,
+    owner: Option<ArtifactOwner>,
     recorded: RecordedAudio,
 ) -> Result<ToolOutput, ToolError> {
     let artifact = artifacts
-        .put_with_source(
+        .put_with_owner(
             "audio/wav",
             recorded.wav_data,
             ArtifactSource::AudioCapture,
             true,
+            owner,
         )
         .await
         .map_err(|error| {
@@ -499,6 +597,7 @@ impl Tool for AudioRecordTool {
             .active
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let config = AudioCaptureConfig {
+            device: Some(device.clone()),
             max_duration_ms: duration_ms,
             auto_stop: true,
             retain_audio: true,
@@ -514,11 +613,10 @@ impl Tool for AudioRecordTool {
         .await
         .map_err(|error| ToolError::structured("audio.record", "action_failed", error.to_string()))?
         .map_err(|error| audio_error("audio.record", error))?;
-        self.deps
-            .state
-            .active
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        finish_recording(&self.deps.artifacts, &device, "one-shot", recorded).await
+        self.deps.state.refresh_indicator().await;
+        // One-shot recordings belong to no session: they must never be
+        // swept by another session's teardown.
+        finish_recording(&self.deps.artifacts, &device, "one-shot", None, recorded).await
     }
 }
 
@@ -605,6 +703,188 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn capture_start_attempts_exactly_the_authorized_device() {
+        use tool_sdk::ToolPack as _;
+        let pack = AudioToolPack::new();
+        let start = pack
+            .tools(&tool_sdk::ToolLoadContext::default())
+            .into_iter()
+            .find(|tool| tool.metadata().id.0 == "audio.capture_start")
+            .unwrap();
+        // Ticket for mic-a + request for mic-a: authorization passes, then
+        // the backend reports the missing device instead of opening the
+        // default input as a silent fallback. Hardware-independent: no
+        // host has this device, so no real capture ever starts.
+        let err = start
+            .invoke(
+                ctx_for("mic-a"),
+                serde_json::json!({"device": "mic-a"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("invalid_target"), "{err:?}");
+        assert!(err.model_message().contains("audio.list_devices"), "{err:?}");
+        // Ticket for mic-a + request for mic-b: denied before any device
+        // is touched.
+        let err = start
+            .invoke(ctx_for("mic-a"), serde_json::json!({"device": "mic-b"}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+    }
+
+    #[test]
+    fn default_device_scope_is_explicit() {
+        use tool_sdk::ToolPack as _;
+        let pack = AudioToolPack::new();
+        let start = pack
+            .tools(&tool_sdk::ToolLoadContext::default())
+            .into_iter()
+            .find(|tool| tool.metadata().id.0 == "audio.capture_start")
+            .unwrap();
+        // No device arg means the OS default — declared as its own exact
+        // scope, never as a wildcard covering named devices.
+        let declared = start.required_capabilities(&serde_json::json!({}));
+        assert_eq!(declared.len(), 1);
+        assert_eq!(declared[0].capability, Capability::MicrophoneCapture);
+        assert_eq!(
+            declared[0].resource,
+            Resource::AudioDevice("default".to_string())
+        );
+        let named = start.required_capabilities(&serde_json::json!({"device": "mic-a"}));
+        assert_eq!(
+            named[0].resource,
+            Resource::AudioDevice("mic-a".to_string())
+        );
+    }
+
+    fn test_deps() -> AudioDeps {
+        AudioDeps {
+            artifacts: Arc::new(artifact_core::InMemoryArtifactStore::new()),
+            state: AudioState::new(),
+        }
+    }
+
+    fn idle_session(device: &str) -> AudioSession {
+        AudioSession {
+            device: device.to_string(),
+            started_at_ms: unix_millis(),
+            capture: Arc::new(std::sync::Mutex::new(AudioCapture::new())),
+        }
+    }
+
+    fn inject_auto_stop(session: &AudioSession) {
+        session
+            .capture
+            .lock()
+            .unwrap()
+            .inject_finished_for_tests(
+                audio_capture::RecordedAudio {
+                    wav_data: vec![7, 7, 7],
+                    sample_rate: 16_000,
+                    channels: 1,
+                    duration_ms: 250,
+                    bytes: 3,
+                },
+                audio_capture::CaptureStats {
+                    current_rms: 0.0,
+                    peak_rms: 0.0,
+                    noise_floor: 0.0,
+                    speech_threshold: 0.05,
+                    speech_candidate_active: false,
+                    speech_detected: false,
+                    silence_duration_ms: 1_000,
+                    duration_ms: 250,
+                    chunk_count: 5,
+                    dropped_chunks: 0,
+                },
+                audio_capture::StopReason::MaximumDuration,
+            );
+    }
+
+    #[tokio::test]
+    async fn status_tracks_real_device_state_not_session_map() {
+        let deps = test_deps();
+        deps.state
+            .sessions
+            .lock()
+            .await
+            .insert("s1".to_string(), idle_session("mic-a"));
+        // The session map is non-empty but nothing streams: without the
+        // reap-then-recompute path this would wrongly report ON.
+        deps.state
+            .active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let status = AudioStatusTool { deps: deps.clone() };
+        let out = status
+            .invoke(
+                ToolContext::new(Principal::Agent(AgentId::new("t"))),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["microphone_on"], false, "{out:?}");
+        assert_eq!(out.content["detail"][0]["live"], false);
+        assert!(!deps.state.is_active());
+    }
+
+    #[tokio::test]
+    async fn auto_stopped_session_surfaces_finished_then_stops_cleanly() {
+        let deps = test_deps();
+        let session = idle_session("mic-a");
+        inject_auto_stop(&session);
+        deps.state
+            .sessions
+            .lock()
+            .await
+            .insert("s1".to_string(), session);
+        // A concurrent session's artifact must survive this stop.
+        let survivor = deps
+            .artifacts
+            .put_with_owner(
+                "audio/wav",
+                vec![9],
+                ArtifactSource::AudioCapture,
+                true,
+                Some(ArtifactOwner::AudioSession("s2".to_string())),
+            )
+            .await
+            .unwrap();
+
+        let status_tool = AudioCaptureStatusTool { deps: deps.clone() };
+        let out = status_tool
+            .invoke(ctx_for("mic-a"), serde_json::json!({"session_id": "s1"}))
+            .await
+            .unwrap();
+        assert_eq!(out.content["live"], false, "{out:?}");
+        assert_eq!(out.content["finished"]["reason"], "maximum_duration");
+
+        let stop = AudioCaptureStopTool { deps: deps.clone() };
+        let out = stop
+            .invoke(ctx_for("mic-a"), serde_json::json!({"session_id": "s1"}))
+            .await
+            .unwrap();
+        assert!(out.content["artifact_id"].is_string(), "{out:?}");
+        // Session A's teardown deleted only A's artifacts.
+        assert!(
+            deps.artifacts
+                .get(&survivor.id)
+                .await
+                .is_ok(),
+            "concurrent session artifact must survive"
+        );
+        let global = AudioStatusTool { deps };
+        let out = global
+            .invoke(
+                ToolContext::new(Principal::Agent(AgentId::new("t"))),
+                serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content["microphone_on"], false, "{out:?}");
     }
 
     #[test]

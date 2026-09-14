@@ -2,6 +2,8 @@
 pub enum AudioError {
     #[error("no default input device is available")]
     NoInputDevice,
+    #[error("requested input device '{0}' was not found; not falling back to another device")]
+    UnknownDevice(String),
     #[error("could not read input device name: {0}")]
     DeviceName(String),
     #[error("could not read default input configuration: {0}")]

@@ -157,6 +157,18 @@ pub enum ArtifactSource {
     Tool,
 }
 
+/// Which live session owns an artifact. Session teardown deletes exactly
+/// the stopped session's artifacts (`delete_owner`) — stopping session A
+/// never deletes artifacts still belonging to concurrent session B, even
+/// for the same source.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactOwner {
+    DesktopCapture(String),
+    CameraSession(String),
+    AudioSession(String),
+}
+
 /// Lifecycle metadata for one stored artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactMetadata {
@@ -172,6 +184,10 @@ pub struct ArtifactMetadata {
     /// Sensitive artifacts (screen, camera, microphone, secrets) expire
     /// sooner and are never written to logs or audit records.
     pub sensitive: bool,
+    /// Owning session for exact-session teardown. `None` for artifacts
+    /// that outlive any one session (files, downloads, still photos).
+    #[serde(default)]
+    pub owner: Option<ArtifactOwner>,
 }
 
 #[async_trait::async_trait]
@@ -190,6 +206,21 @@ pub trait ArtifactStore: Send + Sync {
         self.put(mime_type, bytes).await
     }
 
+    /// Store with lifecycle metadata plus session ownership for
+    /// exact-session teardown. The default implementation keeps the
+    /// source/sensitivity and drops the owner (custom stores keep their
+    /// own policy).
+    async fn put_with_owner(
+        &self,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        source: ArtifactSource,
+        sensitive: bool,
+        _owner: Option<ArtifactOwner>,
+    ) -> Result<ArtifactRef, ArtifactError> {
+        self.put_with_source(mime_type, bytes, source, sensitive).await
+    }
+
     async fn get(&self, id: &ArtifactId) -> Result<Vec<u8>, ArtifactError>;
 
     async fn delete(&self, id: &ArtifactId) -> Result<(), ArtifactError>;
@@ -202,6 +233,13 @@ pub trait ArtifactStore: Send + Sync {
     /// Delete every artifact from one source (session teardown). Returns
     /// the number of artifacts removed.
     async fn delete_source(&self, _source: ArtifactSource) -> usize {
+        0
+    }
+
+    /// Delete exactly one session's artifacts. Stopping session A must
+    /// not delete artifacts still belonging to session B. Returns the
+    /// number of artifacts removed.
+    async fn delete_owner(&self, _owner: &ArtifactOwner) -> usize {
         0
     }
 }
@@ -236,6 +274,7 @@ struct StoredArtifact {
     created_at_ms: u64,
     source: ArtifactSource,
     sensitive: bool,
+    owner: Option<ArtifactOwner>,
 }
 
 struct StoreState {
@@ -373,6 +412,7 @@ impl InMemoryArtifactStore {
         bytes: Vec<u8>,
         source: ArtifactSource,
         sensitive: bool,
+        owner: Option<ArtifactOwner>,
     ) -> Result<ArtifactRef, ArtifactError> {
         let mime_type = mime_type.trim();
         if mime_type.is_empty() {
@@ -405,6 +445,7 @@ impl InMemoryArtifactStore {
                 created_at_ms: unix_millis(),
                 source,
                 sensitive,
+                owner,
             },
         );
         Ok(reference)
@@ -414,7 +455,7 @@ impl InMemoryArtifactStore {
 #[async_trait::async_trait]
 impl ArtifactStore for InMemoryArtifactStore {
     async fn put(&self, mime_type: &str, bytes: Vec<u8>) -> Result<ArtifactRef, ArtifactError> {
-        self.put_inner(mime_type, bytes, ArtifactSource::Tool, false)
+        self.put_inner(mime_type, bytes, ArtifactSource::Tool, false, None)
             .await
     }
 
@@ -425,7 +466,18 @@ impl ArtifactStore for InMemoryArtifactStore {
         source: ArtifactSource,
         sensitive: bool,
     ) -> Result<ArtifactRef, ArtifactError> {
-        self.put_inner(mime_type, bytes, source, sensitive).await
+        self.put_inner(mime_type, bytes, source, sensitive, None).await
+    }
+
+    async fn put_with_owner(
+        &self,
+        mime_type: &str,
+        bytes: Vec<u8>,
+        source: ArtifactSource,
+        sensitive: bool,
+        owner: Option<ArtifactOwner>,
+    ) -> Result<ArtifactRef, ArtifactError> {
+        self.put_inner(mime_type, bytes, source, sensitive, owner).await
     }
 
     async fn get(&self, id: &ArtifactId) -> Result<Vec<u8>, ArtifactError> {
@@ -468,6 +520,7 @@ impl ArtifactStore for InMemoryArtifactStore {
                 .map(|remaining| unix_millis().saturating_add(remaining.as_millis() as u64)),
             source: artifact.source,
             sensitive: artifact.sensitive,
+            owner: artifact.owner.clone(),
         })
     }
 
@@ -480,6 +533,26 @@ impl ArtifactStore for InMemoryArtifactStore {
             .artifacts
             .iter()
             .filter(|(_, artifact)| artifact.source == source)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let removed = ids.len();
+        for id in ids {
+            if let Some(artifact) = state.artifacts.remove(&id) {
+                state.bytes = state.bytes.saturating_sub(artifact.bytes.len());
+            }
+        }
+        removed
+    }
+
+    async fn delete_owner(&self, owner: &ArtifactOwner) -> usize {
+        let Ok(mut state) = self.state.lock() else {
+            return 0;
+        };
+        self.sweep_locked(&mut state);
+        let ids: Vec<ArtifactId> = state
+            .artifacts
+            .iter()
+            .filter(|(_, artifact)| artifact.owner.as_ref() == Some(owner))
             .map(|(id, _)| id.clone())
             .collect();
         let removed = ids.len();
@@ -520,6 +593,46 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert_eq!(store.sweep(), 1);
         assert!(!store.contains(&reference.id));
+    }
+
+    #[tokio::test]
+    async fn stopping_one_session_keeps_concurrent_session_artifacts() {
+        let store = InMemoryArtifactStore::with_limits(16, 1024, 1024, Duration::from_secs(3600));
+        let owner_a = ArtifactOwner::AudioSession("session-a".to_string());
+        let owner_b = ArtifactOwner::AudioSession("session-b".to_string());
+        let artifact_a = store
+            .put_with_owner(
+                "audio/wav",
+                vec![1, 2, 3],
+                ArtifactSource::AudioCapture,
+                true,
+                Some(owner_a.clone()),
+            )
+            .await
+            .unwrap();
+        let artifact_b = store
+            .put_with_owner(
+                "audio/wav",
+                vec![4, 5, 6],
+                ArtifactSource::AudioCapture,
+                true,
+                Some(owner_b.clone()),
+            )
+            .await
+            .unwrap();
+        // Owner metadata is visible for audit/debugging.
+        assert_eq!(
+            store.metadata(&artifact_a.id).await.unwrap().owner,
+            Some(owner_a.clone())
+        );
+        // Stopping session A removes exactly A's artifact.
+        assert_eq!(store.delete_owner(&owner_a).await, 1);
+        assert!(!store.contains(&artifact_a.id));
+        assert!(store.contains(&artifact_b.id));
+        assert_eq!(store.get(&artifact_b.id).await.unwrap(), vec![4, 5, 6]);
+        // Source-wide deletion still works when a whole surface resets.
+        assert_eq!(store.delete_source(ArtifactSource::AudioCapture).await, 1);
+        assert!(!store.contains(&artifact_b.id));
     }
 
     #[tokio::test]

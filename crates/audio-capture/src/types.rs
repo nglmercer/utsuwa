@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioCaptureConfig {
+    /// Exact input device to open (`None` or `"default"` = the OS default
+    /// input). When set to a concrete device, capture opens exactly that
+    /// device and never falls back to another one: permission for
+    /// microphone A must not capture microphone B.
+    pub device: Option<String>,
     pub auto_stop: bool,
     pub silence_duration_ms: u64,
     pub max_duration_ms: u64,
@@ -16,6 +21,7 @@ pub struct AudioCaptureConfig {
 impl Default for AudioCaptureConfig {
     fn default() -> Self {
         Self {
+            device: None,
             auto_stop: true,
             silence_duration_ms: 1_000,
             max_duration_ms: 45_000,
