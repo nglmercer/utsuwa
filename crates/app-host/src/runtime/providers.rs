@@ -22,6 +22,33 @@ pub const SETTING_AUTONOMOUS_FULL_ACCESS: &str = "agent.autonomous_full_access";
 /// Optional native model-facing tool profile. When absent, local providers
 /// use the small-model profile and other providers use the complete profile.
 pub const SETTING_TOOL_PROFILE: &str = "agent.tool_profile";
+/// Optional browser CDP endpoint (JSON string, e.g.
+/// `"http://localhost:9333"`). Loopback only: remote or non-HTTP values
+/// fail closed to the default and warn. Read per turn so changes take
+/// effect without a restart. Never model-selectable.
+pub const SETTING_BROWSER_CDP_ENDPOINT: &str = "browser.cdp_endpoint";
+
+/// Resolve the host-configured CDP endpoint to a safe loopback value.
+/// Non-loopback or malformed configuration warns and falls back to the
+/// default instead of handing a remote debugger to the agent.
+pub(crate) fn read_cdp_endpoint(storage: Option<&Arc<Mutex<Storage>>>) -> String {
+    let configured: Option<String> = storage
+        .and_then(|storage| storage.lock().ok())
+        .and_then(|storage| storage.get_setting(SETTING_BROWSER_CDP_ENDPOINT).ok())
+        .flatten()
+        .and_then(|value| value.as_str().map(str::to_string));
+    let endpoint = tool_browser::sanitize_cdp_endpoint(configured.as_deref());
+    if let Some(configured) = configured {
+        if endpoint != configured.trim().trim_end_matches('/').to_ascii_lowercase() {
+            tracing::warn!(
+                configured = %configured,
+                resolved = %endpoint,
+                "browser.cdp_endpoint is not a loopback http endpoint; using the safe default"
+            );
+        }
+    }
+    endpoint
+}
 
 pub use tool_sdk::ToolProfile;
 

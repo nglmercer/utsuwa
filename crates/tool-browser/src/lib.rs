@@ -109,6 +109,14 @@ pub const MAX_TEXT_CHARS: usize = 8_192;
 /// [`BrowserError::Unsupported`] — never fake success.
 #[async_trait::async_trait]
 pub trait BrowserBackend: Send + Sync {
+    /// Whether tab control can run right now. The tool pack keeps
+    /// `browser.status` visible regardless and hides every control tool
+    /// while this is false, so the model never learns unavailable actions
+    /// by trial and error. Sync and cheap: at most a short TCP probe, no
+    /// CDP round trip.
+    fn is_available(&self) -> bool {
+        true
+    }
     async fn status(&self) -> Result<serde_json::Value, BrowserError>;
     async fn list_tabs(&self) -> Result<Vec<BrowserTab>, BrowserError>;
     async fn open(&self, url: &str) -> Result<BrowserTab, BrowserError>;
@@ -174,6 +182,9 @@ pub struct StubBackend;
 
 #[async_trait::async_trait]
 impl BrowserBackend for StubBackend {
+    fn is_available(&self) -> bool {
+        false
+    }
     async fn status(&self) -> Result<serde_json::Value, BrowserError> {
         Ok(serde_json::json!({"available": false, "backend": "none"}))
     }
@@ -347,6 +358,67 @@ pub struct CdpBackend {
     endpoint: String,
 }
 
+/// Default CDP endpoint used when no host configuration exists.
+pub const DEFAULT_CDP_ENDPOINT: &str = "http://localhost:9222";
+
+/// Resolve the configured CDP endpoint to a safe value. Only loopback
+/// endpoints are ever honored: a remote debugging endpoint would hand a
+/// local browser's full control surface to whoever reaches it, so a
+/// non-loopback value fails closed to the default (and the caller logs
+/// the rejection). The model never selects this endpoint.
+pub fn sanitize_cdp_endpoint(configured: Option<&str>) -> String {
+    let raw = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CDP_ENDPOINT);
+    let parsed = url::Url::parse(raw).ok().filter(|parsed| {
+        parsed.scheme() == "http"
+            && matches!(
+                parsed.host_str().map(str::to_ascii_lowercase).as_deref(),
+                Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
+            )
+    });
+    match parsed {
+        Some(parsed) => parsed.as_str().trim_end_matches('/').to_string(),
+        None => DEFAULT_CDP_ENDPOINT.to_string(),
+    }
+}
+
+/// Cheap synchronous reachability probe for a CDP HTTP endpoint: parse
+/// the host/port and attempt a short-timeout TCP connect. This is only
+/// an availability signal for tool filtering — the real CDP handshake
+/// still happens per call and can fail honestly there.
+fn cdp_endpoint_reachable(endpoint: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    use std::time::Duration as StdDuration;
+    let Ok(parsed) = url::Url::parse(endpoint) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let host = match parsed.host_str() {
+        Some(host) => host,
+        None => return false,
+    };
+    let port = parsed.port_or_known_default().unwrap_or(9222);
+    // Avoid a DNS round trip for the known loopback spellings.
+    let addr = if host.eq_ignore_ascii_case("localhost") {
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port)
+    } else if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse() {
+        std::net::SocketAddr::new(ip, port)
+    } else {
+        match (host, port).to_socket_addrs() {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => addr,
+                None => return false,
+            },
+            Err(_) => return false,
+        }
+    };
+    std::net::TcpStream::connect_timeout(&addr, StdDuration::from_millis(300)).is_ok()
+}
+
 impl CdpBackend {
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
@@ -356,6 +428,10 @@ impl CdpBackend {
                 .expect("reqwest client builds"),
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
         }
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     async fn targets(&self) -> Result<Vec<serde_json::Value>, BrowserError> {
@@ -658,6 +734,10 @@ fn name_clone(value: &serde_json::Value) -> Option<String> {
 
 #[async_trait::async_trait]
 impl BrowserBackend for CdpBackend {
+    fn is_available(&self) -> bool {
+        cdp_endpoint_reachable(&self.endpoint)
+    }
+
     async fn status(&self) -> Result<serde_json::Value, BrowserError> {
         let response = self
             .http
@@ -2377,14 +2457,20 @@ impl tool_sdk::ToolPack for BrowserToolPack {
         "browser"
     }
 
+    /// `browser.status` stays visible so the model can report
+    /// availability; every control tool is hidden while the backend is
+    /// unreachable instead of failing per call.
     fn tools(&self, _ctx: &tool_sdk::ToolLoadContext) -> Vec<Arc<dyn Tool>> {
-        vec![
-            Arc::new(BrowserStatusTool {
-                backend: self.backend.clone(),
-            }),
+        let mut tools: Vec<Arc<dyn Tool>> = vec![Arc::new(BrowserStatusTool {
+            backend: self.backend.clone(),
+        })];
+        if !self.backend.is_available() {
+            return tools;
+        }
+        tools.extend([
             Arc::new(BrowserListTabsTool {
                 backend: self.backend.clone(),
-            }),
+            }) as Arc<dyn Tool>,
             Arc::new(BrowserOpenTool {
                 backend: self.backend.clone(),
             }),
@@ -2447,7 +2533,8 @@ impl tool_sdk::ToolPack for BrowserToolPack {
             Arc::new(BrowserCookiesDeleteTool {
                 backend: self.backend.clone(),
             }),
-        ]
+        ]);
+        tools
     }
 }
 
@@ -2638,15 +2725,31 @@ mod tests {
         ctx.with_ticket(ticket)
     }
 
-    #[test]
-    fn pack_registers_the_full_browser_surface() {
-        let pack = BrowserToolPack::stub();
+    fn pack_ids(pack: &BrowserToolPack) -> Vec<String> {
         let mut ids = pack
             .tools(&tool_sdk::ToolLoadContext::default())
             .iter()
             .map(|tool| tool.metadata().id.0.clone())
             .collect::<Vec<_>>();
         ids.sort();
+        ids
+    }
+
+    #[test]
+    fn unavailable_backend_advertises_status_only() {
+        // No CDP browser: control tools are hidden instead of failing
+        // per call, while status stays visible to report availability.
+        let ids = pack_ids(&BrowserToolPack::stub());
+        assert_eq!(ids, vec!["browser.status"]);
+    }
+
+    #[test]
+    fn available_backend_advertises_the_full_browser_surface() {
+        let pack = BrowserToolPack::with_services(
+            Arc::new(FakeBrowser::new()),
+            Arc::new(artifact_core::InMemoryArtifactStore::new()),
+        );
+        let ids = pack_ids(&pack);
         for expected in [
             "browser.status",
             "browser.list_tabs",
@@ -2673,6 +2776,45 @@ mod tests {
         ] {
             assert!(ids.contains(&expected.to_string()), "{ids:?}");
         }
+    }
+
+    #[test]
+    fn cdp_endpoint_config_is_loopback_only() {
+        assert_eq!(
+            sanitize_cdp_endpoint(None),
+            "http://localhost:9222"
+        );
+        assert_eq!(
+            sanitize_cdp_endpoint(Some("http://127.0.0.1:9333/")),
+            "http://127.0.0.1:9333"
+        );
+        // Remote or non-http endpoints fail closed to the loopback
+        // default: the model never gains a remote-debugging target.
+        for bad in [
+            Some("http://example.com:9222"),
+            Some("http://192.168.1.10:9222"),
+            Some("https://localhost:9222"),
+            Some("ws://localhost:9222"),
+            Some("not a url"),
+            Some(""),
+        ] {
+            assert_eq!(sanitize_cdp_endpoint(bad), DEFAULT_CDP_ENDPOINT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn cdp_probe_detects_live_and_dead_endpoints() {
+        // A bound loopback port probes reachable…
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(cdp_endpoint_reachable(&format!("http://127.0.0.1:{port}")));
+        assert!(CdpBackend::new(format!("http://127.0.0.1:{port}")).is_available());
+        drop(listener);
+        // …and nothing listens after close (refused, no 300 ms wait).
+        assert!(!cdp_endpoint_reachable(&format!("http://127.0.0.1:{port}")));
+        assert!(!cdp_endpoint_reachable("not a url"));
+        assert!(!CdpBackend::new("http://localhost:9").is_available());
+        assert!(!StubBackend.is_available());
     }
 
     #[test]

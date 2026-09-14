@@ -39,10 +39,13 @@ pub(crate) use self::prompts::{compose_host_system_prompt, compose_host_system_p
 pub(crate) use self::providers::configured_tool_profile;
 pub use self::providers::{
     normalize_provider_base_url, tool_profile_for_provider, ToolProfile, SETTING_API_KEY,
-    SETTING_AUTONOMOUS_FULL_ACCESS, SETTING_BASE_URL, SETTING_MCP_SERVERS, SETTING_MODEL_NAME,
-    SETTING_PLUGIN_DIR, SETTING_PROVIDER, SETTING_TOOL_PROFILE,
+    SETTING_AUTONOMOUS_FULL_ACCESS, SETTING_BASE_URL, SETTING_BROWSER_CDP_ENDPOINT,
+    SETTING_MCP_SERVERS, SETTING_MODEL_NAME, SETTING_PLUGIN_DIR, SETTING_PROVIDER,
+    SETTING_TOOL_PROFILE,
 };
-pub(crate) use self::providers::{provider_factory_with_secrets, read_autonomous_full_access};
+pub(crate) use self::providers::{
+    provider_factory_with_secrets, read_autonomous_full_access, read_cdp_endpoint,
+};
 pub use self::session::AgentRequest;
 pub(crate) use self::session::State;
 pub(crate) use file_target::{ConversationFileContext, FileRef};
@@ -733,8 +736,13 @@ impl AgentRuntime {
             .with_pack(tool_archive::ArchiveToolPack::new())
             .with_pack(tool_git::GitToolPack)
             .with_pack(tool_notification::NotificationToolPack)
+            // The CDP endpoint is host configuration (loopback-only,
+            // sanitized), read fresh every turn; the pack hides control
+            // tools while no browser answers there.
             .with_pack(tool_browser::BrowserToolPack::with_services(
-                Arc::new(tool_browser::CdpBackend::new("http://localhost:9222")),
+                Arc::new(tool_browser::CdpBackend::new(read_cdp_endpoint(
+                    self.storage.as_ref(),
+                ))),
                 self.artifacts.clone(),
             ))
             .with_pack(tool_camera::CameraToolPack {
@@ -1555,6 +1563,48 @@ mod tests {
     }
 
     #[test]
+    fn browser_cdp_endpoint_setting_is_loopback_only() {
+        let storage_dir =
+            std::env::temp_dir().join(format!("utsuwa-cdp-endpoint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        let storage = Arc::new(Mutex::new(
+            Storage::open(&storage_dir.join("state.db")).unwrap(),
+        ));
+        // Absent: the default.
+        assert_eq!(
+            read_cdp_endpoint(Some(&storage)),
+            tool_browser::DEFAULT_CDP_ENDPOINT
+        );
+        // Loopback custom port: honored.
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(
+                SETTING_BROWSER_CDP_ENDPOINT,
+                &serde_json::json!("http://127.0.0.1:9333"),
+            )
+            .unwrap();
+        assert_eq!(
+            read_cdp_endpoint(Some(&storage)),
+            "http://127.0.0.1:9333"
+        );
+        // Remote endpoint: fails closed to the default, never honored.
+        storage
+            .lock()
+            .unwrap()
+            .set_setting(
+                SETTING_BROWSER_CDP_ENDPOINT,
+                &serde_json::json!("http://192.168.1.10:9222"),
+            )
+            .unwrap();
+        assert_eq!(
+            read_cdp_endpoint(Some(&storage)),
+            tool_browser::DEFAULT_CDP_ENDPOINT
+        );
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[test]
     fn explicit_model_tool_profile_overrides_provider_inference() {
         let storage_dir =
             std::env::temp_dir().join(format!("utsuwa-tool-profile-{}", std::process::id()));
@@ -1651,6 +1701,7 @@ mod tests {
             .into_iter()
             .map(|metadata| metadata.id.0)
             .collect();
+        // Tools with no backend dependency are always advertised.
         for expected in [
             "http.get",
             "http.download",
@@ -1660,14 +1711,10 @@ mod tests {
             "git.push",
             "notification.show",
             "browser.status",
-            "browser.snapshot",
-            "browser.cookies.delete",
             "camera.list",
-            "camera.capture_photo",
             "audio.list_devices",
             "audio.record",
             "media.metadata",
-            "media.video_keyframes",
             "system.cpu",
             "system.processes",
             "clipboard.read",
@@ -1677,6 +1724,32 @@ mod tests {
         ] {
             assert!(ids.iter().any(|id| id == expected), "missing {expected}");
         }
+        // Backend-dependent tools track live availability: present exactly
+        // when their backend answers on this machine, so the test stays
+        // honest with or without a browser, camera, or ffmpeg installed.
+        let browser_available =
+            tool_browser::CdpBackend::new(read_cdp_endpoint(harness.runtime.storage.as_ref()))
+                .is_available();
+        for control in ["browser.snapshot", "browser.cookies.delete"] {
+            assert_eq!(
+                ids.iter().any(|id| id == control),
+                browser_available,
+                "{control} must track CDP availability"
+            );
+        }
+        use camera_capture::CameraBackend as _;
+        use tool_browser::BrowserBackend as _;
+        let camera_available = AgentRuntime::camera_backend().is_available();
+        assert_eq!(
+            ids.iter().any(|id| id == "camera.capture_photo"),
+            camera_available,
+            "camera.capture_photo must track camera availability"
+        );
+        assert_eq!(
+            ids.iter().any(|id| id == "media.video_keyframes"),
+            tool_media::ffmpeg_available(),
+            "media.video_keyframes must track ffmpeg availability"
+        );
     }
 
     #[tokio::test]

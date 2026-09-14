@@ -40,6 +40,12 @@ pub enum CameraError {
 /// Camera control surface. Implementations must never synthesize a photo:
 /// without OS access they return [`CameraError::BackendUnavailable`].
 pub trait CameraBackend: Send + Sync {
+    /// Whether photo capture can run right now. The tool pack keeps
+    /// `camera.status`/`camera.list` visible regardless and hides capture
+    /// tools while this is false.
+    fn is_available(&self) -> bool {
+        true
+    }
     fn list_cameras(&self) -> Result<Vec<CameraDevice>, CameraError>;
     fn capture_photo(&self, camera_id: &str, max_width: Option<u32>) -> Result<Photo, CameraError>;
 }
@@ -68,6 +74,13 @@ impl NokhwaBackend {
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 impl CameraBackend for NokhwaBackend {
+    fn is_available(&self) -> bool {
+        // A capture stack that enumerates zero devices cannot capture.
+        // Checked per call (cheap query) rather than cached, so devices
+        // plugged in during a session take effect.
+        self.list_cameras().is_ok_and(|cameras| !cameras.is_empty())
+    }
+
     fn list_cameras(&self) -> Result<Vec<CameraDevice>, CameraError> {
         let infos = nokhwa::query(ApiBackend::Auto)
             .map_err(|error| CameraError::BackendUnavailable(error.to_string()))?;
@@ -158,6 +171,10 @@ fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 pub struct StubBackend;
 
 impl CameraBackend for StubBackend {
+    fn is_available(&self) -> bool {
+        false
+    }
+
     fn list_cameras(&self) -> Result<Vec<CameraDevice>, CameraError> {
         Err(CameraError::BackendUnavailable(
             "no camera backend on this host".to_string(),

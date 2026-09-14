@@ -92,6 +92,15 @@ pub trait ToolPack: Send + Sync {
     fn id(&self) -> &'static str;
 
     fn tools(&self, ctx: &ToolLoadContext) -> Vec<Arc<dyn Tool>>;
+
+    /// Whether this pack's backend is usable right now. Packs whose tools
+    /// need a live backend (browser CDP, camera, FFmpeg, desktop) override
+    /// this — or filter inside `tools` to keep status-style tools visible
+    /// — so the model is never offered actions that cannot run. The
+    /// default (`true`) keeps pure/static packs unaffected.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 /// Adapts any `ToolPack` into a `ToolSource`.
@@ -110,6 +119,9 @@ impl<P: ToolPack> ToolSource for PackSource<P> {
     }
 
     async fn load(&self, ctx: &ToolLoadContext) -> Result<Vec<Arc<dyn Tool>>, ToolSourceError> {
+        if !self.0.is_available() {
+            return Ok(Vec::new());
+        }
         Ok(self.0.tools(ctx))
     }
 }
@@ -308,6 +320,38 @@ mod tests {
                 .map(|id| Arc::new(StaticTool(id)) as Arc<dyn Tool>)
                 .collect()
         }
+    }
+
+    struct UnavailablePack(Vec<&'static str>);
+
+    impl ToolPack for UnavailablePack {
+        fn id(&self) -> &'static str {
+            "test.unavailable"
+        }
+
+        fn tools(&self, _ctx: &ToolLoadContext) -> Vec<Arc<dyn Tool>> {
+            self.0
+                .iter()
+                .map(|id| Arc::new(StaticTool(id)) as Arc<dyn Tool>)
+                .collect()
+        }
+
+        fn is_available(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_pack_contributes_no_tools() {
+        let catalog = ToolCatalog::new()
+            .with_pack(StaticPack(vec!["a.x"]))
+            .with_pack(UnavailablePack(vec!["u.y"]));
+        let registry = catalog
+            .snapshot(&ToolLoadContext::new(ToolProfile::Full))
+            .await
+            .unwrap();
+        let ids: Vec<String> = registry.list().into_iter().map(|m| m.id.0).collect();
+        assert_eq!(ids, vec!["a.x"]);
     }
 
     struct FailingSource;

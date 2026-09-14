@@ -967,24 +967,36 @@ impl tool_sdk::ToolPack for MediaToolPack {
         "media"
     }
 
+    /// In-process metadata tools are always advertised. FFmpeg-backed
+    /// tools (frame extraction, thumbnails, waveforms) appear only while
+    /// an `ffmpeg` binary is usable — otherwise the model would learn
+    /// them by trial-and-error `backend_unavailable` failures.
     fn tools(&self, _ctx: &tool_sdk::ToolLoadContext) -> Vec<Arc<dyn Tool>> {
-        let deps = MediaDeps {
-            artifacts: self.artifacts.clone(),
-        };
+        self.tools_with_availability(ffmpeg_available())
+    }
+}
+
+impl MediaToolPack {
+    fn tools_with_availability(&self, ffmpeg_present: bool) -> Vec<Arc<dyn Tool>> {
         let frame_deps = || MediaDeps {
             artifacts: self.artifacts.clone(),
         };
-        let _ = &deps;
-        vec![
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(MediaMetadataTool),
             Arc::new(MediaVideoMetadataTool),
             Arc::new(MediaAudioMetadataTool),
-            Arc::new(MediaVideoFrameTool { deps: frame_deps() }),
+        ];
+        if !ffmpeg_present {
+            return tools;
+        }
+        tools.extend([
+            Arc::new(MediaVideoFrameTool { deps: frame_deps() }) as Arc<dyn Tool>,
             Arc::new(MediaVideoFramesTool { deps: frame_deps() }),
             Arc::new(MediaVideoKeyframesTool { deps: frame_deps() }),
             Arc::new(MediaThumbnailTool { deps: frame_deps() }),
             Arc::new(MediaWaveformTool),
-        ]
+        ]);
+        tools
     }
 }
 
@@ -1081,16 +1093,22 @@ mod tests {
         assert!(matches!(err, ToolError::InvalidArgs { .. }));
     }
 
-    #[test]
-    fn pack_registers_the_media_surface() {
-        let mut ids = MediaToolPack::new()
-            .tools(&tool_sdk::ToolLoadContext::default())
+    fn pack_ids(pack: &MediaToolPack, ffmpeg_present: bool) -> Vec<String> {
+        let mut ids = pack
+            .tools_with_availability(ffmpeg_present)
             .iter()
             .map(|tool| tool.metadata().id.0.clone())
             .collect::<Vec<_>>();
         ids.sort();
+        ids
+    }
+
+    #[test]
+    fn pack_registers_the_media_surface() {
+        // Deterministic in both states: metadata tools always, FFmpeg
+        // tools only when the binary exists.
         assert_eq!(
-            ids,
+            pack_ids(&MediaToolPack::new(), true),
             vec![
                 "media.audio_metadata",
                 "media.metadata",
@@ -1101,6 +1119,24 @@ mod tests {
                 "media.video_metadata",
                 "media.waveform",
             ]
+        );
+        assert_eq!(
+            pack_ids(&MediaToolPack::new(), false),
+            vec![
+                "media.audio_metadata",
+                "media.metadata",
+                "media.video_metadata",
+            ]
+        );
+        // The live registry agrees with the probe on this machine.
+        let live = MediaToolPack::new()
+            .tools(&tool_sdk::ToolLoadContext::default())
+            .iter()
+            .map(|tool| tool.metadata().id.0.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            live.contains(&"media.video_frame".to_string()),
+            ffmpeg_available()
         );
     }
 }

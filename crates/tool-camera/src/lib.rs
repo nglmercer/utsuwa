@@ -543,17 +543,26 @@ impl tool_sdk::ToolPack for CameraToolPack {
         "camera"
     }
 
+    /// `camera.status` and `camera.list` stay visible so the model can
+    /// report availability; capture tools are hidden while no camera
+    /// backend can capture instead of failing per call.
     fn tools(&self, _ctx: &tool_sdk::ToolLoadContext) -> Vec<Arc<dyn Tool>> {
         // One deps bundle per tool, all sharing the backend, store, and
         // visible-capture state.
-        vec![
+        let mut tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(CameraListTool { deps: self.deps() }),
             Arc::new(CameraStatusTool { deps: self.deps() }),
-            Arc::new(CameraCapturePhotoTool { deps: self.deps() }),
+        ];
+        if !self.backend.is_available() {
+            return tools;
+        }
+        tools.extend([
+            Arc::new(CameraCapturePhotoTool { deps: self.deps() }) as Arc<dyn Tool>,
             Arc::new(CameraCaptureStartTool { deps: self.deps() }),
             Arc::new(CameraCaptureFrameTool { deps: self.deps() }),
             Arc::new(CameraCaptureStopTool { deps: self.deps() }),
-        ]
+        ]);
+        tools
     }
 }
 
@@ -791,5 +800,17 @@ mod tests {
                 "camera.status",
             ]
         );
+    }
+
+    #[test]
+    fn stub_backend_advertises_status_and_list_only() {
+        let pack = CameraToolPack::stub();
+        let mut ids = pack
+            .tools(&tool_sdk::ToolLoadContext::default())
+            .iter()
+            .map(|tool| tool.metadata().id.0.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["camera.list", "camera.status"]);
     }
 }
