@@ -4,12 +4,15 @@
 //! tool deliberately exposes no notification actions: actions would be
 //! executable callbacks into the agent, which the security model forbids.
 //! Delivery failures surface as explicit `backend_unavailable` errors —
-//! never fake success. No capability ticket is required (posting a
-//! notification is unprivileged), but the effect is marked
-//! [`ToolEffect::ExternalSideEffect`] so policy still records it.
+//! never fake success. Showing a notification is user-visible external
+//! behavior, so it requires an explicit [`capability_core::Capability::NotificationSend`]
+//! ticket (low-friction policy, but explicit authority, never ambient).
 
+use capability_core::{Capability, Resource};
 use std::sync::Arc;
-use tool_core::{Tool, ToolContext, ToolEffect, ToolError, ToolMetadata, ToolOutput};
+use tool_core::{
+    CapabilityRequirement, Tool, ToolContext, ToolEffect, ToolError, ToolMetadata, ToolOutput,
+};
 
 const MAX_TITLE_CHARS: usize = 128;
 const MAX_BODY_CHARS: usize = 1_024;
@@ -43,9 +46,16 @@ impl Tool for NotificationShowTool {
         }
     }
 
+    fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
+        Some(CapabilityRequirement {
+            capability: Capability::NotificationSend,
+            resource: Resource::NotificationService,
+        })
+    }
+
     async fn invoke(
         &self,
-        _ctx: ToolContext,
+        ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
         let title = args
@@ -69,6 +79,20 @@ impl Tool for NotificationShowTool {
             Some("critical") => notify_rust::Urgency::Critical,
             Some(other) => return Err(invalid(format!("unknown urgency '{other}'"))),
         };
+        // User-visible external behavior: explicit authority required.
+        // Validated first so malformed calls fail as InvalidArgs even
+        // without a ticket (no backend is touched either way).
+        if !ctx.has_ticket(Capability::NotificationSend, Resource::NotificationService) {
+            return Err(ToolError::structured_with_details(
+                "notification.show",
+                "permission_required",
+                "showing a notification needs explicit user authorization",
+                serde_json::json!({
+                    "capability": "NotificationSend",
+                    "resource": "NotificationService",
+                }),
+            ));
+        }
         let mut notification = notify_rust::Notification::new();
         notification.summary(title).body(body).urgency(urgency);
         if let Some(icon) = args.get("icon").and_then(|value| value.as_str()) {
@@ -158,5 +182,41 @@ mod tests {
         let meta = tools[0].metadata();
         assert_eq!(meta.id.0, "notification.show");
         assert!(meta.effects.contains(&ToolEffect::ExternalSideEffect));
+    }
+
+    #[tokio::test]
+    async fn show_requires_notification_send_authority() {
+        use capability_core::ResourceScope;
+        use std::time::Duration;
+        let tool = NotificationShowTool;
+        let args = serde_json::json!({"title": "hi", "body": "there"});
+        // Declared preflight names the capability for the agent loop.
+        let declared = tool
+            .required_capabilities(&args)
+            .pop()
+            .expect("one requirement");
+        assert_eq!(declared.capability, capability_core::Capability::NotificationSend);
+        assert_eq!(
+            declared.resource,
+            capability_core::Resource::NotificationService
+        );
+        // No ticket: denied before the backend is touched.
+        let err = tool.invoke(ctx(), args.clone()).await.unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        // With a ticket the backend runs (and reports honestly when no
+        // notification daemon exists in CI).
+        let ctx = ctx();
+        let ticket = capability_core::CapabilityTicket::mint(
+            ctx.principal.clone(),
+            capability_core::Capability::NotificationSend,
+            ResourceScope::new(vec![capability_core::Resource::NotificationService]),
+            ctx.invocation_id,
+            Duration::from_secs(120),
+        );
+        let outcome = tool.invoke(ctx.with_ticket(ticket), args).await;
+        match outcome {
+            Ok(out) => assert_eq!(out.content["ok"], true),
+            Err(err) => assert_eq!(err.code(), Some("backend_unavailable"), "{err:?}"),
+        }
     }
 }

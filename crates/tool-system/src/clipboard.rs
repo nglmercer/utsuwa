@@ -27,7 +27,7 @@ fn require(
     ctx: &ToolContext,
     capability: capability_core::Capability,
 ) -> Result<(), ToolError> {
-    let resource = capability_core::Resource::Application("clipboard".to_string());
+    let resource = capability_core::Resource::Clipboard;
     if ctx.has_ticket(capability.clone(), resource.clone()) {
         Ok(())
     } else {
@@ -58,7 +58,7 @@ impl Tool for ClipboardReadTool {
     fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: capability_core::Capability::ClipboardRead,
-            resource: capability_core::Resource::Application("clipboard".to_string()),
+            resource: capability_core::Resource::Clipboard,
         })
     }
 
@@ -108,7 +108,7 @@ impl Tool for ClipboardWriteTool {
     fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: capability_core::Capability::ClipboardWrite,
-            resource: capability_core::Resource::Application("clipboard".to_string()),
+            resource: capability_core::Resource::Clipboard,
         })
     }
 
@@ -165,7 +165,7 @@ impl Tool for ClipboardClearTool {
     fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: capability_core::Capability::ClipboardWrite,
-            resource: capability_core::Resource::Application("clipboard".to_string()),
+            resource: capability_core::Resource::Clipboard,
         })
     }
 

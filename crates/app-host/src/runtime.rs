@@ -902,11 +902,11 @@ mod tests {
             ),
             (
                 capability_core::Capability::ClipboardRead,
-                capability_core::Resource::Application("clipboard".to_string()),
+                capability_core::Resource::Clipboard,
             ),
             (
                 capability_core::Capability::ClipboardWrite,
-                capability_core::Resource::Application("clipboard".to_string()),
+                capability_core::Resource::Clipboard,
             ),
             (
                 capability_core::Capability::ApplicationLaunch,

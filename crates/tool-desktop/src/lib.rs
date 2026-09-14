@@ -2670,7 +2670,7 @@ pub mod tools {
         fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
             Some(CapabilityRequirement {
                 capability: Capability::ClipboardRead,
-                resource: Resource::Application("clipboard".to_string()),
+                resource: Resource::Clipboard,
             })
         }
 
@@ -2684,7 +2684,7 @@ pub mod tools {
                 Self::TOOL,
                 &ctx,
                 Capability::ClipboardRead,
-                Resource::Application("clipboard".to_string()),
+                Resource::Clipboard,
             )?;
             let text = self
                 .backend
@@ -2719,7 +2719,7 @@ pub mod tools {
         fn required_capability(&self, _args: &serde_json::Value) -> Option<CapabilityRequirement> {
             Some(CapabilityRequirement {
                 capability: Capability::ClipboardWrite,
-                resource: Resource::Application("clipboard".to_string()),
+                resource: Resource::Clipboard,
             })
         }
 
@@ -2743,7 +2743,7 @@ pub mod tools {
                 "desktop.clipboard_write",
                 &ctx,
                 Capability::ClipboardWrite,
-                Resource::Application("clipboard".to_string()),
+                Resource::Clipboard,
             )?;
             self.backend
                 .clipboard_write(&mime_type, text)

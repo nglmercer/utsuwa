@@ -596,8 +596,10 @@ fn truncate_text(text: &str) -> String {
     out
 }
 
-/// Local sensitivity check for browser nodes (password/token inputs).
-/// Mirrors the desktop heuristic so secret values never reach the model.
+/// Local sensitivity check for browser nodes. Mirrors the desktop
+/// heuristic exactly (same needles, same safe direction) so secret values
+/// — passwords, PINs, OTPs, payment fields, API keys, private keys —
+/// never reach the model from either surface.
 pub fn browser_node_sensitive(role: Option<&str>, name: Option<&str>, tag: &str) -> bool {
     let haystack = format!(
         "{} {} {}",
@@ -606,10 +608,39 @@ pub fn browser_node_sensitive(role: Option<&str>, name: Option<&str>, tag: &str)
         tag
     )
     .to_lowercase();
-    haystack.contains("password")
-        || haystack.contains("passcode")
-        || haystack.contains("token")
-        || haystack.contains("secret")
+    let contains = |needle: &str| haystack.contains(needle);
+    contains("password")
+        || contains("passcode")
+        || contains("secure")
+        || contains("pin field")
+        || contains("credit card")
+        || contains("credit-card")
+        || contains("card number")
+        || contains("cvv")
+        || contains("cvc")
+        || contains("iban")
+        || contains("private key")
+        || contains("secret key")
+        || contains("seed phrase")
+        || contains("otp")
+        || contains("one-time")
+        || contains("2fa")
+        || contains("two-factor")
+        || contains("authenticator")
+        || contains("login")
+        || contains("sign-in")
+        || contains("signin")
+        || contains("api key")
+        || contains("api-key")
+        || contains("apikey")
+        || contains("token")
+        || contains("client secret")
+        || contains("bearer")
+        || contains("secret")
+        || contains("ssn")
+        || contains("social security")
+        || contains("passport")
+        || contains("date of birth")
 }
 
 pub const BROWSER_SENSITIVE_MASK: &str = "••••••••";
@@ -1485,6 +1516,28 @@ impl Tool for BrowserNavigateTool {
             resource: url_resource(url).ok()?,
         })
     }
+    /// Driving an existing tab needs both the destination network ticket
+    /// AND a control ticket scoped to that tab: a URL grant alone must
+    /// not steer tabs the agent was never given control of.
+    fn required_capabilities(&self, args: &serde_json::Value) -> Vec<CapabilityRequirement> {
+        let (Some(url), Some(tab_id)) = (
+            args.get("url").and_then(|value| value.as_str()),
+            args.get("tab_id").and_then(|value| value.as_str()),
+        ) else {
+            return self.required_capability(args).into_iter().collect();
+        };
+        let mut requirements = vec![CapabilityRequirement {
+            capability: Capability::DesktopControl,
+            resource: Resource::BrowserTab(tab_id.to_string()),
+        }];
+        if let Ok(resource) = url_resource(url) {
+            requirements.push(CapabilityRequirement {
+                capability: Capability::NetworkConnect,
+                resource,
+            });
+        }
+        requirements
+    }
     async fn invoke(
         &self,
         ctx: ToolContext,
@@ -1496,6 +1549,12 @@ impl Tool for BrowserNavigateTool {
             .and_then(|value| value.as_str())
             .ok_or_else(|| invalid("browser.navigate", "missing string 'url'"))?;
         let resource = url_resource(url)?;
+        require_ticket(
+            "browser.navigate",
+            &ctx,
+            Capability::DesktopControl,
+            Resource::BrowserTab(tab_id.clone()),
+        )?;
         require_ticket(
             "browser.navigate",
             &ctx,
@@ -1531,13 +1590,13 @@ macro_rules! simple_tab_action {
             fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
                 Some(CapabilityRequirement {
                     capability: if $observe { Capability::DesktopObserve } else { Capability::DesktopControl },
-                    resource: Resource::Window(tab_arg(args, $id).ok()?),
+                    resource: Resource::BrowserTab(tab_arg(args, $id).ok()?),
                 })
             }
             async fn invoke(&self, ctx: ToolContext, args: serde_json::Value) -> Result<ToolOutput, ToolError> {
                 let tab_id = tab_arg(&args, $id)?;
                 let capability = if $observe { Capability::DesktopObserve } else { Capability::DesktopControl };
-                require_ticket($id, &ctx, capability, Resource::Window(tab_id.clone()))?;
+                require_ticket($id, &ctx, capability, Resource::BrowserTab(tab_id.clone()))?;
                 self.backend.$method(&tab_id).await.map_err(|error| backend_error($id, error))?;
                 Ok(ToolOutput::json(serde_json::json!({ "ok": true, "tab_id": tab_id })))
             }
@@ -1704,7 +1763,7 @@ impl Tool for BrowserSnapshotTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopObserve,
-            resource: Resource::Window(tab_arg(args, "browser.snapshot").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.snapshot").ok()?),
         })
     }
     async fn invoke(
@@ -1717,7 +1776,7 @@ impl Tool for BrowserSnapshotTool {
             "browser.snapshot",
             &ctx,
             Capability::DesktopObserve,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         let since = args
             .get("since_snapshot_id")
@@ -1774,7 +1833,7 @@ impl Tool for BrowserQueryTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopObserve,
-            resource: Resource::Window(tab_arg(args, "browser.query").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.query").ok()?),
         })
     }
     async fn invoke(
@@ -1800,7 +1859,7 @@ impl Tool for BrowserQueryTool {
             "browser.query",
             &ctx,
             Capability::DesktopObserve,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         let nodes = self
             .backend
@@ -1830,7 +1889,7 @@ impl Tool for BrowserClickTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopControl,
-            resource: Resource::Window(tab_arg(args, "browser.click").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.click").ok()?),
         })
     }
     async fn invoke(
@@ -1844,7 +1903,7 @@ impl Tool for BrowserClickTool {
             "browser.click",
             &ctx,
             Capability::DesktopControl,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         self.backend
             .click(&tab_id, &node_id)
@@ -1871,7 +1930,7 @@ impl Tool for BrowserTypeTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopControl,
-            resource: Resource::Window(tab_arg(args, "browser.type").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.type").ok()?),
         })
     }
     async fn invoke(
@@ -1892,7 +1951,7 @@ impl Tool for BrowserTypeTool {
             "browser.type",
             &ctx,
             Capability::DesktopControl,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         self.backend
             .type_text(&tab_id, &node_id, text)
@@ -1919,7 +1978,7 @@ impl Tool for BrowserSetValueTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopControl,
-            resource: Resource::Window(tab_arg(args, "browser.set_value").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.set_value").ok()?),
         })
     }
     async fn invoke(
@@ -1940,7 +1999,7 @@ impl Tool for BrowserSetValueTool {
             "browser.set_value",
             &ctx,
             Capability::DesktopControl,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         self.backend
             .set_value(&tab_id, &node_id, value)
@@ -1967,7 +2026,7 @@ impl Tool for BrowserSelectTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopControl,
-            resource: Resource::Window(tab_arg(args, "browser.select").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.select").ok()?),
         })
     }
     async fn invoke(
@@ -1997,7 +2056,7 @@ impl Tool for BrowserSelectTool {
             "browser.select",
             &ctx,
             Capability::DesktopControl,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         self.backend
             .select(&tab_id, &node_id, &selected)
@@ -2028,7 +2087,7 @@ impl Tool for BrowserScrollTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopControl,
-            resource: Resource::Window(tab_arg(args, "browser.scroll").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.scroll").ok()?),
         })
     }
     async fn invoke(
@@ -2052,7 +2111,7 @@ impl Tool for BrowserScrollTool {
             "browser.scroll",
             &ctx,
             Capability::DesktopControl,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         self.backend
             .scroll(&tab_id, node_id, dx, dy)
@@ -2079,7 +2138,7 @@ impl Tool for BrowserGetTextTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopObserve,
-            resource: Resource::Window(tab_arg(args, "browser.get_text").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.get_text").ok()?),
         })
     }
     async fn invoke(
@@ -2093,7 +2152,7 @@ impl Tool for BrowserGetTextTool {
             "browser.get_text",
             &ctx,
             Capability::DesktopObserve,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         let text = self
             .backend
@@ -2123,7 +2182,7 @@ impl Tool for BrowserGetAttributeTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopObserve,
-            resource: Resource::Window(tab_arg(args, "browser.get_attribute").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.get_attribute").ok()?),
         })
     }
     async fn invoke(
@@ -2142,7 +2201,7 @@ impl Tool for BrowserGetAttributeTool {
             "browser.get_attribute",
             &ctx,
             Capability::DesktopObserve,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         let value = self
             .backend
@@ -2176,7 +2235,7 @@ impl Tool for BrowserWaitForTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopObserve,
-            resource: Resource::Window(tab_arg(args, "browser.wait_for").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.wait_for").ok()?),
         })
     }
     async fn invoke(
@@ -2196,7 +2255,7 @@ impl Tool for BrowserWaitForTool {
             "browser.wait_for",
             &ctx,
             Capability::DesktopObserve,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         self.backend
             .wait_for(&tab_id, selector, text, timeout_ms)
@@ -2222,7 +2281,7 @@ impl Tool for BrowserScreenshotTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopObserve,
-            resource: Resource::Window(tab_arg(args, "browser.screenshot").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.screenshot").ok()?),
         })
     }
     async fn invoke(
@@ -2235,7 +2294,7 @@ impl Tool for BrowserScreenshotTool {
             "browser.screenshot",
             &ctx,
             Capability::DesktopObserve,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         let image = self
             .backend
@@ -2258,7 +2317,7 @@ impl Tool for BrowserCookiesListTool {
         ToolMetadata {
             id: capability_core::ToolId::new("browser.cookies.list"),
             description:
-                "List a tab's cookies. Values may contain session secrets: never log them."
+                "List a tab's cookie metadata (name/domain/path/flags). Values are credentials and are NEVER returned: use set/delete by name to manage cookies."
                     .to_string(),
             input_schema: serde_json::json!({
                 "type": "object", "additionalProperties": false,
@@ -2270,7 +2329,7 @@ impl Tool for BrowserCookiesListTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopObserve,
-            resource: Resource::Window(tab_arg(args, "browser.cookies.list").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.cookies.list").ok()?),
         })
     }
     async fn invoke(
@@ -2283,15 +2342,31 @@ impl Tool for BrowserCookiesListTool {
             "browser.cookies.list",
             &ctx,
             Capability::DesktopObserve,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         let cookies = self
             .backend
             .cookies_list(&tab_id)
             .await
             .map_err(|error| backend_error("browser.cookies.list", error))?;
+        // Cookie values are credentials: names, domains, paths, and flags
+        // are model-visible, values are redacted by default with no raw
+        // opt-out. Cookie mutation stays available by name (set/delete).
+        let redacted = cookies
+            .into_iter()
+            .map(|cookie| {
+                serde_json::json!({
+                    "name": cookie.name,
+                    "domain": cookie.domain,
+                    "path": cookie.path,
+                    "secure": cookie.secure,
+                    "http_only": cookie.http_only,
+                    "value_redacted": true,
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(ToolOutput::json(
-            serde_json::json!({ "tab_id": tab_id, "cookies": cookies }),
+            serde_json::json!({ "tab_id": tab_id, "cookies": redacted }),
         ))
     }
 }
@@ -2354,7 +2429,7 @@ impl Tool for BrowserCookiesSetTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopControl,
-            resource: Resource::Window(tab_arg(args, "browser.cookies.set").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.cookies.set").ok()?),
         })
     }
     async fn invoke(
@@ -2368,7 +2443,7 @@ impl Tool for BrowserCookiesSetTool {
             "browser.cookies.set",
             &ctx,
             Capability::DesktopControl,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         self.backend
             .cookies_set(&tab_id, cookie)
@@ -2396,7 +2471,7 @@ impl Tool for BrowserCookiesDeleteTool {
     fn required_capability(&self, args: &serde_json::Value) -> Option<CapabilityRequirement> {
         Some(CapabilityRequirement {
             capability: Capability::DesktopControl,
-            resource: Resource::Window(tab_arg(args, "browser.cookies.delete").ok()?),
+            resource: Resource::BrowserTab(tab_arg(args, "browser.cookies.delete").ok()?),
         })
     }
     async fn invoke(
@@ -2414,7 +2489,7 @@ impl Tool for BrowserCookiesDeleteTool {
             "browser.cookies.delete",
             &ctx,
             Capability::DesktopControl,
-            Resource::Window(tab_id.clone()),
+            Resource::BrowserTab(tab_id.clone()),
         )?;
         self.backend
             .cookies_delete(&tab_id, name)
@@ -2699,7 +2774,14 @@ mod tests {
             Err(BrowserError::Unsupported("fake has no pixels".to_string()))
         }
         async fn cookies_list(&self, _tab_id: &str) -> Result<Vec<BrowserCookie>, BrowserError> {
-            Ok(Vec::new())
+            Ok(vec![BrowserCookie {
+                name: "sessionid".to_string(),
+                value: "session-secret-abc".to_string(),
+                domain: "example.com".to_string(),
+                path: "/".to_string(),
+                secure: true,
+                http_only: true,
+            }])
         }
         async fn cookies_set(
             &self,
@@ -2854,7 +2936,7 @@ mod tests {
             .invoke(
                 ctx_for(
                     Capability::DesktopControl,
-                    Resource::Window("tab-1".to_string()),
+                    Resource::BrowserTab("tab-1".to_string()),
                 ),
                 serde_json::json!({"tab_id": "tab-1", "node_id": "ax-1"}),
             )
@@ -2912,5 +2994,138 @@ mod tests {
         assert_eq!(node_finder("dom-3"), "utsuwaLastQuery[3]");
         // AX ids have no live DOM handle: the script must fail honestly.
         assert_eq!(node_finder("ax-9"), "null");
+    }
+
+    #[test]
+    fn sensitive_nodes_cover_credentials_payments_and_secrets() {
+        // Desktop-parity needles: every one of these masks the value.
+        for name in [
+            "Password",
+            "Current password",
+            "PIN field",
+            "One-time code",
+            "OTP",
+            "Credit card number",
+            "Card CVV",
+            "CVC",
+            "API key",
+            "Client secret",
+            "Bearer token",
+            "Private key",
+            "Seed phrase",
+            "SSN",
+            "Passport number",
+            "Authenticator app",
+            "Sign-in",
+        ] {
+            let node = ax_node_to_browser(&serde_json::json!({
+                "nodeId": "7",
+                "role": {"value": "textbox"},
+                "name": {"value": name},
+                "value": {"value": "hunter2"},
+            }))
+            .unwrap();
+            assert!(node.sensitive, "{name}");
+            assert_eq!(node.value.as_deref(), Some(BROWSER_SENSITIVE_MASK), "{name}");
+        }
+        for name in ["Save", "Search", "Username", "Product title"] {
+            let node = ax_node_to_browser(&serde_json::json!({
+                "nodeId": "8",
+                "role": {"value": "button"},
+                "name": {"value": name},
+                "value": {"value": "visible"},
+            }))
+            .unwrap();
+            assert!(!node.sensitive, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cookie_values_are_redacted_in_list() {
+        let backend: Arc<dyn BrowserBackend> = Arc::new(FakeBrowser::new());
+        let list = BrowserCookiesListTool { backend };
+        let out = list
+            .invoke(
+                ctx_for(
+                    Capability::DesktopObserve,
+                    Resource::BrowserTab("tab-1".to_string()),
+                ),
+                serde_json::json!({"tab_id": "tab-1"}),
+            )
+            .await
+            .unwrap();
+        let cookies = out.content["cookies"].as_array().unwrap();
+        assert_eq!(cookies.len(), 1);
+        // Metadata visible…
+        assert_eq!(cookies[0]["name"], "sessionid");
+        assert_eq!(cookies[0]["domain"], "example.com");
+        assert_eq!(cookies[0]["value_redacted"], true);
+        // …value nowhere: no `value` key, no secret bytes anywhere.
+        assert!(cookies[0].get("value").is_none());
+        assert!(
+            !out.content.to_string().contains("session-secret-abc"),
+            "{out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn navigate_needs_tab_control_plus_network() {
+        use capability_core::ResourceScope;
+        use std::time::Duration;
+        let backend: Arc<dyn BrowserBackend> = Arc::new(FakeBrowser::new());
+        let navigate = BrowserNavigateTool { backend };
+        let args = serde_json::json!({"tab_id": "tab-1", "url": "https://example.com/"});
+        // Declared preflight names both tickets for the agent loop.
+        let declared = navigate.required_capabilities(&args);
+        assert_eq!(declared.len(), 2);
+        assert!(declared.iter().any(|requirement| {
+            requirement.capability == Capability::DesktopControl
+                && requirement.resource == Resource::BrowserTab("tab-1".to_string())
+        }));
+        assert!(declared.iter().any(|requirement| {
+            requirement.capability == Capability::NetworkConnect
+        }));
+        let ctx_with =
+            |capability: Capability, resource: Resource| -> ToolContext {
+                let ctx = ToolContext::new(Principal::Agent(AgentId::new("t")));
+                let ticket = capability_core::CapabilityTicket::mint(
+                    ctx.principal.clone(),
+                    capability,
+                    ResourceScope::new(vec![resource]),
+                    ctx.invocation_id,
+                    Duration::from_secs(120),
+                );
+                ctx.with_ticket(ticket)
+            };
+        let network = url_resource("https://example.com/").unwrap();
+        // Network ticket alone must not steer the tab.
+        let err = navigate
+            .invoke(
+                ctx_with(Capability::NetworkConnect, network),
+                args.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("permission_required"), "{err:?}");
+        // Both tickets: the backend runs.
+        let both = {
+            let ctx = ToolContext::new(Principal::Agent(AgentId::new("t")));
+            let network_ticket = capability_core::CapabilityTicket::mint(
+                ctx.principal.clone(),
+                Capability::NetworkConnect,
+                ResourceScope::new(vec![url_resource("https://example.com/").unwrap()]),
+                ctx.invocation_id,
+                Duration::from_secs(120),
+            );
+            let control_ticket = capability_core::CapabilityTicket::mint(
+                ctx.principal.clone(),
+                Capability::DesktopControl,
+                ResourceScope::new(vec![Resource::BrowserTab("tab-1".to_string())]),
+                ctx.invocation_id,
+                Duration::from_secs(120),
+            );
+            ctx.with_ticket(network_ticket).with_ticket(control_ticket)
+        };
+        navigate.invoke(both, args).await.unwrap();
     }
 }
