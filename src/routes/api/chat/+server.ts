@@ -12,12 +12,111 @@ import {
 	hasApiKey,
 	normalizeOptionalApiKey
 } from '$lib/services/providers/openai-compatible';
+import { isMcpProxyEnabled } from '../mcp/shared';
+import { parseMcpServerConfigs } from '$lib/services/mcp/types';
+import { resolveMcpChatTools, mergeConfirmTools } from '$lib/services/mcp/chat-tools';
+import {
+	runMcpToolLoop,
+	openaiToolAdapter,
+	withPromptHardening,
+	parsePromptHardeningEnv,
+	parseConfirmToolsEnv,
+	type ToolLoopMessage
+} from '$lib/services/mcp/tool-loop';
+import type { FetchImpl } from '$lib/services/mcp/http-client';
 
 // Providers that don't require API keys
 const LOCAL_PROVIDERS: LLMProvider[] = ['ollama', 'lmstudio'];
 
-export const POST: RequestHandler = async ({ request }) => {
-	const { messages, provider, model, apiKey, baseURL, systemPrompt, temperature, maxTokens, topP, presencePenalty, frequencyPenalty } = await request.json();
+interface ServerMcpLoop {
+	/** Round text produced before the final streamed answer. */
+	prefixText: string;
+	/** Full transcript (hardened system + tool turns) for the final call. */
+	messages: ToolLoopMessage[];
+	error?: string;
+}
+
+/**
+ * Run the MCP tool loop ahead of the final streamed answer. Returns null when
+ * MCP is unusable for this request (proxy disabled, no valid servers, no
+ * tools) so the caller falls back to plain chat — chat never breaks because
+ * MCP is down. Tool rounds reuse the already SSRF-guarded provider URL, and
+ * tool execution goes through the same `/api/mcp` proxy (with its own guards)
+ * that the browser uses.
+ */
+async function runServerMcpLoop(args: {
+	mcp: unknown;
+	providerBaseURL: string;
+	apiKey?: string;
+	model: string;
+	system: string;
+	messages: ToolLoopMessage[];
+	proxyFetch: FetchImpl;
+}): Promise<ServerMcpLoop | null> {
+	const record = args.mcp && typeof args.mcp === 'object' ? (args.mcp as Record<string, unknown>) : null;
+	if (!record || !isMcpProxyEnabled(env.MCP_ENABLED)) return null;
+	const { servers } = parseMcpServerConfigs(record.servers);
+	if (servers.length === 0) return null;
+	const clientConfirm = Array.isArray(record.confirmTools)
+		? record.confirmTools.filter((entry): entry is string => typeof entry === 'string')
+		: [];
+	const tools = await resolveMcpChatTools({
+		enabled: true,
+		servers,
+		mode: 'proxy',
+		proxyAvailable: true,
+		confirmTools: mergeConfirmTools(clientConfirm, parseConfirmToolsEnv(env.PUBLIC_MCP_CONFIRM_TOOLS)),
+		fetchImpl: args.proxyFetch
+	});
+	if (!tools) return null;
+	const system = parsePromptHardeningEnv(env.PUBLIC_MCP_PROMPT_HARDENING)
+		? withPromptHardening(args.system)
+		: args.system;
+	const auth = normalizeOptionalApiKey(args.apiKey);
+	const adapter = openaiToolAdapter({
+		fetchImpl: (url, init) => fetch(url, init),
+		url: `${args.providerBaseURL.replace(/\/+$/, '')}/chat/completions`,
+		headers: auth ? { Authorization: `Bearer ${auth}` } : {},
+		model: args.model
+	});
+	let prefixText = '';
+	const result = await runMcpToolLoop({
+		messages: [{ role: 'system', content: system }, ...args.messages],
+		definitions: tools.definitions,
+		caller: (name, argsText) => tools.executor.execute(name, argsText),
+		adapter,
+		onText: (text) => {
+			prefixText += text;
+		}
+	});
+	if (result.error) {
+		return { prefixText, messages: result.messages, error: sanitizeProviderError(result.error, args.providerBaseURL) };
+	}
+	return { prefixText, messages: result.messages };
+}
+
+const SSE_HEADERS = {
+	'Content-Type': 'text/event-stream',
+	'Cache-Control': 'no-cache',
+	Connection: 'keep-alive'
+};
+
+function sseErrorResponse(prefixText: string, error: string): Response {
+	const encoder = new TextEncoder();
+	const stream = new ReadableStream({
+		start(controller) {
+			for (let i = 0; i < prefixText.length; i += 4000) {
+				controller.enqueue(encoder.encode(`0:${JSON.stringify(prefixText.slice(i, i + 4000))}\n`));
+			}
+			controller.enqueue(encoder.encode(`e:${JSON.stringify({ error })}\n`));
+			controller.close();
+		}
+	});
+	return new Response(stream, { headers: SSE_HEADERS });
+}
+
+export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
+	const { messages, provider, model, apiKey, baseURL, systemPrompt, temperature, maxTokens, topP, presencePenalty, frequencyPenalty, mcp } = await request.json();
 
 	if (!Array.isArray(messages)) {
 		return new Response(JSON.stringify({ error: 'messages must be an array' }), {
@@ -78,13 +177,35 @@ export const POST: RequestHandler = async ({ request }) => {
 		// Add system message (use provided systemPrompt or default)
 		const defaultSystemPrompt =
 			'You are a friendly AI assistant displayed as a VRM avatar named Utsuwa. Keep responses conversational and relatively concise.';
-		const messagesWithSystem = [
+		let messagesWithSystem = [
 			{
 				role: 'system' as const,
 				content: systemPrompt || defaultSystemPrompt
 			},
 			...messages
 		];
+		let mcpPrefixText = '';
+
+		// MCP tool rounds run ahead of the final streamed answer. Anthropic is
+		// skipped: its tool_result transcript cannot flow through this route's
+		// OpenAI-shaped xsai stream (Anthropic users get MCP tools through the
+		// direct browser transport instead).
+		if (mcp !== undefined && mcp !== null && typedProvider !== 'anthropic') {
+			const loop = await runServerMcpLoop({
+				mcp,
+				providerBaseURL,
+				apiKey,
+				model,
+				system: systemPrompt || defaultSystemPrompt,
+				messages: messages as ToolLoopMessage[],
+				proxyFetch: (url, init) => eventFetch(url, init)
+			});
+			if (loop) {
+				if (loop.error) return sseErrorResponse(loop.prefixText, loop.error);
+				mcpPrefixText = loop.prefixText;
+				messagesWithSystem = loop.messages as typeof messagesWithSystem;
+			}
+		}
 
 		let result;
 		try {
@@ -129,6 +250,12 @@ export const POST: RequestHandler = async ({ request }) => {
 		const encoder = new TextEncoder();
 		const stream = new ReadableStream({
 			async start(controller) {
+				// Tool-round text the loop already produced, ahead of the final answer.
+				for (let i = 0; i < mcpPrefixText.length; i += 4000) {
+					controller.enqueue(
+						encoder.encode(`0:${JSON.stringify(mcpPrefixText.slice(i, i + 4000))}\n`)
+					);
+				}
 				let reader;
 				try {
 					reader = textStream.getReader();

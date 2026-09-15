@@ -41,6 +41,62 @@ function getCurrentSiteOrigin(): string | undefined {
 	return typeof window !== 'undefined' ? window.location.origin : undefined;
 }
 
+export interface DirectChatEndpoint {
+	/** Fully-qualified chat URL (…/chat/completions or …/messages). */
+	url: string;
+	headers: Record<string, string>;
+	isLocal: boolean;
+	/** Provider base URL before the chat path (used in error messages). */
+	baseUrl: string;
+}
+
+/**
+ * Resolve the endpoint + auth headers for a direct browser→provider call.
+ * Shared by the streaming path and the MCP tool-loop path so both hit the
+ * same URL with the same auth. Returns an error string instead of throwing.
+ */
+export function resolveDirectChatEndpoint(
+	provider: LLMProvider,
+	baseURL: string | undefined,
+	apiKey: string | undefined
+): { endpoint: DirectChatEndpoint } | { error: string } {
+	const isLocal = isLocalLLMProvider(provider);
+	const providerMeta = getLLMProvider(provider);
+	const requiresApiKey = providerMeta?.authentication === 'required' || providerMeta?.requiresApiKey === true;
+	// Optional-key/public providers (including Kilo) and custom endpoints may
+	// be used anonymously; required-key providers still fail early.
+	if (!hasApiKey(apiKey) && requiresApiKey) {
+		return { error: 'API key required' };
+	}
+
+	// Local providers get their known `/v1` normalization. Custom endpoints keep
+	// their configured path, so gateways mounted below `/openai` or `/api` are
+	// not rewritten to a path they do not implement.
+	const providerBaseURL = isLocal || provider === 'openai-compatible'
+		? getChatBaseUrl(provider, baseURL)
+		: baseURL || DEFAULT_CHAT_BASE_URLS[provider];
+	if (!providerBaseURL) {
+		return { error: `Unknown provider: ${provider}` };
+	}
+
+	const headers: Record<string, string> = {
+		'Content-Type': 'application/json'
+	};
+
+	if (provider === 'anthropic') {
+		headers['x-api-key'] = apiKey || '';
+		headers['anthropic-version'] = '2023-06-01';
+		headers['anthropic-dangerous-direct-browser-access'] = 'true';
+	} else {
+		Object.assign(headers, optionalBearerHeaders(apiKey));
+	}
+
+	const url = provider === 'anthropic'
+		? `${providerBaseURL.replace(/\/+$/, '')}/messages`
+		: `${providerBaseURL.replace(/\/+$/, '')}/chat/completions`;
+	return { endpoint: { url, headers, isLocal, baseUrl: providerBaseURL } };
+}
+
 async function readResponsePrefix(response: Response, maxBytes: number): Promise<string> {
 	const reader = response.body?.getReader();
 	if (!reader) return '';
@@ -77,43 +133,19 @@ export async function streamChatDirect(
 ): Promise<void> {
 	const { messages, provider, model, apiKey, baseURL, systemPrompt } = options;
 
-	const isLocal = isLocalLLMProvider(provider);
-	const providerMeta = getLLMProvider(provider);
-	const requiresApiKey = providerMeta?.authentication === 'required' || providerMeta?.requiresApiKey === true;
-	// Optional-key/public providers (including Kilo) and custom endpoints may
-	// be used anonymously; required-key providers still fail early.
-	if (!hasApiKey(apiKey) && requiresApiKey) {
-		onError('API key required');
+	const resolved = resolveDirectChatEndpoint(provider, baseURL, apiKey);
+	if ('error' in resolved) {
+		onError(resolved.error);
 		return;
 	}
-
-	// Local providers get their known `/v1` normalization. Custom endpoints keep
-	// their configured path, so gateways mounted below `/openai` or `/api` are
-	// not rewritten to a path they do not implement.
-	const providerBaseURL = isLocal || provider === 'openai-compatible'
-		? getChatBaseUrl(provider, baseURL)
-		: baseURL || DEFAULT_CHAT_BASE_URLS[provider];
-	if (!providerBaseURL) {
-		onError(`Unknown provider: ${provider}`);
-		return;
-	}
+	const {
+		endpoint: { url, headers, isLocal, baseUrl: providerBaseURL }
+	} = resolved;
 
 	const messagesWithSystem: ChatMessage[] = [
 		{ role: 'system', content: systemPrompt },
 		...messages
 	];
-
-	const headers: Record<string, string> = {
-		'Content-Type': 'application/json'
-	};
-
-	if (provider === 'anthropic') {
-		headers['x-api-key'] = apiKey || '';
-		headers['anthropic-version'] = '2023-06-01';
-		headers['anthropic-dangerous-direct-browser-access'] = 'true';
-	} else {
-		Object.assign(headers, optionalBearerHeaders(apiKey));
-	}
 
 	// Anthropic uses a different request format, and each provider wants images
 	// wrapped its own way (image_url data URLs vs base64 source blocks).
@@ -141,10 +173,6 @@ export async function streamChatDirect(
 					...(options.presencePenalty !== undefined && { presence_penalty: options.presencePenalty }),
 					...(options.frequencyPenalty !== undefined && { frequency_penalty: options.frequencyPenalty })
 				});
-
-	const url = provider === 'anthropic'
-		? `${providerBaseURL.replace(/\/+$/, '')}/messages`
-		: `${providerBaseURL.replace(/\/+$/, '')}/chat/completions`;
 
 	try {
 		const response = await fetch(url, { method: 'POST', headers, body });

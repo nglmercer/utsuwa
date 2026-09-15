@@ -6,6 +6,7 @@
 // post-turn processing, keepsakes, TTS, and the talking animation. Pages provide
 // a small set of hooks to sync their own reactive state.
 import { characterStore } from '$lib/stores/character.svelte';
+import { env as publicEnv } from '$env/dynamic/public';
 import type { ThinkingPhase } from './chat-phase';
 import { chatStore } from '$lib/stores/chat.svelte';
 import { settingsStore } from '$lib/stores/settings.svelte';
@@ -15,7 +16,22 @@ import { personaStore } from '$lib/stores/persona.svelte';
 import { vrmStore } from '$lib/stores/vrm.svelte';
 import { getLLMProvider, getTTSProvider } from '$lib/services/providers/registry';
 import { hasApiKey } from '$lib/services/providers/openai-compatible';
-import { streamChatDirect } from '$lib/services/chat/client-chat';
+import { streamChatDirect, resolveDirectChatEndpoint } from '$lib/services/chat/client-chat';
+import {
+	resolveMcpChatTools,
+	isMcpProxyAvailable,
+	selectMcpExecutorMode,
+	mergeConfirmTools
+} from '$lib/services/mcp/chat-tools';
+import {
+	runMcpToolLoop,
+	openaiToolAdapter,
+	anthropicToolAdapter,
+	withPromptHardening,
+	parsePromptHardeningEnv,
+	parseConfirmToolsEnv,
+	type ToolLoopMessage
+} from '$lib/services/mcp/tool-loop';
 import { processCompanionTurn } from '$lib/services/chat/companion-turn';
 import { retrieveRelevantContext } from '$lib/engine/memory';
 import { buildSystemPrompt, truncateChatHistory, type PromptContext } from '$lib/ai/prompt-builder';
@@ -23,8 +39,8 @@ import { keepImage, type PreparedImage } from '$lib/services/storage/keepsakes';
 import { extractReminderTags, tryExtractReminderFromUserMessage } from '$lib/utils/reminders';
 import { reminderStore } from '$lib/stores/reminders.svelte';
 import { getWorkingMemory, ensureSession } from '$lib/engine/memory';
-import { toOpenAIContent, type ContentPart } from '$lib/services/chat/content';
-import { isDesktopBuildExpected, isNativeRuntimeAvailable } from '$lib/services/platform';
+import { toOpenAIContent, toAnthropicContent, type ContentPart } from '$lib/services/chat/content';
+import { isDesktopBuild, isDesktopBuildExpected, isNativeRuntimeAvailable } from '$lib/services/platform';
 import { sendAgentMessage } from '$lib/services/native/agent.svelte';
 import type { NativeToolStep } from '$lib/services/native/agent';
 import { syncNativeModelProvider } from '$lib/services/native/model-settings';
@@ -93,6 +109,86 @@ function buildMessages(images: PreparedImage[]) {
 		}
 		return { role: m.role as 'user' | 'assistant', content: parts };
 	});
+}
+
+// Deployment-level MCP flags (PUBLIC_* env, baked at build time).
+function mcpConfirmTools(): string[] {
+	return mergeConfirmTools(parseConfirmToolsEnv(publicEnv.PUBLIC_MCP_CONFIRM_TOOLS));
+}
+
+function mcpPromptHardening(): boolean {
+	return parsePromptHardeningEnv(publicEnv.PUBLIC_MCP_PROMPT_HARDENING);
+}
+
+// Prime MCP tools for a direct-transport turn. Returns null when MCP is
+// inactive so the caller falls back to plain streaming.
+async function resolveDirectMcpTurn() {
+	if (!settingsStore.mcpEnabled || settingsStore.mcpServers.length === 0) return null;
+	const proxyAvailable = await isMcpProxyAvailable();
+	return resolveMcpChatTools({
+		enabled: true,
+		servers: settingsStore.mcpServers,
+		mode: selectMcpExecutorMode(isDesktopBuild()),
+		proxyAvailable,
+		confirmTools: mcpConfirmTools()
+	});
+}
+
+// Run one direct-transport turn through the MCP tool loop (up to 5
+// model→tools→model rounds). Round text streams into the bubble via onDelta;
+// throws on provider failure (partial text stays visible, like a stream cut).
+async function runDirectMcpTurn(args: {
+	provider: LLMProvider;
+	model: string;
+	apiKey?: string;
+	baseURL?: string;
+	systemPrompt: string;
+	messages: { role: 'user' | 'assistant'; content: string | ContentPart[] }[];
+	onDelta: (full: string) => void;
+}): Promise<string | null> {
+	const tools = await resolveDirectMcpTurn();
+	if (!tools) return null;
+	const resolved = resolveDirectChatEndpoint(args.provider, args.baseURL, args.apiKey);
+	if ('error' in resolved) throw new Error(resolved.error);
+	const { url, headers } = resolved.endpoint;
+	const system = mcpPromptHardening() ? withPromptHardening(args.systemPrompt) : args.systemPrompt;
+	const isAnthropic = args.provider === 'anthropic';
+	const fetchImpl = (url: string, init: RequestInit) => fetch(url, init);
+	const adapter = isAnthropic
+		? anthropicToolAdapter({ fetchImpl, url, headers, model: args.model, system })
+		: openaiToolAdapter({ fetchImpl, url, headers, model: args.model });
+	const initial: ToolLoopMessage[] = isAnthropic
+		? args.messages.map((m) => ({ role: m.role, content: toAnthropicContent(m.content) }))
+		: [
+				{ role: 'system', content: system },
+				...args.messages.map((m) => ({ role: m.role, content: toOpenAIContent(m.content) }))
+			];
+	let full = '';
+	const result = await runMcpToolLoop({
+		messages: initial,
+		definitions: tools.definitions,
+		caller: (name, argsText) => tools.executor.execute(name, argsText),
+		adapter,
+		onText: (text) => {
+			full += text;
+			args.onDelta(full);
+		}
+	});
+	if (result.error) throw new Error(result.error);
+	return result.text;
+}
+
+// MCP payload for the server route. The server re-validates everything and
+// falls back to plain chat when its proxy is disabled; this client check just
+// avoids sending server configs (which may carry tokens) pointlessly.
+async function buildServerMcpBody(): Promise<
+	{ servers: unknown[]; confirmTools: string[] } | null
+> {
+	if (!settingsStore.mcpEnabled || settingsStore.mcpServers.length === 0) return null;
+	if (!(await isMcpProxyAvailable())) return null;
+	const servers = settingsStore.mcpServers.filter((s) => s.enabled);
+	if (servers.length === 0) return null;
+	return { servers, confirmTools: mcpConfirmTools() };
 }
 
 // Consume the server route's 0:/e: SSE framing, buffering partial lines. The
@@ -289,27 +385,44 @@ export async function sendCompanionMessage(
 		} else if (transport === 'direct') {
 			// Local providers still use the existing direct browser transport on
 			// web builds, where there is no native host.
-			await new Promise<void>((resolve, reject) => {
-				streamChatDirect(
-					{
-						messages,
-						provider: provider as LLMProvider,
-						model: selectedModel,
-						apiKey: apiKey || undefined,
-						baseURL,
-						systemPrompt,
-						...advancedParams
-					},
-					(text) => {
-						fullContent += text;
-						onDelta(fullContent);
-					},
-					(error) => reject(new Error(error)),
-					() => resolve()
-				);
+			const mcpText = await runDirectMcpTurn({
+				provider: provider as LLMProvider,
+				model: selectedModel,
+				apiKey: apiKey || undefined,
+				baseURL,
+				systemPrompt,
+				messages,
+				onDelta: (full) => {
+					fullContent = full;
+					onDelta(full);
+				}
 			});
+			if (mcpText !== null) {
+				fullContent = mcpText;
+			} else {
+				await new Promise<void>((resolve, reject) => {
+					streamChatDirect(
+						{
+							messages,
+							provider: provider as LLMProvider,
+							model: selectedModel,
+							apiKey: apiKey || undefined,
+							baseURL,
+							systemPrompt,
+							...advancedParams
+						},
+						(text) => {
+							fullContent += text;
+							onDelta(fullContent);
+						},
+						(error) => reject(new Error(error)),
+						() => resolve()
+					);
+				});
+			}
 		} else {
 			// Cloud providers on web go through the SvelteKit server route.
+			const mcp = await buildServerMcpBody();
 			fullContent = await streamServerRoute(
 				{
 					messages: messages.map((m) => ({ role: m.role, content: toOpenAIContent(m.content) })),
@@ -320,7 +433,8 @@ export async function sendCompanionMessage(
 					apiKey: apiKey || undefined,
 					baseURL,
 					systemPrompt,
-					...advancedParams
+					...advancedParams,
+					...(mcp ? { mcp } : {})
 				},
 				onDelta
 			);

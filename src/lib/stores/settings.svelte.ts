@@ -8,6 +8,7 @@ import { getBridge } from '$lib/services/native/bridge';
 import { isDesktopBuild } from '$lib/services/platform';
 import { getChatBaseUrl } from '$lib/services/providers/local-endpoints';
 import type { ModelInfo } from '$lib/services/providers/model-capabilities';
+import { parseMcpServerConfigs, type McpServerConfig } from '$lib/services/mcp/types';
 
 export type ProviderCategory = 'llm' | 'tts' | 'stt';
 
@@ -34,6 +35,11 @@ function createSettingsStore() {
 	// Desktop hotkey configuration
 	let hotkeys = $state<HotkeyConfig>({ ...DEFAULT_HOTKEYS });
 
+	// MCP (Model Context Protocol) servers for chat tool use. Off by default;
+	// server configs are validated on load so one bad entry can't break chat.
+	let mcpEnabled = $state(false);
+	let mcpServers = $state<McpServerConfig[]>([]);
+
 	// Load from localStorage on init. Keep the reactive reads inside a closure:
 	// Svelte 5 otherwise treats a top-level initialization block as capturing
 	// only the initial value of rune state.
@@ -46,6 +52,8 @@ function createSettingsStore() {
 				addedProviders = parsed.addedProviders ?? {};
 				selectedSttProvider = parseSttProvider(parsed.sttProvider);
 				hotkeys = { ...DEFAULT_HOTKEYS, ...parsed.hotkeys };
+				mcpEnabled = parsed.mcpEnabled === true;
+				mcpServers = parseMcpServerConfigs(parsed.mcpServers).servers;
 
 				// Migrate old settings format if needed
 				if (parsed.anthropicApiKey && !providerConfigs.anthropic) {
@@ -94,7 +102,9 @@ function createSettingsStore() {
 			const persistedSettings: Record<string, unknown> = {
 				providerConfigs: persistedProviderConfigs,
 				addedProviders,
-				hotkeys
+				hotkeys,
+				mcpEnabled,
+				mcpServers
 			};
 			if (selectedSttProvider) persistedSettings.sttProvider = selectedSttProvider;
 			localStorage.setItem('utsuwa-settings', JSON.stringify(persistedSettings));
@@ -182,6 +192,8 @@ function createSettingsStore() {
 					addedProviders = parsed.addedProviders ?? {};
 					selectedSttProvider = parseSttProvider(parsed.sttProvider);
 					hotkeys = { ...DEFAULT_HOTKEYS, ...parsed.hotkeys };
+					mcpEnabled = parsed.mcpEnabled === true;
+					mcpServers = parseMcpServerConfigs(parsed.mcpServers).servers;
 				} catch {
 					// Ignore malformed data from other window
 				}
@@ -325,6 +337,54 @@ function createSettingsStore() {
 		return config.cachedModels;
 	}
 
+	// MCP server configuration (validated; invalid entries are dropped)
+	function setMcpEnabled(enabled: boolean) {
+		mcpEnabled = enabled;
+		save();
+	}
+
+	function getMcpServers(): McpServerConfig[] {
+		return mcpServers;
+	}
+
+	/** Replace the whole list. Returns reasons for dropped entries. */
+	function setMcpServers(servers: unknown): string[] {
+		const parsed = parseMcpServerConfigs(servers);
+		mcpServers = parsed.servers;
+		save();
+		return parsed.dropped;
+	}
+
+	function addMcpServer(server: unknown): string | null {
+		const parsed = parseMcpServerConfigs([server]);
+		if (parsed.servers.length !== 1) return parsed.dropped[0] ?? 'Invalid server config';
+		const next = parsed.servers[0];
+		if (mcpServers.some((s) => s.id === next.id)) return `A server with id '${next.id}' already exists`;
+		mcpServers = [...mcpServers, next];
+		save();
+		return null;
+	}
+
+	function updateMcpServer(id: string, patch: Record<string, unknown>): string | null {
+		const index = mcpServers.findIndex((s) => s.id === id);
+		if (index < 0) return `Unknown server '${id}'`;
+		const parsed = parseMcpServerConfigs([{ ...mcpServers[index], ...patch, id }]);
+		if (parsed.servers.length !== 1) return parsed.dropped[0] ?? 'Invalid server config';
+		mcpServers = mcpServers.map((s, i) => (i === index ? parsed.servers[0] : s));
+		save();
+		return null;
+	}
+
+	function removeMcpServer(id: string) {
+		mcpServers = mcpServers.filter((s) => s.id !== id);
+		save();
+	}
+
+	function setMcpServerEnabled(id: string, enabled: boolean) {
+		mcpServers = mcpServers.map((s) => (s.id === id ? { ...s, enabled } : s));
+		save();
+	}
+
 	// Hotkey configuration
 	function setHotkey(action: keyof HotkeyConfig, shortcut: string) {
 		hotkeys[action] = shortcut;
@@ -384,7 +444,22 @@ function createSettingsStore() {
 			return hotkeys;
 		},
 		setHotkey,
-		resetHotkeys
+		resetHotkeys,
+
+		// MCP servers
+		get mcpEnabled() {
+			return mcpEnabled;
+		},
+		get mcpServers() {
+			return mcpServers;
+		},
+		setMcpEnabled,
+		getMcpServers,
+		setMcpServers,
+		addMcpServer,
+		updateMcpServer,
+		removeMcpServer,
+		setMcpServerEnabled
 	};
 }
 
