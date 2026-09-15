@@ -97,6 +97,25 @@ pub enum IpcMethod {
     PluginUpdate,
     #[serde(rename = "plugin.remove")]
     PluginRemove,
+    /// Queryable host state for the deterministic frontend/native
+    /// handshake. A one-shot `app.ready` event must not be the only source
+    /// of truth: the frontend calls this after registering listeners (and
+    /// again after any missed event) to learn the host version, platform,
+    /// desktop backend, and bootstrap capabilities.
+    #[serde(rename = "host.runtime_state")]
+    HostRuntimeState,
+    /// Frontend-to-host readiness signal. Sent after the page has
+    /// registered its native event listeners; the host marks the frontend
+    /// ready and answers with the same payload as `host.runtime_state`.
+    /// This replaces timing-dependent `app.ready` delivery.
+    #[serde(rename = "host.frontend_ready")]
+    HostFrontendReady,
+    /// Debug-oriented frontend diagnostic report (`window.onerror`,
+    /// `unhandledrejection`, `console.error`, bootstrap markers). Handled
+    /// by logging a sanitized, truncated record on the host; never returns
+    /// privileged data and performs no host action.
+    #[serde(rename = "diagnostics.report")]
+    DiagnosticsReport,
 }
 
 /// Request envelope: frontend → host.
@@ -222,6 +241,26 @@ mod tests {
     fn raw_shell_is_rejected() {
         let raw = r#"{"id":"1","method":"shell.exec","params":{"cmd":"rm -rf /"}}"#;
         assert!(IpcRequest::parse(raw).is_err());
+    }
+
+    #[test]
+    fn handshake_and_diagnostics_methods_parse() {
+        for (raw, method) in [
+            (
+                r#"{"id":"1","method":"host.runtime_state","params":{}}"#,
+                IpcMethod::HostRuntimeState,
+            ),
+            (
+                r#"{"id":"2","method":"host.frontend_ready","params":{}}"#,
+                IpcMethod::HostFrontendReady,
+            ),
+            (
+                r#"{"id":"3","method":"diagnostics.report","params":{"kind":"window.error"}}"#,
+                IpcMethod::DiagnosticsReport,
+            ),
+        ] {
+            assert_eq!(IpcRequest::parse(raw).unwrap().method, method);
+        }
     }
 
     #[test]

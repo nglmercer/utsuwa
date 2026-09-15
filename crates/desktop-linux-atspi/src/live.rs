@@ -103,9 +103,25 @@ impl AvailabilityProbe for RealAvailabilityProbe {
     }
 }
 
+/// Bound for one registry connection setup. The availability probe has its
+/// own (shorter) budget; live operations share this one.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound for one live registry operation (tree walk, element action). Full
+/// desktop walks over D-Bus can take seconds on loaded systems, so this is
+/// generous — its job is ruling out infinite hangs, not enforcing speed.
+const LIVE_OP_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// One host-owned AT-SPI availability service. Construction starts one
 /// bounded background probe; all subsequent `is_available()` calls are
 /// atomic reads and never touch D-Bus, spawn a thread, or create a runtime.
+///
+/// The service also owns the single cached registry connection. AT-SPI
+/// clients are expected to hold one persistent connection: creating a fresh
+/// `AccessibilityConnection` per call churns D-Bus setup on every status
+/// poll, and re-creation after drop has been observed to hang forever
+/// (nested `block_on` inside the connection constructor's peer-listener
+/// setup), which wedged the host UI thread. Every live operation therefore
+/// runs through [`Self::run_live`] on the shared connection with a timeout.
 #[derive(Clone)]
 pub struct AtspiService {
     state: Arc<AtomicU8>,
@@ -113,6 +129,7 @@ pub struct AtspiService {
     probe: Arc<dyn AvailabilityProbe>,
     last_probe_ms: Arc<AtomicU64>,
     changes: tokio::sync::watch::Sender<Availability>,
+    connection: Arc<tokio::sync::Mutex<Option<AccessibilityConnection>>>,
 }
 
 impl std::fmt::Debug for AtspiService {
@@ -147,6 +164,67 @@ impl AtspiService {
             probe,
             last_probe_ms: Arc::new(AtomicU64::new(0)),
             changes,
+            connection: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Shared registry connection, connecting lazily on first use.
+    /// Concurrent callers serialize on the setup and share the result;
+    /// failures are never cached, so the next call retries.
+    pub async fn connection(&self) -> Result<AccessibilityConnection, AtspiError> {
+        let mut slot = self.connection.lock().await;
+        if let Some(conn) = slot.as_ref() {
+            return Ok(conn.clone());
+        }
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, AccessibilityConnection::new())
+            .await
+            .map_err(|_| {
+                AtspiError::bus(
+                    "registry connect",
+                    "timed out setting up the a11y connection",
+                )
+            })?
+            .map_err(|detail| {
+                AtspiError::BackendUnavailable(format!("AT-SPI registry unreachable: {detail}"))
+            })?;
+        *slot = Some(conn.clone());
+        Ok(conn)
+    }
+
+    /// Drop the cached connection so the next operation reconnects. Called
+    /// automatically by [`Self::run_live`] on bus failures and timeouts; a
+    /// stale cache after a registry restart therefore heals itself.
+    pub async fn invalidate_connection(&self) {
+        *self.connection.lock().await = None;
+    }
+
+    /// Run one live registry operation on the shared connection with a
+    /// timeout. Every live operation must go through here: it is the only
+    /// path that bounds D-Bus hangs and heals a stale connection.
+    pub async fn run_live<F, Fut, R>(
+        &self,
+        operation: &'static str,
+        run: F,
+    ) -> Result<R, AtspiError>
+    where
+        F: FnOnce(AccessibilityConnection) -> Fut,
+        Fut: std::future::Future<Output = Result<R, AtspiError>>,
+    {
+        let conn = self.connection().await?;
+        match tokio::time::timeout(LIVE_OP_TIMEOUT, run(conn)).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error @ AtspiError::Bus { .. })) => {
+                self.invalidate_connection().await;
+                Err(error)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                self.invalidate_connection().await;
+                Err(AtspiError::bus(
+                    operation,
+                    "timed out waiting for the a11y registry",
+                ))
+            }
         }
     }
 
@@ -435,21 +513,19 @@ impl Walker<'_> {
     }
 }
 
-async fn connect() -> Result<(AccessibilityConnection, atspi::zbus::Connection), AtspiError> {
-    let accessible = AccessibilityConnection::new().await.map_err(|detail| {
-        AtspiError::BackendUnavailable(format!("AT-SPI registry unreachable: {detail}"))
-    })?;
-    let connection = accessible.connection().clone();
-    Ok((accessible, connection))
-}
-
 /// One snapshot tree per top-level window, across all applications.
-pub async fn collect_window_trees() -> Result<Vec<AccessibleSnapshot>, AtspiError> {
-    let (accessible, connection) = connect().await?;
+///
+/// Takes the service's shared connection: callers must go through
+/// [`AtspiService::run_live`], never construct a connection per call.
+pub async fn collect_window_trees(
+    accessible: AccessibilityConnection,
+) -> Result<Vec<AccessibleSnapshot>, AtspiError> {
+    let connection = accessible.connection().clone();
     let root = accessible
         .root_accessible_on_registry()
         .await
         .map_err(|detail| AtspiError::bus("registry root", detail))?;
+    tracing::trace!("desktop.atspi.collect.root.ok");
     let mut walker = Walker {
         connection: &connection,
         budget: MAX_TREE_NODES,
@@ -459,6 +535,7 @@ pub async fn collect_window_trees() -> Result<Vec<AccessibleSnapshot>, AtspiErro
         .get_children()
         .await
         .map_err(|detail| AtspiError::bus("list applications", detail))?;
+    tracing::trace!(count = apps.len(), "desktop.atspi.collect.apps.ok");
     for app_ref in apps {
         let Some(app_bus) = app_ref.name_as_str().map(|name| name.to_owned()) else {
             continue;
@@ -511,8 +588,11 @@ fn resolve(id: &str) -> Result<(String, String), AtspiError> {
 
 /// Invoke the element's default action (first `click`-like action, else
 /// the first action the object advertises).
-pub async fn invoke_element(element_id: &str) -> Result<(), AtspiError> {
-    let (_accessible, connection) = connect().await?;
+pub async fn invoke_element(
+    accessible: AccessibilityConnection,
+    element_id: &str,
+) -> Result<(), AtspiError> {
+    let connection = accessible.connection().clone();
     let (bus, path) = resolve(element_id)?;
     let proxy = proxy_for(&connection, &bus, &path).await?;
     let proxies = proxy
@@ -555,8 +635,11 @@ pub async fn invoke_element(element_id: &str) -> Result<(), AtspiError> {
 }
 
 /// Move keyboard focus to the element.
-pub async fn focus_element(element_id: &str) -> Result<(), AtspiError> {
-    let (_accessible, connection) = connect().await?;
+pub async fn focus_element(
+    accessible: AccessibilityConnection,
+    element_id: &str,
+) -> Result<(), AtspiError> {
+    let connection = accessible.connection().clone();
     let (bus, path) = resolve(element_id)?;
     let proxy = proxy_for(&connection, &bus, &path).await?;
     let proxies = proxy
@@ -582,8 +665,12 @@ pub async fn focus_element(element_id: &str) -> Result<(), AtspiError> {
 }
 
 /// Set an editable element's text (or numeric value for `Value` objects).
-pub async fn set_value(element_id: &str, value: &str) -> Result<(), AtspiError> {
-    let (_accessible, connection) = connect().await?;
+pub async fn set_value(
+    accessible: AccessibilityConnection,
+    element_id: &str,
+    value: &str,
+) -> Result<(), AtspiError> {
+    let connection = accessible.connection().clone();
     let (bus, path) = resolve(element_id)?;
     let proxy = proxy_for(&connection, &bus, &path).await?;
     let proxies = proxy
@@ -622,8 +709,11 @@ pub async fn set_value(element_id: &str, value: &str) -> Result<(), AtspiError> 
 }
 
 /// Select the element through its parent's `Selection` interface.
-pub async fn select_element(element_id: &str) -> Result<(), AtspiError> {
-    let (_accessible, connection) = connect().await?;
+pub async fn select_element(
+    accessible: AccessibilityConnection,
+    element_id: &str,
+) -> Result<(), AtspiError> {
+    let connection = accessible.connection().clone();
     let (bus, path) = resolve(element_id)?;
     let proxy = proxy_for(&connection, &bus, &path).await?;
     let parent_ref = proxy
@@ -671,9 +761,13 @@ pub async fn select_element(element_id: &str) -> Result<(), AtspiError> {
 }
 
 /// Run an `expand`- or `collapse`-named action on the element.
-pub async fn expand_element(element_id: &str, expand: bool) -> Result<(), AtspiError> {
+pub async fn expand_element(
+    accessible: AccessibilityConnection,
+    element_id: &str,
+    expand: bool,
+) -> Result<(), AtspiError> {
     let wanted = if expand { "expand" } else { "collapse" };
-    let (_accessible, connection) = connect().await?;
+    let connection = accessible.connection().clone();
     let (bus, path) = resolve(element_id)?;
     let proxy = proxy_for(&connection, &bus, &path).await?;
     let proxies = proxy
@@ -782,5 +876,36 @@ mod tests {
         }
         assert_eq!(service.availability(), Availability::Unavailable);
         assert!(!service.is_available());
+    }
+
+    /// Live-session regression test: repeated window-tree collection through
+    /// the shared service connection (the host's status-snapshot path) must
+    /// complete every time. A fresh `AccessibilityConnection` per call hung
+    /// forever on re-creation and wedged the UI thread; the shared
+    /// connection plus timeouts rule that out. Skips without a registry.
+    #[test]
+    fn repeated_window_tree_collection_completes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let service = AtspiService::new();
+        // The probe runs on a background worker; wait for it before judging
+        // availability so slow sessions skip instead of failing.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.availability() == Availability::Probing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !service.is_available() {
+            eprintln!("SKIP live AT-SPI test: no registry");
+            return;
+        }
+        for round in 1..=3 {
+            let outcome = runtime.block_on(service.run_live("test_collect", collect_window_trees));
+            assert!(
+                outcome.is_ok(),
+                "collect_window_trees round {round} failed: {outcome:?}"
+            );
+        }
     }
 }

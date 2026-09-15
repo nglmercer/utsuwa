@@ -12,10 +12,25 @@ use wry::http::{Request, Response, StatusCode};
 
 pub const APP_SCHEME: &str = "companion";
 pub const APP_HOST: &str = "app";
+/// Serialized origin of the bundled app, the only origin the asset server
+/// ever reflects in `Access-Control-Allow-Origin`.
+pub const APP_ORIGIN: &str = "companion://app";
 
 /// Initial page: the app route, served through the SPA fallback.
 pub fn initial_url() -> String {
     format!("{APP_SCHEME}://{APP_HOST}/app")
+}
+
+/// Bounded startup diagnostics for the bundled asset root.
+#[derive(Debug, Clone)]
+pub struct AssetReport {
+    pub root: PathBuf,
+    pub index_exists: bool,
+    pub index_size: u64,
+    pub index_modified_secs: Option<u64>,
+    pub file_count: usize,
+    /// True when the walk hit its entry cap (count is a lower bound).
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -86,74 +101,216 @@ impl AssetServer {
         Some(resolved)
     }
 
+    /// Canonical asset root (already canonicalized at construction).
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Bounded verification snapshot for startup logging: index presence,
+    /// size, mtime, and a capped file count. Never follows symlinks out of
+    /// the root (the walk stays within canonicalized entries).
+    pub fn report(&self) -> AssetReport {
+        const MAX_ENTRIES: usize = 50_000;
+        const MAX_DEPTH: usize = 12;
+        let index = self.root.join("index.html");
+        let (index_exists, index_size, index_modified_secs) =
+            std::fs::metadata(&index).map_or((false, 0, None), |meta| {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                (meta.is_file(), meta.len(), modified)
+            });
+        let mut file_count = 0usize;
+        let mut truncated = false;
+        let mut stack = vec![(self.root.clone(), 0usize)];
+        'walk: while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if file_count >= MAX_ENTRIES {
+                    truncated = true;
+                    break 'walk;
+                }
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                if kind.is_file() {
+                    file_count += 1;
+                } else if kind.is_dir() && depth < MAX_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                }
+            }
+        }
+        AssetReport {
+            root: self.root.clone(),
+            index_exists,
+            index_size,
+            index_modified_secs,
+            file_count,
+            truncated,
+        }
+    }
+
     pub fn handle(&self, request: Request<Vec<u8>>) -> Response<Cow<'static, [u8]>> {
+        let started = std::time::Instant::now();
+        let method = request.method().to_string();
         let uri = request.uri().clone();
-        let Some(mut path) = self.resolve(&uri) else {
-            return status(StatusCode::FORBIDDEN, "forbidden");
+        let allow_origin = cors_allow_origin(&request);
+        let (path_label, response) = match self.resolve(&uri) {
+            None => (
+                "<rejected>".to_string(),
+                status(StatusCode::FORBIDDEN, "forbidden", allow_origin),
+            ),
+            Some(mut path) => {
+                if path.is_dir() {
+                    path.push("index.html");
+                }
+                if !path.is_file() && is_spa_route(uri.path()) {
+                    // SPA route (e.g. `/app`, `/app/settings`) → client-side router.
+                    path = self.root.join("index.html");
+                }
+                let label = path.display().to_string();
+                let response = match std::fs::read(&path) {
+                    Ok(bytes) => body(
+                        StatusCode::OK,
+                        mime_for(&path),
+                        Cow::Owned(bytes),
+                        allow_origin,
+                    ),
+                    Err(_) => status(StatusCode::NOT_FOUND, "not found", allow_origin),
+                };
+                (label, response)
+            }
         };
-        if path.is_dir() {
-            path.push("index.html");
+        // Per-request trace (method/URI/status/MIME/bytes/elapsed); failures
+        // additionally surface at debug so `--debug` shows them without
+        // `--trace`. No file contents or secrets are ever logged.
+        let status = response.status();
+        let mime = response
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("?");
+        tracing::trace!(
+            method = %method,
+            uri = %uri,
+            path = %path_label,
+            status = status.as_u16(),
+            mime,
+            bytes = response.body().len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "webview.asset.request"
+        );
+        if status != StatusCode::OK {
+            tracing::debug!(
+                method = %method,
+                uri = %uri,
+                status = status.as_u16(),
+                "webview.asset.failed"
+            );
         }
-        if !path.is_file()
-            && uri
-                .path()
-                .split('/')
-                .next_back()
-                .is_some_and(|last| !last.contains('.'))
-        {
-            // SPA route (e.g. `/app`, `/overlay`) → client-side router.
-            path = self.root.join("index.html");
-        }
-        match std::fs::read(&path) {
-            Ok(bytes) => body(StatusCode::OK, mime_for(&path), Cow::Owned(bytes)),
-            Err(_) => status(StatusCode::NOT_FOUND, "not found"),
-        }
+        response
     }
 }
 
-fn status(code: StatusCode, message: &'static str) -> Response<Cow<'static, [u8]>> {
-    body(code, "text/plain", Cow::Borrowed(message.as_bytes()))
+/// Path looks like a client-side route (last segment has no file extension)
+/// rather than a real asset reference.
+fn is_spa_route(path: &str) -> bool {
+    path.split('/')
+        .next_back()
+        .is_some_and(|last| !last.contains('.'))
+}
+
+fn status(
+    code: StatusCode,
+    message: &'static str,
+    allow_origin: &'static str,
+) -> Response<Cow<'static, [u8]>> {
+    body(
+        code,
+        "text/plain",
+        Cow::Borrowed(message.as_bytes()),
+        allow_origin,
+    )
 }
 
 fn body(
     code: StatusCode,
     content_type: &'static str,
     bytes: Cow<'static, [u8]>,
+    allow_origin: &'static str,
 ) -> Response<Cow<'static, [u8]>> {
-    Response::builder()
+    let mut builder = Response::builder()
         .status(code)
         .header("Content-Type", content_type)
-        // Tight scope: assets are local-only; no shared reference needed.
-        .header("Access-Control-Allow-Origin", "null")
+        .header("Access-Control-Allow-Origin", allow_origin);
+    if allow_origin == APP_ORIGIN {
+        builder = builder.header("Vary", "Origin");
+    }
+    builder
         .body(bytes)
         // Builder inputs are hardcoded-valid; fall back to an empty body
         // instead of unwrapping on the serving path.
         .unwrap_or_else(|_| Response::new(Cow::Borrowed(&[])))
 }
 
+/// Narrow CORS policy for the custom origin.
+///
+/// Same-origin subresource loads (scripts, styles, modules, workers) from
+/// `companion://app` never consult this header — it only matters for
+/// CORS-mode fetches. When the request carries the single expected app
+/// origin, reflect it so credentialed same-app fetches succeed; navigations
+/// (no `Origin` header) and opaque contexts (`Origin: null`) keep the
+/// historical `null`. Never `*`: no other origin may read app assets.
+fn cors_allow_origin(request: &Request<Vec<u8>>) -> &'static str {
+    let origin = request
+        .headers()
+        .get("Origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if origin == APP_ORIGIN {
+        APP_ORIGIN
+    } else {
+        "null"
+    }
+}
+
 fn mime_for(path: &Path) -> &'static str {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some("html") => "text/html",
-        Some("js" | "mjs") => "text/javascript",
-        Some("css") => "text/css",
-        Some("json" | "map") => "application/json",
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("ico") => "image/x-icon",
-        Some("woff") => "font/woff",
-        Some("woff2") => "font/woff2",
-        Some("ttf") => "font/ttf",
-        Some("otf") => "font/otf",
-        Some("mp3") => "audio/mpeg",
-        Some("wav") => "audio/wav",
-        Some("mp4") => "video/mp4",
-        Some("webm") => "video/webm",
-        Some("wasm") => "application/wasm",
-        Some("txt") => "text/plain",
-        Some("xml") => "application/xml",
+    // Case-insensitive: some pipelines emit `.JS`/`.CSS`. Standards-compatible
+    // values throughout (`text/javascript` per RFC 9239, not `application/javascript`).
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html",
+        "js" | "mjs" => "text/javascript",
+        "css" => "text/css",
+        "json" | "map" | "webmanifest" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain",
+        "xml" => "application/xml",
         _ => "application/octet-stream",
     }
 }
@@ -196,7 +353,9 @@ pub fn is_navigation_allowed(url: &str, dev_mode: bool) -> bool {
     let custom_scheme = url::Url::parse(url).ok().is_some_and(|parsed| {
         parsed.scheme() == APP_SCHEME
             && parsed.host_str() == Some(APP_HOST)
-            && parsed.path().starts_with('/')
+            // Bare `companion://app` (empty path) is the same document as
+            // `companion://app/`; both resolve to the bundled index.
+            && (parsed.path().is_empty() || parsed.path().starts_with('/'))
     });
     if custom_scheme {
         return true;
@@ -214,15 +373,30 @@ mod tests {
     fn server_with(files: &[(&str, &str)]) -> (tempfile_like::Dir, AssetServer) {
         let dir = tempfile_like::Dir::create();
         for (name, content) in files {
-            std::fs::write(dir.path().join(name), content).unwrap();
+            let path = dir.path().join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
         }
         let server = AssetServer::new(dir.path().to_path_buf()).unwrap();
         (dir, server)
     }
 
     fn get(server: &AssetServer, url: &str) -> Response<Cow<'static, [u8]>> {
-        let request = Request::builder().uri(url).body(Vec::new()).unwrap();
-        server.handle(request)
+        get_with_origin(server, url, None)
+    }
+
+    fn get_with_origin(
+        server: &AssetServer,
+        url: &str,
+        origin: Option<&str>,
+    ) -> Response<Cow<'static, [u8]>> {
+        let mut builder = Request::builder().uri(url);
+        if let Some(origin) = origin {
+            builder = builder.header("Origin", origin);
+        }
+        server.handle(builder.body(Vec::new()).unwrap())
     }
 
     #[test]
@@ -278,14 +452,150 @@ mod tests {
     #[test]
     fn spa_routes_fall_back_to_index() {
         let (_d, s) = server_with(&[("index.html", "<app>")]);
-        let res = get(&s, "companion://app/app");
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(res.body().as_ref(), b"<app>");
+        for route in [
+            "companion://app/app",
+            "companion://app/app/",
+            "companion://app/app/settings",
+            "companion://app/",
+            "companion://app",
+        ] {
+            let res = get(&s, route);
+            assert_eq!(res.status(), StatusCode::OK, "{route}");
+            assert_eq!(res.body().as_ref(), b"<app>", "{route}");
+            assert_eq!(res.headers()["Content-Type"], "text/html", "{route}");
+        }
         // Unknown extension-bearing file is a real 404, not the fallback.
         assert_eq!(
             get(&s, "companion://app/missing.js").status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[test]
+    fn nested_generated_assets_are_served_not_fallen_back() {
+        let (_d, s) = server_with(&[
+            ("index.html", "<app>"),
+            ("_app/immutable/entry/app.HASH.js", "js"),
+            ("_app/immutable/chunks/x.HASH.css", "css"),
+            ("favicon.svg", "<svg/>"),
+        ]);
+        let res = get(&s, "companion://app/_app/immutable/entry/app.HASH.js");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.body().as_ref(), b"js");
+        assert_eq!(res.headers()["Content-Type"], "text/javascript");
+        let res = get(&s, "companion://app/_app/immutable/chunks/x.HASH.css");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["Content-Type"], "text/css");
+        let res = get(&s, "companion://app/favicon.svg");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["Content-Type"], "image/svg+xml");
+        // Missing nested asset stays a 404 (no index fallback for files).
+        assert_eq!(
+            get(&s, "companion://app/_app/immutable/missing.js").status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn query_strings_do_not_change_resolution() {
+        let (_d, s) = server_with(&[("index.html", "<app>"), ("app.js", "js")]);
+        let res = get(&s, "companion://app/app.js?v=123");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.body().as_ref(), b"js");
+        let res = get(&s, "companion://app/app?onboarding=1");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.body().as_ref(), b"<app>");
+    }
+
+    #[test]
+    fn mime_table_covers_bundled_frontend_types() {
+        for (name, mime) in [
+            ("a.html", "text/html"),
+            ("a.htm", "text/html"),
+            ("a.js", "text/javascript"),
+            ("a.mjs", "text/javascript"),
+            ("a.JS", "text/javascript"),
+            ("a.css", "text/css"),
+            ("a.CSS", "text/css"),
+            ("a.json", "application/json"),
+            ("a.map", "application/json"),
+            ("a.wasm", "application/wasm"),
+            ("a.svg", "image/svg+xml"),
+            ("a.png", "image/png"),
+            ("a.webp", "image/webp"),
+            ("a.avif", "image/avif"),
+            ("a.woff", "font/woff"),
+            ("a.woff2", "font/woff2"),
+            ("a.ttf", "font/ttf"),
+            ("a.mp4", "video/mp4"),
+            ("a.webm", "video/webm"),
+            ("a.bin", "application/octet-stream"),
+        ] {
+            let (_d, s) = server_with(&[("index.html", "<app>"), (name, "x")]);
+            let res = get(&s, &format!("companion://app/{name}"));
+            assert_eq!(res.status(), StatusCode::OK, "{name}");
+            assert_eq!(res.headers()["Content-Type"], mime, "{name}");
+        }
+    }
+
+    #[test]
+    fn cors_policy_reflects_only_the_app_origin() {
+        let (_d, s) = server_with(&[("index.html", "<app>")]);
+        // Navigation-style request (no Origin): historical `null`.
+        let res = get(&s, "companion://app/app");
+        assert_eq!(res.headers()["Access-Control-Allow-Origin"], "null");
+        assert!(res.headers().get("Vary").is_none());
+        // Same-app fetch: narrow reflection + Vary.
+        let res = get_with_origin(&s, "companion://app/app", Some(APP_ORIGIN));
+        assert_eq!(res.headers()["Access-Control-Allow-Origin"], APP_ORIGIN);
+        assert_eq!(res.headers()["Vary"], "Origin");
+        // Foreign origins (and opaque `null`) never get a reflection.
+        for origin in ["https://example.com", "null", "companion://evil"] {
+            let res = get_with_origin(&s, "companion://app/app", Some(origin));
+            assert_eq!(
+                res.headers()["Access-Control-Allow-Origin"],
+                "null",
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_traversal_variants_fail_closed() {
+        let (_d, s) = server_with(&[("index.html", "hi")]);
+        for url in [
+            "companion://app/%2e%2e/secret",
+            "companion://app/%2E%2E/secret",
+            "companion://app/%2e%2E%2fsecret",
+            "companion://app/a/../../secret",
+        ] {
+            assert_eq!(get(&s, url).status(), StatusCode::FORBIDDEN, "{url}");
+        }
+    }
+
+    #[test]
+    fn asset_report_describes_index_and_counts_files() {
+        let (_d, s) = server_with(&[
+            ("index.html", "<app>"),
+            ("app.js", "js"),
+            ("_app/immutable/x.js", "js"),
+        ]);
+        let report = s.report();
+        assert!(report.index_exists);
+        assert_eq!(report.index_size, 5);
+        assert!(report.index_modified_secs.is_some());
+        assert_eq!(report.file_count, 3);
+        assert!(!report.truncated);
+        assert!(report.root.is_absolute());
+    }
+
+    #[test]
+    fn asset_report_marks_missing_index() {
+        let (_d, s) = server_with(&[("app.js", "js")]);
+        let report = s.report();
+        assert!(!report.index_exists);
+        assert_eq!(report.index_size, 0);
+        assert_eq!(report.file_count, 1);
     }
 
     #[test]
@@ -296,6 +606,17 @@ mod tests {
     #[test]
     fn navigation_policy() {
         assert!(is_navigation_allowed("companion://app/index.html", false));
+        assert!(is_navigation_allowed("companion://app/app", false));
+        assert!(is_navigation_allowed("companion://app/app/", false));
+        assert!(is_navigation_allowed("companion://app/app/settings", false));
+        assert!(is_navigation_allowed(
+            "companion://app/app?onboarding=1",
+            false
+        ));
+        assert!(is_navigation_allowed("companion://app/app#section", false));
+        assert!(is_navigation_allowed("companion://app/", false));
+        assert!(is_navigation_allowed("companion://app", false));
+        assert!(is_navigation_allowed("COMPANION://app/app", false));
         assert!(!is_navigation_allowed(
             "companion://app.attacker/index.html",
             false

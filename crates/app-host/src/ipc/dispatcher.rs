@@ -11,7 +11,17 @@ use crate::runtime::AgentRuntime;
 use ipc_core::{HostEvent, IpcErrorBody, IpcErrorResponse, IpcMethod, IpcRequest, IpcResponse};
 use policy_core::ApprovalQueue;
 use serde_json::Value;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+
+/// Version of the `window.utsuwa` bridge protocol spoken by this host.
+/// Must stay in sync with `BRIDGE_VERSION` in `src/bridge.js` and
+/// `EXPECTED_BRIDGE_PROTOCOL` in the frontend handshake module. Bump on any
+/// incompatible bridge change so a stale/partial bridge is detected instead
+/// of being mistaken for a healthy host.
+pub const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 
 /// Host state the dispatcher may report. The agent runtime and storage
 /// attachments are optional so headless/unit configurations keep working;
@@ -26,6 +36,9 @@ pub struct Dispatcher {
     pub(crate) storage: Option<Arc<Mutex<storage_core::Storage>>>,
     pub(crate) audit: Option<Arc<audit_core::InMemorySink>>,
     pub(crate) secrets: Option<Arc<dyn secret_core::SecretStore>>,
+    /// Set when the frontend completes the deterministic handshake
+    /// (`host.frontend_ready`) after registering its event listeners.
+    pub(crate) frontend_ready: Arc<AtomicBool>,
 }
 
 impl Clone for Dispatcher {
@@ -40,6 +53,7 @@ impl Clone for Dispatcher {
             storage: self.storage.clone(),
             audit: self.audit.clone(),
             secrets: self.secrets.clone(),
+            frontend_ready: Arc::clone(&self.frontend_ready),
         }
     }
 }
@@ -56,7 +70,33 @@ impl Dispatcher {
             storage: None,
             audit: None,
             secrets: None,
+            frontend_ready: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the frontend has completed the deterministic handshake.
+    /// Shared across dispatcher clones (the flag lives behind an `Arc`).
+    pub fn is_frontend_ready(&self) -> bool {
+        self.frontend_ready.load(Ordering::SeqCst)
+    }
+
+    /// Queryable host state for bootstrap. The frontend calls
+    /// `host.runtime_state` / `host.frontend_ready` so a missed one-shot
+    /// `app.ready` event can never strand it.
+    pub fn runtime_state(&self) -> Value {
+        serde_json::json!({
+            "bridgeProtocol": BRIDGE_PROTOCOL_VERSION,
+            "hostVersion": self.app_version,
+            "ready": true,
+            "platform": std::env::consts::OS,
+            "desktopBackend": desktop_backend(),
+            "frontendReady": self.is_frontend_ready(),
+            "capabilities": {
+                "agent": self.agent.is_some(),
+                "audioCapture": self.audio_capture.is_some(),
+                "storage": self.storage.is_some(),
+            },
+        })
     }
 
     /// Attach the approval queue so the permission dialog's replies
@@ -144,23 +184,69 @@ impl Dispatcher {
                 return;
             }
         };
+        // Method name only (never params: they may carry secrets). Proves
+        // which frontend calls reach the host and when; the matching
+        // `webview.ipc.reply` proves the dispatch completed (a request
+        // without a reply means the handler wedged the calling thread).
+        tracing::debug!(method = ?request.method, id = %request.id, "webview.ipc.request");
 
         if request.method == IpcMethod::ProvidersFetchModels {
             let dispatcher = self.clone();
             let reply_id = request.id.clone();
+            let method = request.method.clone();
             // Run off the UI/IPC callback thread on a dedicated worker so a
             // slow provider cannot freeze the app. The worker is a plain OS
             // thread outside every Tokio runtime, so entering an executor
             // here can never nest inside a Tokio worker.
             std::thread::spawn(move || {
+                let started = std::time::Instant::now();
                 let owned = request;
                 let result = dispatcher.block_on_async(move |dispatcher| async move {
                     dispatcher.fetch_provider_models(&owned).await
                 });
+                tracing::debug!(
+                    method = ?method,
+                    id = %reply_id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "webview.ipc.reply"
+                );
                 callback(dispatcher.reply_script_for(&reply_id, result));
             });
+        } else if runs_off_ui_thread(&request.method) {
+            let dispatcher = self.clone();
+            let owned = request;
+            // Blocking OS services (AT-SPI/D-Bus, X11, portals) must never
+            // run on the UI/IPC callback thread: a same-process round-trip
+            // would deadlock the main loop. The worker dispatches
+            // synchronously WITHOUT entering a runtime first, so the nested
+            // `block_on_host` calls inside stay legal (they refuse when a
+            // Tokio context is already entered).
+            let spawned = std::thread::Builder::new()
+                .name("utsuwa-ipc-worker".to_string())
+                .spawn(move || {
+                    let started = std::time::Instant::now();
+                    let script = dispatcher.reply_script(&owned);
+                    tracing::debug!(
+                        method = ?owned.method,
+                        id = %owned.id,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "webview.ipc.reply"
+                    );
+                    callback(script);
+                });
+            if spawned.is_err() {
+                tracing::warn!("dropping ipc reply: worker thread failed to spawn");
+            }
         } else {
-            callback(self.reply_script(&request));
+            let started = std::time::Instant::now();
+            let script = self.reply_script(&request);
+            tracing::debug!(
+                method = ?request.method,
+                id = %request.id,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "webview.ipc.reply"
+            );
+            callback(script);
         }
     }
 
@@ -242,6 +328,16 @@ impl Dispatcher {
                 "host": "utsuwa-native",
             })),
             IpcMethod::AppReady => Ok(serde_json::json!({ "ok": true })),
+            IpcMethod::HostRuntimeState => Ok(self.runtime_state()),
+            IpcMethod::HostFrontendReady => {
+                let first = !self.frontend_ready.swap(true, Ordering::SeqCst);
+                tracing::debug!(
+                    first_handshake = first,
+                    "host.frontend.ready: frontend registered listeners"
+                );
+                Ok(self.runtime_state())
+            }
+            IpcMethod::DiagnosticsReport => self.diagnostics_report(request),
             IpcMethod::PermissionApprove => self.decide(request, true),
             IpcMethod::PermissionDeny => self.decide(request, false),
             IpcMethod::PermissionList => self.list_pending(),
@@ -279,6 +375,127 @@ impl Dispatcher {
             IpcMethod::PluginUpdate => self.plugin_manage(request, PluginOp::Update),
             IpcMethod::PluginRemove => self.plugin_manage(request, PluginOp::Remove),
         }
+    }
+
+    /// Debug-oriented frontend diagnostic report. Only known string fields
+    /// are read, each truncated, so a compromised page cannot flood the
+    /// host log with unbounded payloads or exfiltrate anything beyond its
+    /// own error text. This method performs no host action and returns no
+    /// privileged data.
+    fn diagnostics_report(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
+        let params = &request.params;
+        let kind = params
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let kind = truncate(kind, 64);
+        let message = params
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|m| truncate(m, 2000))
+            .unwrap_or_default();
+        let url = params
+            .get("url")
+            .and_then(Value::as_str)
+            .map(|u| truncate(u, 500))
+            .unwrap_or_default();
+        let line = params.get("line").and_then(Value::as_u64).unwrap_or(0);
+        let stack = params
+            .get("stack")
+            .and_then(Value::as_str)
+            .map(|s| truncate(s, 2000))
+            .unwrap_or_default();
+        // Flood guard: a page logging in a hot loop degrades to debug
+        // after the burst budget; the IPC reply is unaffected.
+        let loud = diagnostics_priority();
+        match kind.as_ref() {
+            "window.error" | "unhandledrejection" | "console.error" if loud => {
+                tracing::warn!(
+                    kind = %kind,
+                    message = %message,
+                    url = %url,
+                    line,
+                    stack = %stack,
+                    "webview diagnostic"
+                );
+            }
+            _ => {
+                tracing::debug!(
+                    kind = %kind,
+                    message = %message,
+                    url = %url,
+                    line,
+                    throttled = !loud,
+                    "webview diagnostic"
+                );
+            }
+        }
+        Ok(serde_json::json!({ "ok": true }))
+    }
+}
+
+/// Lock-free flood guard for frontend diagnostics: allows `DIAG_BURST`
+/// warn-level reports per rolling window; the rest degrade to debug.
+const DIAG_BURST: u32 = 30;
+const DIAG_WINDOW_SECS: u64 = 60;
+
+static DIAG_WINDOW_START: AtomicU64 = AtomicU64::new(0);
+static DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// True when this report is within the warn-level burst budget.
+fn diagnostics_priority() -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(DIAG_WINDOW_START.load(Ordering::Relaxed)) >= DIAG_WINDOW_SECS {
+        // New window: best-effort reset (a lost race just shifts it).
+        DIAG_WINDOW_START.store(now, Ordering::Relaxed);
+        DIAG_COUNT.store(1, Ordering::Relaxed);
+        return true;
+    }
+    DIAG_COUNT.fetch_add(1, Ordering::Relaxed) < DIAG_BURST
+}
+
+/// Methods that may block on OS services (AT-SPI/D-Bus round-trips, X11,
+/// portal approvals) and therefore always dispatch on a worker thread,
+/// never on the UI/IPC callback thread. Everything else is in-memory or
+/// local-file fast and stays inline.
+fn runs_off_ui_thread(method: &IpcMethod) -> bool {
+    matches!(
+        method,
+        IpcMethod::DesktopShareScreenStart
+            | IpcMethod::DesktopShareScreenPause
+            | IpcMethod::DesktopShareScreenResume
+            | IpcMethod::DesktopShareScreenStop
+            | IpcMethod::DesktopShareScreenStatus
+            | IpcMethod::DesktopControlEnable
+            | IpcMethod::DesktopControlDisable
+            | IpcMethod::DesktopEmergencyStop
+            | IpcMethod::DesktopEmergencyClear
+    )
+}
+
+/// Desktop WebView backend driving this host process. Reported in
+/// `host.runtime_state` so diagnostics can name the platform path.
+fn desktop_backend() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "gtk"
+    } else if cfg!(target_os = "windows") {
+        "webview2"
+    } else if cfg!(target_os = "macos") {
+        "wkwebview"
+    } else {
+        "unknown"
+    }
+}
+
+/// Truncate untrusted frontend text at a char boundary for log safety.
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        text.chars().take(max_chars).collect()
     }
 }
 
@@ -322,12 +539,20 @@ fn internal_error_script(id: &str) -> String {
 }
 
 /// Script that pushes a [`HostEvent`] to the page bridge.
+///
+/// Lossless by construction: when the bridge already exists the event goes
+/// through `__emit` (which buffers until the frontend drains it after
+/// registering listeners); when the bridge initialisation script has not
+/// run yet — e.g. `app.ready` evaluated before document start — the event
+/// is stashed in `window.__utsuwaEarlyEvents`, which the bridge drains on
+/// load. Either way the event is never silently dropped.
 pub fn emit_script(event: &HostEvent) -> String {
     let data = event.data.to_string();
+    let name = serde_json::to_string(&event.event).unwrap_or_else(|_| "\"\"".to_string());
     format!(
-        "window.utsuwa && window.utsuwa.__emit({}, {})",
-        serde_json::to_string(&event.event).unwrap_or_else(|_| "\"\"".to_string()),
-        data
+        "(function(){{var e={name},d={data};var b=window.utsuwa;\
+         if(b&&b.__emit){{b.__emit(e,d);}}else{{\
+         (window.__utsuwaEarlyEvents=window.__utsuwaEarlyEvents||[]).push({{event:e,data:d}});}}}})();"
     )
 }
 
@@ -966,6 +1191,70 @@ mod tests {
             event: "agent.text_delta".to_string(),
             data: serde_json::json!({"delta": "hi"}),
         });
-        assert!(script.contains("__emit(\"agent.text_delta\""), "{script}");
+        // Live bridge path …
+        assert!(script.contains("b.__emit(e,d)"), "{script}");
+        assert!(script.contains("\"agent.text_delta\""), "{script}");
+        assert!(script.contains("\"delta\":\"hi\""), "{script}");
+        // … plus the pre-bridge stash so early events are never dropped.
+        assert!(script.contains("__utsuwaEarlyEvents"), "{script}");
+    }
+
+    #[test]
+    fn runtime_state_reports_version_platform_and_capabilities() {
+        let dispatcher = dispatcher().with_agent(stub_runtime());
+        let script = dispatcher
+            .handle_message(r#"{"id":"70","method":"host.runtime_state","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"70\", true"), "{script}");
+        assert!(
+            script.contains(&format!("\"bridgeProtocol\":{BRIDGE_PROTOCOL_VERSION}")),
+            "{script}"
+        );
+        assert!(script.contains("\"hostVersion\":\"0.1.0\""), "{script}");
+        assert!(script.contains("\"ready\":true"), "{script}");
+        assert!(
+            script.contains(&format!("\"platform\":\"{}\"", std::env::consts::OS)),
+            "{script}"
+        );
+        assert!(script.contains("\"desktopBackend\":"), "{script}");
+        assert!(script.contains("\"agent\":true"), "{script}");
+        assert!(script.contains("\"audioCapture\":false"), "{script}");
+        assert!(script.contains("\"storage\":false"), "{script}");
+    }
+
+    #[test]
+    fn frontend_ready_handshake_marks_ready_and_returns_state() {
+        let dispatcher = dispatcher();
+        assert!(!dispatcher.is_frontend_ready());
+        let script = dispatcher
+            .handle_message(r#"{"id":"71","method":"host.frontend_ready","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"71\", true"), "{script}");
+        assert!(script.contains("\"ready\":true"), "{script}");
+        assert!(dispatcher.is_frontend_ready());
+        // Clones share the flag: the IPC-handler clone and the emit clone
+        // observe the same handshake.
+        assert!(dispatcher.clone().is_frontend_ready());
+        // Repeat handshakes (reload/navigation) stay idempotent.
+        let script = dispatcher
+            .handle_message(r#"{"id":"72","method":"host.frontend_ready","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"72\", true"), "{script}");
+    }
+
+    #[test]
+    fn diagnostics_report_is_accepted_without_side_effects() {
+        let script = dispatcher()
+            .handle_message(
+                r#"{"id":"73","method":"diagnostics.report","params":{"kind":"window.error","message":"boom","url":"companion://app/app","line":12,"stack":"at f"}}"#,
+            )
+            .unwrap();
+        assert!(script.contains("__resolve(\"73\", true"), "{script}");
+        assert!(script.contains("\"ok\":true"), "{script}");
+        // Unknown kinds and missing fields degrade, never reject.
+        let script = dispatcher()
+            .handle_message(r#"{"id":"74","method":"diagnostics.report","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("__resolve(\"74\", true"), "{script}");
     }
 }

@@ -26,6 +26,12 @@ fn main() {
         );
     }
 
+    // Build-time WebKitGTK/GTK versions for `--debug` startup diagnostics.
+    // Best-effort only: a failed probe records "unknown" instead of failing
+    // the build (the app must also compile where pkg-config is absent).
+    probe_pkg_version("webkit2gtk-4.1", "UTSUWA_WEBKIT_PC_VERSION");
+    probe_pkg_version("gtk+-3.0", "UTSUWA_GTK_PC_VERSION");
+
     let skip_web_build = env::var("UTSUWA_SKIP_WEB_BUILD")
         .map(|value| matches!(value.as_str(), "1" | "true"))
         .unwrap_or(false);
@@ -52,4 +58,18 @@ fn main() {
             workspace_root.display()
         );
     }
+}
+
+/// Best-effort `pkg-config --modversion` probe. Emits
+/// `cargo:rustc-env=<ENV>=<version|unknown>`; never fails the build.
+fn probe_pkg_version(package: &str, env_name: &str) {
+    let version = Command::new("pkg-config")
+        .args(["--modversion", package])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env={env_name}={version}");
 }

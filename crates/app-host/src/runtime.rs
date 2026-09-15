@@ -864,21 +864,29 @@ impl AgentRuntime {
     }
 
     pub fn screen_share_status(&self) -> ScreenShareStatus {
+        // Step traces (not debug: the frontend polls this): a missing
+        // completion trace names the wedged backend call.
+        tracing::trace!("screen_share.status.begin");
         let plugin = self
             .desktop
             .lock()
             .map(|plugin| plugin.clone())
             .unwrap_or_else(|_| tool_desktop::plugin::DesktopPlugin::stub());
+        tracing::trace!("screen_share.status.plugin_locked");
         let displays = if plugin.is_available() {
             // Never block a Tokio worker for a status snapshot: agent-turn
             // callers use `screen_share_status_async` instead.
             if tokio::runtime::Handle::try_current().is_ok() {
                 Vec::new()
             } else {
-                self.block_on_host(plugin.backend.list_displays())
+                tracing::trace!("screen_share.status.list_displays.begin");
+                let displays = self
+                    .block_on_host(plugin.backend.list_displays())
                     .ok()
                     .and_then(|inner| inner.ok())
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                tracing::trace!("screen_share.status.list_displays.ok");
+                displays
             }
         } else {
             Vec::new()
@@ -887,10 +895,14 @@ impl AgentRuntime {
             if tokio::runtime::Handle::try_current().is_ok() {
                 Vec::new()
             } else {
-                self.block_on_host(plugin.backend.list_windows())
+                tracing::trace!("screen_share.status.list_windows.begin");
+                let windows = self
+                    .block_on_host(plugin.backend.list_windows())
                     .ok()
                     .and_then(|inner| inner.ok())
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                tracing::trace!("screen_share.status.list_windows.ok");
+                windows
             }
         } else {
             Vec::new()

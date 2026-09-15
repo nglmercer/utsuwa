@@ -8,9 +8,26 @@
 	import { moduleRegistry } from '$lib/services/modules';
 	import { migrateLegacyElevenLabsVoice } from '$lib/services/tts/legacy-voice-migration';
 	import { isDesktopBuild } from '$lib/services/platform/platform';
+	import { nativeBoot, type BootSnapshot } from '$lib/services/native/readiness';
+	import NativeBootGate from '$lib/components/native/NativeBootGate.svelte';
 	import { SITE_URL } from '$lib/config/site';
 
 	let { children } = $props();
+
+	// Desktop native handshake: runs once per page load inside the native
+	// host (packaged or dev WebView). Plain browsers skip it entirely —
+	// a missing bridge is normal on the web, fatal only on desktop.
+	let boot = $state<BootSnapshot>(nativeBoot.getSnapshot());
+	$effect(() => {
+		if (!browser || !isDesktopBuild()) return;
+		const unsubscribe = nativeBoot.subscribe((snapshot) => {
+			boot = snapshot;
+		});
+		nativeBoot.ensureHandshake().catch(() => {
+			// The fatal overlay renders from `boot`; nothing else to do.
+		});
+		return unsubscribe;
+	});
 
 	// Marketing/content routes that should never live inside the desktop app.
 	const isWebOnly = (path: string) =>
@@ -67,4 +84,7 @@
 
 {#if !redirecting}
 	{@render children()}
+{/if}
+{#if browser && isDesktopBuild() && boot.phase === 'fatal'}
+	<NativeBootGate snapshot={boot} />
 {/if}

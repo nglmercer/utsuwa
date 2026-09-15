@@ -21,20 +21,9 @@
 
 		<link rel="icon" href="/favicon-light.png" type="image/png" media="(prefers-color-scheme: light)" />
 		<link rel="icon" href="/favicon-dark.png" type="image/png" media="(prefers-color-scheme: dark)" />
-		<script>
-			(function() {
-				const colorMode = localStorage.getItem('colorMode') || 'system';
-				let shouldBeDark;
-				if (colorMode === 'system') {
-					shouldBeDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-				} else {
-					shouldBeDark = colorMode === 'dark';
-				}
-				if (shouldBeDark) {
-					document.documentElement.classList.add('dark');
-				}
-			})();
-		</script>
+		<!-- External (not inline) so the desktop CSP allows it without a
+		     hardcoded hash: SvelteKit only auto-hashes scripts it emits. -->
+		<script src="/theme-init.js"></script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

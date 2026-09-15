@@ -1,6 +1,6 @@
 import { db, type DBFact, type DBSessionSummary, type DBConversationTurn } from '$lib/db';
 import type { Fact, SessionSummary, ConversationTurn, MemorySearchOptions, NewFact } from '$lib/types/memory';
-import { embedText, isEmbeddingReady } from '$lib/services/embeddings';
+import { embedText, initEmbeddingModel, isEmbeddingReady } from '$lib/services/embeddings';
 import { findDuplicateFact } from '$lib/engine/fact-dedup';
 import { EMBEDDING_MODEL_ID, hasCurrentEmbedding, needsReembedding } from '$lib/engine/embedding-version';
 
@@ -91,7 +91,29 @@ export async function saveFact(fact: NewFact): Promise<number> {
 	};
 
 	const id = await db.facts.add(dbFact);
-	return id as number;
+	const numericId = id as number;
+	// On-demand model warm-up: boot skips the heavyweight ONNX download when
+	// no facts exist yet, so the first stored fact kicks a background init
+	// (single-flight inside `initEmbeddingModel`) and embeds itself once the
+	// model is ready. Later saves embed inline; anything missed is covered
+	// by the boot-time backfill. Fire-and-forget: storage never blocks on it.
+	if (!embedding) {
+		void ensureFactEmbedding(numericId, fact.content);
+	}
+	return numericId;
+}
+
+/** Background init + embed for one fact; resolves silently on any failure. */
+async function ensureFactEmbedding(factId: number, content: string): Promise<void> {
+	try {
+		const ready = await initEmbeddingModel();
+		if (!ready) return;
+		const vector = await embedText(content);
+		if (vector) await updateFactEmbedding(factId, vector);
+	} catch {
+		// Model download/init failed (offline, WebGL blocked, ...): the fact
+		// stays embedding-less and the boot backfill retries next startup.
+	}
 }
 
 export async function incrementFactReference(factId: number): Promise<void> {

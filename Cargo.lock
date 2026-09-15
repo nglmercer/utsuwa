@@ -267,6 +267,7 @@ dependencies = [
  "url",
  "uuid",
  "wat",
+ "webkit2gtk",
  "winit",
  "wry",
 ]

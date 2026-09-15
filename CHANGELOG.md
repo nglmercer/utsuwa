@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **The Linux desktop app opens again**: WebKitGTK 2.46+ refuses top-level navigation to custom schemes that aren't registered as CORS-enabled, and wry 0.56.1 only registers them as secure — so the bundled app sat on a blank window. The host now applies the missing registration itself (no fork), and startup is checkpoint-logged under `--debug` so any future boot failure points at its stage.
+- **The Linux app no longer freezes a few seconds after loading**: every screen-sharing status poll created and dropped a fresh AT-SPI connection, and the second creation hangs forever upstream. The host now holds one shared, timeout-guarded registry connection, and desktop IPC dispatches off the UI thread, so a blocking OS round-trip can never deadlock the main loop again.
+- The desktop CSP no longer blocks its own theme script (it lives in an external file now), and frontend crashes surface in the host log instead of failing silently.
+- Fresh installs no longer download the ONNX embedding model at every startup when no memory facts exist; semantic recall still warms it on demand.
+
 ## [0.13.2] - 2026-08-25
 
 ### Fixed

@@ -3,8 +3,30 @@
 // every helper degrades to a clear rejection instead of throwing on
 // `undefined`.
 
+export interface InvokeOptions {
+	/** Per-request timeout in ms (default 60000 in the bridge). */
+	timeoutMs?: number;
+}
+
 export interface UtsuwaBridge {
-	invoke(method: string, params?: Record<string, unknown>): Promise<unknown>;
+	invoke(
+		method: string,
+		params?: Record<string, unknown>,
+		options?: InvokeOptions
+	): Promise<unknown>;
+	/**
+	 * Bridge protocol version. Always present on current hosts; missing on
+	 * hosts older than the handshake (treated as incompatible by
+	 * `readiness.ts` rather than as a healthy host).
+	 */
+	bridgeVersion?: number;
+	/**
+	 * Replay buffered host events (registered after listeners) then
+	 * dispatch live. Returns the replayed count.
+	 */
+	markReady?: () => number;
+	/** Whether `markReady()` already ran. */
+	isReady?: () => boolean;
 }
 
 /**

@@ -55,6 +55,12 @@ wry = "0.56"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+# Same WebKitGTK binding wry 0.56.1 builds on (=2.0.2, v2_38): the host uses
+# the public `WebViewExtUnix::webview()` handle to register the custom scheme
+# as CORS-enabled, which wry 0.56.1 omits and WebKitGTK 2.46+ requires for
+# top-level custom-scheme navigation. Pinned exactly like wry's own
+# requirement so both crates share one instance.
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 desktop-linux.workspace = true
 desktop-linux-atspi.workspace = true
 desktop-linux-wayland.workspace = true

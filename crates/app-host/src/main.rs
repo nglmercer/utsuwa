@@ -20,10 +20,11 @@ use app_host::{
 };
 use ipc_core::HostEvent;
 use policy_core::ApprovalQueue;
-use std::sync::{
-    mpsc::{Receiver, Sender},
-    Arc, Mutex,
-};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "linux"))]
+use std::sync::mpsc::Receiver;
+use std::sync::{mpsc::Sender, Arc, Mutex};
 use wry::{PermissionKind, PermissionResponse, WebViewBuilder};
 
 #[cfg(not(target_os = "linux"))]
@@ -36,13 +37,55 @@ use winit::{
 };
 
 /// Bridge installed before any page script runs: `window.utsuwa.invoke`
-/// for typed requests, `utsuwa-host-event` for host pushes (Task 6).
+/// for typed requests, `utsuwa-host-event` for host pushes. Buffers early
+/// host events until the frontend drains them after registering listeners.
 const BRIDGE_JS: &str = include_str!("bridge.js");
 
-/// Wakes the UI thread after queueing a reply/emit script. The winit
-/// path pings the event-loop proxy; the GTK path needs nothing — a
-/// timeout source drains the queue several times a second.
+/// Debug diagnostics installed right after the bridge (same document-start
+/// timing): forwards `window.onerror`, `unhandledrejection`,
+/// `console.error`, and load markers to Rust over `diagnostics.report`.
+/// Like all wry initialisation scripts this bypasses the page CSP.
+const DIAGNOSTICS_JS: &str = include_str!("diagnostics.js");
+
+/// Wakes the UI thread after queueing a reply/emit script. The winit path
+/// pings the event-loop proxy; the GTK path needs nothing — queueing into
+/// the tokio channel wakes the main-context consumer directly.
 type Waker = Arc<dyn Fn() + Send + Sync>;
+
+/// Abstraction over the reply-script queue so Linux can deliver through an
+/// event-driven main-context consumer while the winit path keeps its
+/// event-loop wakeups. Returns false when the consumer is gone.
+trait ScriptQueue: Clone + Send + Sync + 'static {
+    fn send_script(&self, script: String) -> bool;
+}
+
+impl ScriptQueue for Sender<String> {
+    fn send_script(&self, script: String) -> bool {
+        self.send(script).is_ok()
+    }
+}
+
+impl ScriptQueue for tokio::sync::mpsc::UnboundedSender<String> {
+    fn send_script(&self, script: String) -> bool {
+        self.send(script).is_ok()
+    }
+}
+
+/// Hook invoked with each custom-protocol request URI (Linux watchdog and
+/// first-request logging). Fired from the protocol handler on the UI thread.
+type AssetHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Classify a queued script for failure logs without printing payloads
+/// (replies may carry settings content or other sensitive data).
+fn script_kind(script: &str) -> &'static str {
+    if script.contains("__emit") {
+        "emit"
+    } else if script.contains("__resolve") {
+        "resolve"
+    } else {
+        "other"
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CliOptions {
@@ -161,15 +204,22 @@ fn init_logging(options: CliOptions) -> Option<tracing_appender::non_blocking::W
 }
 
 /// Shared WebView configuration: URL, navigation policy, custom scheme,
-/// bridge script, and the typed IPC handler. Replies queue on
-/// `reply_tx`; the platform runner drains them on the UI thread (every
-/// reply wakes it through `waker`).
-fn configure_builder(
+/// bridge scripts, and the typed IPC handler. Replies queue on
+/// `reply_tx`; the platform runner drains them on the UI thread.
+///
+/// When `defer_initial_navigation` is set (Linux), the builder is created
+/// without an initial URL so the caller can request navigation explicitly
+/// after post-build setup (CORS registration, load signals) is complete.
+/// Returns the builder plus the initial URL to navigate to.
+fn configure_builder<Q: ScriptQueue>(
     config: &AppHostConfig,
     dispatcher: &Dispatcher,
-    reply_tx: Sender<String>,
+    reply_tx: Q,
     waker: Waker,
-) -> Option<WebViewBuilder<'static>> {
+    defer_initial_navigation: bool,
+    asset_hook: Option<AssetHook>,
+) -> Option<(WebViewBuilder<'static>, String)> {
+    tracing::debug!("webview.configure.begin");
     let dev_mode = matches!(config.frontend, FrontendSource::DevUrl(_));
     let initial_url = match &config.frontend {
         FrontendSource::DevUrl(url) => {
@@ -192,18 +242,43 @@ fn configure_builder(
                 tracing::info!(%err, "no asset dir; media custom scheme remains enabled in dev mode");
                 None
             } else {
-                tracing::error!(%err, "cannot serve bundled frontend (set UTSUWA_ASSET_DIR)");
+                tracing::error!(%err, asset_dir, "cannot serve bundled frontend (run `pnpm build:native` or set UTSUWA_ASSET_DIR)");
                 return None;
             }
         }
     };
+    if let Some(server) = &asset_server {
+        let report = server.report();
+        tracing::debug!(
+            root = %report.root.display(),
+            index_exists = report.index_exists,
+            index_bytes = report.index_size,
+            index_mtime_unix = report.index_modified_secs,
+            files = report.file_count,
+            truncated = report.truncated,
+            app_version = env!("CARGO_PKG_VERSION"),
+            "webview.assets.verified"
+        );
+        if !dev_mode && !report.index_exists {
+            tracing::error!(
+                root = %report.root.display(),
+                "bundled frontend has no build/index.html; run `pnpm build:native` (or set UTSUWA_ASSET_DIR) instead of opening an empty window"
+            );
+            return None;
+        }
+    }
 
-    let mut builder = WebViewBuilder::new()
-        .with_url(&initial_url)
+    let mut builder = WebViewBuilder::new();
+    if !defer_initial_navigation {
+        builder = builder.with_url(&initial_url);
+    }
+    builder = builder
         .with_permission_handler(permission_response)
         .with_navigation_handler(move |url| {
             let allowed = protocol::is_navigation_allowed(&url, dev_mode);
-            if !allowed {
+            if allowed {
+                tracing::debug!(%url, "webview.navigation.policy.allow");
+            } else {
                 tracing::warn!(%url, "blocked navigation outside companion://app");
             }
             allowed
@@ -214,6 +289,9 @@ fn configure_builder(
     });
     let media_registry = dispatcher.media_registry();
     builder = builder.with_custom_protocol(protocol::APP_SCHEME.to_string(), move |_, req| {
+        if let Some(hook) = &asset_hook {
+            hook(&req.uri().to_string());
+        }
         if app_host::audio::is_media_path(req.uri().path()) {
             media_registry.handle(req)
         } else if let Some(server) = &asset_server {
@@ -226,9 +304,14 @@ fn configure_builder(
                 .unwrap_or_else(|_| wry::http::Response::new(std::borrow::Cow::Borrowed(&[])))
         }
     });
+    tracing::debug!(
+        scheme = protocol::APP_SCHEME,
+        "webview.custom_protocol.registered"
+    );
     let ipc_dispatcher = dispatcher.clone();
     builder = builder.with_initialization_script(BRIDGE_JS);
-    Some(builder.with_ipc_handler(move |request| {
+    builder = builder.with_initialization_script(DIAGNOSTICS_JS);
+    let builder = builder.with_ipc_handler(move |request| {
         // Typed dispatch: only `IpcMethod` members parse, so raw OS
         // operations can never arrive here (ipc-core has no such
         // variants). Replies go back through the bridge's
@@ -237,14 +320,19 @@ fn configure_builder(
         let waker = Arc::clone(&waker);
         ipc_dispatcher.handle_message_with_callback(request.body(), move |script| {
             // Queue full / loop gone: log and drop; the bridge
-            // promise stays pending rather than resolving wrongly.
-            if reply_tx.send(script).is_err() {
-                tracing::warn!("dropping ipc reply: reply queue closed");
-            } else {
+            // promise rejects on timeout rather than resolving wrongly.
+            if reply_tx.send_script(script) {
                 waker();
+            } else {
+                tracing::warn!("dropping ipc reply: reply queue closed");
             }
         });
-    }))
+    });
+    tracing::debug!(
+        deferred_navigation = defer_initial_navigation,
+        "webview.configure.ok"
+    );
+    Some((builder, initial_url))
 }
 
 /// Announce readiness over the same typed event channel the frontend
@@ -259,20 +347,27 @@ fn ready_script(dispatcher: &Dispatcher) -> String {
 /// Linux runner: GTK window + embedded WebView. GDK picks the Wayland
 /// backend on Wayland sessions and X11 under XWayland, so one binary
 /// covers both — no `env -u WAYLAND_DISPLAY` needed anymore.
+///
+/// Startup order (each step checkpoint-logged under `--debug`):
+/// GTK init → window → builder (custom protocol registered inside
+/// `build_gtk`) → CORS fix → load signals → explicit initial navigation →
+/// window shown → event-driven script consumer → main loop.
 #[cfg(target_os = "linux")]
 fn run_gtk(
     config: AppHostConfig,
     dispatcher: Dispatcher,
-    reply_tx: Sender<String>,
-    reply_rx: Receiver<String>,
+    script_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    mut script_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) {
     use gtk::prelude::*;
     use wry::WebViewBuilderExtUnix;
 
     if let Err(err) = gtk::init() {
-        tracing::error!(%err, "gtk::init failed");
+        tracing::error!(%err, "gtk.init.failed");
         std::process::exit(1);
     }
+    tracing::debug!("gtk.init.ok");
+    log_linux_runtime_diagnostics();
     tracing::info!(
         session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
         "starting GTK-embedded webview (X11 and Wayland)"
@@ -281,45 +376,319 @@ fn run_gtk(
     let window = gtk::Window::new(gtk::WindowType::Toplevel);
     window.set_title("Utsuwa");
     window.set_default_size(1200, 800);
+    tracing::debug!("gtk.window.created");
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
     window.add(&vbox);
 
+    let dev_mode = matches!(config.frontend, FrontendSource::DevUrl(_));
+    // Watchdog state: set when the initial document request reaches Rust.
+    let initial_served = Arc::new(AtomicBool::new(false));
+    let first_request_seen = Arc::new(AtomicBool::new(false));
+    let hook_url = match &config.frontend {
+        FrontendSource::DevUrl(url) => url.clone(),
+        FrontendSource::Bundled => protocol::initial_url(),
+    };
+    let hook_served = Arc::clone(&initial_served);
+    let hook_first = Arc::clone(&first_request_seen);
+    let asset_hook: AssetHook = Arc::new(move |uri| {
+        if uri == hook_url {
+            hook_served.store(true, Ordering::SeqCst);
+        }
+        if !hook_first.swap(true, Ordering::SeqCst) {
+            tracing::debug!(uri, "webview.asset.first_request");
+        }
+    });
+
     let noop: Waker = Arc::new(|| {});
-    let builder = match configure_builder(&config, &dispatcher, reply_tx.clone(), noop) {
-        Some(builder) => builder,
+    tracing::debug!("webview.build_gtk.begin");
+    let (builder, initial_url) = match configure_builder(
+        &config,
+        &dispatcher,
+        script_tx.clone(),
+        noop,
+        true,
+        Some(asset_hook),
+    ) {
+        Some(built) => built,
         None => std::process::exit(1),
     };
     let webview = match builder.build_gtk(&vbox) {
-        Ok(webview) => webview,
+        Ok(webview) => {
+            tracing::debug!("webview.build_gtk.ok");
+            webview
+        }
         Err(err) => {
-            tracing::error!(%err, "failed to create webview");
+            tracing::error!(%err, "webview.build_gtk.failed");
             tracing::error!("XWayland fallback still available: env -u WAYLAND_DISPLAY cargo run");
             std::process::exit(1);
         }
     };
-    window.show_all();
-    if reply_tx.send(ready_script(&dispatcher)).is_err() {
-        tracing::warn!("dropping app.ready event: reply queue closed");
+
+    // WebKitGTK 2.46+ fix (see the webkit2gtk note in Cargo.toml): wry
+    // 0.56.1 registers the custom scheme as secure but not as CORS-enabled,
+    // and newer WebKitGTK refuses top-level navigation to such schemes.
+    // Registering here runs before the initial navigation is requested and
+    // before the main loop starts, which is timing-equivalent to wry doing
+    // it during its own setup — nothing is processed until `gtk::main()`.
+    if !register_custom_scheme_cors(&webview) {
+        tracing::error!(
+            "custom-scheme CORS registration failed; on WebKitGTK >= 2.46 bundled companion:// navigation is expected to fail"
+        );
     }
 
-    // Reply/emit scripts drain on the GTK thread. The webview never
-    // crosses threads: this source is installed here and only ever runs
-    // on the main loop (`timeout_add_local` accepts the non-Send
-    // closure, unlike thread-bound sources).
-    gtk::glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
-        while let Ok(script) = reply_rx.try_recv() {
-            if let Err(err) = webview.evaluate_script(&script) {
-                tracing::warn!(%err, "failed to deliver ipc reply to webview");
+    let page_committed = Arc::new(AtomicBool::new(false));
+    let asset_root = std::env::var("UTSUWA_ASSET_DIR").unwrap_or_else(|_| "build".to_string());
+    connect_load_signals(
+        &webview,
+        Arc::clone(&page_committed),
+        &asset_root,
+        &initial_url,
+    );
+
+    // Deferred initial navigation: requested only after the custom protocol
+    // (registered during `build_gtk`, before any load) and the CORS fix are
+    // both in place. Verified against wry 0.56.1 sources: its builder calls
+    // `register_uri_scheme` before `load_uri`, so protocol-before-navigation
+    // holds either way; deferring additionally orders our CORS fix first.
+    tracing::debug!(url = %initial_url, "webview.navigation.request");
+    if let Err(err) = webview.load_url(&initial_url) {
+        tracing::error!(%err, url = %initial_url, "webview.navigation.request_failed");
+        // Show diagnostics instead of exiting: a window explaining the
+        // failure beats a dead process for a scheduling failure.
+        use webkit2gtk::WebViewExt as _;
+        use wry::WebViewExtUnix as _;
+        webview.webview().load_html(
+            &fatal_page_html(
+                &asset_root,
+                &initial_url,
+                &format!("initial navigation could not be scheduled: {err}"),
+            ),
+            None,
+        );
+    }
+
+    window.show_all();
+    tracing::debug!("webview.window.shown");
+    if !script_tx.send_script(ready_script(&dispatcher)) {
+        tracing::warn!("dropping app.ready event: reply queue closed");
+    }
+    tracing::debug!("host.app_ready.queued");
+
+    // Clone the inner handle before `webview` moves into the consumer: the
+    // watchdog below needs it to show the fatal page on total failure.
+    let watchdog_view = {
+        use wry::WebViewExtUnix as _;
+        webview.webview()
+    };
+
+    // Event-driven script delivery: producers on any thread push into the
+    // unbounded channel and each send wakes this main-context task — no
+    // polling, no idle wakeups. The WebView never crosses threads: the
+    // consumer future is `spawn_local`, so it only ever runs on the GTK
+    // thread. (Dropping the JoinHandle detaches; only `abort()` cancels.)
+    {
+        let context = gtk::glib::MainContext::default();
+        let _consumer = context.spawn_local(async move {
+            while let Some(script) = script_rx.recv().await {
+                if let Err(err) = webview.evaluate_script(&script) {
+                    tracing::warn!(
+                        %err,
+                        kind = script_kind(&script),
+                        "failed to deliver ipc reply to webview"
+                    );
+                }
             }
-        }
-        gtk::glib::ControlFlow::Continue
-    });
+        });
+    }
+
+    // Bundled-mode watchdog: if the initial document never reaches the Rust
+    // handler, the window would otherwise sit blank with no explanation.
+    if !dev_mode {
+        let seen = Arc::clone(&initial_served);
+        let committed = Arc::clone(&page_committed);
+        let fatal_url = initial_url.clone();
+        let fatal_root = asset_root.clone();
+        gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(10), move || {
+            tracing::debug!(
+                seen = seen.load(Ordering::SeqCst),
+                committed = committed.load(Ordering::SeqCst),
+                "webview.navigation.watchdog.fired"
+            );
+            if !seen.load(Ordering::SeqCst) && !committed.load(Ordering::SeqCst) {
+                tracing::error!(
+                    url = %fatal_url,
+                    asset_root = %fatal_root,
+                    "bundled navigation watchdog: the initial document never reached the Rust protocol handler; \
+                     likely WebKit/Wry custom-scheme registration failure (run with --trace for webview.asset.request lines)"
+                );
+                use webkit2gtk::WebViewExt as _;
+                watchdog_view.load_html(
+                    &fatal_page_html(
+                        &fatal_root,
+                        &fatal_url,
+                        "the initial document request never reached the host protocol handler",
+                    ),
+                    None,
+                );
+            } else {
+                tracing::debug!("webview.navigation.watchdog.ok");
+            }
+        });
+    }
 
     window.connect_delete_event(|_, _| {
         gtk::main_quit();
         gtk::glib::Propagation::Proceed
     });
+    tracing::debug!("webview.mainloop.enter");
     gtk::main();
+    tracing::debug!("webview.mainloop.exited");
+}
+
+/// Connect WebKit load signals for navigation checkpoints and the native
+/// fatal-error page. `load_failed` on the WebView fires for main-frame
+/// loads only, so subresource 404s never trigger the fatal page; the
+/// `page_committed` guard additionally prevents clobbering a page that
+/// already committed (e.g. a later reload failing).
+#[cfg(target_os = "linux")]
+fn connect_load_signals(
+    webview: &wry::WebView,
+    page_committed: Arc<AtomicBool>,
+    asset_root: &str,
+    initial_url: &str,
+) {
+    use webkit2gtk::WebViewExt as _;
+    use wry::WebViewExtUnix as _;
+
+    let inner = webview.webview();
+    let committed = Arc::clone(&page_committed);
+    inner.connect_load_changed(move |view, event| {
+        use webkit2gtk::LoadEvent;
+        let uri = view.uri().as_deref().unwrap_or("?").to_string();
+        match event {
+            LoadEvent::Started => {
+                committed.store(false, Ordering::SeqCst);
+                tracing::debug!(uri, "webview.navigation.started");
+            }
+            LoadEvent::Redirected => {
+                tracing::debug!(uri, "webview.navigation.redirected");
+            }
+            LoadEvent::Committed => {
+                committed.store(true, Ordering::SeqCst);
+                tracing::debug!(uri, "webview.navigation.committed");
+            }
+            LoadEvent::Finished => {
+                committed.store(true, Ordering::SeqCst);
+                tracing::debug!(uri, "webview.navigation.completed");
+            }
+            _ => {}
+        }
+    });
+    let fatal_root = asset_root.to_string();
+    let fatal_url = initial_url.to_string();
+    inner.connect_load_failed(move |view, event, uri, error| {
+        tracing::error!(%uri, %error, event = ?event, "webview.navigation.failed");
+        if !page_committed.load(Ordering::SeqCst) {
+            view.load_html(
+                &fatal_page_html(&fatal_root, &fatal_url, &error.to_string()),
+                None,
+            );
+        }
+        // Handled: our diagnostic page replaces WebKit's default error page.
+        true
+    });
+}
+
+/// Register the app custom scheme as CORS-enabled on the WebView's context.
+///
+/// wry 0.56.1 (`webkitgtk/web_context.rs`) calls only
+/// `register_uri_scheme_as_secure`; WebKitGTK 2.46+ additionally requires
+/// `register_uri_scheme_as_cors_enabled` for top-level custom-scheme
+/// navigation. Applied here through wry's public `WebViewExtUnix::webview`
+/// handle — same underlying context, no fork or patch needed.
+#[cfg(target_os = "linux")]
+fn register_custom_scheme_cors(webview: &wry::WebView) -> bool {
+    use webkit2gtk::{SecurityManagerExt, WebContextExt, WebViewExt};
+    use wry::WebViewExtUnix as _;
+
+    let inner = webview.webview();
+    let Some(context) = inner.context() else {
+        tracing::error!("webview.custom_scheme.cors_failed: no WebContext on inner WebView");
+        return false;
+    };
+    let Some(manager) = context.security_manager() else {
+        tracing::error!("webview.custom_scheme.cors_failed: no SecurityManager on WebContext");
+        return false;
+    };
+    manager.register_uri_scheme_as_cors_enabled(protocol::APP_SCHEME);
+    tracing::debug!(
+        scheme = protocol::APP_SCHEME,
+        "webview.custom_scheme.cors_enabled"
+    );
+    true
+}
+
+/// Debug-only Linux runtime diagnostics. Optional evidence only — nothing
+/// here is a hard requirement for startup.
+#[cfg(target_os = "linux")]
+fn log_linux_runtime_diagnostics() {
+    let display_backend = gtk::gdk::Display::default()
+        .map(|display| {
+            use gtk::glib::ObjectExt as _;
+            display.type_().name().to_string()
+        })
+        .unwrap_or_else(|| "none".to_string());
+    tracing::debug!(
+        gtk = format!(
+            "{}.{}.{}",
+            gtk::major_version(),
+            gtk::minor_version(),
+            gtk::micro_version()
+        ),
+        gdk_backend = %display_backend,
+        session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default(),
+        wayland_display_present = std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        display_present = std::env::var_os("DISPLAY").is_some(),
+        webkit_build = env!("UTSUWA_WEBKIT_PC_VERSION"),
+        app_version = env!("CARGO_PKG_VERSION"),
+        "linux.runtime.diagnostics"
+    );
+}
+
+/// Minimal native diagnostic page shown when bundled navigation fails,
+/// instead of leaving a blank window. Static HTML, no scripts, no secrets.
+#[cfg(target_os = "linux")]
+fn fatal_page_html(asset_root: &str, initial_url: &str, error: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Utsuwa failed to load</title>\
+         <style>body{{font-family:sans-serif;max-width:46rem;margin:4rem auto;padding:0 1rem;\
+         color:#e8e8e8;background:#1a1a1a}}code{{background:#333;padding:.1rem .3rem;\
+         border-radius:.25rem}}h1{{font-size:1.4rem}}</style></head><body>\
+         <h1>Utsuwa failed to load its bundled frontend</h1>\
+         <p>Asset root: <code>{root}</code></p>\
+         <p>Initial URL: <code>{url}</code></p>\
+         <p>WebKitGTK (build): <code>{webkit}</code> · GTK (build): <code>{gtk}</code></p>\
+         <p>Error: <code>{error}</code></p>\
+         <p>Run with <code>cargo run -- --trace</code> and look for \
+         <code>webview.asset.request</code> lines to see whether document \
+         requests reach the host.</p></body></html>",
+        root = escape_html(asset_root),
+        url = escape_html(initial_url),
+        webkit = escape_html(env!("UTSUWA_WEBKIT_PC_VERSION")),
+        gtk = escape_html(env!("UTSUWA_GTK_PC_VERSION")),
+        error = escape_html(error),
+    )
+}
+
+/// Minimal HTML escaping for the fatal page (untrusted error text).
+#[cfg(target_os = "linux")]
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -344,7 +713,11 @@ impl HostApp {
         };
         while let Ok(script) = self.reply_rx.try_recv() {
             if let Err(err) = webview.evaluate_script(&script) {
-                tracing::warn!(%err, "failed to deliver ipc reply to webview");
+                tracing::warn!(
+                    %err,
+                    kind = script_kind(&script),
+                    "failed to deliver ipc reply to webview"
+                );
             }
         }
     }
@@ -374,14 +747,20 @@ impl HostApp {
                 tracing::warn!("dropping ipc reply: event loop closed");
             }
         });
-        let builder =
-            match configure_builder(&self.config, &self.dispatcher, self.reply_tx.clone(), waker) {
-                Some(builder) => builder,
-                None => {
-                    event_loop.exit();
-                    return;
-                }
-            };
+        let (builder, _initial_url) = match configure_builder(
+            &self.config,
+            &self.dispatcher,
+            self.reply_tx.clone(),
+            waker,
+            false,
+            None,
+        ) {
+            Some(built) => built,
+            None => {
+                event_loop.exit();
+                return;
+            }
+        };
         match builder.build(&window) {
             Ok(webview) => {
                 self.window = Some(window);
@@ -447,6 +826,7 @@ fn run_winit(
 /// Shared host startup: storage, audit, approvals, dispatcher, and the
 /// agent runtime. The UI runner (GTK or winit) takes over afterwards.
 fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
+    tracing::debug!("host.boot.begin");
     let boot_started = std::time::Instant::now();
     // SQLite state: settings KV + persistent grants. A host without
     // storage still runs — approvals go in-memory and every launch
@@ -585,25 +965,28 @@ fn main() {
         }
     };
 
-    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-    // Agent runtime → frontend event path: scripts queue on the reply
-    // channel and the UI runner evaluates them on its thread, exactly
-    // like IPC replies.
-    let emit_tx = reply_tx.clone();
-
     #[cfg(target_os = "linux")]
     {
+        // Agent runtime → frontend event path: scripts queue on the script
+        // channel and the GTK main-context consumer evaluates them on the
+        // UI thread, exactly like IPC replies. Unbounded async channel:
+        // `send` is synchronous and thread-safe, and each send wakes the
+        // consumer task — no polling, no waker needed.
+        let (script_tx, script_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let emit_tx = script_tx.clone();
         let emit: EmitFn = Arc::new(move |event| {
             if emit_tx.send(emit_script(&event)).is_err() {
                 tracing::warn!("dropping agent event: reply queue closed");
             }
         });
         let dispatcher = start_host(emit, dev_grant_workspace);
-        run_gtk(config, dispatcher, reply_tx, reply_rx);
+        run_gtk(config, dispatcher, script_tx, script_rx);
     }
 
     #[cfg(not(target_os = "linux"))]
     {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let emit_tx = reply_tx.clone();
         let event_loop = match EventLoop::new() {
             Ok(event_loop) => event_loop,
             Err(err) => {
@@ -650,5 +1033,23 @@ mod tests {
             permission_response(PermissionKind::Geolocation),
             PermissionResponse::Default
         );
+    }
+
+    #[test]
+    fn script_kind_classifies_without_payloads() {
+        assert_eq!(script_kind("window.utsuwa && x.__emit(\"a\",{})\n"), "emit");
+        assert_eq!(script_kind("__resolve(\"1\", true, {})"), "resolve");
+        assert_eq!(script_kind("alert(1)"), "other");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fatal_page_contains_diagnostics_and_escapes_html() {
+        let html = fatal_page_html("build", "companion://app/app", "<oops>&\"");
+        assert!(html.contains("Utsuwa failed to load"), "{html}");
+        assert!(html.contains("companion://app/app"), "{html}");
+        assert!(html.contains("&lt;oops&gt;&amp;&quot;"), "{html}");
+        assert!(!html.contains("<oops>"), "{html}");
+        assert!(!html.contains("<script"), "{html}");
     }
 }

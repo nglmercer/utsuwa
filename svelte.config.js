@@ -47,6 +47,17 @@ const config = {
 		// CSP is managed separately. connect/img stay permissive because users
 		// point the app at arbitrary provider endpoints and it pulls the on-device
 		// embedding model from a CDN; the protection is locking script-src.
+		//
+		// Custom-scheme notes (companion://app in the wry/WebKitGTK host):
+		// - The host registers the scheme as secure + CORS-enabled, so WebKit
+		//   treats companion://app as a real tuple origin and 'self' matches
+		//   same-app scripts, styles, workers, and fetches. Keep app.html free
+		//   of inline scripts: SvelteKit only auto-hashes scripts it emits, so
+		//   hand-written inline scripts would be blocked (use /theme-init.js).
+		// - 'wasm-unsafe-eval' allows WebAssembly.compile for the lazy-loaded
+		//   ONNX/Transformers embedding chunk while still blocking JS eval.
+		// - connect-src keeps http: (not just https:) for local LLM endpoints
+		//   such as http://localhost:11434 (Ollama).
 		csp: isDesktop
 			? {
 					mode: 'hash',

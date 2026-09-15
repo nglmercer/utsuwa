@@ -56,8 +56,14 @@ impl DesktopBackend for AtspiBackend {
     }
 
     async fn list_windows(&self) -> Result<Vec<WindowInfo>, DesktopError> {
+        tracing::trace!("desktop.atspi.list_windows.begin");
         self.ensure_available("window enumeration")?;
-        let trees = live::collect_window_trees().await.map_err(describe)?;
+        let trees = self
+            .service
+            .run_live("collect_window_trees", live::collect_window_trees)
+            .await
+            .map_err(describe)?;
+        tracing::trace!(count = trees.len(), "desktop.atspi.list_windows.ok");
         Ok(trees
             .iter()
             .map(|tree| WindowInfo {
@@ -70,7 +76,11 @@ impl DesktopBackend for AtspiBackend {
 
     async fn accessibility_tree(&self, window_id: &str) -> Result<Vec<ElementNode>, DesktopError> {
         self.ensure_available("accessibility tree")?;
-        let trees = live::collect_window_trees().await.map_err(describe)?;
+        let trees = self
+            .service
+            .run_live("collect_window_trees", live::collect_window_trees)
+            .await
+            .map_err(describe)?;
         let tree = trees
             .iter()
             .find(|tree| tree.id == window_id)
@@ -101,7 +111,10 @@ impl DesktopBackend for AtspiBackend {
 
     async fn invoke_element(&self, _window_id: &str, element_id: &str) -> Result<(), DesktopError> {
         self.ensure_available("element invocation")?;
-        live::invoke_element(element_id)
+        self.service
+            .run_live("invoke_element", |conn| {
+                live::invoke_element(conn, element_id)
+            })
             .await
             .map_err(|error| match error {
                 AtspiError::Unsupported(detail) => DesktopError::UnknownElement(detail),
@@ -111,7 +124,10 @@ impl DesktopBackend for AtspiBackend {
 
     async fn focus_element(&self, _window_id: &str, element_id: &str) -> Result<(), DesktopError> {
         self.ensure_available("element focus")?;
-        live::focus_element(element_id)
+        self.service
+            .run_live("focus_element", |conn| {
+                live::focus_element(conn, element_id)
+            })
             .await
             .map_err(|error| match error {
                 AtspiError::Unsupported(detail) => DesktopError::UnknownElement(detail),
@@ -126,7 +142,8 @@ impl DesktopBackend for AtspiBackend {
         value: &str,
     ) -> Result<(), DesktopError> {
         self.ensure_available("semantic value setting")?;
-        live::set_value(element_id, value)
+        self.service
+            .run_live("set_value", |conn| live::set_value(conn, element_id, value))
             .await
             .map_err(|error| match error {
                 AtspiError::Unsupported(detail) => DesktopError::UnknownElement(detail),
@@ -136,12 +153,20 @@ impl DesktopBackend for AtspiBackend {
 
     async fn select_element(&self, _window_id: &str, element_id: &str) -> Result<(), DesktopError> {
         self.ensure_available("semantic selection")?;
-        live::select_element(element_id).await.map_err(describe)
+        self.service
+            .run_live("select_element", |conn| {
+                live::select_element(conn, element_id)
+            })
+            .await
+            .map_err(describe)
     }
 
     async fn expand_element(&self, _window_id: &str, element_id: &str) -> Result<(), DesktopError> {
         self.ensure_available("semantic expansion")?;
-        live::expand_element(element_id, true)
+        self.service
+            .run_live("expand_element", |conn| {
+                live::expand_element(conn, element_id, true)
+            })
             .await
             .map_err(describe)
     }
@@ -152,14 +177,18 @@ impl DesktopBackend for AtspiBackend {
         element_id: &str,
     ) -> Result<(), DesktopError> {
         self.ensure_available("semantic collapse")?;
-        live::expand_element(element_id, false)
+        self.service
+            .run_live("expand_element", |conn| {
+                live::expand_element(conn, element_id, false)
+            })
             .await
             .map_err(describe)
     }
 
     async fn focus_window(&self, window_id: &str) -> Result<(), DesktopError> {
         self.ensure_available("window focus")?;
-        live::focus_element(window_id)
+        self.service
+            .run_live("focus_element", |conn| live::focus_element(conn, window_id))
             .await
             .map_err(|error| match error {
                 AtspiError::Unsupported(_) => DesktopError::UnknownWindow(window_id.to_string()),

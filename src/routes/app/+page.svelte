@@ -176,18 +176,28 @@
 		})();
 	});
 
-	// Initialize embedding model and backfill any facts without embeddings
+	// Initialize the embedding model only when semantic memory actually needs
+	// it. Downloading/compiling the ONNX model on every startup — notably for
+	// fresh installs with zero facts — wastes bandwidth and delays boot, and
+	// must never break the page (recall degrades to keyword search without
+	// it). Facts saved while the model is unready are backfilled here on the
+	// next startup; the memory pipeline also warms the model on demand.
 	$effect(() => {
-		initEmbeddingModel().then(async (ready) => {
-			if (ready) {
+		(async () => {
+			try {
 				const status = await getEmbeddingBackfillStatus();
-				if (status.withoutEmbeddings > 0) {
+				if (status.total === 0) {
+					console.info('Skipping embedding model init: no stored facts.');
+					return;
+				}
+				const ready = await initEmbeddingModel();
+				if (ready && status.withoutEmbeddings > 0) {
 					await backfillEmbeddings();
 				}
+			} catch (e) {
+				console.error('Failed to initialize embedding model:', e);
 			}
-		}).catch((e) => {
-			console.error('Failed to initialize embedding model:', e);
-		});
+		})();
 	});
 
 	// Check for first-run (onboarding). ?onboarding=1 force-opens it for testing
