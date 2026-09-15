@@ -7,6 +7,8 @@
 //! [`IpcMethod`], so they cannot even parse).
 
 use super::plugins::PluginOp;
+#[cfg(test)]
+use crate::runtime::sync_factory;
 use crate::runtime::AgentRuntime;
 use ipc_core::{HostEvent, IpcErrorBody, IpcErrorResponse, IpcMethod, IpcRequest, IpcResponse};
 use policy_core::ApprovalQueue;
@@ -800,7 +802,7 @@ mod tests {
             None,
             None,
             emit,
-            Arc::new(|| Err(crate::runtime::RuntimeError::ModelNotConfigured)),
+            sync_factory(|| Err(crate::runtime::RuntimeError::ModelNotConfigured)),
         )
         .unwrap()
     }
@@ -886,7 +888,7 @@ mod tests {
             Some(Arc::clone(&storage)),
             None,
             emit,
-            Arc::new(|| Err(crate::runtime::RuntimeError::ModelNotConfigured)),
+            sync_factory(|| Err(crate::runtime::RuntimeError::ModelNotConfigured)),
         )
         .unwrap();
         assert!(!agent.autonomous_full_access_enabled());
@@ -932,7 +934,7 @@ mod tests {
                 Some(storage),
                 None,
                 Arc::new(|_| {}),
-                Arc::new(|| Err(crate::runtime::RuntimeError::ModelNotConfigured)),
+                sync_factory(|| Err(crate::runtime::RuntimeError::ModelNotConfigured)),
             )
             .unwrap()
         };

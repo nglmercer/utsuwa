@@ -4,11 +4,28 @@ import { parseLMStudioCapabilities, parseLMStudioModelCapabilities } from './mod
 
 test('LM Studio trained_for_tool_use maps to native tool support', () => {
 	assert.deepEqual(parseLMStudioCapabilities({ vision: true, trained_for_tool_use: true }), {
+		imageInput: 'supported',
 		vision: true,
 		toolCalling: true,
 		nativeToolCalling: true,
-		toolCallingSupport: 'native'
+		toolCallingSupport: 'native',
+		toolCalls: 'supported'
 	});
+});
+
+test('LM Studio explicit vision false maps to unsupported image input', () => {
+	const parsed = parseLMStudioCapabilities({ vision: false });
+	assert.equal(parsed.imageInput, 'unsupported');
+	assert.equal(parsed.vision, false);
+});
+
+test('LM Studio vlm server type proves image input without a vision flag', () => {
+	const parsed = parseLMStudioModelCapabilities({ key: 'qwen', type: 'vlm' });
+	assert.equal(parsed.imageInput, 'supported');
+	assert.equal(
+		parseLMStudioModelCapabilities({ key: 'llama', type: 'llm' }).imageInput,
+		undefined
+	);
 });
 
 test('missing LM Studio capabilities stay unknown', () => {

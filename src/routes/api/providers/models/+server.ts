@@ -68,6 +68,7 @@ async function fetchOpenAIModels(
 	providerId = 'openai'
 ): Promise<ModelInfo[]> {
 	return fetchOpenAICompatibleModels(apiKey, baseUrl, providerId, {
+		includeCapabilities: true,
 		normalizeName: (id) => normalizeModelName(id, providerId)
 	});
 }
@@ -261,9 +262,15 @@ export const POST: RequestHandler = async ({ request }) => {
 					models = await fetchOllamaModels(cleanBaseUrl);
 				} else {
 					// Custom endpoints own their path semantics; do not assume `/v1`.
+					// Preserve parsed capability metadata; the protocol is
+					// OpenAI-compatible even when `/models` omits it.
 					models = (await fetchOpenAIModels(apiKey, cleanBaseUrl, 'openai-compatible')).map((model) => ({
 						...model,
-						capabilities: { toolCalling: true, toolCallingSupport: 'compatible' as const }
+						capabilities: {
+							...model.capabilities,
+							toolCalling: true,
+							toolCallingSupport: 'compatible' as const
+						}
 					}));
 				}
 				break;

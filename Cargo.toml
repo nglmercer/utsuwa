@@ -20,6 +20,7 @@ members = [
     "crates/capability-core",
     "crates/ipc-core",
     "crates/model-core",
+    "crates/model-catalog",
     "crates/model-openai-compatible",
     "crates/policy-core",
     "crates/storage-core",
@@ -75,6 +76,7 @@ ipc-core = { path = "crates/ipc-core" }
 keyring = { version = "4" }
 secret-core = { path = "crates/secret-core" }
 model-core = { path = "crates/model-core" }
+model-catalog = { path = "crates/model-catalog" }
 model-openai-compatible = { path = "crates/model-openai-compatible" }
 policy-core = { path = "crates/policy-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }

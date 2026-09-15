@@ -4,11 +4,30 @@
  * Tool support is deliberately more expressive than a boolean: a provider can
  * speak the tools protocol while the selected model has no explicit tool-use
  * training metadata, and an unknown value must remain usable.
+ *
+ * Media capabilities use the normalized {@link CapabilitySupport} states,
+ * mirroring the native `model-core` contract: only an explicit `supported`
+ * (from real provider API metadata) enables the media path. `unknown`
+ * means the catalog entry was silent and must never be treated as
+ * supported. Nothing here is ever inferred from the model id.
  */
 export type ToolCallingSupport = 'native' | 'compatible' | 'unsupported' | 'unknown';
 
+/** Whether a provider API explicitly supports a capability. */
+export type CapabilitySupport = 'supported' | 'unsupported' | 'unknown';
+
 export interface ModelCapabilities {
+	/** @deprecated Use `imageInput === 'supported'` instead. Kept as a
+	 * derived alias populated by the parsers below. */
 	vision?: boolean;
+	imageInput?: CapabilitySupport;
+	audioInput?: CapabilitySupport;
+	videoInput?: CapabilitySupport;
+	pdfInput?: CapabilitySupport;
+	toolCalls?: CapabilitySupport;
+	parallelToolCalls?: CapabilitySupport;
+	structuredOutput?: CapabilitySupport;
+	reasoning?: CapabilitySupport;
 	toolCalling?: boolean;
 	nativeToolCalling?: boolean;
 	toolCallingSupport?: ToolCallingSupport;
@@ -31,6 +50,26 @@ interface RawModelCapabilities {
 }
 
 /**
+ * Derive the legacy `vision` boolean alias from a normalized image-input
+ * state: supported -> true, unsupported -> false, unknown/absent -> undefined.
+ */
+export function visionAlias(imageInput: CapabilitySupport | undefined): boolean | undefined {
+	if (imageInput === 'supported') return true;
+	if (imageInput === 'unsupported') return false;
+	return undefined;
+}
+
+/**
+ * Normalize one advertised boolean into a support state: explicit true ->
+ * supported, explicit false -> unsupported, anything else -> unknown.
+ */
+export function supportFromFlag(value: unknown): CapabilitySupport {
+	if (value === true) return 'supported';
+	if (value === false) return 'unsupported';
+	return 'unknown';
+}
+
+/**
  * Convert LM Studio's REST metadata to the provider-neutral shape used by the
  * model picker and connection diagnostics. The v0 API returned capabilities
  * as an array in some releases; the v1 API returns an object with
@@ -39,18 +78,26 @@ interface RawModelCapabilities {
 export function parseLMStudioCapabilities(raw: unknown): ModelCapabilities {
 	if (Array.isArray(raw)) {
 		const capabilities = raw.filter((value): value is string => typeof value === 'string');
-		const vision = capabilities.includes('vision');
+		const imageInput: CapabilitySupport | undefined = capabilities.includes('vision')
+			? 'supported'
+			: undefined;
 		const toolCalling =
 			capabilities.includes('tool_use') ||
 			capabilities.includes('tool-use') ||
 			capabilities.includes('trained_for_tool_use');
 		return {
-			...(vision ? { vision: true } : {}),
+			...(imageInput !== undefined
+				? {
+						imageInput,
+						...(visionAlias(imageInput) !== undefined ? { vision: visionAlias(imageInput) } : {})
+					}
+				: {}),
 			...(toolCalling
 				? {
 						toolCalling: true,
 						nativeToolCalling: true,
-						toolCallingSupport: 'native' as const
+						toolCallingSupport: 'native' as const,
+						toolCalls: 'supported' as const
 					}
 				: { toolCallingSupport: 'unknown' as const })
 		};
@@ -61,7 +108,12 @@ export function parseLMStudioCapabilities(raw: unknown): ModelCapabilities {
 	}
 
 	const value = raw as RawModelCapabilities;
-	const vision = value.vision === true ? true : value.vision === false ? false : undefined;
+	const imageInput =
+		value.vision === true
+			? ('supported' as const)
+			: value.vision === false
+				? ('unsupported' as const)
+				: undefined;
 	const explicitlyNative = value.trained_for_tool_use === true || value.nativeToolCalling === true;
 	const explicitlyUnsupported =
 		value.trained_for_tool_use === false ||
@@ -77,10 +129,17 @@ export function parseLMStudioCapabilities(raw: unknown): ModelCapabilities {
 				: 'unknown';
 
 	return {
-		...(vision !== undefined ? { vision } : {}),
+		...(imageInput !== undefined
+			? { imageInput, ...(visionAlias(imageInput) !== undefined ? { vision: visionAlias(imageInput) } : {}) }
+			: {}),
 		...(support !== 'unknown' && support !== 'unsupported' ? { toolCalling: true } : {}),
 		...(support === 'native' ? { nativeToolCalling: true } : {}),
-		toolCallingSupport: support
+		toolCallingSupport: support,
+		...(support === 'native' || support === 'compatible'
+			? { toolCalls: 'supported' as const }
+			: support === 'unsupported'
+				? { toolCalls: 'unsupported' as const }
+				: {})
 	};
 }
 
@@ -102,8 +161,24 @@ export function parseLMStudioModelCapabilities(model: Record<string, unknown>): 
 		});
 	}
 
+	const rootVision =
+		model.vision === true
+			? ('supported' as const)
+			: model.vision === false
+				? ('unsupported' as const)
+				: undefined;
+	// A server-declared `vlm` type is API metadata (not a name hint) and
+	// proves image input when no explicit vision flag exists.
+	const modelType = typeof model.type === 'string' ? model.type.toLowerCase() : undefined;
+	const imageInput = parsed.imageInput ?? rootVision ?? (modelType === 'vlm' ? 'supported' : undefined);
+
 	return {
 		...parsed,
-		...(model.vision === true || model.vision === false ? { vision: model.vision } : {})
+		...(imageInput !== undefined
+			? {
+					imageInput,
+					...(visionAlias(imageInput) !== undefined ? { vision: visionAlias(imageInput) } : {})
+				}
+			: {})
 	};
 }

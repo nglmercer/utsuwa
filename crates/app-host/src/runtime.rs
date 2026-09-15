@@ -38,10 +38,10 @@ pub(crate) use self::prompts::{compose_host_system_prompt, compose_host_system_p
 #[cfg(test)]
 pub(crate) use self::providers::configured_tool_profile;
 pub use self::providers::{
-    normalize_provider_base_url, tool_profile_for_provider, ToolProfile, SETTING_API_KEY,
-    SETTING_AUTONOMOUS_FULL_ACCESS, SETTING_BASE_URL, SETTING_BROWSER_CDP_ENDPOINT,
-    SETTING_MCP_SERVERS, SETTING_MODEL_NAME, SETTING_MODEL_VISION, SETTING_PLUGIN_DIR,
-    SETTING_PROVIDER, SETTING_TOOL_PROFILE,
+    normalize_provider_base_url, sync_factory, tool_profile_for_provider, ProviderFactory,
+    ToolProfile, SETTING_API_KEY, SETTING_AUTONOMOUS_FULL_ACCESS, SETTING_BASE_URL,
+    SETTING_BROWSER_CDP_ENDPOINT, SETTING_MCP_SERVERS, SETTING_MODEL_NAME, SETTING_MODEL_VISION,
+    SETTING_PLUGIN_DIR, SETTING_PROVIDER, SETTING_TOOL_PROFILE,
 };
 pub(crate) use self::providers::{
     provider_factory_with_secrets, read_autonomous_full_access, read_cdp_endpoint,
@@ -58,6 +58,7 @@ use audit_core::AuditSink;
 use capability_core::AgentId;
 use ipc_core::HostEvent;
 use mcp_runtime::McpManager;
+#[cfg(test)]
 use model_core::ModelProvider;
 use policy_core::ApprovalQueue;
 use std::sync::{
@@ -182,7 +183,7 @@ pub struct AgentRuntime {
     approvals: Arc<Mutex<ApprovalQueue>>,
     audit: Option<Arc<dyn AuditSink>>,
     emit: EmitFn,
-    provider_factory: Arc<dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync>,
+    provider_factory: ProviderFactory,
     processes: Arc<ProcessManager>,
     mcp: Arc<McpManager>,
     plugins: Arc<plugin_wasm::PluginRuntime>,
@@ -258,15 +259,14 @@ impl AgentRuntime {
             sensors,
         )
     }
-    /// Start with an explicit provider factory (tests inject stubs).
+    /// Start with an explicit provider factory (tests inject stubs via
+    /// [`sync_factory`]).
     pub fn start_with_factory(
         approvals: Arc<Mutex<ApprovalQueue>>,
         storage: Option<Arc<Mutex<Storage>>>,
         audit: Option<Arc<dyn AuditSink>>,
         emit: EmitFn,
-        provider_factory: Arc<
-            dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync,
-        >,
+        provider_factory: ProviderFactory,
     ) -> Result<Arc<Self>, RuntimeError> {
         Self::start_with_factory_and_sensors(
             approvals,
@@ -286,9 +286,7 @@ impl AgentRuntime {
         storage: Option<Arc<Mutex<Storage>>>,
         audit: Option<Arc<dyn AuditSink>>,
         emit: EmitFn,
-        provider_factory: Arc<
-            dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync,
-        >,
+        provider_factory: ProviderFactory,
         sensors: Arc<SensorActivityHub>,
     ) -> Result<Arc<Self>, RuntimeError> {
         let startup = Instant::now();
@@ -1669,7 +1667,7 @@ mod tests {
             None,
             None,
             emit,
-            Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+            sync_factory(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
         )
         .unwrap();
         Harness {
@@ -1690,7 +1688,7 @@ mod tests {
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+            sync_factory(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
         )
         .unwrap();
         Harness {
@@ -1715,7 +1713,7 @@ mod tests {
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+            sync_factory(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
         )
         .unwrap();
         (
@@ -2212,7 +2210,7 @@ mod tests {
             Some(storage),
             None,
             Arc::new(move |event| sink.lock().unwrap().push(event)),
-            Arc::new({
+            sync_factory({
                 let provider = Arc::clone(&provider);
                 move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)
             }),
@@ -2576,7 +2574,7 @@ mod tests {
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new({
+            sync_factory({
                 let provider = Arc::clone(&provider);
                 move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)
             }),
@@ -2729,7 +2727,7 @@ mod tests {
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new(|| {
+            sync_factory(|| {
                 Ok(Arc::new(Driver {
                     calls: Mutex::new(0),
                 }) as Arc<dyn ModelProvider>)
@@ -3011,7 +3009,7 @@ mod tests {
                 Arc::new(move |event| {
                     sink.lock().unwrap().push(event);
                 }),
-                Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+                sync_factory(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
             )
             .unwrap();
             Harness {
@@ -3073,7 +3071,7 @@ mod tests {
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
+            sync_factory(move || Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)),
         )
         .unwrap();
         let harness = Harness {
@@ -3120,8 +3118,8 @@ mod tests {
             .all(|e| e.event != "agent.turn_done"));
     }
 
-    #[test]
-    fn legacy_api_key_migrates_to_the_secret_store() {
+    #[tokio::test]
+    async fn legacy_api_key_migrates_to_the_secret_store() {
         use secret_core::{SecretStore, ACCOUNT_MODEL_API_KEY};
 
         let dir =
@@ -3133,10 +3131,7 @@ mod tests {
         {
             let store = storage.lock().unwrap();
             store
-                .set_setting(
-                    SETTING_BASE_URL,
-                    &serde_json::json!("http://localhost:11434/v1"),
-                )
+                .set_setting(SETTING_BASE_URL, &serde_json::json!("http://127.0.0.1:9/"))
                 .unwrap();
             store
                 .set_setting(SETTING_MODEL_NAME, &serde_json::json!("m"))
@@ -3150,7 +3145,8 @@ mod tests {
             provider_factory_with_secrets(Some(Arc::clone(&storage)), Arc::clone(&secrets));
 
         // First build migrates the plaintext row into the secret store.
-        factory().unwrap();
+        // (Closed-port base: the catalog fails open to Unknown instantly.)
+        factory().await.unwrap();
         assert_eq!(
             secrets.get(ACCOUNT_MODEL_API_KEY).unwrap(),
             Some("sk-legacy".to_string())
@@ -3165,15 +3161,15 @@ mod tests {
         );
 
         // Second build reads from the secret store, not settings.
-        factory().unwrap();
+        factory().await.unwrap();
         assert_eq!(
             secrets.get(ACCOUNT_MODEL_API_KEY).unwrap(),
             Some("sk-legacy".to_string())
         );
     }
 
-    #[test]
-    fn provider_builds_without_any_key() {
+    #[tokio::test]
+    async fn provider_builds_without_any_key() {
         let dir = std::env::temp_dir().join(format!("utsuwa-runtime-nokey-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let storage = Arc::new(Mutex::new(
@@ -3182,10 +3178,7 @@ mod tests {
         {
             let store = storage.lock().unwrap();
             store
-                .set_setting(
-                    SETTING_BASE_URL,
-                    &serde_json::json!("http://localhost:11434/v1"),
-                )
+                .set_setting(SETTING_BASE_URL, &serde_json::json!("http://127.0.0.1:9/"))
                 .unwrap();
             store
                 .set_setting(SETTING_MODEL_NAME, &serde_json::json!("m"))
@@ -3194,12 +3187,13 @@ mod tests {
         let secrets: Arc<dyn secret_core::SecretStore> =
             Arc::new(secret_core::MemoryStore::default());
         let factory = provider_factory_with_secrets(Some(storage), secrets);
-        // Ollama-style keyless providers still construct.
-        factory().unwrap();
+        // Ollama-style keyless providers still construct (catalog fails
+        // open to Unknown on the closed port).
+        factory().await.unwrap();
     }
 
-    #[test]
-    fn kilo_provider_builds_without_an_api_key() {
+    #[tokio::test]
+    async fn kilo_provider_builds_without_an_api_key() {
         let dir =
             std::env::temp_dir().join(format!("utsuwa-runtime-kilo-nokey-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3214,7 +3208,9 @@ mod tests {
             store
                 .set_setting(
                     SETTING_BASE_URL,
-                    &serde_json::json!("https://api.kilo.ai/api/gateway"),
+                    // Closed port keeps the test hermetic: no key is
+                    // required, and the catalog fails open to Unknown.
+                    &serde_json::json!("http://127.0.0.1:9/"),
                 )
                 .unwrap();
             store
@@ -3226,11 +3222,11 @@ mod tests {
         let factory = provider_factory_with_secrets(Some(storage), secrets);
 
         // Kilo is routed through the generic OpenAI-compatible factory.
-        factory().unwrap();
+        factory().await.unwrap();
     }
 
-    #[test]
-    fn cloud_provider_without_key_is_not_configured() {
+    #[tokio::test]
+    async fn cloud_provider_without_key_is_not_configured() {
         let dir =
             std::env::temp_dir().join(format!("utsuwa-runtime-cloud-nokey-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3255,12 +3251,18 @@ mod tests {
         let secrets: Arc<dyn secret_core::SecretStore> =
             Arc::new(secret_core::MemoryStore::default());
         let factory = provider_factory_with_secrets(Some(storage), secrets);
-        assert!(matches!(factory(), Err(RuntimeError::ModelNotConfigured)));
+        // Fails before any catalog network: the key check precedes discovery.
+        assert!(matches!(
+            factory().await,
+            Err(RuntimeError::ModelNotConfigured)
+        ));
     }
 
-    #[test]
-    fn provider_factory_resolves_vision_from_stored_settings() {
-        fn factory_for(settings: &[(&str, serde_json::Value)]) -> model_core::ModelCapabilities {
+    #[tokio::test]
+    async fn provider_factory_applies_stored_vision_override_over_unknown_catalog() {
+        async fn factory_for(
+            settings: &[(&str, serde_json::Value)],
+        ) -> model_core::ModelCapabilities {
             let dir = std::env::temp_dir().join(format!(
                 "utsuwa-runtime-vision-{}-{}",
                 std::process::id(),
@@ -3279,28 +3281,28 @@ mod tests {
             let secrets: Arc<dyn secret_core::SecretStore> =
                 Arc::new(secret_core::MemoryStore::default());
             let factory = provider_factory_with_secrets(Some(storage), secrets);
-            factory().unwrap().capabilities()
+            factory().await.unwrap().capabilities()
         }
         let local = |model: &str| {
             vec![
                 (SETTING_PROVIDER, serde_json::json!("ollama")),
-                (
-                    SETTING_BASE_URL,
-                    serde_json::json!("http://localhost:11434/v1"),
-                ),
+                // Closed port: the catalog is unreachable, so discovery
+                // yields Unknown however vision-capable the name looks.
+                (SETTING_BASE_URL, serde_json::json!("http://127.0.0.1:9/")),
                 (SETTING_MODEL_NAME, serde_json::json!(model)),
             ]
         };
-        // No override: the provider/model-name heuristic decides.
-        assert!(factory_for(&local("llava:13b")).image_tool_results);
-        assert!(!factory_for(&local("llama3.1:8b")).image_tool_results);
-        // Explicit stored override wins over the heuristic either way.
+        // No override: an unreachable catalog stays conservative — the model
+        // name is never inspected.
+        assert!(!factory_for(&local("llava:13b")).await.image_tool_results);
+        assert!(!factory_for(&local("llama3.1:8b")).await.image_tool_results);
+        // Explicit stored override wins over discovery either way.
         let mut forced = local("llama3.1:8b");
         forced.push((SETTING_MODEL_VISION, serde_json::json!(true)));
-        assert!(factory_for(&forced).image_tool_results);
+        assert!(factory_for(&forced).await.image_tool_results);
         let mut denied = local("llava:13b");
         denied.push((SETTING_MODEL_VISION, serde_json::json!(false)));
-        assert!(!factory_for(&denied).image_tool_results);
+        assert!(!factory_for(&denied).await.image_tool_results);
     }
 
     #[test]
@@ -3325,7 +3327,7 @@ mod tests {
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new(|| Ok(Arc::new(HangingProvider) as Arc<dyn ModelProvider>)),
+            sync_factory(|| Ok(Arc::new(HangingProvider) as Arc<dyn ModelProvider>)),
         )
         .unwrap();
 
@@ -3447,29 +3449,121 @@ mod tests {
     #[test]
     fn secret_store_reads_run_off_the_async_worker() {
         // Regression test for the turn that died before provider init: the
-        // provider factory reads the API key through the synchronous secret
-        // store, and on Linux that call panics when made on an async worker.
-        // The factory must therefore run on the blocking pool: the turn
-        // completes instead of losing its worker with no terminal event.
-        let provider = QueueProvider::new(vec![text_turn("key read off-worker")]);
+        // real provider factory reads the API key through the synchronous
+        // secret store, and on Linux that call panics when made on an async
+        // worker. The factory must therefore read settings/secrets on the
+        // blocking pool while the catalog HTTP stays on the worker: the
+        // turn completes instead of losing its worker with no terminal
+        // event. The nested-runtime secret store panics if touched on any
+        // async worker, so reaching `turn_done` proves the hop.
+        //
+        // The mock provider (catalog + chat) runs on a plain thread with
+        // its own runtime so this stays a sync harness test like the rest.
+        let (url_tx, url_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                url_tx
+                    .send(format!("http://{}", listener.local_addr().unwrap()))
+                    .unwrap();
+                // First connection: GET /models (catalog). Second: POST
+                // /chat/completions (turn). Route by request path.
+                for _ in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut head = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        head.extend_from_slice(&chunk[..n]);
+                    }
+                    let head_text = String::from_utf8_lossy(&head).into_owned();
+                    let header_end =
+                        head_text.find("\r\n\r\n").map(|i| i + 4).unwrap_or(head.len());
+                    let len: usize = head_text
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    let mut body = head[header_end..].to_vec();
+                    while body.len() < len {
+                        let n = socket.read(&mut chunk).await.unwrap();
+                        body.extend_from_slice(&chunk[..n]);
+                    }
+                    if head_text.contains("GET /models") {
+                        let payload = serde_json::json!({
+                            "data": [{
+                                "id": "m",
+                                "architecture": { "input_modalities": ["text"] },
+                                "supported_parameters": ["tools"],
+                            }],
+                        })
+                        .to_string();
+                        socket
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                    payload.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"key read off-worker\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+        });
+        let base_url: String = url_rx.recv().unwrap();
+
+        let dir =
+            std::env::temp_dir().join(format!("utsuwa-runtime-keychain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = Arc::new(Mutex::new(
+            storage_core::Storage::open(&dir.join("state.db")).unwrap(),
+        ));
+        {
+            let store = storage.lock().unwrap();
+            store
+                .set_setting(SETTING_PROVIDER, &serde_json::json!("openai-compatible"))
+                .unwrap();
+            store
+                .set_setting(SETTING_BASE_URL, &serde_json::json!(base_url))
+                .unwrap();
+            store
+                .set_setting(SETTING_MODEL_NAME, &serde_json::json!("m"))
+                .unwrap();
+        }
         let secrets: Arc<dyn secret_core::SecretStore> = Arc::new(NestedRuntimeSecretStore {
             inner: secret_core::MemoryStore::default(),
         });
         let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
-        let runtime = AgentRuntime::start_with_factory(
+        let runtime = AgentRuntime::start_with_secrets(
             Arc::clone(&approvals),
-            None,
+            Some(storage),
             None,
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new(move || {
-                // What `resolve_api_key` does with the keychain on every turn.
-                let _ = secrets.get(secret_core::ACCOUNT_MODEL_API_KEY);
-                Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)
-            }),
+            secrets,
         )
         .unwrap();
         let harness = Harness {
@@ -3481,6 +3575,7 @@ mod tests {
         let done = wait_for(&harness, "agent.turn_done");
         assert_eq!(done.data["text"], "key read off-worker");
         assert!(harness.runtime.lock_state().unwrap().running.is_none());
+        server.join().unwrap();
     }
 
     #[test]
@@ -3495,7 +3590,7 @@ mod tests {
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new(|| -> Result<Arc<dyn ModelProvider>, RuntimeError> {
+            sync_factory(|| -> Result<Arc<dyn ModelProvider>, RuntimeError> {
                 panic!("boom in provider factory")
             }),
         )
@@ -3561,7 +3656,7 @@ mod tests {
             Arc::new(move |event| {
                 sink.lock().unwrap().push(event);
             }),
-            Arc::new(|| Ok(Arc::new(PanicProvider) as Arc<dyn ModelProvider>)),
+            sync_factory(|| Ok(Arc::new(PanicProvider) as Arc<dyn ModelProvider>)),
         )
         .unwrap();
         let harness = Harness {

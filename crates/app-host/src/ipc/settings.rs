@@ -291,10 +291,10 @@ impl Dispatcher {
                 .and_then(|_| {
                     storage.set_setting("model.name", &Value::String(model.trim().to_string()))
                 })
-                // The vision override tracks the model it was classified
-                // with: a sync without `vision` clears a stale override so
-                // the provider/model-name heuristic applies instead of a
-                // previous model's classification.
+                // The vision override is a debug switch, not a cached
+                // classification: a sync without `vision` clears a stale
+                // override so API discovery applies instead of a previous
+                // model's forced value.
                 .and_then(|_| match vision {
                     Some(vision) => storage
                         .set_setting("model.vision", &Value::Bool(vision))

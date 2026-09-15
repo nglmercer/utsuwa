@@ -8,8 +8,8 @@ use artifact_core::ArtifactStore;
 use base64::Engine as _;
 use futures_util::StreamExt;
 use model_core::{
-    FinishReason, ImageDetail, ModelCapabilities, ModelContentPart, ModelError, ModelMessage,
-    ModelProvider, ModelRequest, ModelRole, ModelStream, ModelStreamEvent, ToolCall,
+    FinishReason, ImageDetail, Modality, ModelCapabilities, ModelContentPart, ModelError,
+    ModelMessage, ModelProvider, ModelRequest, ModelRole, ModelStream, ModelStreamEvent, ToolCall,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -20,6 +20,25 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const MODELS_PATH: &str = "/models";
 const MAX_PROVIDER_ERROR_BODY: usize = 8 * 1024;
 
+/// Shared catalog handle so an adapter can report a stale-metadata
+/// capability rejection: the catalog suppresses the advertised capability
+/// and reloads provider metadata before the single retry.
+#[derive(Debug, Clone)]
+pub struct CapabilityContext {
+    pub catalog: Arc<model_catalog::ModelCatalogService>,
+    pub request: model_catalog::CatalogRequest,
+}
+
+fn capability_enabled(caps: ModelCapabilities, modality: Modality) -> bool {
+    match modality {
+        Modality::Image => caps.image_input || caps.image_tool_results,
+        Modality::Audio => caps.audio_input,
+        Modality::Video => caps.video_input,
+        Modality::Pdf => caps.pdf_input,
+        Modality::Text => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleClient {
     http: reqwest::Client,
@@ -27,6 +46,7 @@ pub struct OpenAICompatibleClient {
     api_key: Option<String>,
     model: String,
     capabilities: ModelCapabilities,
+    capability_context: Option<CapabilityContext>,
 }
 
 impl OpenAICompatibleClient {
@@ -48,6 +68,7 @@ impl OpenAICompatibleClient {
             // tool results: image parts degrade to explicit metadata text
             // unless the caller opts in via `with_capabilities`.
             capabilities: ModelCapabilities::default(),
+            capability_context: None,
         }
     }
 
@@ -55,6 +76,14 @@ impl OpenAICompatibleClient {
     /// image/audio/video input, image tool results, streaming).
     pub fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Attach the catalog identity for stale-metadata recovery. When the
+    /// provider explicitly rejects a media kind, the adapter reports it
+    /// (suppress + invalidate) before the single retry without that media.
+    pub fn with_capability_context(mut self, context: CapabilityContext) -> Self {
+        self.capability_context = Some(context);
         self
     }
 
@@ -123,8 +152,46 @@ impl ModelProvider for OpenAICompatibleClient {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
-        let request = self.capabilities.apply_to_request(&request);
-        let body = request_body_with_artifacts(&self.model, &request).await?;
+        match self.stream_once(&request, self.capabilities).await {
+            Ok(stream) => Ok(stream),
+            Err(error) => {
+                // Stale catalog recovery: the provider explicitly rejects a
+                // media kind the catalog advertised. Report it (temporary
+                // suppress + invalidate), rebuild without that media, retry
+                // once. This is not a normal 429/5xx retry — the payload
+                // changes — so `ModelError::is_retryable` stays false and
+                // the agent never backs off on the identical request.
+                let Some(modality) = error.capability_modality() else {
+                    return Err(error);
+                };
+                if !capability_enabled(self.capabilities, modality) {
+                    return Err(error);
+                }
+                if let Some(context) = &self.capability_context {
+                    context
+                        .catalog
+                        .note_capability_error(&context.request, modality);
+                }
+                tracing::warn!(
+                    modality = ?modality,
+                    error = %error,
+                    "provider rejected advertised media capability; retrying once without it"
+                );
+                self.stream_once(&request, self.capabilities.without_modality(modality))
+                    .await
+            }
+        }
+    }
+}
+
+impl OpenAICompatibleClient {
+    async fn stream_once(
+        &self,
+        request: &ModelRequest,
+        caps: ModelCapabilities,
+    ) -> Result<ModelStream, ModelError> {
+        let rewritten = caps.apply_to_request(request);
+        let body = request_body_with_artifacts(&self.model, &rewritten, &caps).await?;
         let mut req = self.http.post(self.url()).json(&body);
         if let Some(key) = self.api_key.as_deref() {
             req = req.bearer_auth(key);
@@ -137,7 +204,7 @@ impl ModelProvider for OpenAICompatibleClient {
         let byte_stream = response.bytes_stream();
         let state = StreamState {
             buffer: String::new(),
-            assembler: SseAssembler::default().with_tool_names(tool_name_map(&request.tools)),
+            assembler: SseAssembler::default().with_tool_names(tool_name_map(&rewritten.tools)),
             bytes: Box::pin(byte_stream),
             finished: false,
         };
@@ -162,6 +229,7 @@ pub struct AnthropicClient {
     api_key: String,
     model: String,
     capabilities: ModelCapabilities,
+    capability_context: Option<CapabilityContext>,
 }
 
 impl AnthropicClient {
@@ -177,12 +245,20 @@ impl AnthropicClient {
             model: model.into(),
             // Anthropic tool_result blocks natively accept images.
             capabilities: ModelCapabilities::default().with_image_tool_results(true),
+            capability_context: None,
         }
     }
 
     /// Declare what the target endpoint actually supports.
     pub fn with_capabilities(mut self, capabilities: ModelCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Attach the catalog identity for stale-metadata recovery (same
+    /// single-retry contract as the OpenAI-compatible client).
+    pub fn with_capability_context(mut self, context: CapabilityContext) -> Self {
+        self.capability_context = Some(context);
         self
     }
 
@@ -198,8 +274,40 @@ impl ModelProvider for AnthropicClient {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ModelError> {
-        let request = self.capabilities.apply_to_request(&request);
-        let body = anthropic_request_body_with_artifacts(&self.model, &request).await?;
+        match self.stream_once(&request, self.capabilities).await {
+            Ok(stream) => Ok(stream),
+            Err(error) => {
+                let Some(modality) = error.capability_modality() else {
+                    return Err(error);
+                };
+                if !capability_enabled(self.capabilities, modality) {
+                    return Err(error);
+                }
+                if let Some(context) = &self.capability_context {
+                    context
+                        .catalog
+                        .note_capability_error(&context.request, modality);
+                }
+                tracing::warn!(
+                    modality = ?modality,
+                    error = %error,
+                    "provider rejected advertised media capability; retrying once without it"
+                );
+                self.stream_once(&request, self.capabilities.without_modality(modality))
+                    .await
+            }
+        }
+    }
+}
+
+impl AnthropicClient {
+    async fn stream_once(
+        &self,
+        request: &ModelRequest,
+        caps: ModelCapabilities,
+    ) -> Result<ModelStream, ModelError> {
+        let rewritten = caps.apply_to_request(request);
+        let body = anthropic_request_body_with_artifacts(&self.model, &rewritten, &caps).await?;
         let response = self
             .http
             .post(self.url())
@@ -212,7 +320,8 @@ impl ModelProvider for AnthropicClient {
         let response = validate_streaming_response(response, &self.url()).await?;
         let state = AnthropicStreamState {
             buffer: String::new(),
-            assembler: AnthropicAssembler::default().with_tool_names(tool_name_map(&request.tools)),
+            assembler: AnthropicAssembler::default()
+                .with_tool_names(tool_name_map(&rewritten.tools)),
             bytes: Box::pin(response.bytes_stream()),
             finished: false,
         };
@@ -570,6 +679,7 @@ fn anthropic_request_body(model: &str, request: &ModelRequest) -> Value {
 async fn anthropic_request_body_with_artifacts(
     model: &str,
     request: &ModelRequest,
+    caps: &ModelCapabilities,
 ) -> Result<Value, ModelError> {
     let system = request
         .messages
@@ -582,7 +692,7 @@ async fn anthropic_request_body_with_artifacts(
         "model": model,
         "stream": true,
         "max_tokens": request.max_tokens.unwrap_or(1024),
-        "messages": anthropic_messages_with_artifacts(&request.messages, request.artifact_store.as_ref()).await?,
+        "messages": anthropic_messages_with_artifacts(&request.messages, request.artifact_store.as_ref(), caps).await?,
         "tools": request.tools.iter().map(|tool| serde_json::json!({
             "name": wire_tool_name(&tool.name),
             "description": tool.description,
@@ -635,6 +745,7 @@ fn anthropic_messages(messages: &[ModelMessage]) -> Vec<Value> {
 async fn anthropic_messages_with_artifacts(
     messages: &[ModelMessage],
     store: Option<&Arc<dyn ArtifactStore>>,
+    caps: &ModelCapabilities,
 ) -> Result<Vec<Value>, ModelError> {
     let mut output = Vec::new();
     for message in messages {
@@ -644,7 +755,7 @@ async fn anthropic_messages_with_artifacts(
                 let content = if message.content_parts.is_empty() {
                     anthropic_content(message.content_value.as_ref(), &message.content)
                 } else {
-                    anthropic_typed_parts(&message.content_parts, store).await?
+                    anthropic_typed_parts(&message.content_parts, store, caps.image_input).await?
                 };
                 append_anthropic_message(&mut output, "user", content);
             }
@@ -653,7 +764,8 @@ async fn anthropic_messages_with_artifacts(
                     if message.content_parts.is_empty() {
                         anthropic_content(message.content_value.as_ref(), &message.content)
                     } else {
-                        anthropic_typed_parts(&message.content_parts, store).await?
+                        anthropic_typed_parts(&message.content_parts, store, caps.image_input)
+                            .await?
                     }
                 } else {
                     let mut blocks = if message.content_parts.is_empty() {
@@ -666,7 +778,8 @@ async fn anthropic_messages_with_artifacts(
                             })]
                         }
                     } else {
-                        anthropic_typed_blocks(&message.content_parts, store).await?
+                        anthropic_typed_blocks(&message.content_parts, store, caps.image_input)
+                            .await?
                     };
                     for call in &message.tool_calls {
                         let input = serde_json::from_str::<Value>(&call.arguments)
@@ -687,7 +800,7 @@ async fn anthropic_messages_with_artifacts(
                     let content = if result.parts.is_empty() {
                         Value::String(result.content.clone())
                     } else {
-                        anthropic_typed_parts(&result.parts, store).await?
+                        anthropic_typed_parts(&result.parts, store, caps.image_tool_results).await?
                     };
                     let mut block = serde_json::json!({
                         "type": "tool_result",
@@ -708,13 +821,17 @@ async fn anthropic_messages_with_artifacts(
 async fn anthropic_typed_parts(
     parts: &[ModelContentPart],
     store: Option<&Arc<dyn ArtifactStore>>,
+    images_supported: bool,
 ) -> Result<Value, ModelError> {
-    Ok(Value::Array(anthropic_typed_blocks(parts, store).await?))
+    Ok(Value::Array(
+        anthropic_typed_blocks(parts, store, images_supported).await?,
+    ))
 }
 
 async fn anthropic_typed_blocks(
     parts: &[ModelContentPart],
     store: Option<&Arc<dyn ArtifactStore>>,
+    images_supported: bool,
 ) -> Result<Vec<Value>, ModelError> {
     let mut blocks = Vec::new();
     for part in parts {
@@ -731,6 +848,16 @@ async fn anthropic_typed_blocks(
                 artifact,
                 detail: _,
             } => {
+                if !images_supported {
+                    blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": format!(
+                            "[image omitted: this provider does not accept image input; artifact_id={} mime_type={} size_bytes={}]",
+                            artifact.id, artifact.mime_type, artifact.size_bytes,
+                        ),
+                    }));
+                    continue;
+                }
                 let bytes = resolve_image_bytes(store, artifact).await?;
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes);
                 blocks.push(serde_json::json!({
@@ -1075,10 +1202,13 @@ fn request_body(model: &str, request: &ModelRequest) -> serde_json::Value {
 async fn request_body_with_artifacts(
     model: &str,
     request: &ModelRequest,
+    caps: &ModelCapabilities,
 ) -> Result<serde_json::Value, ModelError> {
     let mut messages = Vec::with_capacity(request.messages.len());
     for message in &request.messages {
-        messages.push(wire_message_with_artifacts(message, request.artifact_store.as_ref()).await?);
+        messages.push(
+            wire_message_with_artifacts(message, request.artifact_store.as_ref(), caps).await?,
+        );
     }
     let mut body = serde_json::json!({
         "model": model,
@@ -1137,6 +1267,7 @@ fn wire_message(message: &ModelMessage) -> serde_json::Value {
 async fn wire_message_with_artifacts(
     message: &ModelMessage,
     store: Option<&Arc<dyn ArtifactStore>>,
+    caps: &ModelCapabilities,
 ) -> Result<serde_json::Value, ModelError> {
     let role = match message.role {
         ModelRole::System => "system",
@@ -1148,7 +1279,7 @@ async fn wire_message_with_artifacts(
         if result.parts.is_empty() {
             Value::String(result.content.clone())
         } else {
-            openai_typed_parts(&result.parts, store).await?
+            openai_typed_parts(&result.parts, store, caps.image_tool_results).await?
         }
     } else if message.content_parts.is_empty() {
         message
@@ -1156,7 +1287,7 @@ async fn wire_message_with_artifacts(
             .clone()
             .unwrap_or_else(|| Value::String(message.content.clone()))
     } else {
-        openai_typed_parts(&message.content_parts, store).await?
+        openai_typed_parts(&message.content_parts, store, caps.image_input).await?
     };
     let mut value = serde_json::json!({ "role": role, "content": content });
     if !message.tool_calls.is_empty() {
@@ -1181,6 +1312,7 @@ async fn wire_message_with_artifacts(
 async fn openai_typed_parts(
     parts: &[ModelContentPart],
     store: Option<&Arc<dyn ArtifactStore>>,
+    images_supported: bool,
 ) -> Result<Value, ModelError> {
     let mut blocks = Vec::new();
     for part in parts {
@@ -1194,6 +1326,20 @@ async fn openai_typed_parts(
                 "text": value.to_string(),
             })),
             ModelContentPart::Image { artifact, detail } => {
+                // Tool-result images are normally rewritten by
+                // `ModelCapabilities::apply_to_request` before this point;
+                // this arm covers user-message media and any direct caller,
+                // so Unsupported/Unknown capabilities never emit bytes.
+                if !images_supported {
+                    blocks.push(serde_json::json!({
+                        "type": "text",
+                        "text": format!(
+                            "[image omitted: this provider does not accept image input; artifact_id={} mime_type={} size_bytes={}]",
+                            artifact.id, artifact.mime_type, artifact.size_bytes,
+                        ),
+                    }));
+                    continue;
+                }
                 let bytes = resolve_image_bytes(store, artifact).await?;
                 let data = base64::engine::general_purpose::STANDARD.encode(bytes);
                 let mut image = serde_json::json!({
@@ -1591,9 +1737,10 @@ mod tests {
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
 
-        let openai = request_body_with_artifacts("vision-model", &request)
-            .await
-            .unwrap();
+        let openai =
+            request_body_with_artifacts("vision-model", &request, &ModelCapabilities::full())
+                .await
+                .unwrap();
         let openai_content = &openai["messages"][0]["content"];
         assert_eq!(openai_content[0]["type"], "text");
         assert_eq!(openai_content[1]["type"], "image_url");
@@ -1602,9 +1749,13 @@ mod tests {
             .as_str()
             .is_some_and(|url| url.starts_with("data:image/png;base64,")));
 
-        let anthropic = anthropic_request_body_with_artifacts("claude-vision", &request)
-            .await
-            .unwrap();
+        let anthropic = anthropic_request_body_with_artifacts(
+            "claude-vision",
+            &request,
+            &ModelCapabilities::full(),
+        )
+        .await
+        .unwrap();
         let anthropic_content = &anthropic["messages"][0]["content"][0]["content"];
         assert_eq!(anthropic_content[0]["type"], "text");
         assert_eq!(anthropic_content[1]["type"], "image");
@@ -2018,9 +2169,10 @@ mod tests {
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(media_result(&memory).await)])
                 .with_artifact_store(store);
-        let body = request_body_with_artifacts("vision-model", &request)
-            .await
-            .unwrap();
+        let body =
+            request_body_with_artifacts("vision-model", &request, &ModelCapabilities::full())
+                .await
+                .unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         // Four parts in, four blocks out: nothing silently dropped.
         assert_eq!(content.len(), 4);
@@ -2057,7 +2209,7 @@ mod tests {
             }]);
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
-        let err = request_body_with_artifacts("vision-model", &request)
+        let err = request_body_with_artifacts("vision-model", &request, &ModelCapabilities::full())
             .await
             .unwrap_err();
         assert!(matches!(err, ModelError::Artifact(_)), "{err:?}");
@@ -2084,7 +2236,7 @@ mod tests {
             }]);
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
-        let err = request_body_with_artifacts("vision-model", &request)
+        let err = request_body_with_artifacts("vision-model", &request, &ModelCapabilities::full())
             .await
             .unwrap_err();
         assert!(matches!(err, ModelError::Artifact(_)), "{err:?}");
@@ -2108,7 +2260,7 @@ mod tests {
             }]);
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
-        let err = request_body_with_artifacts("vision-model", &request)
+        let err = request_body_with_artifacts("vision-model", &request, &ModelCapabilities::full())
             .await
             .unwrap_err();
         assert!(
@@ -2134,12 +2286,263 @@ mod tests {
         };
         let store: Arc<dyn ArtifactStore> = memory.clone();
         let request = ModelRequest::new(vec![message]).with_artifact_store(store);
-        let body = request_body_with_artifacts("chat-model", &request)
+        let body = request_body_with_artifacts("chat-model", &request, &ModelCapabilities::full())
             .await
             .unwrap();
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert!(content[0]["text"].as_str().unwrap().contains(&audio.id.0));
+    }
+
+    #[test]
+    fn capability_rejections_name_the_modality_and_skip_normal_retries() {
+        for (message, modality) in [
+            (
+                "No endpoints found that support image input",
+                Modality::Image,
+            ),
+            ("image input unsupported for this model", Modality::Image),
+            ("unsupported modality", Modality::Image),
+            ("audio input unsupported", Modality::Audio),
+            ("video input unsupported", Modality::Video),
+        ] {
+            let error = ModelError::Provider {
+                status: 400,
+                message: message.to_string(),
+            };
+            assert_eq!(error.capability_modality(), Some(modality), "{message}");
+            assert!(!error.is_retryable(), "{message}");
+        }
+        // Even a retryable status with a capability diagnostic must not take
+        // the backoff path: the payload has to change, not the timing.
+        let error = ModelError::Provider {
+            status: 429,
+            message: "No endpoints found that support image input".to_string(),
+        };
+        assert_eq!(error.capability_modality(), Some(Modality::Image));
+        assert!(!error.is_retryable());
+        // Ordinary errors are untouched.
+        assert_eq!(
+            ModelError::Provider {
+                status: 429,
+                message: "rate limited".to_string()
+            }
+            .capability_modality(),
+            None
+        );
+        assert!(ModelError::Provider {
+            status: 429,
+            message: "rate limited".to_string()
+        }
+        .is_retryable());
+    }
+
+    /// The original failure: `desktop.screenshot` succeeds but the selected
+    /// router does not advertise image input. The screenshot artifact must
+    /// NOT be serialized as image bytes; the request degrades to explicit
+    /// text/tool fallback metadata instead.
+    #[tokio::test]
+    async fn unknown_image_capability_never_serializes_image_bytes() {
+        use model_core::ResolvedModelInfo;
+        let memory = Arc::new(InMemoryArtifactStore::new());
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let shot = memory
+            .put("image/png", vec![0x89, b'P', b'N', b'G'])
+            .await
+            .unwrap();
+        let shot_id = shot.id.0.clone();
+        let result = model_core::ToolResult::text("shot-1", "screenshot taken").with_parts(vec![
+            ModelContentPart::Text("screenshot taken".to_string()),
+            ModelContentPart::Image {
+                artifact: shot,
+                detail: None,
+            },
+        ]);
+        // Router entry without modality metadata -> Unknown -> fallback.
+        let info = ResolvedModelInfo::unknown("kilo-auto/free");
+        let caps = ModelCapabilities::from_resolved(&info);
+        assert!(!caps.image_input && !caps.image_tool_results);
+        let request =
+            ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
+        let rewritten = caps.apply_to_request(&request);
+        let body = request_body_with_artifacts("kilo-auto/free", &rewritten, &caps)
+            .await
+            .unwrap();
+        let serialized = serde_json::to_string(&body).unwrap();
+        assert!(
+            !serialized.contains("image_url"),
+            "no image blocks may reach the provider: {serialized}"
+        );
+        assert!(!serialized.contains(";base64,"), "{serialized}");
+        assert!(
+            serialized.contains(&shot_id),
+            "fallback metadata must name the artifact: {serialized}"
+        );
+    }
+
+    /// The positive path: a provider advertising image input receives the
+    /// actual screenshot bytes inline.
+    #[tokio::test]
+    async fn advertised_image_capability_sends_image_bytes() {
+        use model_core::{CapabilitySource, CapabilitySupport};
+        let memory = Arc::new(InMemoryArtifactStore::new());
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let shot = memory
+            .put("image/png", vec![0x89, b'P', b'N', b'G'])
+            .await
+            .unwrap();
+        let result = model_core::ToolResult::text("shot-1", "screenshot taken").with_parts(vec![
+            ModelContentPart::Text("screenshot taken".to_string()),
+            ModelContentPart::Image {
+                artifact: shot,
+                detail: None,
+            },
+        ]);
+        let info = model_catalog::normalize_openai_compatible_record(
+            "vlm-9b",
+            &serde_json::json!({
+                "architecture": { "input_modalities": ["text", "image"] },
+                "supported_parameters": ["tools"],
+            }),
+            CapabilitySource::ProviderApi,
+        );
+        assert_eq!(info.image_input(), CapabilitySupport::Supported);
+        let caps = ModelCapabilities::from_resolved(&info);
+        let request =
+            ModelRequest::new(vec![ModelMessage::tool_result(result)]).with_artifact_store(store);
+        let rewritten = caps.apply_to_request(&request);
+        let body = request_body_with_artifacts("vlm-9b", &rewritten, &caps)
+            .await
+            .unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[1]["type"], "image_url");
+        assert!(content[1]["image_url"]["url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+    }
+
+    /// Stale metadata recovery over HTTP: the first request carries images
+    /// (catalog advertised support), the provider explicitly rejects them,
+    /// and the single retry goes out as text fallback — while the catalog
+    /// records the downgrade.
+    #[tokio::test]
+    async fn stream_retries_once_without_rejected_media() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (bodies_tx, bodies_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&chunk[..n]);
+                }
+                let head_text = String::from_utf8_lossy(&head).into_owned();
+                let header_end = head_text
+                    .find("\r\n\r\n")
+                    .map(|i| i + 4)
+                    .unwrap_or(head.len());
+                let len: usize = head_text
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length:")
+                            .or_else(|| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                let mut body = head[header_end..].to_vec();
+                while body.len() < len {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    body.extend_from_slice(&chunk[..n]);
+                }
+                bodies.push(String::from_utf8_lossy(&body).into_owned());
+                if attempt == 0 {
+                    let payload = serde_json::json!({
+                        "error": { "message": "No endpoints found that support image input" }
+                    })
+                    .to_string();
+                    socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                                payload.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            bodies_tx.send(bodies).unwrap();
+        });
+
+        let catalog = Arc::new(model_catalog::ModelCatalogService::new());
+        let catalog_request = model_catalog::CatalogRequest::new(
+            "kilo",
+            format!("http://{addr}"),
+            "router/free",
+            None,
+        );
+        let client = OpenAICompatibleClient::new(format!("http://{addr}"), None, "router/free")
+            .with_capabilities(ModelCapabilities::full())
+            .with_capability_context(CapabilityContext {
+                catalog: Arc::clone(&catalog),
+                request: catalog_request.clone(),
+            });
+        let memory = Arc::new(InMemoryArtifactStore::new());
+        let store: Arc<dyn ArtifactStore> = memory.clone();
+        let shot = memory
+            .put("image/png", vec![0x89, b'P', b'N', b'G'])
+            .await
+            .unwrap();
+        let request = ModelRequest::new(vec![ModelMessage::tool_result(
+            model_core::ToolResult::text("shot-1", "screenshot").with_parts(vec![
+                ModelContentPart::Image {
+                    artifact: shot,
+                    detail: None,
+                },
+            ]),
+        )])
+        .with_artifact_store(store);
+        let mut stream = client.stream(request).await.unwrap();
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            if let ModelStreamEvent::TextDelta(delta) = event.unwrap() {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "ok");
+        let bodies = bodies_rx.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(bodies.len(), 2, "exactly one retry");
+        assert!(
+            bodies[0].contains("image_url"),
+            "first attempt carries the advertised image"
+        );
+        assert!(
+            !bodies[1].contains("image_url") && !bodies[1].contains(";base64,"),
+            "retry must not carry image bytes: {}",
+            bodies[1]
+        );
+        assert!(
+            bodies[1].contains("shot-1") || bodies[1].contains("omitted"),
+            "retry keeps explicit fallback metadata: {}",
+            bodies[1]
+        );
     }
 
     #[tokio::test]
@@ -2149,7 +2552,7 @@ mod tests {
         let request =
             ModelRequest::new(vec![ModelMessage::tool_result(media_result(&memory).await)])
                 .with_artifact_store(store);
-        let _ = request_body_with_artifacts("vision-model", &request)
+        let _ = request_body_with_artifacts("vision-model", &request, &ModelCapabilities::full())
             .await
             .unwrap();
         // The long-lived request still carries artifact references only:

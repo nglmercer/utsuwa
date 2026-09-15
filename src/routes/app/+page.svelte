@@ -42,7 +42,7 @@
 	import { displayStore } from '$lib/stores/display.svelte';
 	import { startWaitTone, stopWaitTone, destroyWaitTone } from '$lib/utils/wait-tone';
 	import { debugEventsStore } from '$lib/stores/debugEvents.svelte';
-	import { getLLMProvider, providerSupportsVision } from '$lib/services/providers/registry';
+	import { getLLMProvider } from '$lib/services/providers/registry';
 	import { isLocalLLMProvider } from '$lib/services/providers/local-endpoints';
 	import { canShowImages } from '$lib/services/providers/vision';
 	import { settingsStore } from '$lib/stores/settings.svelte';
@@ -146,14 +146,14 @@
 	let thinkingImages = $state<{ id: string; url: string }[]>([]);
 
 	// Can the active LLM actually see images? Gates the "show" affordance.
+	// Decided only by the discovered model's normalized API metadata.
 	const visionCapable = $derived.by(() => {
 		const cs = modulesStore.getModuleSettings('consciousness');
 		const provider = cs.activeProvider as string;
 		const model = cs.activeModel as string;
 		if (!provider) return false;
 		const discovered = settingsStore.getCachedModels(provider)?.find((entry) => entry.id === model);
-		if (discovered?.capabilities?.vision !== undefined) return discovered.capabilities.vision;
-		return canShowImages(providerSupportsVision(provider), isLocalLLMProvider(provider), model);
+		return canShowImages(discovered);
 	});
 
 	// Provider info for the one-time "where do photos go" disclosure.

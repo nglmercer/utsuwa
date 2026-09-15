@@ -6,8 +6,7 @@ import {
 	TTS_PROVIDERS,
 	getLLMProvider,
 	getSTTProvider,
-	getTTSProvider,
-	providerSupportsVision
+	getTTSProvider
 } from './registry.ts';
 
 test('Gemini Transcribe is registered as a dedicated STT provider', () => {
@@ -67,12 +66,11 @@ test('every TTS provider declares whether it needs an API key', () => {
 	}
 });
 
-test('vision-capable cloud providers are flagged; text-only and local are not', () => {
-	assert.equal(providerSupportsVision('openai'), true);
-	assert.equal(providerSupportsVision('anthropic'), true);
-	assert.equal(providerSupportsVision('google'), true);
-	assert.equal(providerSupportsVision('xai'), true);
-	assert.equal(providerSupportsVision('deepseek'), false);
-	assert.equal(providerSupportsVision('ollama'), false);
-	assert.equal(providerSupportsVision('lmstudio'), false);
+test('no provider carries a vision assumption; capabilities come from model metadata', () => {
+	for (const provider of LLM_PROVIDERS) {
+		assert.ok(
+			!('supportsVision' in provider),
+			`${provider.id} must not assume vision from the provider id`
+		);
+	}
 });

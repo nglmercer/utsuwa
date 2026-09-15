@@ -40,13 +40,65 @@ fn usage() -> &'static str {
      \t[--api-key KEY] [--vision auto|on|off] [--profile NAME] [--yes]\n\
      \t[--timeout-secs N] [--verbose]\n\
      \n\
-     \tDefaults: --provider kilo --model kilo-auto/free\n\
+     \tDefaults: --provider kilo --model kilo-auto/free --vision auto\n\
      \t--api-key falls back to $UTSUWA_MODEL_API_KEY (Kilo needs none).\n\
-     \t--vision auto omits the override so the provider/model heuristic decides.\n\
+     \t--vision auto uses the API-discovered capability; on is a debug\n\
+     \toverride that forces image sending; off force-disables it.\n\
      \t--profile minimal|simple|standard|developer|computeruse|full shrinks the\n\
      \tmodel-facing tool surface (default full, like the app; small free models\n\
      \tcope better with developer for shell/file tasks).\n\
      \t--yes auto-approves permission requests with session grants."
+}
+
+fn vision_mode(vision: Option<bool>) -> &'static str {
+    match vision {
+        None => "auto",
+        Some(true) => "on",
+        Some(false) => "off",
+    }
+}
+
+/// Resolve and print the effective model capabilities using the same
+/// discovery path as the agent runtime (provider `/models` catalog, plus
+/// the `--vision` debug override). Runs before the turn so a misresolved
+/// capability is visible without reading trace logs.
+fn print_resolved_capabilities(args: &CliArgs) {
+    let base_url = if args.provider == "anthropic" {
+        args.base_url.trim_end_matches('/').to_string()
+    } else {
+        app_host::runtime::normalize_provider_base_url(&args.provider, &args.base_url)
+    };
+    let config = app_host::runtime::providers::ProviderConfig {
+        provider: args.provider.clone(),
+        base_url,
+        name: args.model.clone(),
+        api_key: args.api_key.clone(),
+        vision: args.vision,
+    };
+    let resolved = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(async {
+            let catalog = model_catalog::ModelCatalogService::new();
+            app_host::runtime::providers::resolve_provider_capabilities(&config, &catalog).await
+        }),
+        Err(error) => {
+            eprintln!("capability discovery unavailable ({error}); assuming text-only");
+            return;
+        }
+    };
+    println!("provider={}", args.provider);
+    println!("model={}", args.model);
+    println!("capabilities_source={}", resolved.info.source);
+    println!("image_input={}", resolved.info.image_input());
+    println!("audio_input={}", resolved.info.audio_input());
+    println!("video_input={}", resolved.info.video_input());
+    println!("pdf_input={}", resolved.info.pdf_input());
+    println!("tool_calls={}", resolved.info.tool_calls);
+    println!("parallel_tool_calls={}", resolved.info.parallel_tool_calls);
+    println!("structured_output={}", resolved.info.structured_output);
+    println!("reasoning={}", resolved.info.reasoning);
 }
 
 const KNOWN_PROFILES: &[&str] = &[
@@ -299,7 +351,7 @@ fn run(argv: Vec<String>) -> i32 {
         }
     };
     println!(
-        "provider={} model={} base_url={} api_key={} vision={:?} profile={}",
+        "provider={} model={} base_url={} api_key={} vision={} profile={}",
         args.provider,
         args.model,
         args.base_url,
@@ -308,9 +360,10 @@ fn run(argv: Vec<String>) -> i32 {
         } else {
             "none"
         },
-        args.vision,
+        vision_mode(args.vision),
         args.profile.as_deref().unwrap_or("full"),
     );
+    print_resolved_capabilities(&args);
     println!("---");
     if let Err(error) = runtime.send_message(args.ask.clone()) {
         eprintln!("cannot start turn: {error}");
@@ -506,5 +559,22 @@ mod tests {
         assert!(parse_args(&argv(&["--ask", "  "])).is_err());
         assert!(parse_args(&argv(&["--ask", "hi", "--vision", "maybe"])).is_err());
         assert!(parse_args(&argv(&["--ask", "hi", "--nope"])).is_err());
+    }
+
+    #[test]
+    fn vision_flag_defaults_to_auto_discovery() {
+        // `auto` (and the default) means API-discovered; `on`/`off` are
+        // debug overrides that force image sending on or off.
+        assert_eq!(parse_args(&argv(&["--ask", "hi"])).unwrap().vision, None);
+        assert_eq!(
+            parse_args(&argv(&["--ask", "hi", "--vision", "auto"]))
+                .unwrap()
+                .vision,
+            None
+        );
+        assert_eq!(vision_mode(None), "auto");
+        assert_eq!(vision_mode(Some(true)), "on");
+        assert_eq!(vision_mode(Some(false)), "off");
+        assert!(usage().contains("--vision auto"));
     }
 }

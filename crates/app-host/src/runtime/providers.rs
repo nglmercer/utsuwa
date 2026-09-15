@@ -1,7 +1,14 @@
 //! Model provider configuration: settings keys, profiles, factory.
+//!
+//! Capabilities are discovered from the provider's real model/catalog API
+//! via [`model_catalog::ModelCatalogService`] — never from model-name
+//! substrings or provider-id assumptions. The stored `model.vision` value
+//! is only a debug override (`--vision on|off`); when absent, the
+//! API-discovered capability decides.
 use super::RuntimeError;
-use model_core::ModelProvider;
-use model_openai_compatible::{AnthropicClient, OpenAICompatibleClient};
+use model_catalog::{CatalogRequest, ModelCatalogService};
+use model_core::{CapabilitySource, ModelCapabilities, ModelProvider, ResolvedModelInfo};
+use model_openai_compatible::{AnthropicClient, CapabilityContext, OpenAICompatibleClient};
 use std::sync::{Arc, Mutex};
 use storage_core::Storage;
 
@@ -9,11 +16,40 @@ pub const SETTING_PROVIDER: &str = "model.provider";
 pub const SETTING_BASE_URL: &str = "model.base_url";
 pub const SETTING_API_KEY: &str = "model.api_key";
 pub const SETTING_MODEL_NAME: &str = "model.name";
-/// Explicit operator override for whether the configured model accepts
-/// images. Written by `settings.set_model_provider` when the frontend
-/// sends `vision`; when absent, [`model_supports_vision`] infers from the
-/// provider id + model name instead. Explicit configuration always wins.
+/// Debug override for whether the configured model accepts images. Written
+/// by `settings.set_model_provider` when the caller sends `vision`
+/// (`--vision on|off`); when absent, the provider API's advertised
+/// capability decides (`--vision auto`). An explicit override always wins
+/// over discovery.
 pub const SETTING_MODEL_VISION: &str = "model.vision";
+
+/// Async provider constructor. Resolution is async because capability
+/// discovery fetches the provider's `/models` catalog over HTTP; blocking
+/// settings/keychain reads hop to the blocking pool inside.
+pub type ProviderFactory = Arc<
+    dyn Fn()
+            -> futures_util::future::BoxFuture<'static, Result<Arc<dyn ModelProvider>, RuntimeError>>
+        + Send
+        + Sync,
+>;
+
+/// Wrap a synchronous constructor (tests inject stub providers) as a
+/// [`ProviderFactory`]. Construction runs inside the future so a stub
+/// panic surfaces through the factory future like any real provider
+/// failure instead of unwinding through the factory call site.
+pub fn sync_factory(
+    build: impl Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync + 'static,
+) -> ProviderFactory {
+    let build = Arc::new(build);
+    Arc::new(move || {
+        let build = Arc::clone(&build);
+        Box::pin(async move { build() })
+            as futures_util::future::BoxFuture<
+                'static,
+                Result<Arc<dyn ModelProvider>, RuntimeError>,
+            >
+    })
+}
 /// Settings key holding the MCP server set (JSON array of server configs).
 pub const SETTING_MCP_SERVERS: &str = "mcp.servers";
 /// Settings key holding the WASM plugin directory (JSON string path).
@@ -151,153 +187,165 @@ pub(crate) fn read_autonomous_full_access(storage: Option<&Arc<Mutex<Storage>>>)
 pub(crate) fn provider_factory_with_secrets(
     storage: Option<Arc<Mutex<Storage>>>,
     secrets: Arc<dyn secret_core::SecretStore>,
-) -> Arc<dyn Fn() -> Result<Arc<dyn ModelProvider>, RuntimeError> + Send + Sync> {
+) -> ProviderFactory {
+    // The catalog service is shared across turns so `/models` responses are
+    // cached per provider + base URL + auth identity (5–30 minute TTL).
+    let catalog = Arc::new(ModelCatalogService::new());
     Arc::new(move || {
-        let storage = storage.as_ref().ok_or(RuntimeError::ModelNotConfigured)?;
-        let storage = storage
-            .lock()
-            .map_err(|_| RuntimeError::Settings("storage lock failed".to_string()))?;
-        let get = |key: &str| -> Result<Option<String>, RuntimeError> {
-            storage
-                .get_setting(key)
-                .map_err(|e| RuntimeError::Settings(e.to_string()))
-                .map(|v| v.and_then(|v| v.as_str().map(str::to_string)))
-        };
-        let raw_base_url = get(SETTING_BASE_URL)?
-            .filter(|s| !s.is_empty())
-            .ok_or(RuntimeError::ModelNotConfigured)?;
-        let name = get(SETTING_MODEL_NAME)?
-            .filter(|s| !s.is_empty())
-            .ok_or(RuntimeError::ModelNotConfigured)?;
-        // Older databases may lack the provider id, so retain compatibility
-        // by treating them as generic OpenAI-compatible endpoints.
-        let provider = get(SETTING_PROVIDER)?.unwrap_or_else(|| "openai-compatible".to_string());
-        // Frontend synchronization normalizes this already, but older native
-        // databases can contain a bare LM Studio/Ollama host or a pasted full
-        // endpoint. Normalize at the provider boundary as a defense in depth.
-        let base_url = if provider == "anthropic" {
-            raw_base_url.trim_end_matches('/').to_string()
-        } else {
-            normalize_provider_base_url(&provider, &raw_base_url)
-        };
-        let api_key = resolve_api_key(&storage, secrets.as_ref())?;
-        let vision = storage
-            .get_setting(SETTING_MODEL_VISION)
-            .ok()
-            .flatten()
-            .and_then(|value| value.as_bool());
-        tracing::debug!(
-            provider = %provider,
-            model = %name,
-            normalized_base_url = %sanitize_provider_url_for_log(&base_url),
-            vision_override = ?vision,
-            "native agent provider selected"
-        );
-        ProviderRegistry::default_registry().create(
-            &provider,
-            ProviderConfig {
-                provider: provider.clone(),
-                base_url,
-                name,
-                api_key,
-                vision,
-            },
-        )
+        let storage = storage.clone();
+        let secrets = Arc::clone(&secrets);
+        let catalog = Arc::clone(&catalog);
+        Box::pin(async move {
+            // The settings/keychain reads perform blocking work (SQLite plus
+            // synchronous OS-keychain IPC, which enters a nested Tokio
+            // runtime on Linux), so they run on the blocking pool while the
+            // catalog HTTP below stays on this async worker.
+            let config = tokio::task::spawn_blocking(move || {
+                read_provider_config(storage.as_ref(), secrets.as_ref())
+            })
+            .await
+            .map_err(|err| RuntimeError::Executor(format!("provider task failed: {err}")))??;
+            // Fail fast before any catalog network when a key is required.
+            if provider_requires_api_key(&config.provider) && config.api_key.is_none() {
+                return Err(RuntimeError::ModelNotConfigured);
+            }
+            let resolved = resolve_provider_capabilities(&config, &catalog).await;
+            tracing::debug!(
+                provider = %config.provider,
+                model = %config.name,
+                normalized_base_url = %sanitize_provider_url_for_log(&config.base_url),
+                capabilities_source = %resolved.info.source,
+                image_input = %resolved.info.image_input(),
+                vision_override = ?config.vision,
+                "native agent provider selected"
+            );
+            let provider_id = config.provider.clone();
+            ProviderRegistry::default_registry().create(&provider_id, config, &resolved, &catalog)
+        })
+            as futures_util::future::BoxFuture<
+                'static,
+                Result<Arc<dyn ModelProvider>, RuntimeError>,
+            >
+    })
+}
+
+/// Read the stored model identity. Blocking-safe (SQLite + sync keychain
+/// IPC): callers run this on the blocking pool, never on an async worker.
+fn read_provider_config(
+    storage: Option<&Arc<Mutex<Storage>>>,
+    secrets: &dyn secret_core::SecretStore,
+) -> Result<ProviderConfig, RuntimeError> {
+    let storage = storage.ok_or(RuntimeError::ModelNotConfigured)?;
+    let storage = storage
+        .lock()
+        .map_err(|_| RuntimeError::Settings("storage lock failed".to_string()))?;
+    let get = |key: &str| -> Result<Option<String>, RuntimeError> {
+        storage
+            .get_setting(key)
+            .map_err(|e| RuntimeError::Settings(e.to_string()))
+            .map(|v| v.and_then(|v| v.as_str().map(str::to_string)))
+    };
+    let raw_base_url = get(SETTING_BASE_URL)?
+        .filter(|s| !s.is_empty())
+        .ok_or(RuntimeError::ModelNotConfigured)?;
+    let name = get(SETTING_MODEL_NAME)?
+        .filter(|s| !s.is_empty())
+        .ok_or(RuntimeError::ModelNotConfigured)?;
+    // Older databases may lack the provider id, so retain compatibility
+    // by treating them as generic OpenAI-compatible endpoints.
+    let provider = get(SETTING_PROVIDER)?.unwrap_or_else(|| "openai-compatible".to_string());
+    // Frontend synchronization normalizes this already, but older native
+    // databases can contain a bare LM Studio/Ollama host or a pasted full
+    // endpoint. Normalize at the provider boundary as a defense in depth.
+    let base_url = if provider == "anthropic" {
+        raw_base_url.trim_end_matches('/').to_string()
+    } else {
+        normalize_provider_base_url(&provider, &raw_base_url)
+    };
+    let api_key = resolve_api_key(&storage, secrets)?;
+    let vision = storage
+        .get_setting(SETTING_MODEL_VISION)
+        .ok()
+        .flatten()
+        .and_then(|value| value.as_bool());
+    Ok(ProviderConfig {
+        provider,
+        base_url,
+        name,
+        api_key,
+        vision,
     })
 }
 
 /// Resolved, secret-free-except-key parameters for one provider instance.
-/// Settings/secret reading stays in [`provider_factory_with_secrets`];
-/// factories only construct clients.
+/// Settings/secret reading stays in [`read_provider_config`]; factories
+/// only construct clients.
 pub struct ProviderConfig {
     pub provider: String,
     pub base_url: String,
     pub name: String,
     pub api_key: Option<String>,
-    /// Explicit vision override from [`SETTING_MODEL_VISION`]. `None`
-    /// means "infer from provider + model name".
+    /// Debug vision override from [`SETTING_MODEL_VISION`]. `None` (`auto`)
+    /// means "use the API-discovered capability"; `Some(true)` forces
+    /// image sending and `Some(false)` force-disables it.
     pub vision: Option<bool>,
 }
 
-/// Infer whether a provider/model pair accepts image input. This mirrors
-/// the frontend gate (`canShowImages` in
-/// `src/lib/services/providers/vision.ts`, plus the `supportsVision`
-/// flags in `registry.ts`): a flagged cloud provider or a local provider,
-/// AND a model id that looks vision-capable. Keep the two in sync — a
-/// mismatch means the UI offers vision the host then degrades to metadata
-/// text, or vice versa.
+/// API-discovered capabilities for one configured model, plus the catalog
+/// identity the adapter needs for stale-metadata recovery.
+pub struct ProviderCapabilities {
+    pub info: ResolvedModelInfo,
+    pub capabilities: ModelCapabilities,
+    pub catalog_request: CatalogRequest,
+}
+
+/// Resolve capabilities for the selected model before creating its client:
 ///
-/// An explicit [`SETTING_MODEL_VISION`] value always wins over this
-/// heuristic; it exists so gateways and new model ids work without a
-/// code change.
-pub fn model_supports_vision(provider_id: &str, model_name: &str) -> bool {
-    let provider = provider_id.trim().to_ascii_lowercase();
-    let provider_has_vision =
-        matches!(provider.as_str(), "openai" | "anthropic" | "google" | "xai");
-    let is_local = matches!(provider.as_str(), "ollama" | "lmstudio");
-    if !provider_has_vision && !is_local {
-        return false;
+/// ```text
+/// selected model
+///     ↓ ModelCatalogService.resolve_model()
+/// ResolvedModelInfo
+///     ↓ ModelCapabilities::from_resolved
+/// ModelCapabilities (+ debug override) → ModelProvider
+/// ```
+///
+/// Only explicit `Supported` enables a capability. `Unknown` (catalog
+/// silent or unreachable) maps to the safe text/tool fallback.
+pub async fn resolve_provider_capabilities(
+    config: &ProviderConfig,
+    catalog: &ModelCatalogService,
+) -> ProviderCapabilities {
+    let catalog_request = CatalogRequest::new(
+        config.provider.clone(),
+        config.base_url.clone(),
+        config.name.clone(),
+        config.api_key.clone(),
+    );
+    let mut info = catalog.resolve_model_or_unknown(&catalog_request).await;
+    let mut capabilities = ModelCapabilities::from_resolved(&info);
+    match config.vision {
+        Some(true) => {
+            capabilities.image_input = true;
+            capabilities.image_tool_results = true;
+            info.source = CapabilitySource::DebugOverride;
+        }
+        Some(false) => {
+            capabilities.image_input = false;
+            capabilities.image_tool_results = false;
+        }
+        None => {}
     }
-    model_name_looks_vision_capable(model_name)
+    ProviderCapabilities {
+        info,
+        capabilities,
+        catalog_request,
+    }
 }
 
-/// Substrings that strongly imply a model accepts images. Lowercase;
-/// mirrors `VISION_MODEL_HINTS` in `src/lib/services/providers/vision.ts`.
-const VISION_MODEL_HINTS: &[&str] = &[
-    "vision",
-    "-vl",
-    "vl-",
-    "llava",
-    "bakllava",
-    "moondream",
-    "minicpm-v",
-    "llama3.2-vision",
-    "llama-3.2-vision",
-    "qwen2-vl",
-    "qwen2.5-vl",
-    "gemma3",
-    "pixtral",
-    "internvl",
-    "gpt-4o",
-    "gpt-4.1",
-    "gpt-4-turbo",
-    "gpt-4-vision",
-    "gpt-5",
-    "o3",
-    "o4",
-    "claude-3",
-    "claude-4",
-    "claude-opus",
-    "claude-sonnet",
-    "claude-haiku",
-    "gemini",
-    "grok-2-vision",
-    "grok-4",
-    "llama4",
-    "llama-4",
-    "mistral-small-3",
-    "phi-3.5-vision",
-    "phi-4-multimodal",
-];
-
-/// Names that match a hint but are actually text-only. Mirrors
-/// `TEXT_ONLY_MODELS` in `src/lib/services/providers/vision.ts`.
-const TEXT_ONLY_MODELS: &[&str] = &["gemma3:1b", "gemma-3-1b", "gemma3:270m"];
-
-fn model_name_looks_vision_capable(model_name: &str) -> bool {
-    let name = model_name.to_ascii_lowercase();
-    if name.is_empty() {
-        return false;
-    }
-    if TEXT_ONLY_MODELS.iter().any(|denied| name.contains(denied)) {
-        return false;
-    }
-    VISION_MODEL_HINTS.iter().any(|hint| name.contains(hint))
-}
-
-/// Constructs one provider family from a resolved [`ProviderConfig`].
-/// Adding a provider means adding a factory + one registry line —
-/// never touching the settings/caching code above.
+/// Constructs one provider family from a resolved [`ProviderConfig`]
+/// plus its API-discovered [`ProviderCapabilities`]. Adding a provider
+/// means adding a factory + one registry line — never touching the
+/// settings/caching code above.
 pub trait ModelProviderFactory: Send + Sync {
     fn id(&self) -> &'static str;
 
@@ -308,7 +356,27 @@ pub trait ModelProviderFactory: Send + Sync {
         self.id() == provider_id
     }
 
-    fn create(&self, config: ProviderConfig) -> Result<Arc<dyn ModelProvider>, RuntimeError>;
+    fn create(
+        &self,
+        config: ProviderConfig,
+        resolved: &ProviderCapabilities,
+        catalog: &Arc<ModelCatalogService>,
+    ) -> Result<Arc<dyn ModelProvider>, RuntimeError>;
+}
+
+fn capability_context(
+    resolved: &ProviderCapabilities,
+    catalog: &Arc<ModelCatalogService>,
+) -> CapabilityContext {
+    CapabilityContext {
+        catalog: Arc::clone(catalog),
+        request: model_catalog::CatalogRequest::new(
+            resolved.catalog_request.provider.clone(),
+            resolved.catalog_request.base_url.clone(),
+            resolved.catalog_request.model.clone(),
+            resolved.catalog_request.api_key.clone(),
+        ),
+    }
 }
 
 /// Anthropic Messages API client.
@@ -319,12 +387,18 @@ impl ModelProviderFactory for AnthropicProviderFactory {
         "anthropic"
     }
 
-    fn create(&self, config: ProviderConfig) -> Result<Arc<dyn ModelProvider>, RuntimeError> {
+    fn create(
+        &self,
+        config: ProviderConfig,
+        resolved: &ProviderCapabilities,
+        catalog: &Arc<ModelCatalogService>,
+    ) -> Result<Arc<dyn ModelProvider>, RuntimeError> {
         let api_key = config.api_key.ok_or(RuntimeError::ModelNotConfigured)?;
-        Ok(
-            Arc::new(AnthropicClient::new(config.base_url, api_key, config.name))
-                as Arc<dyn ModelProvider>,
-        )
+        Ok(Arc::new(
+            AnthropicClient::new(config.base_url, api_key, config.name)
+                .with_capabilities(resolved.capabilities)
+                .with_capability_context(capability_context(resolved, catalog)),
+        ) as Arc<dyn ModelProvider>)
     }
 }
 
@@ -342,27 +416,24 @@ impl ModelProviderFactory for OpenAiCompatibleProviderFactory {
         true
     }
 
-    fn create(&self, config: ProviderConfig) -> Result<Arc<dyn ModelProvider>, RuntimeError> {
-        // Without image tool results, screenshots degrade to metadata text
-        // and a vision-capable model never sees pixels. Explicit operator
-        // configuration wins; otherwise infer from provider + model name.
-        let vision = config
-            .vision
-            .unwrap_or_else(|| model_supports_vision(&config.provider, &config.name));
+    fn create(
+        &self,
+        config: ProviderConfig,
+        resolved: &ProviderCapabilities,
+        catalog: &Arc<ModelCatalogService>,
+    ) -> Result<Arc<dyn ModelProvider>, RuntimeError> {
         tracing::debug!(
             provider = %config.provider,
             model = %config.name,
-            vision,
-            explicit = config.vision.is_some(),
-            "openai-compatible vision capability resolved"
+            capabilities_source = %resolved.info.source,
+            image_input = %resolved.info.image_input(),
+            explicit_override = config.vision.is_some(),
+            "openai-compatible capabilities resolved"
         );
-        let mut capabilities = model_core::ModelCapabilities::default();
-        if vision {
-            capabilities = capabilities.with_image_tool_results(true);
-        }
         Ok(Arc::new(
             OpenAICompatibleClient::new(config.base_url, config.api_key, config.name)
-                .with_capabilities(capabilities),
+                .with_capabilities(resolved.capabilities)
+                .with_capability_context(capability_context(resolved, catalog)),
         ) as Arc<dyn ModelProvider>)
     }
 }
@@ -395,13 +466,15 @@ impl ProviderRegistry {
         &self,
         provider_id: &str,
         config: ProviderConfig,
+        resolved: &ProviderCapabilities,
+        catalog: &Arc<ModelCatalogService>,
     ) -> Result<Arc<dyn ModelProvider>, RuntimeError> {
         for factory in &self.factories {
             if factory.supports(provider_id) {
                 if provider_requires_api_key(provider_id) && config.api_key.is_none() {
                     return Err(RuntimeError::ModelNotConfigured);
                 }
-                return factory.create(config);
+                return factory.create(config, resolved, catalog);
             }
         }
         Err(RuntimeError::ModelNotConfigured)
@@ -516,50 +589,186 @@ mod tests {
         }
     }
 
-    #[test]
-    fn vision_heuristic_matches_cloud_and_local_models() {
-        // Flagged cloud provider + vision model name.
-        assert!(model_supports_vision("openai", "gpt-4o"));
-        assert!(model_supports_vision("openai", "GPT-5-mini"));
-        assert!(model_supports_vision("anthropic", "claude-sonnet-4-5"));
-        assert!(model_supports_vision("google", "gemini-2.5-flash"));
-        // Local providers depend on the installed model.
-        assert!(model_supports_vision("ollama", "llava:13b"));
-        assert!(model_supports_vision("ollama", "qwen2.5-vl:7b"));
-        assert!(model_supports_vision("lmstudio", "gemma3:4b"));
-        // Text-only models stay text-only everywhere.
-        assert!(!model_supports_vision("openai", "gpt-3.5-turbo"));
-        assert!(!model_supports_vision("ollama", "llama3.1:8b"));
-        assert!(!model_supports_vision("ollama", "gemma3:1b"));
-        assert!(!model_supports_vision("ollama", ""));
-        // Unflagged providers never infer vision (explicit opt-in only).
-        assert!(!model_supports_vision("deepseek", "deepseek-vl2"));
-        assert!(!model_supports_vision("kilo", "gpt-4o"));
-        assert!(!model_supports_vision("openai-compatible", "llava"));
+    /// Serve one canned `/models` payload, returning the base URL to point
+    /// the catalog at. The socket stays open for the catalog's single fetch.
+    async fn mock_models_server(
+        payload: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            let body = payload.to_string();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        (base_url, handle)
     }
 
-    #[test]
-    fn factory_applies_explicit_vision_override_over_heuristic() {
+    #[tokio::test]
+    async fn auto_uses_api_discovered_capabilities() {
+        let catalog = ModelCatalogService::new();
+        // Advertised image input -> images enabled, regardless of the name.
+        let (base_url, server) = mock_models_server(serde_json::json!({
+            "data": [{
+                "id": "plain-name-7b",
+                "architecture": { "input_modalities": ["text", "image"] },
+                "supported_parameters": ["tools"],
+            }],
+        }))
+        .await;
+        let discovered = ProviderConfig {
+            base_url,
+            ..config("openai-compatible", "plain-name-7b", None)
+        };
+        let resolved = resolve_provider_capabilities(&discovered, &catalog).await;
+        server.await.unwrap();
+        assert_eq!(
+            resolved.info.image_input(),
+            model_core::CapabilitySupport::Supported
+        );
+        assert!(resolved.capabilities.image_tool_results);
+
+        // Text-only advertisement -> images disabled, even for a vision-y name.
+        let (base_url, server) = mock_models_server(serde_json::json!({
+            "data": [{
+                "id": "gpt-4o-vision-ultra",
+                "architecture": { "input_modalities": ["text"] },
+                "supported_parameters": ["tools"],
+            }],
+        }))
+        .await;
+        let discovered = ProviderConfig {
+            base_url,
+            ..config("openai-compatible", "gpt-4o-vision-ultra", None)
+        };
+        let resolved = resolve_provider_capabilities(&discovered, &catalog).await;
+        server.await.unwrap();
+        assert_eq!(
+            resolved.info.image_input(),
+            model_core::CapabilitySupport::Unsupported
+        );
+        assert!(!resolved.capabilities.image_tool_results);
+
+        // Silent catalog entry -> Unknown -> conservative fallback.
+        let (base_url, server) = mock_models_server(serde_json::json!({
+            "data": [{ "id": "llava-finetune-13b" }],
+        }))
+        .await;
+        let discovered = ProviderConfig {
+            base_url,
+            ..config("openai-compatible", "llava-finetune-13b", None)
+        };
+        let resolved = resolve_provider_capabilities(&discovered, &catalog).await;
+        server.await.unwrap();
+        assert_eq!(
+            resolved.info.image_input(),
+            model_core::CapabilitySupport::Unknown
+        );
+        assert!(!resolved.capabilities.image_tool_results);
+    }
+
+    #[tokio::test]
+    async fn unreachable_catalog_fails_open_to_conservative_unknown() {
+        let catalog = ModelCatalogService::new();
+        // Nothing listens on the discard port: instant connection refused.
+        let discovered = ProviderConfig {
+            base_url: "http://127.0.0.1:9/".to_string(),
+            ..config("openai-compatible", "llava:13b", None)
+        };
+        let resolved = resolve_provider_capabilities(&discovered, &catalog).await;
+        assert_eq!(
+            resolved.info.image_input(),
+            model_core::CapabilitySupport::Unknown
+        );
+        assert!(!resolved.capabilities.image_tool_results);
+    }
+
+    #[tokio::test]
+    async fn factory_applies_explicit_vision_override_over_discovery() {
+        let catalog = Arc::new(ModelCatalogService::new());
         let factory = OpenAiCompatibleProviderFactory;
-        // Heuristic on: gateway model id the heuristic does not know.
-        let inferred = factory.create(config("openai", "gpt-4o", None)).unwrap();
-        assert!(inferred.capabilities().image_tool_results);
-        assert!(inferred.capabilities().image_input);
-        // Explicit true wins over a negative heuristic (unknown gateway id).
-        let forced = factory
-            .create(config("openai-compatible", "my-custom-vlm-9b", Some(true)))
+        let registry = ProviderRegistry::default_registry();
+        // Closed port: discovery always yields Unknown here.
+        let closed = "http://127.0.0.1:9/".to_string();
+
+        // Explicit true forces images on (debug override).
+        let forced = ProviderConfig {
+            base_url: closed.clone(),
+            ..config("openai-compatible", "text-model", Some(true))
+        };
+        let resolved = resolve_provider_capabilities(&forced, &catalog).await;
+        let client = registry
+            .create(&forced.provider.clone(), forced, &resolved, &catalog)
             .unwrap();
-        assert!(forced.capabilities().image_tool_results);
-        // Explicit false wins over a positive heuristic.
-        let denied = factory
-            .create(config("openai", "gpt-4o", Some(false)))
+        assert!(client.capabilities().image_tool_results);
+
+        // Explicit false forces images off even when advertised.
+        let (base_url, server) = mock_models_server(serde_json::json!({
+            "data": [{
+                "id": "vlm-9b",
+                "architecture": { "input_modalities": ["text", "image"] },
+                "supported_parameters": ["tools"],
+            }],
+        }))
+        .await;
+        let denied = ProviderConfig {
+            base_url,
+            ..config("openai-compatible", "vlm-9b", Some(false))
+        };
+        let resolved = resolve_provider_capabilities(&denied, &catalog).await;
+        server.await.unwrap();
+        assert_eq!(
+            resolved.info.image_input(),
+            model_core::CapabilitySupport::Supported,
+            "discovery still reports the advertisement"
+        );
+        assert!(
+            !resolved.capabilities.image_tool_results,
+            "but the override disables sending"
+        );
+        let client = registry
+            .create(&denied.provider.clone(), denied, &resolved, &catalog)
             .unwrap();
-        assert!(!denied.capabilities().image_tool_results);
-        assert!(!denied.capabilities().image_input);
-        // Default stays conservative for text models.
-        let text = factory
-            .create(config("ollama", "llama3.1:8b", None))
+        assert!(!client.capabilities().image_tool_results);
+
+        // Auto with silent entry stays conservative for the factory too.
+        let silent = ProviderConfig {
+            base_url: closed,
+            ..config("ollama", "llama3.1:8b", None)
+        };
+        let resolved = resolve_provider_capabilities(&silent, &catalog).await;
+        let client = factory
+            .create(
+                ProviderConfig {
+                    provider: silent.provider.clone(),
+                    base_url: silent.base_url.clone(),
+                    name: silent.name.clone(),
+                    api_key: None,
+                    vision: None,
+                },
+                &resolved,
+                &catalog,
+            )
             .unwrap();
-        assert!(!text.capabilities().image_tool_results);
+        assert!(!client.capabilities().image_tool_results);
     }
 }

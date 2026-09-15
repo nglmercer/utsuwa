@@ -236,6 +236,7 @@ dependencies = [
  "ipc-core",
  "mcp-runtime",
  "memory",
+ "model-catalog",
  "model-core",
  "model-openai-compatible",
  "plugin-wasm",
@@ -3609,6 +3610,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-catalog"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "model-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "model-core"
 version = "0.1.0"
 dependencies = [
@@ -3633,12 +3650,14 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
+ "model-catalog",
  "model-core",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

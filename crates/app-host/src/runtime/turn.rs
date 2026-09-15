@@ -20,17 +20,21 @@ impl AgentRuntime {
         generation: u64,
         system_prompt: Option<String>,
     ) -> Result<Agent, RuntimeError> {
-        // The provider factory performs blocking work (SQLite settings reads
-        // plus synchronous OS-keychain IPC for the API key). On Linux the
-        // keychain backend enters a nested Tokio runtime, which panics with
-        // `Cannot start a runtime from within a runtime` when called on an
-        // async worker — so the whole factory runs on the blocking pool,
-        // keeping the two agent workers free. A factory panic surfaces here
-        // as a `JoinError` and becomes `turn_failed`, never a lost worker.
+        // The factory is async: it hops blocking settings/keychain reads to
+        // the blocking pool internally (the Linux keychain backend enters a
+        // nested Tokio runtime, which panics on an async worker) while the
+        // model-catalog HTTP stays on this worker. A factory panic becomes
+        // `turn_failed`, never a lost worker.
         let factory = Arc::clone(&self.provider_factory);
-        let provider = tokio::task::spawn_blocking(move || (factory)())
-            .await
-            .map_err(|err| RuntimeError::Executor(format!("provider task failed: {err}")))??;
+        let provider =
+            futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(factory()))
+                .await
+                .map_err(|payload| {
+                    RuntimeError::Executor(format!(
+                        "provider task failed: {}",
+                        panic_payload_message(&payload)
+                    ))
+                })??;
         let mut agent = Agent::new(provider)
             .with_agent_id(self.agent_id.clone())
             .with_limits(AgentLimits::default());

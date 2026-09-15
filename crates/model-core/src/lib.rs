@@ -56,9 +56,179 @@ pub enum VideoFormat {
     Other,
 }
 
+/// Whether a provider API explicitly supports a capability.
+///
+/// `Unknown` means the catalog entry carried no metadata for the
+/// capability. Unknown must never be treated as supported: runtime
+/// booleans map it to `false` (text/tool fallback) unless an explicit
+/// debug override forces the media path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+impl CapabilitySupport {
+    pub fn is_supported(self) -> bool {
+        matches!(self, CapabilitySupport::Supported)
+    }
+
+    /// Runtime boolean: only explicit `Supported` enables the capability.
+    pub fn as_bool(self) -> bool {
+        self.is_supported()
+    }
+
+    pub fn from_advertised(advertised_known: bool, contains: bool) -> Self {
+        if !advertised_known {
+            CapabilitySupport::Unknown
+        } else if contains {
+            CapabilitySupport::Supported
+        } else {
+            CapabilitySupport::Unsupported
+        }
+    }
+}
+
+impl std::fmt::Display for CapabilitySupport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CapabilitySupport::Supported => write!(f, "supported"),
+            CapabilitySupport::Unsupported => write!(f, "unsupported"),
+            CapabilitySupport::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Input/output modality advertised by a provider catalog entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Modality {
+    Text,
+    Image,
+    Audio,
+    Video,
+    Pdf,
+}
+
+impl Modality {
+    /// Parse one provider `input_modalities` token. Returns `None` for
+    /// unrecognized tokens so future modalities fail open to unknown
+    /// rather than corrupting the known set.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "text" | "txt" => Some(Modality::Text),
+            "image" | "images" | "vision" => Some(Modality::Image),
+            "audio" => Some(Modality::Audio),
+            "video" => Some(Modality::Video),
+            "pdf" | "document" | "documents" | "file" => Some(Modality::Pdf),
+            _ => None,
+        }
+    }
+}
+
+/// Where a [`ResolvedModelInfo`] came from. Provider API metadata is the
+/// source of truth; anything else is explicitly labeled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type", content = "name")]
+pub enum CapabilitySource {
+    ProviderApi,
+    PublicCatalog(String),
+    DebugOverride,
+    Unknown,
+}
+
+impl std::fmt::Display for CapabilitySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CapabilitySource::ProviderApi => write!(f, "provider_api"),
+            CapabilitySource::PublicCatalog(name) => write!(f, "public_catalog:{name}"),
+            CapabilitySource::DebugOverride => write!(f, "debug_override"),
+            CapabilitySource::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Normalized per-model capability record. Built only from real
+/// provider/public API metadata — never from model-name substrings or
+/// provider-id assumptions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedModelInfo {
+    pub id: String,
+    pub input_modalities: std::collections::HashSet<Modality>,
+    pub output_modalities: std::collections::HashSet<Modality>,
+    /// False when the catalog entry omitted modality metadata entirely.
+    /// Guards the Supported/Unsupported vs Unknown distinction: an absent
+    /// field yields Unknown, a present field without the modality yields
+    /// Unsupported.
+    #[serde(default)]
+    pub modalities_known: bool,
+    pub tool_calls: CapabilitySupport,
+    pub parallel_tool_calls: CapabilitySupport,
+    pub structured_output: CapabilitySupport,
+    pub reasoning: CapabilitySupport,
+    pub source: CapabilitySource,
+}
+
+impl ResolvedModelInfo {
+    pub fn unknown(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            input_modalities: std::collections::HashSet::new(),
+            output_modalities: std::collections::HashSet::new(),
+            modalities_known: false,
+            tool_calls: CapabilitySupport::Unknown,
+            parallel_tool_calls: CapabilitySupport::Unknown,
+            structured_output: CapabilitySupport::Unknown,
+            reasoning: CapabilitySupport::Unknown,
+            source: CapabilitySource::Unknown,
+        }
+    }
+
+    fn modality_support(&self, modality: Modality) -> CapabilitySupport {
+        if !self.modalities_known {
+            return CapabilitySupport::Unknown;
+        }
+        if self.input_modalities.contains(&modality) {
+            CapabilitySupport::Supported
+        } else {
+            CapabilitySupport::Unsupported
+        }
+    }
+
+    pub fn image_input(&self) -> CapabilitySupport {
+        self.modality_support(Modality::Image)
+    }
+
+    pub fn audio_input(&self) -> CapabilitySupport {
+        self.modality_support(Modality::Audio)
+    }
+
+    pub fn video_input(&self) -> CapabilitySupport {
+        self.modality_support(Modality::Video)
+    }
+
+    pub fn pdf_input(&self) -> CapabilitySupport {
+        self.modality_support(Modality::Pdf)
+    }
+
+    /// Downgrade one modality to unsupported (stale-metadata recovery).
+    /// Marks modalities known so the downgrade is explicit, not unknown.
+    pub fn with_modality_unsupported(mut self, modality: Modality) -> Self {
+        self.modalities_known = true;
+        self.input_modalities.remove(&modality);
+        self
+    }
+}
+
 /// Explicit provider capability contract. Adapters declare what they
 /// actually support; agent plumbing routes around the gaps (sampled video
 /// frames, image fallback text) instead of assuming uniform support.
+///
+/// Runtime booleans derive from [`ResolvedModelInfo`] via
+/// [`ModelCapabilities::from_resolved`]: only explicit `Supported` becomes
+/// `true`. `Unknown` and `Unsupported` both disable the media path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapabilities {
     pub tool_calls: bool,
@@ -67,7 +237,9 @@ pub struct ModelCapabilities {
     pub image_tool_results: bool,
     pub audio_input: bool,
     pub video_input: bool,
+    pub pdf_input: bool,
     pub structured_output: bool,
+    pub reasoning: bool,
     pub streaming: bool,
 }
 
@@ -84,7 +256,9 @@ impl Default for ModelCapabilities {
             image_tool_results: false,
             audio_input: false,
             video_input: false,
+            pdf_input: false,
             structured_output: false,
+            reasoning: false,
             streaming: true,
         }
     }
@@ -100,9 +274,46 @@ impl ModelCapabilities {
             image_tool_results: true,
             audio_input: true,
             video_input: true,
+            pdf_input: true,
             structured_output: true,
+            reasoning: true,
             streaming: true,
         }
+    }
+
+    /// Build runtime booleans from API-resolved metadata. Only explicit
+    /// `Supported` enables a capability; `Unknown` never becomes `true`.
+    pub fn from_resolved(info: &ResolvedModelInfo) -> Self {
+        let image = info.image_input().as_bool();
+        Self {
+            tool_calls: info.tool_calls.as_bool(),
+            parallel_tool_calls: info.parallel_tool_calls.as_bool(),
+            image_input: image,
+            image_tool_results: image,
+            audio_input: info.audio_input().as_bool(),
+            video_input: info.video_input().as_bool(),
+            pdf_input: info.pdf_input().as_bool(),
+            structured_output: info.structured_output.as_bool(),
+            reasoning: info.reasoning.as_bool(),
+            streaming: true,
+        }
+    }
+
+    /// Disable one modality after an explicit provider capability error
+    /// (stale catalog recovery). Used for the single retry without the
+    /// rejected media kind.
+    pub fn without_modality(mut self, modality: Modality) -> Self {
+        match modality {
+            Modality::Image => {
+                self.image_input = false;
+                self.image_tool_results = false;
+            }
+            Modality::Audio => self.audio_input = false,
+            Modality::Video => self.video_input = false,
+            Modality::Pdf => self.pdf_input = false,
+            Modality::Text => {}
+        }
+        self
     }
 
     pub fn with_image_tool_results(mut self, supported: bool) -> Self {
@@ -453,7 +664,15 @@ impl ModelError {
     /// stalling the turn through a backoff ladder, and everything else
     /// (4xx validation, bad payloads, artifacts, cancellation) is
     /// deterministic and must surface immediately.
+    ///
+    /// A capability mismatch (provider explicitly rejects a media kind the
+    /// catalog advertised) is never a normal retry: the adapter rebuilds
+    /// the request without the rejected media and retries once instead of
+    /// backing off on the identical payload.
     pub fn is_retryable(&self) -> bool {
+        if self.capability_modality().is_some() {
+            return false;
+        }
         match self {
             ModelError::Provider { status, .. } => {
                 *status == 429 || *status == 408 || (500..600).contains(status)
@@ -461,6 +680,100 @@ impl ModelError {
             _ => false,
         }
     }
+
+    /// Detect an explicit provider capability rejection and name the media
+    /// kind it refuses. Matches provider phrasings such as "image input
+    /// unsupported", "no endpoints support image input", "unsupported
+    /// modality", "audio input unsupported", "video input unsupported".
+    /// Returns `None` for ordinary errors (auth, rate limits, 5xx).
+    pub fn capability_modality(&self) -> Option<Modality> {
+        let message = match self {
+            ModelError::Provider { message, .. } => message.as_str(),
+            ModelError::InvalidResponse(message) => message.as_str(),
+            _ => return None,
+        };
+        capability_modality_from_message(message)
+    }
+}
+
+/// Classify a provider diagnostic as a media-capability rejection.
+/// Case-insensitive substring match over the explicit phrasings providers
+/// use when a model/route cannot accept a modality.
+pub fn capability_modality_from_message(message: &str) -> Option<Modality> {
+    let text = message.to_ascii_lowercase();
+    let mentions = |words: &[&str]| words.iter().any(|word| text.contains(word));
+    // Image phrasings first: the most common router failure ("No endpoints
+    // found that support image input").
+    if mentions(&["image input", "image_url", "image url"])
+        && mentions(&[
+            "unsupported",
+            "not support",
+            "no endpoint",
+            "no endpoints",
+            "does not support",
+            "don't support",
+            "cannot accept",
+            "can't accept",
+            "invalid",
+            "rejected",
+        ])
+    {
+        return Some(Modality::Image);
+    }
+    if mentions(&["audio input", "audio_url", "audio url"])
+        && mentions(&[
+            "unsupported",
+            "not support",
+            "no endpoint",
+            "no endpoints",
+            "does not support",
+            "cannot accept",
+            "invalid",
+            "rejected",
+        ])
+    {
+        return Some(Modality::Audio);
+    }
+    if mentions(&["video input", "video_url", "video url"])
+        && mentions(&[
+            "unsupported",
+            "not support",
+            "no endpoint",
+            "no endpoints",
+            "does not support",
+            "cannot accept",
+            "invalid",
+            "rejected",
+        ])
+    {
+        return Some(Modality::Video);
+    }
+    if mentions(&["pdf input", "pdf_url", "pdf url", "document input"])
+        && mentions(&[
+            "unsupported",
+            "not support",
+            "no endpoint",
+            "no endpoints",
+            "does not support",
+            "cannot accept",
+            "invalid",
+            "rejected",
+        ])
+    {
+        return Some(Modality::Pdf);
+    }
+    // Generic modality rejection without a named kind. Callers treat this
+    // as an image-path failure (the only media kind the OpenAI-compatible
+    // wire format serializes inline today) while still invalidating the
+    // catalog entry.
+    if mentions(&[
+        "unsupported modality",
+        "unsupported media",
+        "modality not supported",
+    ]) {
+        return Some(Modality::Image);
+    }
+    None
 }
 
 pub type ModelStream =

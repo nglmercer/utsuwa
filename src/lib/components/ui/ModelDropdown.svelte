@@ -2,6 +2,7 @@
 	import { DropdownMenu } from 'bits-ui';
 	import { Icon } from '$lib/components/ui';
 	import type { ModelCapabilities } from '$lib/services/providers/model-capabilities';
+	import { canShowImages } from '$lib/services/providers/vision';
 
 	interface Model {
 		id: string;
@@ -127,7 +128,7 @@
 								{#if model.free}
 									<span class="model-badge free">Free</span>
 								{/if}
-								{#if model.capabilities?.vision}
+								{#if canShowImages(model)}
 									<span class="model-badge">Vision</span>
 								{/if}
 								{#if toolBadge(model.capabilities)}

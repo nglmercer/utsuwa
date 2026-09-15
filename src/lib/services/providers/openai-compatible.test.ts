@@ -74,7 +74,15 @@ test('Kilo model parsing marks free models, preserves names, and sorts free firs
 	assert.equal(models[0].name, 'StepFun Flash');
 	assert.equal(models[0].free, true);
 	assert.deepEqual(models[0].capabilities, {
+		imageInput: 'supported',
 		vision: true,
+		audioInput: 'unsupported',
+		videoInput: 'unsupported',
+		pdfInput: 'unsupported',
+		toolCalls: 'supported',
+		parallelToolCalls: 'unsupported',
+		structuredOutput: 'unsupported',
+		reasoning: 'unsupported',
 		toolCalling: true,
 		toolCallingSupport: 'compatible'
 	});
@@ -85,6 +93,42 @@ test('Kilo model parsing marks free models, preserves names, and sorts free firs
 		).map((model) => model.id),
 		['free/model']
 	);
+});
+
+test('capability parsing never inspects the model id', () => {
+	const models = parseOpenAICompatibleModels(
+		{
+			data: [
+				{ id: 'super-vision-9000' },
+				{
+					id: 'gpt-text-only',
+					architecture: { input_modalities: ['text'] },
+					supported_parameters: []
+				},
+				{
+					id: 'plain-name-7b',
+					architecture: { input_modalities: ['text', 'audio', 'video', 'pdf'] },
+					supported_parameters: ['tools', 'parallel_tool_calls', 'response_format', 'reasoning']
+				}
+			]
+		},
+		{ includeCapabilities: true }
+	);
+	// Silent entry: unknown (absent keys), despite the vision-y name.
+	assert.deepEqual(models[0].capabilities, { toolCallingSupport: 'unknown' });
+	// Text-only advertisement stays text-only.
+	assert.equal(models[1].capabilities?.imageInput, 'unsupported');
+	assert.equal(models[1].capabilities?.vision, false);
+	assert.equal(models[1].capabilities?.toolCalls, 'unsupported');
+	// Each advertised modality enables independently.
+	assert.equal(models[2].capabilities?.imageInput, 'unsupported');
+	assert.equal(models[2].capabilities?.audioInput, 'supported');
+	assert.equal(models[2].capabilities?.videoInput, 'supported');
+	assert.equal(models[2].capabilities?.pdfInput, 'supported');
+	assert.equal(models[2].capabilities?.toolCalls, 'supported');
+	assert.equal(models[2].capabilities?.parallelToolCalls, 'supported');
+	assert.equal(models[2].capabilities?.structuredOutput, 'supported');
+	assert.equal(models[2].capabilities?.reasoning, 'supported');
 });
 
 test('shared model fetcher uses the exact Kilo models URL and optional auth', async () => {

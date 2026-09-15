@@ -1,4 +1,5 @@
-import type { ModelCapabilities, ModelInfo } from './model-capabilities';
+import type { CapabilitySupport, ModelCapabilities, ModelInfo } from './model-capabilities';
+import { visionAlias } from './model-capabilities.ts';
 
 /**
  * Shared helpers for optional-key / public OpenAI-compatible gateways
@@ -104,22 +105,72 @@ function parseStringArray(value: unknown): string[] {
 	return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
-/** Map common OpenAI-compatible capability metadata when a gateway provides it. */
+function supportFromAdvertised(advertised: string[] | undefined, token: string): CapabilitySupport | undefined {
+	if (advertised === undefined) return undefined;
+	return advertised.includes(token) ? 'supported' : 'unsupported';
+}
+
+/**
+ * Map common OpenAI-compatible capability metadata when a gateway provides
+ * it. Reads only real metadata: `architecture.input_modalities` (plus a
+ * top-level fallback) and `supported_parameters`. Absent fields stay
+ * `undefined` (unknown); a present field without the token is
+ * `unsupported`. The model id is never inspected.
+ */
 export function parseOpenAICompatibleModelCapabilities(raw: RawOpenAIModel): ModelCapabilities {
-	const supported = parseStringArray(raw.supported_parameters).map((item) => item.toLowerCase());
+	const supportedRaw = Array.isArray(raw.supported_parameters)
+		? parseStringArray(raw.supported_parameters).map((item) => item.toLowerCase())
+		: undefined;
 	const architecture =
 		raw.architecture && typeof raw.architecture === 'object'
 			? (raw.architecture as Record<string, unknown>)
 			: undefined;
-	const modalities = parseStringArray(architecture?.input_modalities).map((item) => item.toLowerCase());
-	const toolCalling = supported.includes('tools') || supported.includes('tool_choice');
-	const vision = modalities.includes('image') || modalities.includes('video');
+	const stringArrayOrUndefined = (value: unknown): string[] | undefined =>
+		Array.isArray(value)
+			? value.filter((item): item is string => typeof item === 'string')
+			: undefined;
+	const modalitiesRaw =
+		stringArrayOrUndefined(architecture?.input_modalities) ??
+		stringArrayOrUndefined(raw.input_modalities);
+	const modalities = modalitiesRaw?.map((item) => item.toLowerCase());
+
+	const imageInput = modalities ? ((modalities.includes('image') || modalities.includes('vision') ? 'supported' : 'unsupported') as CapabilitySupport) : undefined;
+	const audioInput = supportFromAdvertised(modalities, 'audio');
+	const videoInput = supportFromAdvertised(modalities, 'video');
+	const pdfInput = modalities
+		? ((modalities.includes('pdf') || modalities.includes('document') || modalities.includes('file') ? 'supported' : 'unsupported') as CapabilitySupport)
+		: undefined;
+
+	const toolCalls = supportedRaw
+		? ((supportedRaw.includes('tools') || supportedRaw.includes('tool_choice') ? 'supported' : 'unsupported') as CapabilitySupport)
+		: undefined;
+	const parallelToolCalls = supportFromAdvertised(supportedRaw, 'parallel_tool_calls');
+	const structuredOutput = supportedRaw
+		? ((supportedRaw.includes('response_format') || supportedRaw.includes('structured_output') || supportedRaw.includes('json_schema') ? 'supported' : 'unsupported') as CapabilitySupport)
+		: undefined;
+	const reasoning = supportedRaw
+		? ((supportedRaw.includes('reasoning') || supportedRaw.includes('reasoning_effort') ? 'supported' : 'unsupported') as CapabilitySupport)
+		: undefined;
+
+	const toolCallingSupport =
+		toolCalls === 'supported' ? ('compatible' as const) : ('unknown' as const);
 
 	return {
-		...(vision ? { vision: true } : {}),
-		...(toolCalling
-			? { toolCalling: true, toolCallingSupport: 'compatible' as const }
-			: { toolCallingSupport: 'unknown' as const })
+		...(imageInput !== undefined
+			? {
+					imageInput,
+					...(visionAlias(imageInput) !== undefined ? { vision: visionAlias(imageInput) } : {})
+				}
+			: {}),
+		...(audioInput !== undefined ? { audioInput } : {}),
+		...(videoInput !== undefined ? { videoInput } : {}),
+		...(pdfInput !== undefined ? { pdfInput } : {}),
+		...(toolCalls !== undefined ? { toolCalls } : {}),
+		...(parallelToolCalls !== undefined ? { parallelToolCalls } : {}),
+		...(structuredOutput !== undefined ? { structuredOutput } : {}),
+		...(reasoning !== undefined ? { reasoning } : {}),
+		...(toolCalls === 'supported' ? { toolCalling: true } : {}),
+		toolCallingSupport
 	};
 }
 

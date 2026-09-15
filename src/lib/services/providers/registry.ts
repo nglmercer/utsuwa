@@ -26,10 +26,10 @@ export interface ProviderMetadata {
 	// hand-entered model), rather than a fixed provider. The settings UI shows a
 	// base-URL field and a manual model input for these.
 	custom?: boolean;
-	// Whether this provider's models are broadly vision-capable. Coarse, cloud
-	// only. Local providers (Ollama/LM Studio) leave this unset and rely on a
-	// per-model heuristic, since vision depends on the installed model.
-	supportsVision?: boolean;
+	// NOTE: there is intentionally no per-provider vision flag. Whether a
+	// model accepts images comes only from its normalized provider API
+	// metadata (`capabilities.imageInput === 'supported'`), never from the
+	// provider id.
 	models?: ModelInfo[];
 	voices?: Array<{ id: string; name: string }>;
 }
@@ -47,7 +47,6 @@ export const LLM_PROVIDERS: ProviderMetadata[] = [
 		category: 'llm',
 		icon: '🤖',
 		requiresApiKey: true,
-		supportsVision: true,
 		defaultBaseUrl: DEFAULT_CHAT_BASE_URLS.openai
 	},
 	{
@@ -57,7 +56,6 @@ export const LLM_PROVIDERS: ProviderMetadata[] = [
 		category: 'llm',
 		icon: '🧠',
 		requiresApiKey: true,
-		supportsVision: true,
 		defaultBaseUrl: DEFAULT_CHAT_BASE_URLS.anthropic
 	},
 	{
@@ -68,7 +66,6 @@ export const LLM_PROVIDERS: ProviderMetadata[] = [
 		icon: '✨',
 		iconColor: '#4285F4',
 		requiresApiKey: true,
-		supportsVision: true,
 		defaultBaseUrl: DEFAULT_CHAT_BASE_URLS.google
 	},
 	{
@@ -88,7 +85,6 @@ export const LLM_PROVIDERS: ProviderMetadata[] = [
 		icon: '𝕏',
 		requiresApiKey: true,
 		authentication: 'required',
-		supportsVision: true,
 		defaultBaseUrl: DEFAULT_CHAT_BASE_URLS.xai
 	},
 	// Optional-key public gateway. Anonymous requests work with supported free
@@ -314,9 +310,4 @@ export function getTTSProvider(id: string): ProviderMetadata | undefined {
 
 export function getSTTProvider(id: string): ProviderMetadata | undefined {
 	return STT_PROVIDERS.find((p) => p.id === id);
-}
-
-/** Whether an LLM provider's models are broadly vision-capable (cloud providers). */
-export function providerSupportsVision(id: string): boolean {
-	return getLLMProvider(id)?.supportsVision === true;
 }
