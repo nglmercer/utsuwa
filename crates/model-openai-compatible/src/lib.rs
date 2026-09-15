@@ -190,6 +190,10 @@ impl OpenAICompatibleClient {
         request: &ModelRequest,
         caps: ModelCapabilities,
     ) -> Result<ModelStream, ModelError> {
+        // Clock starts before the POST so TTFT/total cover the full
+        // request→headers→first-content path — the POST→headers wait is
+        // where slow providers spend most of their time.
+        let started = std::time::Instant::now();
         let rewritten = caps.apply_to_request(request);
         let body = request_body_with_artifacts(&self.model, &rewritten, &caps).await?;
         let mut req = self.http.post(self.url()).json(&body);
@@ -207,16 +211,62 @@ impl OpenAICompatibleClient {
             assembler: SseAssembler::default().with_tool_names(tool_name_map(&rewritten.tools)),
             bytes: Box::pin(byte_stream),
             finished: false,
+            started,
+            first_content_at: None,
+            completed: false,
+            model: self.model.clone(),
         };
         let stream = futures_util::stream::unfold(state, |mut state| async move {
             match next_event(&mut state).await {
-                Ok(Some(event)) => Some((Ok(event), state)),
-                Ok(None) => None,
+                Ok(Some(event)) => {
+                    if state.first_content_at.is_none()
+                        && matches!(
+                            event,
+                            ModelStreamEvent::TextDelta(_) | ModelStreamEvent::ToolCall(_)
+                        )
+                    {
+                        let ttft = state.started.elapsed();
+                        state.first_content_at = Some(state.started + ttft);
+                        tracing::debug!(
+                            model = %state.model,
+                            ttft_ms = ttft.as_millis() as u64,
+                            "model stream first content"
+                        );
+                    }
+                    // The agent stops polling at Done without driving the
+                    // stream to exhaustion, so completion is logged on the
+                    // terminal event (once) rather than only on None.
+                    if !state.completed && matches!(event, ModelStreamEvent::Done { .. }) {
+                        state.completed = true;
+                        log_stream_complete(&state.model, state.started, state.first_content_at);
+                    }
+                    Some((Ok(event), state))
+                }
+                Ok(None) => {
+                    if !state.completed {
+                        state.completed = true;
+                        log_stream_complete(&state.model, state.started, state.first_content_at);
+                    }
+                    None
+                }
                 Err(err) => Some((Err(err), state)),
             }
         });
         Ok(Box::pin(stream))
     }
+}
+
+fn log_stream_complete(
+    model: &str,
+    started: std::time::Instant,
+    first_content_at: Option<std::time::Instant>,
+) {
+    tracing::debug!(
+        model = %model,
+        total_ms = started.elapsed().as_millis() as u64,
+        ttft_ms = first_content_at.map(|at| at.duration_since(started).as_millis() as u64),
+        "model stream complete"
+    );
 }
 
 /// Anthropic Messages adapter. It lives beside the OpenAI-compatible adapter
@@ -306,6 +356,9 @@ impl AnthropicClient {
         request: &ModelRequest,
         caps: ModelCapabilities,
     ) -> Result<ModelStream, ModelError> {
+        // Clock starts before the POST so TTFT/total cover the full
+        // request→headers→first-content path.
+        let started = std::time::Instant::now();
         let rewritten = caps.apply_to_request(request);
         let body = anthropic_request_body_with_artifacts(&self.model, &rewritten, &caps).await?;
         let response = self
@@ -324,11 +377,44 @@ impl AnthropicClient {
                 .with_tool_names(tool_name_map(&rewritten.tools)),
             bytes: Box::pin(response.bytes_stream()),
             finished: false,
+            started,
+            first_content_at: None,
+            completed: false,
+            model: self.model.clone(),
         };
         let stream = futures_util::stream::unfold(state, |mut state| async move {
             match next_anthropic_event(&mut state).await {
-                Ok(Some(event)) => Some((Ok(event), state)),
-                Ok(None) => None,
+                Ok(Some(event)) => {
+                    if state.first_content_at.is_none()
+                        && matches!(
+                            event,
+                            ModelStreamEvent::TextDelta(_) | ModelStreamEvent::ToolCall(_)
+                        )
+                    {
+                        let ttft = state.started.elapsed();
+                        state.first_content_at = Some(state.started + ttft);
+                        tracing::debug!(
+                            model = %state.model,
+                            ttft_ms = ttft.as_millis() as u64,
+                            "model stream first content"
+                        );
+                    }
+                    // The agent stops polling at Done without driving the
+                    // stream to exhaustion, so completion is logged on the
+                    // terminal event (once) rather than only on None.
+                    if !state.completed && matches!(event, ModelStreamEvent::Done { .. }) {
+                        state.completed = true;
+                        log_stream_complete(&state.model, state.started, state.first_content_at);
+                    }
+                    Some((Ok(event), state))
+                }
+                Ok(None) => {
+                    if !state.completed {
+                        state.completed = true;
+                        log_stream_complete(&state.model, state.started, state.first_content_at);
+                    }
+                    None
+                }
                 Err(err) => Some((Err(err), state)),
             }
         });
@@ -465,6 +551,10 @@ struct AnthropicStreamState {
         Box<dyn futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
     >,
     finished: bool,
+    started: std::time::Instant,
+    first_content_at: Option<std::time::Instant>,
+    completed: bool,
+    model: String,
 }
 
 async fn next_anthropic_event(
@@ -993,6 +1083,10 @@ struct StreamState {
         Box<dyn futures_core::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
     >,
     finished: bool,
+    started: std::time::Instant,
+    first_content_at: Option<std::time::Instant>,
+    completed: bool,
+    model: String,
 }
 
 /// Pull the next stream event, buffering SSE lines across chunk splits.

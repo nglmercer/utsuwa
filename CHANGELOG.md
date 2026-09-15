@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Per-request timing diagnostics**: `--debug` turn logs now report time-to-first-content and total stream time per model request plus per-iteration timings, so the next slow turn shows exactly where wall-clock time went.
+
 ### Changed
 - **Model capabilities are now discovered from real provider APIs instead of model-name heuristics**: a new `model-catalog` service resolves every model through its provider's actual `/models` endpoint (Kilo/OpenRouter/OpenAI-compatible, LM Studio with `/api/v1` → `/api/v0` → `/v1` fallbacks, Ollama `/api/tags` + `/api/show`, Anthropic/Google list endpoints), normalizing `architecture.input_modalities` and `supported_parameters` into explicit supported/unsupported/unknown states. All `VISION_MODEL_HINTS` / `TEXT_ONLY_MODELS` substring lists and `gpt-* = vision`-style provider assumptions are gone on both sides of the bridge; silent catalog entries resolve to Unknown and safely degrade to text/tool fallback instead of erroring with `No endpoints found that support image input`. Stale advertisements self-heal: an explicit provider capability rejection suppresses the capability, invalidates the cached catalog, and retries once without the rejected media. `model-cli --vision` is now `auto` (API-discovered, the default) with `on`/`off` as debug overrides, and the CLI prints the resolved `capabilities_source` plus per-modality states before each run.
 

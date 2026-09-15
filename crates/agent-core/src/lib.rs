@@ -467,18 +467,26 @@ impl Agent {
         // model cannot accidentally emit a blind coordinate macro.
         let mut desktop_observation_required = true;
 
-        for _ in 0..self.limits.max_iterations {
+        for iteration in 0..self.limits.max_iterations {
+            let iteration_started = std::time::Instant::now();
             let mut request = ModelRequest::new(messages.clone());
             request.max_tokens = Some(1024);
             request.tools = tool_defs.clone();
             request.artifact_store = self.artifact_store.clone();
             debug_assert_eq!(request.tools.len(), tool_defs.len());
             tracing::debug!(
+                iteration,
                 tool_count = request.tools.len(),
                 tool_ids = ?tool_ids,
                 "native agent model request includes tool definitions"
             );
             let (text, calls, turn_truncated) = self.stream_turn(request).await?;
+            tracing::debug!(
+                iteration,
+                iteration_ms = iteration_started.elapsed().as_millis() as u64,
+                tool_calls = calls.len(),
+                "native agent iteration complete"
+            );
             truncated |= turn_truncated;
             final_text = text.clone();
             if calls.is_empty() {
