@@ -20,6 +20,14 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const MODELS_PATH: &str = "/models";
 const MAX_PROVIDER_ERROR_BODY: usize = 8 * 1024;
 
+/// Default stream stall watchdog: abort a chat stream that delivers no SSE
+/// bytes for this long. Generous enough to never trip on slow-but-healthy
+/// free-tier generation (observed healthy pauses are single-digit seconds)
+/// while bounding the worst case to a clear error instead of a silent hang.
+/// Any arriving chunk — including `: keep-alive` comments — resets the
+/// window; only true silence trips it.
+pub const DEFAULT_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Shared catalog handle so an adapter can report a stale-metadata
 /// capability rejection: the catalog suppresses the advertised capability
 /// and reloads provider metadata before the single retry.
@@ -47,6 +55,7 @@ pub struct OpenAICompatibleClient {
     model: String,
     capabilities: ModelCapabilities,
     capability_context: Option<CapabilityContext>,
+    stream_stall_timeout: Duration,
 }
 
 impl OpenAICompatibleClient {
@@ -69,6 +78,7 @@ impl OpenAICompatibleClient {
             // unless the caller opts in via `with_capabilities`.
             capabilities: ModelCapabilities::default(),
             capability_context: None,
+            stream_stall_timeout: DEFAULT_STREAM_STALL_TIMEOUT,
         }
     }
 
@@ -84,6 +94,13 @@ impl OpenAICompatibleClient {
     /// (suppress + invalidate) before the single retry without that media.
     pub fn with_capability_context(mut self, context: CapabilityContext) -> Self {
         self.capability_context = Some(context);
+        self
+    }
+
+    /// Override the stream stall watchdog (tests use milliseconds;
+    /// production keeps [`DEFAULT_STREAM_STALL_TIMEOUT`]).
+    pub fn with_stream_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_stall_timeout = timeout;
         self
     }
 
@@ -200,11 +217,28 @@ impl OpenAICompatibleClient {
         if let Some(key) = self.api_key.as_deref() {
             req = req.bearer_auth(key);
         }
-        let response = req
-            .send()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
-        let response = validate_streaming_response(response, &self.url()).await?;
+        // Bound the headers wait too: without this a provider that accepts
+        // the connection and never responds would hang outside the
+        // mid-stream watchdog below.
+        let send = async {
+            let response = req
+                .send()
+                .await
+                .map_err(|e| ModelError::Transport(e.to_string()))?;
+            validate_streaming_response(response, &self.url()).await
+        };
+        let response = match tokio::time::timeout(self.stream_stall_timeout, send).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(ModelError::Transport(format!(
+                    "provider stream stalled: no response headers for {}s from model '{}'; \
+                     the provider accepted the request but never started responding",
+                    self.stream_stall_timeout.as_secs(),
+                    self.model,
+                )));
+            }
+        };
         let byte_stream = response.bytes_stream();
         let state = StreamState {
             buffer: String::new(),
@@ -212,12 +246,16 @@ impl OpenAICompatibleClient {
             bytes: Box::pin(byte_stream),
             finished: false,
             started,
+            // Headers just arrived, so the mid-stream watchdog starts fresh
+            // here even though the request clock started at the POST above.
+            last_chunk_at: std::time::Instant::now(),
             first_content_at: None,
             completed: false,
+            stall_timeout: self.stream_stall_timeout,
             model: self.model.clone(),
         };
         let stream = futures_util::stream::unfold(state, |mut state| async move {
-            match next_event(&mut state).await {
+            match next_event_guarded(&mut state).await {
                 Ok(Some(event)) => {
                     if state.first_content_at.is_none()
                         && matches!(
@@ -280,6 +318,7 @@ pub struct AnthropicClient {
     model: String,
     capabilities: ModelCapabilities,
     capability_context: Option<CapabilityContext>,
+    stream_stall_timeout: Duration,
 }
 
 impl AnthropicClient {
@@ -296,6 +335,7 @@ impl AnthropicClient {
             // Anthropic tool_result blocks natively accept images.
             capabilities: ModelCapabilities::default().with_image_tool_results(true),
             capability_context: None,
+            stream_stall_timeout: DEFAULT_STREAM_STALL_TIMEOUT,
         }
     }
 
@@ -309,6 +349,13 @@ impl AnthropicClient {
     /// single-retry contract as the OpenAI-compatible client).
     pub fn with_capability_context(mut self, context: CapabilityContext) -> Self {
         self.capability_context = Some(context);
+        self
+    }
+
+    /// Override the stream stall watchdog (tests use milliseconds;
+    /// production keeps [`DEFAULT_STREAM_STALL_TIMEOUT`]).
+    pub fn with_stream_stall_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_stall_timeout = timeout;
         self
     }
 
@@ -361,16 +408,30 @@ impl AnthropicClient {
         let started = std::time::Instant::now();
         let rewritten = caps.apply_to_request(request);
         let body = anthropic_request_body_with_artifacts(&self.model, &rewritten, &caps).await?;
-        let response = self
-            .http
-            .post(self.url())
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ModelError::Transport(e.to_string()))?;
-        let response = validate_streaming_response(response, &self.url()).await?;
+        let send = async {
+            let response = self
+                .http
+                .post(self.url())
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ModelError::Transport(e.to_string()))?;
+            validate_streaming_response(response, &self.url()).await
+        };
+        let response = match tokio::time::timeout(self.stream_stall_timeout, send).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(ModelError::Transport(format!(
+                    "provider stream stalled: no response headers for {}s from model '{}'; \
+                     the provider accepted the request but never started responding",
+                    self.stream_stall_timeout.as_secs(),
+                    self.model,
+                )));
+            }
+        };
         let state = AnthropicStreamState {
             buffer: String::new(),
             assembler: AnthropicAssembler::default()
@@ -378,12 +439,16 @@ impl AnthropicClient {
             bytes: Box::pin(response.bytes_stream()),
             finished: false,
             started,
+            // Headers just arrived, so the mid-stream watchdog starts fresh
+            // here even though the request clock started at the POST above.
+            last_chunk_at: std::time::Instant::now(),
             first_content_at: None,
             completed: false,
+            stall_timeout: self.stream_stall_timeout,
             model: self.model.clone(),
         };
         let stream = futures_util::stream::unfold(state, |mut state| async move {
-            match next_anthropic_event(&mut state).await {
+            match next_anthropic_event_guarded(&mut state).await {
                 Ok(Some(event)) => {
                     if state.first_content_at.is_none()
                         && matches!(
@@ -552,8 +617,11 @@ struct AnthropicStreamState {
     >,
     finished: bool,
     started: std::time::Instant,
+    /// Last time any SSE bytes arrived (including `: keep-alive` comments).
+    last_chunk_at: std::time::Instant,
     first_content_at: Option<std::time::Instant>,
     completed: bool,
+    stall_timeout: Duration,
     model: String,
 }
 
@@ -569,6 +637,7 @@ async fn next_anthropic_event(
         }
         match state.bytes.next().await {
             Some(Ok(chunk)) => {
+                state.last_chunk_at = std::time::Instant::now();
                 state.buffer.push_str(
                     std::str::from_utf8(&chunk)
                         .map_err(|e| ModelError::InvalidResponse(e.to_string()))?,
@@ -580,6 +649,26 @@ async fn next_anthropic_event(
                 state.finished = true;
                 state.assembler.finish();
             }
+        }
+    }
+}
+
+/// [`next_anthropic_event`] with the stall watchdog (same contract as
+/// [`next_event_guarded`]: arriving bytes extend the window).
+async fn next_anthropic_event_guarded(
+    state: &mut AnthropicStreamState,
+) -> Result<Option<ModelStreamEvent>, ModelError> {
+    loop {
+        let idle = state.last_chunk_at.elapsed();
+        if idle >= state.stall_timeout {
+            return Err(stall_error(&state.model, state.stall_timeout));
+        }
+        match tokio::time::timeout(state.stall_timeout - idle, next_anthropic_event(state)).await {
+            Ok(outcome) => return outcome,
+            Err(_) if state.last_chunk_at.elapsed() >= state.stall_timeout => {
+                return Err(stall_error(&state.model, state.stall_timeout));
+            }
+            Err(_) => {}
         }
     }
 }
@@ -1084,8 +1173,11 @@ struct StreamState {
     >,
     finished: bool,
     started: std::time::Instant,
+    /// Last time any SSE bytes arrived (including `: keep-alive` comments).
+    last_chunk_at: std::time::Instant,
     first_content_at: Option<std::time::Instant>,
     completed: bool,
+    stall_timeout: Duration,
     model: String,
 }
 
@@ -1100,6 +1192,7 @@ async fn next_event(state: &mut StreamState) -> Result<Option<ModelStreamEvent>,
         }
         match state.bytes.next().await {
             Some(Ok(chunk)) => {
+                state.last_chunk_at = std::time::Instant::now();
                 state.buffer.push_str(
                     std::str::from_utf8(&chunk)
                         .map_err(|e| ModelError::InvalidResponse(e.to_string()))?,
@@ -1113,6 +1206,37 @@ async fn next_event(state: &mut StreamState) -> Result<Option<ModelStreamEvent>,
             }
         }
     }
+}
+
+/// [`next_event`] with the stall watchdog: bound each wait by the time
+/// since bytes last arrived. A timeout re-checks the clock before failing,
+/// so chunks that landed mid-wait (keep-alive comments, slow dribbles)
+/// extend the window instead of tripping it.
+async fn next_event_guarded(
+    state: &mut StreamState,
+) -> Result<Option<ModelStreamEvent>, ModelError> {
+    loop {
+        let idle = state.last_chunk_at.elapsed();
+        if idle >= state.stall_timeout {
+            return Err(stall_error(&state.model, state.stall_timeout));
+        }
+        match tokio::time::timeout(state.stall_timeout - idle, next_event(state)).await {
+            Ok(outcome) => return outcome,
+            Err(_) if state.last_chunk_at.elapsed() >= state.stall_timeout => {
+                return Err(stall_error(&state.model, state.stall_timeout));
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn stall_error(model: &str, timeout: Duration) -> ModelError {
+    ModelError::Transport(format!(
+        "provider stream stalled: no response data for {}s from model '{model}'; \
+         the provider stopped sending mid-response (overloaded gateway, dropped connection, \
+         or exhausted free-tier quota) — retry the turn or switch to a faster model",
+        timeout.as_secs(),
+    ))
 }
 
 /// Move complete lines out of the buffer into the assembler.
@@ -2637,6 +2761,170 @@ mod tests {
             "retry keeps explicit fallback metadata: {}",
             bodies[1]
         );
+    }
+
+    /// A provider that accepts the request and then goes silent must fail
+    /// the stream with a clear stall error — never hang the turn forever.
+    #[tokio::test]
+    async fn stream_stall_guard_aborts_silent_provider() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .await
+                .unwrap();
+            // Go silent far beyond the test watchdog window.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let client = OpenAICompatibleClient::new(format!("http://{addr}"), None, "m")
+            .with_stream_stall_timeout(Duration::from_millis(300));
+        let request = ModelRequest::new(vec![ModelMessage::user("hi")]);
+        let started = std::time::Instant::now();
+        let mut stream = client.stream(request).await.unwrap();
+        let mut outcome = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(_) => {}
+                Err(error) => {
+                    outcome = Some(error);
+                    break;
+                }
+            }
+        }
+        let elapsed = started.elapsed();
+        server.abort();
+        let error = outcome.expect("silent stream must error, not hang");
+        assert!(
+            matches!(error, ModelError::Transport(_)),
+            "stall must be a fatal transport error: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("stalled"),
+            "stall message must say so: {error}"
+        );
+        assert!(
+            !error.is_retryable(),
+            "stall must not enter backoff retries"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "watchdog must fire promptly, took {elapsed:?}"
+        );
+    }
+
+    /// A provider that accepts the connection and never sends response
+    /// headers must fail the request promptly — the headers wait is outside
+    /// the mid-stream watchdog, so it gets the same bound.
+    #[tokio::test]
+    async fn stream_stall_guard_aborts_missing_response_headers() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            // Never respond.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let client = OpenAICompatibleClient::new(format!("http://{addr}"), None, "m")
+            .with_stream_stall_timeout(Duration::from_millis(300));
+        let request = ModelRequest::new(vec![ModelMessage::user("hi")]);
+        let started = std::time::Instant::now();
+        let error = match client.stream(request).await {
+            Ok(_) => panic!("missing headers must error, not hang"),
+            Err(error) => error,
+        };
+        server.abort();
+        assert!(
+            matches!(error, ModelError::Transport(_)),
+            "headers stall must be a fatal transport error: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("no response headers"),
+            "headers stall message must say so: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "headers watchdog must fire promptly"
+        );
+    }
+
+    /// Slow-but-healthy streams survive: keep-alive comments and dribbled
+    /// chunks reset the watchdog window, so only true silence trips it.
+    /// This is the guard's highest-risk behavior — a false positive here
+    /// would break slow providers.
+    #[tokio::test]
+    async fn stream_stall_guard_survives_keep_alive_dribble() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .await
+                .unwrap();
+            // Total elapsed (~500ms) exceeds the 300ms window, but every
+            // 100ms something arrives, so the watchdog must never fire.
+            for _ in 0..4 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                socket.write_all(b": keep-alive\n\n").await.unwrap();
+                socket.flush().await.unwrap();
+            }
+            socket
+                .write_all(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"slow\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = OpenAICompatibleClient::new(format!("http://{addr}"), None, "m")
+            .with_stream_stall_timeout(Duration::from_millis(300));
+        let request = ModelRequest::new(vec![ModelMessage::user("hi")]);
+        let mut stream = client.stream(request).await.unwrap();
+        let mut text = String::new();
+        while let Some(event) = stream.next().await {
+            if let ModelStreamEvent::TextDelta(delta) = event.unwrap() {
+                text.push_str(&delta);
+            }
+        }
+        server.await.unwrap();
+        assert_eq!(text, "slow");
     }
 
     #[tokio::test]
