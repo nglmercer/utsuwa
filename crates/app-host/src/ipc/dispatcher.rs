@@ -873,9 +873,24 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            script.contains("requires the string 'simple' or 'full'"),
+            script.contains("requires one of minimal, simple, standard"),
             "{script}"
         );
+        for (id, profile) in [
+            ("39", "minimal"),
+            ("40", "standard"),
+            ("41", "developer"),
+            ("42", "computeruse"),
+            ("43", "full"),
+        ] {
+            let script = dispatcher
+                .handle_message(&format!(
+                    r#"{{"id":"{id}","method":"settings.set","params":{{"key":"{}","value":"{profile}"}}}}"#,
+                    crate::runtime::SETTING_TOOL_PROFILE
+                ))
+                .unwrap();
+            assert!(script.contains("\"ok\":true"), "{profile}: {script}");
+        }
     }
 
     #[test]

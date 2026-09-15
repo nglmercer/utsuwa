@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Agent tool-profile selector in Settings**: the native agent's tool surface (`minimal` … `full`) is now user-configurable from the desktop Settings panel and persists via `settings.set`. Smaller profiles answer simple requests noticeably faster (a trivial Kilo request dropped from ~17 s wall-clock on 131 tools to ~10 s on 64 tools in local testing); the default stays `full` for cloud / `simple` for local providers.
 - **Per-request timing diagnostics**: `--debug` turn logs now report time-to-first-content and total stream time per model request plus per-iteration timings, so the next slow turn shows exactly where wall-clock time went.
 
 ### Fixed

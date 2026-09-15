@@ -10,15 +10,26 @@
 		revokeHomeReadAccess,
 		setAutonomousFullAccess
 	} from '$lib/services/native/permissions';
+	import {
+		AGENT_TOOL_PROFILES,
+		AGENT_TOOL_PROFILE_DESCRIPTIONS,
+		getAgentToolProfile,
+		isAgentToolProfile,
+		setAgentToolProfile,
+		type AgentToolProfile
+	} from '$lib/services/native/agent-profile';
 
 	let enabled = $state(false);
 	let autonomousFullAccess = $state(false);
+	let toolProfile = $state<AgentToolProfile | null>(null);
 	let home = $state<string | null>(null);
 	let busy = $state(false);
 	let autonomousBusy = $state(false);
+	let profileBusy = $state(false);
 	let nativeAvailable = $state<boolean | null>(null);
 	let notice = $state<string | null>(null);
 	let autonomousNotice = $state<string | null>(null);
+	let profileNotice = $state<string | null>(null);
 	let error = $state<string | null>(null);
 
 	async function refresh() {
@@ -32,13 +43,15 @@
 		nativeAvailable = true;
 		try {
 			const invoke = (m: string, p?: Record<string, unknown>) => bridge.invoke(m, p);
-			const [snapshot, fullAccess] = await Promise.all([
+			const [snapshot, fullAccess, profile] = await Promise.all([
 				listGrants(invoke),
-				getAutonomousFullAccess(invoke)
+				getAutonomousFullAccess(invoke),
+				getAgentToolProfile(invoke)
 			]);
 			enabled = homeReadGranted(snapshot);
 			home = snapshot.home;
 			autonomousFullAccess = fullAccess;
+			toolProfile = profile;
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'native access settings failed';
@@ -108,6 +121,31 @@
 			error = e instanceof Error ? e.message : 'could not update Autonomous Full Access';
 		} finally {
 			autonomousBusy = false;
+		}
+	}
+
+	async function changeToolProfile(event: Event) {
+		if (!browser || profileBusy || nativeAvailable !== true) return;
+		const bridge = getBridge();
+		if (!bridge) {
+			nativeAvailable = false;
+			error = null;
+			return;
+		}
+		const value = (event.currentTarget as HTMLSelectElement | null)?.value ?? '';
+		if (!isAgentToolProfile(value)) return;
+		profileBusy = true;
+		profileNotice = null;
+		error = null;
+		try {
+			await setAgentToolProfile((m, p) => bridge.invoke(m, p), value);
+			await refresh();
+			profileNotice = `Agent tool profile is now “${value}”. Applies to the next agent turn.`;
+		} catch (e) {
+			error = e instanceof Error ? e.message : 'could not update the agent tool profile';
+			await refresh();
+		} finally {
+			profileBusy = false;
 		}
 	}
 </script>
@@ -205,6 +243,46 @@
 			<p class="busy">Working…</p>
 		{/if}
 	</div>
+
+	<div class="card">
+		<div class="card-head">
+			<div>
+				<p class="title">Agent tool profile</p>
+				<p class="meta">Native desktop only · persistent · applies next turn</p>
+			</div>
+			<select
+				class="profile-select"
+				value={toolProfile ?? ''}
+				onchange={changeToolProfile}
+				disabled={profileBusy || nativeAvailable !== true}
+				aria-label="Agent tool profile"
+			>
+				<option value="" disabled={toolProfile !== null}>Default (unset)</option>
+				{#each AGENT_TOOL_PROFILES as profile}
+					<option value={profile} selected={toolProfile === profile}>{profile}</option>
+				{/each}
+			</select>
+		</div>
+		<p class="note">
+			Bounds how many tool definitions ride on every agent request. Smaller profiles answer
+			simple requests faster; larger ones unlock more tools.
+			{#if toolProfile !== null}
+				Current: <strong>{toolProfile}</strong> — {AGENT_TOOL_PROFILE_DESCRIPTIONS[toolProfile]}
+			{:else}
+				Unset: cloud providers use <strong>full</strong>, local providers use
+				<strong>simple</strong>.
+			{/if}
+		</p>
+		{#if nativeAvailable === false}
+			<p class="unavailable">The agent tool profile is available only in the native desktop app.</p>
+		{/if}
+		{#if profileNotice}
+			<p class="notice">{profileNotice}</p>
+		{/if}
+		{#if profileBusy}
+			<p class="busy">Working…</p>
+		{/if}
+	</div>
 </div>
 
 <style>
@@ -277,6 +355,19 @@
 	}
 	.unavailable {
 		opacity: 0.7;
+	}
+	.profile-select {
+		background: var(--bg-tertiary);
+		color: inherit;
+		border: 1px solid var(--border, #2a2a2e);
+		border-radius: 6px;
+		padding: 0.4rem 0.6rem;
+		font-size: 0.85rem;
+		flex-shrink: 0;
+		max-width: 12rem;
+	}
+	.profile-select:disabled {
+		opacity: 0.5;
 	}
 	.note code {
 		font-size: 0.78rem;

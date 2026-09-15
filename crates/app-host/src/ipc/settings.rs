@@ -89,14 +89,23 @@ impl Dispatcher {
                 .map(|profile| {
                     matches!(
                         profile.trim().to_ascii_lowercase().as_str(),
-                        "simple" | "full"
+                        "minimal"
+                            | "simple"
+                            | "standard"
+                            | "developer"
+                            | "computeruse"
+                            | "computer-use"
+                            | "computer_use"
+                            | "full"
                     )
                 })
                 .unwrap_or(false);
             if !valid {
                 return Err(IpcErrorBody {
                     code: ErrorCode::InvalidParams,
-                    message: format!("settings.set '{key}' requires the string 'simple' or 'full'"),
+                    message: format!(
+                        "settings.set '{key}' requires one of minimal, simple, standard, developer, computeruse, full"
+                    ),
                 });
             }
         }
