@@ -1019,6 +1019,56 @@ mod tests {
     }
 
     #[test]
+    fn model_vision_override_roundtrips_and_clears() {
+        let storage = temp_storage("model-vision");
+        let secrets: Arc<dyn secret_core::SecretStore> =
+            Arc::new(secret_core::MemoryStore::default());
+        let dispatcher = dispatcher()
+            .with_storage(Arc::clone(&storage))
+            .with_secret_store(Arc::clone(&secrets));
+        let script = dispatcher
+            .handle_message(
+                r#"{"id":"40","method":"settings.set_model_provider","params":{"provider":"ollama","base_url":"http://localhost:11434/v1","model":"llava:13b","vision":true}}"#,
+            )
+            .unwrap();
+        assert!(script.contains("__resolve(\"40\", true"), "{script}");
+        assert_eq!(
+            storage.lock().unwrap().get_setting("model.vision").unwrap(),
+            Some(serde_json::json!(true))
+        );
+        let script = dispatcher
+            .handle_message(r#"{"id":"41","method":"settings.get_model_provider","params":{}}"#)
+            .unwrap();
+        assert!(script.contains("\"vision\":true"), "{script}");
+        // A sync without `vision` clears the stale override so the
+        // provider/model-name heuristic applies to the new model.
+        let script = dispatcher
+            .handle_message(
+                r#"{"id":"42","method":"settings.set_model_provider","params":{"provider":"ollama","base_url":"http://localhost:11434/v1","model":"llama3.1:8b"}}"#,
+            )
+            .unwrap();
+        assert!(script.contains("__resolve(\"42\", true"), "{script}");
+        assert_eq!(
+            storage.lock().unwrap().get_setting("model.vision").unwrap(),
+            None
+        );
+        // Non-boolean vision is rejected, not coerced.
+        let script = dispatcher
+            .handle_message(
+                r#"{"id":"43","method":"settings.set_model_provider","params":{"provider":"ollama","base_url":"http://localhost:11434/v1","model":"llava:13b","vision":"yes"}}"#,
+            )
+            .unwrap();
+        assert!(script.contains("__resolve(\"43\", false"), "{script}");
+        // The generic endpoint cannot write the vision override either.
+        let script = dispatcher
+            .handle_message(
+                r#"{"id":"44","method":"settings.set","params":{"key":"model.vision","value":true}}"#,
+            )
+            .unwrap();
+        assert!(script.contains("__resolve(\"44\", false"), "{script}");
+    }
+
+    #[test]
     fn settings_without_storage_or_key_rejects() {
         let script = dispatcher()
             .handle_message(r#"{"id":"33","method":"settings.get","params":{"key":"k"}}"#)

@@ -133,6 +133,8 @@ fn host_environment_context_for_context(
             .to_string(),
         "Computer use follows observe, reason, act, wait for state change, and observe again. Prefer desktop.accessibility_tree or desktop.observe and semantic element actions; use keyboard shortcuts next, and coordinates only as a last resort. Issue at most one desktop-control action, then wait for its result and make a fresh observation before another action. Never emit a blind multi-click or coordinate macro."
             .to_string(),
+        "Vision is one fresh image per observation: desktop.observe with include_image returns the newest sampled frame (or one screenshot when nothing is shared). Never request frames in a tight loop, never batch several image observations per step, and never expect video — act on the single image, then observe again after the next state change."
+            .to_string(),
         "Never translate filesystem directory names according to the language of the conversation."
             .to_string(),
         "\"Desktop\", \"escritorio\", \"bureau\", and similar words refer to the Desktop directory reported by the host; they do not mean a literal directory with that translated name."

@@ -52,7 +52,9 @@ bound to that session.
 
 Stopping the share deterministically tears the session down:
 
-- capture stops and session frame artifacts are deleted,
+- capture stops; session frame artifacts are kept for in-flight model
+  requests and expire via the short sensitive-capture TTL (eager
+  deletion used to race the next request resolving their bytes),
 - control is disabled and the application allowlist clears,
 - exactly the session-bound grants are revoked — unrelated
   filesystem, network, camera, and microphone grants survive.

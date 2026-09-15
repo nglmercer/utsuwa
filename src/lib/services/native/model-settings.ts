@@ -1,6 +1,7 @@
 import { getBridge } from './bridge';
 import { buildNativeModelProviderParams, normalizeNativeBaseUrl } from './model-settings-logic';
 import { getLLMProvider } from '$lib/services/providers/registry';
+import { canShowImages } from '$lib/services/providers/vision';
 import { modulesStore } from '$lib/stores/modules.svelte';
 import { settingsStore } from '$lib/stores/settings.svelte';
 import { hasApiKey } from '$lib/services/providers/openai-compatible';
@@ -13,6 +14,8 @@ export interface NativeModelProviderConfig {
 	model: string;
 	/** Omit to preserve the host's existing key; pass an empty string to clear it. */
 	apiKey?: string;
+	/** Explicit vision classification; omit to let the host infer from provider + model name. */
+	vision?: boolean;
 }
 
 /** Normalize at the native boundary too, so a caller or an older saved value
@@ -77,10 +80,18 @@ export async function syncNativeModelProvider(
 	if (apiKey === undefined && nativeProvider !== null && nativeProvider !== providerId) {
 		apiKey = '';
 	}
+	// Classify vision with the same gate the chat UI uses, so the native
+	// agent sends pixels (not metadata text) to models that can see them.
+	const vision = canShowImages(
+		provider.supportsVision === true,
+		provider.isLocal === true,
+		model
+	);
 	return setNativeModelProvider({
 		provider: providerId,
 		baseUrl,
 		model,
-		apiKey
+		apiKey,
+		vision
 	});
 }

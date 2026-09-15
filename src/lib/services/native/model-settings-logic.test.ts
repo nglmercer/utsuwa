@@ -50,3 +50,26 @@ test('native settings payload sends the normalized provider base URL', () => {
 		}
 	);
 });
+
+test('native settings payload carries the vision classification when present', () => {
+	assert.deepEqual(
+		buildNativeModelProviderParams({
+			provider: 'ollama',
+			baseUrl: 'http://localhost:11434',
+			model: 'llava:13b',
+			vision: true
+		}),
+		{
+			provider: 'ollama',
+			base_url: 'http://localhost:11434/v1',
+			model: 'llava:13b',
+			vision: true
+		}
+	);
+	const without = buildNativeModelProviderParams({
+		provider: 'ollama',
+		baseUrl: 'http://localhost:11434',
+		model: 'llama3.1:8b'
+	});
+	assert.ok(!('vision' in without));
+});

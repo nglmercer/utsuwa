@@ -14,7 +14,10 @@
 
 pub mod plugin;
 
-use artifact_core::{ArtifactStore, ImageArtifactRef};
+use artifact_core::{
+    ArtifactError, ArtifactId, ArtifactMetadata, ArtifactOwner, ArtifactRef, ArtifactSource,
+    ArtifactStore, ImageArtifactRef,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -638,10 +641,6 @@ struct ManagedCapture {
     capture: Box<dyn CaptureSession>,
     backend: Arc<dyn DesktopBackend>,
     artifacts: Arc<dyn ArtifactStore>,
-    /// Artifact ids minted for sampled frames, newest last. Bounded so a
-    /// long session cannot accumulate an unbounded cleanup list; the store
-    /// TTL expires anything that falls off.
-    frame_artifacts: Vec<artifact_core::ArtifactId>,
     last_fingerprint: Option<[u8; 32]>,
     last_observation: Option<Instant>,
     boost_until: Option<Instant>,
@@ -649,8 +648,51 @@ struct ManagedCapture {
     session: ComputerSession,
 }
 
-/// Upper bound for per-session tracked frame artifacts pending cleanup.
-const MAX_TRACKED_FRAME_ARTIFACTS: usize = 512;
+/// Artifact-store adapter that tags every capture frame with its owning
+/// session plus the short sensitive-screen-capture TTL. Backends only
+/// know `put`, so the manager wraps the shared store before handing it
+/// to `start_capture`. Teardown then needs no eager deletion — which
+/// could otherwise remove frame bytes before the next model request
+/// resolves them — and the store TTL reclaims the bytes instead.
+struct OwnedCaptureArtifacts {
+    inner: Arc<dyn ArtifactStore>,
+    owner: ArtifactOwner,
+}
+
+#[async_trait::async_trait]
+impl ArtifactStore for OwnedCaptureArtifacts {
+    async fn put(&self, mime_type: &str, bytes: Vec<u8>) -> Result<ArtifactRef, ArtifactError> {
+        self.inner
+            .put_with_owner(
+                mime_type,
+                bytes,
+                ArtifactSource::ScreenCapture,
+                true,
+                Some(self.owner.clone()),
+            )
+            .await
+    }
+
+    async fn get(&self, id: &ArtifactId) -> Result<Vec<u8>, ArtifactError> {
+        self.inner.get(id).await
+    }
+
+    async fn delete(&self, id: &ArtifactId) -> Result<(), ArtifactError> {
+        self.inner.delete(id).await
+    }
+
+    async fn metadata(&self, id: &ArtifactId) -> Option<ArtifactMetadata> {
+        self.inner.metadata(id).await
+    }
+
+    async fn delete_source(&self, source: ArtifactSource) -> usize {
+        self.inner.delete_source(source).await
+    }
+
+    async fn delete_owner(&self, owner: &ArtifactOwner) -> usize {
+        self.inner.delete_owner(owner).await
+    }
+}
 
 type ManagedCaptureHandle = Arc<tokio::sync::Mutex<ManagedCapture>>;
 
@@ -788,10 +830,17 @@ impl ComputerSessionManager {
             ));
         }
         config.max_fps = config.max_fps.clamp(1, 60);
+        let id = CaptureSessionId::fresh();
+        // Tag the session's frames at creation so teardown can rely on
+        // the short TTL instead of deleting bytes a model request may
+        // still be about to resolve.
+        let artifacts: Arc<dyn ArtifactStore> = Arc::new(OwnedCaptureArtifacts {
+            inner: artifacts,
+            owner: ArtifactOwner::DesktopCapture(id.0.clone()),
+        });
         let capture = backend
             .start_capture(config.clone(), artifacts.clone())
             .await?;
-        let id = CaptureSessionId::fresh();
         let now = chrono::Utc::now();
         let session = ComputerSession {
             id: ComputerSessionId(id.0.clone()),
@@ -812,7 +861,6 @@ impl ComputerSessionManager {
                 capture,
                 backend,
                 artifacts,
-                frame_artifacts: Vec::new(),
                 last_fingerprint: None,
                 last_observation: None,
                 boost_until: None,
@@ -973,12 +1021,6 @@ impl ComputerSessionManager {
         let frame = managed.capture.next_frame().await?;
         managed.last_observation = Some(now);
         managed.session.last_activity_at = Some(chrono::Utc::now());
-        managed
-            .frame_artifacts
-            .push(frame.image.artifact.id.clone());
-        if managed.frame_artifacts.len() > MAX_TRACKED_FRAME_ARTIFACTS {
-            managed.frame_artifacts.remove(0);
-        }
         let bytes = managed
             .artifacts
             .get(&frame.image.artifact.id)
@@ -1004,9 +1046,13 @@ impl ComputerSessionManager {
     }
 
     /// Stop one session and tear it down deterministically: the native
-    /// stream stops, temporary frame artifacts are deleted best-effort,
-    /// session control is disabled, and the allowlist clears when no
-    /// sessions remain. The host must additionally revoke
+    /// stream stops, session control is disabled, and the allowlist clears
+    /// when no sessions remain. Frame artifacts are deliberately NOT
+    /// deleted here: a tool result already handed to the model may still
+    /// be resolving its image bytes when the next request is built, and
+    /// eager deletion would race that consumption. Frames carry the short
+    /// sensitive-capture TTL (plus session ownership), so the store
+    /// reclaims them within minutes. The host must additionally revoke
     /// session-specific capability grants, emit audit records, and publish
     /// frontend state — see [`ShareState`].
     pub async fn stop_capture(&self, id: &CaptureSessionId) -> Result<(), DesktopError> {
@@ -1020,9 +1066,6 @@ impl ComputerSessionManager {
         managed.session.capture_enabled = false;
         managed.session.control_enabled = false;
         let stop = managed.capture.stop().await;
-        for artifact_id in std::mem::take(&mut managed.frame_artifacts) {
-            let _ = managed.artifacts.delete(&artifact_id).await;
-        }
         if self.captures.lock().await.is_empty() {
             self.set_allowed_applications(Vec::new());
         }
@@ -3217,6 +3260,7 @@ pub mod tools {
     pub struct ObserveTool {
         pub backend: Arc<dyn DesktopBackend>,
         pub captures: ComputerSessionManager,
+        pub artifacts: Arc<dyn ArtifactStore>,
     }
 
     #[async_trait::async_trait]
@@ -3224,14 +3268,14 @@ pub mod tools {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: capability_core::ToolId::new("desktop.observe"),
-                description: "Observe the current desktop state. Prefer semantic accessibility snapshots; pass an active capture session id when a sampled image is also needed. Screen visibility is separately authorized by desktop.capture_start.".to_string(),
+                description: "Observe the current desktop state: one fresh accessibility snapshot plus, with include_image, exactly one fresh sampled image. The image reuses the single active Share Screen session when one exists, else falls back to one screenshot; pass session_id only to choose among several active sessions. One frame per call — never a stream.".to_string(),
                 input_schema: serde_json::json!({
                     "type":"object",
                     "additionalProperties":false,
                     "properties": {
                         "window_id":{"type":"string"},
                         "since_snapshot_id":{"type":"string"},
-                        "session_id":{"type":"string"},
+                        "session_id":{"type":"string","description":"Optional: capture session for the sampled image. Defaults to the single active session, else a one-shot screenshot."},
                         "include_accessibility":{"type":"boolean"},
                         "include_image":{"type":"boolean"}
                     }
@@ -3264,16 +3308,19 @@ pub mod tools {
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
             if include_image {
-                if let Some(session_id) = args
+                // A sampled image always needs screen-capture authority:
+                // session-scoped when the caller names a session, else the
+                // desktop-wide still the screenshot fallback captures.
+                let resource = args
                     .get("session_id")
                     .and_then(|value| value.as_str())
                     .filter(|value| !value.trim().is_empty())
-                {
-                    requirements.push(CapabilityRequirement {
-                        capability: Capability::ScreenCapture,
-                        resource: Resource::Window(session_id.to_string()),
-                    });
-                }
+                    .map(|session_id| Resource::Window(session_id.to_string()))
+                    .unwrap_or_else(|| super::CaptureTarget::Desktop.resource());
+                requirements.push(CapabilityRequirement {
+                    capability: Capability::ScreenCapture,
+                    resource,
+                });
             }
             requirements
         }
@@ -3328,40 +3375,125 @@ pub mod tools {
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
             if include_image {
-                let Some(session_raw) = args.get("session_id").and_then(|value| value.as_str())
-                else {
-                    content["image_available"] = serde_json::Value::Bool(false);
-                    content["image_reason"] = serde_json::Value::String(
-                        "start a separately authorized capture session first".to_string(),
-                    );
-                    return Ok(ToolOutput::json(content));
+                // One fresh image per call: an explicit session wins, else
+                // the single active Share Screen session is reused, else a
+                // one-shot screenshot is captured. Several active sessions
+                // are ambiguous and must be disambiguated by session_id.
+                let explicit = args
+                    .get("session_id")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string);
+                let resolved = match explicit {
+                    Some(id) => ObserveImage::Session(CaptureSessionId(id)),
+                    None => match self.captures.sessions().await.as_slice() {
+                        [] => ObserveImage::Screenshot,
+                        [session] => ObserveImage::Session(CaptureSessionId(session.id.0.clone())),
+                        sessions => {
+                            content["image_available"] = serde_json::Value::Bool(false);
+                            content["image_reason"] = serde_json::Value::String(format!(
+                                "{} active capture sessions; pass session_id to choose one",
+                                sessions.len()
+                            ));
+                            return Ok(ToolOutput::json(content));
+                        }
+                    },
                 };
-                let id = CaptureSessionId(session_raw.to_string());
-                require_ticket(
-                    "desktop.observe",
-                    &ctx,
-                    Capability::ScreenCapture,
-                    Resource::Window(id.0.clone()),
-                )?;
-                let observation = self
-                    .captures
-                    .next_observation(&id)
-                    .await
-                    .map_err(|error| backend_error("desktop.observe", error))?;
-                content["changed"] = serde_json::Value::Bool(observation.changed);
-                content["throttled"] = serde_json::Value::Bool(observation.throttled);
-                if let Some(frame) = observation.frame {
-                    content["frame_id"] = serde_json::json!(frame.frame_id);
-                    content["timestamp_ms"] = serde_json::json!(frame.timestamp_ms);
-                    content["width"] = serde_json::json!(frame.width);
-                    content["height"] = serde_json::json!(frame.height);
-                    return Ok(ToolOutput::multipart(
-                        content,
-                        vec![ContentPart::Image(frame.image)],
-                    ));
+                match resolved {
+                    ObserveImage::Session(id) => {
+                        require_session_capture_ticket("desktop.observe", &ctx, &id)?;
+                        let observation = self
+                            .captures
+                            .next_observation(&id)
+                            .await
+                            .map_err(|error| backend_error("desktop.observe", error))?;
+                        content["changed"] = serde_json::Value::Bool(observation.changed);
+                        content["throttled"] = serde_json::Value::Bool(observation.throttled);
+                        if let Some(frame) = observation.frame {
+                            content["image_source"] =
+                                serde_json::Value::String("capture_session".to_string());
+                            content["frame_id"] = serde_json::json!(frame.frame_id);
+                            content["timestamp_ms"] = serde_json::json!(frame.timestamp_ms);
+                            content["width"] = serde_json::json!(frame.width);
+                            content["height"] = serde_json::json!(frame.height);
+                            return Ok(ToolOutput::multipart(
+                                content,
+                                vec![ContentPart::Image(frame.image)],
+                            ));
+                        }
+                    }
+                    ObserveImage::Screenshot => {
+                        require_ticket(
+                            "desktop.observe",
+                            &ctx,
+                            Capability::ScreenCapture,
+                            super::CaptureTarget::Desktop.resource(),
+                        )?;
+                        let shot = self
+                            .backend
+                            .screenshot_with_config(super::CaptureConfig::default())
+                            .await
+                            .map_err(|error| backend_error("desktop.observe", error))?;
+                        if shot.png_bytes.len() > MAX_SCREENSHOT_BYTES {
+                            return Err(failed("desktop.observe", "screenshot exceeds 2 MiB"));
+                        }
+                        let artifact = self
+                            .artifacts
+                            .put_with_source(
+                                "image/png",
+                                shot.png_bytes,
+                                artifact_core::ArtifactSource::ScreenCapture,
+                                true,
+                            )
+                            .await
+                            .map_err(|error| artifact_failed("desktop.observe", error))?;
+                        let image = ImageArtifactRef::new(artifact, shot.width, shot.height);
+                        content["image_source"] =
+                            serde_json::Value::String("screenshot".to_string());
+                        content["width"] = serde_json::json!(shot.width);
+                        content["height"] = serde_json::json!(shot.height);
+                        return Ok(ToolOutput::multipart(
+                            content,
+                            vec![ContentPart::Image(image)],
+                        ));
+                    }
                 }
             }
             Ok(ToolOutput::json(content))
+        }
+    }
+
+    /// Where `desktop.observe` takes its one sampled image from.
+    enum ObserveImage {
+        Session(CaptureSessionId),
+        Screenshot,
+    }
+
+    /// Screen-capture authority for one session frame. The session-scoped
+    /// ticket always works; a desktop-wide still-capture ticket works too,
+    /// since it already authorizes whole-desktop screenshots and the
+    /// reused session frame shows no more than that. This matters for the
+    /// implicit reuse path, where `required_capabilities` cannot name the
+    /// session synchronously and advertises the desktop-wide ticket.
+    fn require_session_capture_ticket(
+        tool: &str,
+        ctx: &ToolContext,
+        id: &CaptureSessionId,
+    ) -> Result<(), ToolError> {
+        if ctx.has_ticket(Capability::ScreenCapture, Resource::Window(id.0.clone()))
+            || ctx.has_ticket(
+                Capability::ScreenCapture,
+                super::CaptureTarget::Desktop.resource(),
+            )
+        {
+            Ok(())
+        } else {
+            require_ticket(
+                tool,
+                ctx,
+                Capability::ScreenCapture,
+                Resource::Window(id.0.clone()),
+            )
         }
     }
 
@@ -3575,6 +3707,7 @@ pub mod tools {
             out.push(Arc::new(ObserveTool {
                 backend: backend.clone(),
                 captures: captures.clone(),
+                artifacts: artifacts.clone(),
             }));
         }
         if plugin.supports(DesktopCapability::AccessibilityTree) {
@@ -4001,6 +4134,7 @@ mod tests {
     use super::tools::*;
     use super::FakeBackend;
     use super::{CaptureConfig, CaptureSessionId, ComputerSessionManager};
+    use artifact_core::ArtifactStore as _;
     use capability_core::{
         Capability, CapabilityTicket, InvocationId, Principal, Resource, ResourceScope,
     };
@@ -4499,6 +4633,7 @@ mod tests {
         let tool = ObserveTool {
             backend,
             captures: manager,
+            artifacts: Arc::new(artifact_core::InMemoryArtifactStore::new()),
         };
         let first = tool
             .invoke(
@@ -4551,7 +4686,7 @@ mod tests {
             Arc::new(artifact_core::InMemoryArtifactStore::new());
         let manager = ComputerSessionManager::new();
         let session = manager
-            .start_capture(backend.clone(), CaptureConfig::default(), artifacts)
+            .start_capture(backend.clone(), CaptureConfig::default(), artifacts.clone())
             .await
             .unwrap();
         let session_id = session.id.0.clone();
@@ -4563,6 +4698,7 @@ mod tests {
         let tool = ObserveTool {
             backend,
             captures: manager,
+            artifacts,
         };
         let requirements = tool.required_capabilities(&args);
         assert_eq!(requirements.len(), 2);
@@ -4591,6 +4727,160 @@ mod tests {
             output.parts.first(),
             Some(artifact_core::ContentPart::Image(_))
         ));
+    }
+
+    fn observe_ctx_with(observe_resource: Resource, capture_resource: Resource) -> ToolContext {
+        let mut ctx = ToolContext::new(Principal::User);
+        let invocation = ctx.invocation_id;
+        ctx = ctx.with_ticket(ticket(
+            Capability::DesktopObserve,
+            observe_resource,
+            &invocation,
+        ));
+        ctx = ctx.with_ticket(ticket(
+            Capability::ScreenCapture,
+            capture_resource,
+            &invocation,
+        ));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn observe_image_reuses_the_single_active_session() {
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
+        let artifacts: Arc<dyn artifact_core::ArtifactStore> =
+            Arc::new(artifact_core::InMemoryArtifactStore::new());
+        let manager = ComputerSessionManager::new();
+        let session = manager
+            .start_capture(backend.clone(), CaptureConfig::default(), artifacts.clone())
+            .await
+            .unwrap();
+        let tool = ObserveTool {
+            backend,
+            captures: manager,
+            artifacts,
+        };
+        // No session_id: the policy engine sees the desktop-wide still
+        // ticket (the session cannot be named synchronously).
+        let args = serde_json::json!({"include_accessibility": false, "include_image": true});
+        let requirements = tool.required_capabilities(&args);
+        assert_eq!(requirements.len(), 2);
+        assert_eq!(requirements[1].capability, Capability::ScreenCapture);
+        assert_eq!(
+            requirements[1].resource,
+            Resource::Window(String::new()),
+            "desktop-wide still resource, not a session id"
+        );
+        // The desktop-wide ticket authorizes the reused session frame.
+        let ctx = observe_ctx_with(
+            Resource::Window(String::new()),
+            Resource::Window(String::new()),
+        );
+        let output = tool.invoke(ctx, args).await.unwrap();
+        assert_eq!(output.content["image_source"], "capture_session");
+        assert!(output.content.get("frame_id").is_some());
+        assert!(matches!(
+            output.parts.first(),
+            Some(artifact_core::ContentPart::Image(_))
+        ));
+        // The session-scoped ticket keeps working for the same call.
+        let ctx = observe_ctx_with(
+            Resource::Window(String::new()),
+            Resource::Window(session.id.0.clone()),
+        );
+        let args = serde_json::json!({"include_accessibility": false, "include_image": true});
+        // Throttled (same observation window) but authorized: no
+        // permission error, just no new frame yet.
+        let output = tool.invoke(ctx, args).await.unwrap();
+        assert_eq!(output.content["throttled"], true);
+    }
+
+    #[tokio::test]
+    async fn observe_image_falls_back_to_one_screenshot() {
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
+        let artifacts: Arc<dyn artifact_core::ArtifactStore> =
+            Arc::new(artifact_core::InMemoryArtifactStore::new());
+        let tool = ObserveTool {
+            backend,
+            captures: ComputerSessionManager::new(),
+            artifacts,
+        };
+        let ctx = observe_ctx_with(
+            Resource::Window(String::new()),
+            Resource::Window(String::new()),
+        );
+        let output = tool
+            .invoke(
+                ctx,
+                serde_json::json!({"include_accessibility": false, "include_image": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["image_source"], "screenshot");
+        assert_eq!(output.content["width"], 2);
+        assert_eq!(output.content["height"], 2);
+        assert!(matches!(
+            output.parts.first(),
+            Some(artifact_core::ContentPart::Image(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn observe_image_with_several_sessions_requires_session_id() {
+        let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
+        let artifacts: Arc<dyn artifact_core::ArtifactStore> =
+            Arc::new(artifact_core::InMemoryArtifactStore::new());
+        let manager = ComputerSessionManager::new();
+        manager
+            .start_capture(backend.clone(), CaptureConfig::default(), artifacts.clone())
+            .await
+            .unwrap();
+        let second = manager
+            .start_capture(backend.clone(), CaptureConfig::default(), artifacts.clone())
+            .await
+            .unwrap();
+        let tool = ObserveTool {
+            backend,
+            captures: manager,
+            artifacts,
+        };
+        let ctx = observe_ctx_with(
+            Resource::Window(String::new()),
+            Resource::Window(String::new()),
+        );
+        let output = tool
+            .invoke(
+                ctx,
+                serde_json::json!({"include_accessibility": false, "include_image": true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["image_available"], false);
+        assert!(output.content["image_reason"]
+            .as_str()
+            .unwrap()
+            .contains("session_id"));
+        assert!(output
+            .parts
+            .iter()
+            .all(|part| !matches!(part, artifact_core::ContentPart::Image(_))));
+        // Explicit choice resolves the ambiguity.
+        let ctx = observe_ctx_with(
+            Resource::Window(String::new()),
+            Resource::Window(second.id.0.clone()),
+        );
+        let output = tool
+            .invoke(
+                ctx,
+                serde_json::json!({
+                    "include_accessibility": false,
+                    "include_image": true,
+                    "session_id": second.id.0,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.content["image_source"], "capture_session");
     }
 
     /// Serializes control-path tests against the emergency-stop test: the
@@ -4891,7 +5181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_stop_cleans_up_frames_and_policy() {
+    async fn session_stop_keeps_frames_for_inflight_requests_and_clears_policy() {
         let backend: Arc<dyn super::DesktopBackend> = Arc::new(FakeBackend::new());
         let memory = Arc::new(artifact_core::InMemoryArtifactStore::new());
         let artifacts: Arc<dyn artifact_core::ArtifactStore> = memory.clone();
@@ -4914,9 +5204,34 @@ mod tests {
         assert!(first.changed);
         assert!(!memory.is_empty());
 
+        let frame_id = first
+            .frame
+            .as_ref()
+            .expect("changed observation carries a frame")
+            .image
+            .artifact
+            .id
+            .clone();
+        // Frames are tagged with the owning session plus the short
+        // sensitive-capture TTL.
+        let metadata = memory.metadata(&frame_id).await.expect("frame stored");
+        assert_eq!(
+            metadata.source,
+            artifact_core::ArtifactSource::ScreenCapture
+        );
+        assert!(metadata.sensitive);
+        assert_eq!(
+            metadata.owner,
+            Some(artifact_core::ArtifactOwner::DesktopCapture(
+                session.id.0.clone()
+            ))
+        );
+
         manager.stop_capture(&capture_id).await.unwrap();
-        // Temporary frame artifacts are deleted instead of waiting for TTL.
-        assert_eq!(memory.len(), 0);
+        // Frames survive teardown for in-flight model requests; the short
+        // TTL reclaims them instead of eager deletion racing consumption.
+        assert!(memory.contains(&frame_id));
+        assert!(!memory.is_empty());
         // Policy clears once no session remains.
         assert!(manager.allowed_applications().is_empty());
         let state = manager.share_state().await;

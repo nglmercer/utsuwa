@@ -67,7 +67,7 @@ impl Dispatcher {
         }
         if matches!(
             key,
-            "model.provider" | "model.base_url" | "model.name" | "model.api_key"
+            "model.provider" | "model.base_url" | "model.name" | "model.api_key" | "model.vision"
         ) {
             return Err(IpcErrorBody {
                 code: ErrorCode::InvalidParams,
@@ -146,6 +146,13 @@ impl Dispatcher {
         let provider = read_string("model.provider")?.unwrap_or_default();
         let base_url = read_string("model.base_url")?.unwrap_or_default();
         let model = read_string("model.name")?.unwrap_or_default();
+        let vision = storage
+            .get_setting("model.vision")
+            .map_err(|err| IpcErrorBody {
+                code: ErrorCode::Internal,
+                message: err.to_string(),
+            })?
+            .and_then(|value| value.as_bool());
         drop(storage);
         let has_api_key = self
             .secrets
@@ -163,6 +170,7 @@ impl Dispatcher {
             "base_url": base_url,
             "model": model,
             "has_api_key": has_api_key,
+            "vision": vision,
         }))
     }
     /// Atomically synchronize the model identity/configuration with native
@@ -204,6 +212,16 @@ impl Dispatcher {
                 message: "settings.set_model_provider needs 'model'".to_string(),
             })?;
         let base_url = validate_model_base_url(base_url)?;
+        let vision = match request.params.get("vision") {
+            None => None,
+            Some(Value::Bool(vision)) => Some(*vision),
+            Some(_) => {
+                return Err(IpcErrorBody {
+                    code: ErrorCode::InvalidParams,
+                    message: "settings.set_model_provider 'vision' must be a boolean".to_string(),
+                })
+            }
+        };
         for (name, value) in [
             ("provider", provider),
             ("base_url", base_url.as_str()),
@@ -272,6 +290,16 @@ impl Dispatcher {
                 })
                 .and_then(|_| {
                     storage.set_setting("model.name", &Value::String(model.trim().to_string()))
+                })
+                // The vision override tracks the model it was classified
+                // with: a sync without `vision` clears a stale override so
+                // the provider/model-name heuristic applies instead of a
+                // previous model's classification.
+                .and_then(|_| match vision {
+                    Some(vision) => storage
+                        .set_setting("model.vision", &Value::Bool(vision))
+                        .map(|_| ()),
+                    None => storage.delete_setting("model.vision").map(|_| ()),
                 })
                 // Remove the old plaintext migration row after the key has
                 // reached the native secret store.

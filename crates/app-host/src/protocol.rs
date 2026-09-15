@@ -632,6 +632,92 @@ mod tests {
         assert!(!is_navigation_allowed("file:///etc/passwd", true));
     }
 
+    #[test]
+    fn bundled_frontend_fixture_when_present() {
+        // Integration coverage against the real `pnpm build:native` output
+        // when this checkout has one (the CI native-bundle job builds it,
+        // then runs the host tests). Otherwise a no-op, not a failure: the
+        // `rust` CI matrix sets UTSUWA_SKIP_WEB_BUILD and has no bundle.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build");
+        if !root.join("index.html").is_file() {
+            eprintln!("skipping bundled-frontend fixture: no build/index.html");
+            return;
+        }
+        let server = AssetServer::new(root.clone()).expect("real build dir serves");
+        let report = server.report();
+        assert!(report.index_exists, "build/ must contain index.html");
+        assert!(report.index_size > 0);
+        assert!(report.file_count > 1, "build/ looks unexpectedly empty");
+
+        // SPA routes serve the index document.
+        for route in ["companion://app/app", "companion://app/app/settings"] {
+            let res = get(&server, route);
+            assert_eq!(res.status(), StatusCode::OK, "{route}");
+            assert_eq!(res.headers()["Content-Type"], "text/html", "{route}");
+            assert!(!res.body().is_empty(), "{route}");
+        }
+        // The served document matches the file on disk byte-for-byte.
+        let disk = std::fs::read(root.join("index.html")).unwrap();
+        let res = get(&server, "companion://app/app");
+        assert_eq!(res.body().as_ref(), disk.as_slice());
+
+        // Every generated asset under /_app resolves through the handler
+        // with its real MIME type (no index fallback, no 404s): this is the
+        // `_app/immutable/*.js` path the boot depends on.
+        let app_dir = root.join("_app");
+        let mut checked = 0usize;
+        let mut stack = vec![app_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !path.is_file() {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .replace('\\', "/");
+                let url = format!("companion://app/{rel}");
+                let res = get(&server, &url);
+                assert_eq!(res.status(), StatusCode::OK, "{url}");
+                let expected = match path.extension().and_then(|e| e.to_str()) {
+                    Some("js") => "text/javascript",
+                    Some("css") => "text/css",
+                    Some("json") | Some("map") => "application/json",
+                    _ => continue,
+                };
+                assert_eq!(res.headers()["Content-Type"], expected, "{url}");
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "expected generated JS/CSS assets under build/_app"
+        );
+
+        // theme-init.js is referenced by app.html outside SvelteKit's hashed
+        // inline scripts, so it must serve as plain script bytes.
+        if root.join("theme-init.js").is_file() {
+            let res = get(&server, "companion://app/theme-init.js");
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(res.headers()["Content-Type"], "text/javascript");
+        }
+        if root.join("favicon.svg").is_file() {
+            let res = get(&server, "companion://app/favicon.svg");
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(res.headers()["Content-Type"], "image/svg+xml");
+        }
+    }
+
     // Minimal tempdir helper: std-only, no new dev-dependency.
     mod tempfile_like {
         use std::path::{Path, PathBuf};

@@ -19,7 +19,7 @@ mod linux {
     use pw::{properties::properties, spa};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        Arc, Mutex,
     };
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -769,15 +769,71 @@ mod linux {
         rgb: Vec<u8>,
     }
 
-    enum FrameMessage {
+    /// Latest-frame slot shared between the PipeWire worker thread and the
+    /// async consumer. The producer overwrites unconditionally, so a slow
+    /// model round trip can never leave the consumer reading stale queued
+    /// frames: `take` always returns the newest frame produced so far (or
+    /// waits for the next one). A FIFO here would hold the oldest
+    /// unconsumed frames while the worker dropped every newer one.
+    #[derive(Debug, Default)]
+    struct LatestFrameSlot {
+        state: Mutex<SlotState>,
+    }
+
+    #[derive(Debug, Default)]
+    struct SlotState {
+        frame: Option<RawFrame>,
+        /// Take-once worker error. A transient fault surfaces on one
+        /// `take` and clears; the consumer keeps waiting for the next
+        /// good frame instead of failing every call afterwards.
+        error: Option<String>,
+    }
+
+    enum SlotTake {
         Frame(RawFrame),
         Error(String),
+        Empty,
+    }
+
+    impl LatestFrameSlot {
+        fn store(&self, frame: RawFrame) {
+            let mut state = self.state.lock().unwrap_or_else(|poisoned| {
+                // A panicking producer must not wedge capture forever.
+                poisoned.into_inner()
+            });
+            state.frame = Some(frame);
+        }
+
+        fn report_error(&self, message: String) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.error = Some(message);
+        }
+
+        /// Take the newest frame, else a pending worker error, else `Empty`.
+        /// Taking removes the frame so a second immediate call waits for a
+        /// genuinely new capture instead of re-reading the same pixels.
+        fn take(&self) -> SlotTake {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(error) = state.error.take() {
+                return SlotTake::Error(error);
+            }
+            match state.frame.take() {
+                Some(frame) => SlotTake::Frame(frame),
+                None => SlotTake::Empty,
+            }
+        }
     }
 
     struct PortalCaptureSession {
         artifacts: Arc<dyn ArtifactStore>,
         config: CaptureConfig,
-        frames: mpsc::Receiver<FrameMessage>,
+        slot: Arc<LatestFrameSlot>,
         stop_sender: Option<pw::channel::Sender<()>>,
         worker: Option<JoinHandle<()>>,
         portal_session: Option<Session<'static, Screencast<'static>>>,
@@ -840,11 +896,12 @@ mod linux {
                     DesktopError::BackendUnavailable(format!("open PipeWire remote: {error}"))
                 })?;
 
-            let (frame_sender, frames) = mpsc::sync_channel(3);
+            let slot = Arc::new(LatestFrameSlot::default());
             let (stop_sender, stop_receiver) = pw::channel::channel();
             let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
             let max_width = config.max_width;
             let max_fps = config.max_fps.clamp(1, 60);
+            let worker_slot = Arc::clone(&slot);
             let worker = std::thread::Builder::new()
                 .name("utsuwa-wayland-capture".to_string())
                 .spawn(move || {
@@ -853,7 +910,7 @@ mod linux {
                         fd,
                         max_width,
                         max_fps,
-                        frame_sender,
+                        worker_slot,
                         stop_receiver,
                         ready_sender,
                     )
@@ -883,7 +940,7 @@ mod linux {
             Ok(Self {
                 artifacts,
                 config,
-                frames,
+                slot,
                 stop_sender: Some(stop_sender),
                 worker: Some(worker),
                 portal_session: Some(session),
@@ -903,23 +960,28 @@ mod linux {
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             let raw = loop {
-                match self.frames.try_recv() {
-                    Ok(FrameMessage::Frame(frame)) => break frame,
-                    Ok(FrameMessage::Error(error)) => {
-                        return Err(DesktopError::BackendUnavailable(error))
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
+                match self.slot.take() {
+                    // The slot always holds the newest produced frame, so a
+                    // slow consumer observes current screen state, never a
+                    // stale head-of-queue frame.
+                    SlotTake::Frame(frame) => break frame,
+                    SlotTake::Error(error) => return Err(DesktopError::BackendUnavailable(error)),
+                    SlotTake::Empty => {
+                        if self
+                            .worker
+                            .as_ref()
+                            .is_some_and(|worker| worker.is_finished())
+                        {
+                            return Err(DesktopError::BackendUnavailable(
+                                "PipeWire capture stream ended".to_string(),
+                            ));
+                        }
                         if tokio::time::Instant::now() >= deadline {
                             return Err(DesktopError::ActionFailed(
                                 "PipeWire capture produced no frame within 5 seconds".to_string(),
                             ));
                         }
                         tokio::time::sleep(Duration::from_millis(8)).await;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return Err(DesktopError::BackendUnavailable(
-                            "PipeWire capture stream ended".to_string(),
-                        ))
                     }
                 }
             };
@@ -969,16 +1031,23 @@ mod linux {
 
     struct PipewireUserData {
         format: spa::param::video::VideoInfoRaw,
-        sender: mpsc::SyncSender<FrameMessage>,
-        error_reported: bool,
+        slot: Arc<LatestFrameSlot>,
+        /// Consecutive buffers the client could not map (typically
+        /// DMA-BUF). A lone blip is skipped; a persistent run is
+        /// reported so the consumer fails fast instead of timing out.
+        unmapped_streak: u32,
     }
+
+    /// Buffers the client may fail to map before the worker reports an
+    /// error. At 30fps this is ~1s of consecutive failures.
+    const MAX_UNMAPPED_STREAK: u32 = 30;
 
     fn run_pipewire(
         node_id: u32,
         fd: std::os::fd::OwnedFd,
         max_width: Option<u32>,
         max_fps: u32,
-        sender: mpsc::SyncSender<FrameMessage>,
+        slot: Arc<LatestFrameSlot>,
         stop_receiver: pw::channel::Receiver<()>,
         ready_sender: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) {
@@ -1005,8 +1074,8 @@ mod linux {
             let _listener = stream
                 .add_local_listener_with_user_data(PipewireUserData {
                     format: Default::default(),
-                    sender: sender.clone(),
-                    error_reported: false,
+                    slot: Arc::clone(&slot),
+                    unmapped_streak: 0,
                 })
                 .param_changed(|_, user_data, id, param| {
                     let Some(param) = param else { return };
@@ -1035,12 +1104,12 @@ mod linux {
                     };
                     let format = user_data.format.format();
                     let Some(bytes_per_pixel) = bytes_per_pixel(format) else {
-                        if !user_data.error_reported {
-                            let _ = user_data.sender.try_send(FrameMessage::Error(format!(
-                                "unsupported PipeWire pixel format: {format:?}"
-                            )));
-                            user_data.error_reported = true;
-                        }
+                        // Persistent: every buffer carries the same format,
+                        // so every consumer call fails explicitly instead
+                        // of timing out on an empty slot.
+                        user_data.slot.report_error(format!(
+                            "unsupported PipeWire pixel format: {format:?}"
+                        ));
                         return;
                     };
                     let size = user_data.format.size();
@@ -1058,14 +1127,20 @@ mod linux {
                     let offset = data.chunk().offset() as usize;
                     let size = data.chunk().size() as usize;
                     let Some(bytes) = data.data() else {
-                        if !user_data.error_reported {
-                            let _ = user_data.sender.try_send(FrameMessage::Error(
-                                "PipeWire delivered an unmapped video buffer".to_string(),
+                        // DMA-BUF (or otherwise unmappable) buffer. Skip lone
+                        // blips; report a persistent run so the consumer
+                        // fails fast with a cause instead of a bare timeout.
+                        user_data.unmapped_streak =
+                            user_data.unmapped_streak.saturating_add(1);
+                        if user_data.unmapped_streak >= MAX_UNMAPPED_STREAK {
+                            let buffer_type = data.type_();
+                            user_data.slot.report_error(format!(
+                                "PipeWire delivered {buffer_type:?} video buffers the client cannot map"
                             ));
-                            user_data.error_reported = true;
                         }
                         return;
                     };
+                    user_data.unmapped_streak = 0;
                     let start = offset.min(bytes.len());
                     let end = start.saturating_add(size).min(bytes.len());
                     let raw = &bytes[start..end];
@@ -1080,11 +1155,11 @@ mod linux {
                     ) else {
                         return;
                     };
-                    let _ = user_data.sender.try_send(FrameMessage::Frame(RawFrame {
+                    user_data.slot.store(RawFrame {
                         width,
                         height,
                         rgb,
-                    }));
+                    });
                 })
                 .register()
                 .map_err(|error| error.to_string())?;
@@ -1092,10 +1167,13 @@ mod linux {
                 let mainloop = mainloop.clone();
                 move |_| mainloop.quit()
             });
-            let values = video_params(max_width, max_fps);
-            let pod = pw::spa::pod::Pod::from_bytes(&values)
+            let format_values = video_params(max_width, max_fps);
+            let format_pod = pw::spa::pod::Pod::from_bytes(&format_values)
                 .ok_or_else(|| "invalid serialized PipeWire format pod".to_string())?;
-            let mut params = [pod];
+            let buffer_values = buffers_params();
+            let buffer_pod = pw::spa::pod::Pod::from_bytes(&buffer_values)
+                .ok_or_else(|| "invalid serialized PipeWire buffers pod".to_string())?;
+            let mut params = [format_pod, buffer_pod];
             stream
                 .connect(
                     spa::utils::Direction::Input,
@@ -1114,8 +1192,50 @@ mod linux {
             if let Some(sender) = ready_sender.take() {
                 let _ = sender.send(Err(error.clone()));
             }
-            let _ = sender.try_send(FrameMessage::Error(error));
+            slot.report_error(error);
         }
+    }
+
+    /// `SPA_PARAM_BUFFERS_dataType` from `spa/param/buffers.h`: "possible
+    /// memory types", a flags-choice Int mask of `spa_data_type` bits.
+    /// libspa 0.10 exposes no typed Buffers-properties enum, so the stable
+    /// SPA ABI value is spelled out (START=0, buffers=1, blocks=2, size=3,
+    /// stride=4, align=5, dataType=6).
+    const SPA_PARAM_BUFFERS_DATA_TYPE: u32 = 6;
+
+    /// Buffers param requesting CPU-readable memory. The worker only
+    /// understands mapped buffers, so DMA-BUF-only negotiation would
+    /// surface as unmapped buffers at capture time; PipeWire converts
+    /// from the source as needed to satisfy this mask.
+    fn buffers_param_object() -> spa::pod::Object {
+        // Bits are (1 << spa_data_type), per spa/param/buffers.h.
+        let memfd = 1i32 << spa::buffer::DataType::MemFd.as_raw();
+        let memptr = 1i32 << spa::buffer::DataType::MemPtr.as_raw();
+        spa::pod::Object {
+            type_: spa::utils::SpaTypes::ObjectParamBuffers.as_raw(),
+            id: spa::param::ParamType::Buffers.as_raw(),
+            properties: vec![spa::pod::Property {
+                key: SPA_PARAM_BUFFERS_DATA_TYPE,
+                flags: spa::pod::PropertyFlags::empty(),
+                value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+                    spa::utils::ChoiceFlags::empty(),
+                    spa::utils::ChoiceEnum::Flags {
+                        default: memfd | memptr,
+                        flags: vec![memfd, memptr],
+                    },
+                ))),
+            }],
+        }
+    }
+
+    fn buffers_params() -> Vec<u8> {
+        pw::spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &pw::spa::pod::Value::Object(buffers_param_object()),
+        )
+        .expect("PipeWire buffers serialization")
+        .0
+        .into_inner()
     }
 
     fn video_params(max_width: Option<u32>, max_fps: u32) -> Vec<u8> {
@@ -1348,6 +1468,83 @@ mod linux {
             }
         }
         !crc
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn raw(width: u32) -> RawFrame {
+            RawFrame {
+                width,
+                height: 1,
+                rgb: vec![0; width as usize * 3],
+            }
+        }
+
+        #[test]
+        fn slot_returns_newest_frame_not_oldest_queued() {
+            let slot = LatestFrameSlot::default();
+            assert!(matches!(slot.take(), SlotTake::Empty));
+            // A burst of producer frames with no consumer in between: only
+            // the newest survives, so a slow model round trip observes
+            // current screen state.
+            slot.store(raw(1));
+            slot.store(raw(2));
+            slot.store(raw(3));
+            match slot.take() {
+                SlotTake::Frame(frame) => assert_eq!(frame.width, 3),
+                _ => panic!("expected the newest frame"),
+            }
+            // Taking removes the frame: an immediate second call waits for
+            // a genuinely new capture instead of re-reading pixels.
+            assert!(matches!(slot.take(), SlotTake::Empty));
+        }
+
+        #[test]
+        fn buffers_param_requests_cpu_readable_memory() {
+            let object = buffers_param_object();
+            assert_eq!(object.id, spa::param::ParamType::Buffers.as_raw());
+            assert_eq!(object.properties.len(), 1);
+            let property = &object.properties[0];
+            assert_eq!(property.key, SPA_PARAM_BUFFERS_DATA_TYPE);
+            match &property.value {
+                spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(choice)) => match &choice.1 {
+                    spa::utils::ChoiceEnum::Flags { default, flags } => {
+                        let memfd = 1i32 << spa::buffer::DataType::MemFd.as_raw();
+                        let memptr = 1i32 << spa::buffer::DataType::MemPtr.as_raw();
+                        let dmabuf = 1i32 << spa::buffer::DataType::DmaBuf.as_raw();
+                        assert_eq!(*default, memfd | memptr);
+                        assert!(flags.contains(&memfd) && flags.contains(&memptr));
+                        assert_eq!(*default & dmabuf, 0, "DMA-BUF must stay out of the mask");
+                    }
+                    _ => panic!("dataType must be a flags choice"),
+                },
+                _ => panic!("dataType must be an Int choice"),
+            }
+            // And it serializes to a parseable pod for stream.connect.
+            let bytes = buffers_params();
+            assert!(!bytes.is_empty());
+            assert!(spa::pod::Pod::from_bytes(&bytes).is_some());
+        }
+
+        #[test]
+        fn slot_error_is_take_once_and_prioritized() {
+            let slot = LatestFrameSlot::default();
+            slot.report_error("unmapped".to_string());
+            slot.store(raw(9));
+            match slot.take() {
+                SlotTake::Error(message) => assert_eq!(message, "unmapped"),
+                _ => panic!("expected the worker error first"),
+            }
+            // The error cleared; the frame that arrived alongside it is
+            // still consumable.
+            match slot.take() {
+                SlotTake::Frame(frame) => assert_eq!(frame.width, 9),
+                _ => panic!("expected the frame after the error cleared"),
+            }
+            assert!(matches!(slot.take(), SlotTake::Empty));
+        }
     }
 }
 

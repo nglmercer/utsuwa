@@ -9,6 +9,11 @@ pub const SETTING_PROVIDER: &str = "model.provider";
 pub const SETTING_BASE_URL: &str = "model.base_url";
 pub const SETTING_API_KEY: &str = "model.api_key";
 pub const SETTING_MODEL_NAME: &str = "model.name";
+/// Explicit operator override for whether the configured model accepts
+/// images. Written by `settings.set_model_provider` when the frontend
+/// sends `vision`; when absent, [`model_supports_vision`] infers from the
+/// provider id + model name instead. Explicit configuration always wins.
+pub const SETTING_MODEL_VISION: &str = "model.vision";
 /// Settings key holding the MCP server set (JSON array of server configs).
 pub const SETTING_MCP_SERVERS: &str = "mcp.servers";
 /// Settings key holding the WASM plugin directory (JSON string path).
@@ -176,18 +181,26 @@ pub(crate) fn provider_factory_with_secrets(
             normalize_provider_base_url(&provider, &raw_base_url)
         };
         let api_key = resolve_api_key(&storage, secrets.as_ref())?;
+        let vision = storage
+            .get_setting(SETTING_MODEL_VISION)
+            .ok()
+            .flatten()
+            .and_then(|value| value.as_bool());
         tracing::debug!(
             provider = %provider,
             model = %name,
             normalized_base_url = %sanitize_provider_url_for_log(&base_url),
+            vision_override = ?vision,
             "native agent provider selected"
         );
         ProviderRegistry::default_registry().create(
             &provider,
             ProviderConfig {
+                provider: provider.clone(),
                 base_url,
                 name,
                 api_key,
+                vision,
             },
         )
     })
@@ -197,9 +210,89 @@ pub(crate) fn provider_factory_with_secrets(
 /// Settings/secret reading stays in [`provider_factory_with_secrets`];
 /// factories only construct clients.
 pub struct ProviderConfig {
+    pub provider: String,
     pub base_url: String,
     pub name: String,
     pub api_key: Option<String>,
+    /// Explicit vision override from [`SETTING_MODEL_VISION`]. `None`
+    /// means "infer from provider + model name".
+    pub vision: Option<bool>,
+}
+
+/// Infer whether a provider/model pair accepts image input. This mirrors
+/// the frontend gate (`canShowImages` in
+/// `src/lib/services/providers/vision.ts`, plus the `supportsVision`
+/// flags in `registry.ts`): a flagged cloud provider or a local provider,
+/// AND a model id that looks vision-capable. Keep the two in sync — a
+/// mismatch means the UI offers vision the host then degrades to metadata
+/// text, or vice versa.
+///
+/// An explicit [`SETTING_MODEL_VISION`] value always wins over this
+/// heuristic; it exists so gateways and new model ids work without a
+/// code change.
+pub fn model_supports_vision(provider_id: &str, model_name: &str) -> bool {
+    let provider = provider_id.trim().to_ascii_lowercase();
+    let provider_has_vision =
+        matches!(provider.as_str(), "openai" | "anthropic" | "google" | "xai");
+    let is_local = matches!(provider.as_str(), "ollama" | "lmstudio");
+    if !provider_has_vision && !is_local {
+        return false;
+    }
+    model_name_looks_vision_capable(model_name)
+}
+
+/// Substrings that strongly imply a model accepts images. Lowercase;
+/// mirrors `VISION_MODEL_HINTS` in `src/lib/services/providers/vision.ts`.
+const VISION_MODEL_HINTS: &[&str] = &[
+    "vision",
+    "-vl",
+    "vl-",
+    "llava",
+    "bakllava",
+    "moondream",
+    "minicpm-v",
+    "llama3.2-vision",
+    "llama-3.2-vision",
+    "qwen2-vl",
+    "qwen2.5-vl",
+    "gemma3",
+    "pixtral",
+    "internvl",
+    "gpt-4o",
+    "gpt-4.1",
+    "gpt-4-turbo",
+    "gpt-4-vision",
+    "gpt-5",
+    "o3",
+    "o4",
+    "claude-3",
+    "claude-4",
+    "claude-opus",
+    "claude-sonnet",
+    "claude-haiku",
+    "gemini",
+    "grok-2-vision",
+    "grok-4",
+    "llama4",
+    "llama-4",
+    "mistral-small-3",
+    "phi-3.5-vision",
+    "phi-4-multimodal",
+];
+
+/// Names that match a hint but are actually text-only. Mirrors
+/// `TEXT_ONLY_MODELS` in `src/lib/services/providers/vision.ts`.
+const TEXT_ONLY_MODELS: &[&str] = &["gemma3:1b", "gemma-3-1b", "gemma3:270m"];
+
+fn model_name_looks_vision_capable(model_name: &str) -> bool {
+    let name = model_name.to_ascii_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    if TEXT_ONLY_MODELS.iter().any(|denied| name.contains(denied)) {
+        return false;
+    }
+    VISION_MODEL_HINTS.iter().any(|hint| name.contains(hint))
 }
 
 /// Constructs one provider family from a resolved [`ProviderConfig`].
@@ -250,11 +343,27 @@ impl ModelProviderFactory for OpenAiCompatibleProviderFactory {
     }
 
     fn create(&self, config: ProviderConfig) -> Result<Arc<dyn ModelProvider>, RuntimeError> {
-        Ok(Arc::new(OpenAICompatibleClient::new(
-            config.base_url,
-            config.api_key,
-            config.name,
-        )) as Arc<dyn ModelProvider>)
+        // Without image tool results, screenshots degrade to metadata text
+        // and a vision-capable model never sees pixels. Explicit operator
+        // configuration wins; otherwise infer from provider + model name.
+        let vision = config
+            .vision
+            .unwrap_or_else(|| model_supports_vision(&config.provider, &config.name));
+        tracing::debug!(
+            provider = %config.provider,
+            model = %config.name,
+            vision,
+            explicit = config.vision.is_some(),
+            "openai-compatible vision capability resolved"
+        );
+        let mut capabilities = model_core::ModelCapabilities::default();
+        if vision {
+            capabilities = capabilities.with_image_tool_results(true);
+        }
+        Ok(Arc::new(
+            OpenAICompatibleClient::new(config.base_url, config.api_key, config.name)
+                .with_capabilities(capabilities),
+        ) as Arc<dyn ModelProvider>)
     }
 }
 
@@ -391,4 +500,66 @@ fn resolve_api_key(
         return Ok(Some(key));
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(provider: &str, name: &str, vision: Option<bool>) -> ProviderConfig {
+        ProviderConfig {
+            provider: provider.to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            name: name.to_string(),
+            api_key: None,
+            vision,
+        }
+    }
+
+    #[test]
+    fn vision_heuristic_matches_cloud_and_local_models() {
+        // Flagged cloud provider + vision model name.
+        assert!(model_supports_vision("openai", "gpt-4o"));
+        assert!(model_supports_vision("openai", "GPT-5-mini"));
+        assert!(model_supports_vision("anthropic", "claude-sonnet-4-5"));
+        assert!(model_supports_vision("google", "gemini-2.5-flash"));
+        // Local providers depend on the installed model.
+        assert!(model_supports_vision("ollama", "llava:13b"));
+        assert!(model_supports_vision("ollama", "qwen2.5-vl:7b"));
+        assert!(model_supports_vision("lmstudio", "gemma3:4b"));
+        // Text-only models stay text-only everywhere.
+        assert!(!model_supports_vision("openai", "gpt-3.5-turbo"));
+        assert!(!model_supports_vision("ollama", "llama3.1:8b"));
+        assert!(!model_supports_vision("ollama", "gemma3:1b"));
+        assert!(!model_supports_vision("ollama", ""));
+        // Unflagged providers never infer vision (explicit opt-in only).
+        assert!(!model_supports_vision("deepseek", "deepseek-vl2"));
+        assert!(!model_supports_vision("kilo", "gpt-4o"));
+        assert!(!model_supports_vision("openai-compatible", "llava"));
+    }
+
+    #[test]
+    fn factory_applies_explicit_vision_override_over_heuristic() {
+        let factory = OpenAiCompatibleProviderFactory;
+        // Heuristic on: gateway model id the heuristic does not know.
+        let inferred = factory.create(config("openai", "gpt-4o", None)).unwrap();
+        assert!(inferred.capabilities().image_tool_results);
+        assert!(inferred.capabilities().image_input);
+        // Explicit true wins over a negative heuristic (unknown gateway id).
+        let forced = factory
+            .create(config("openai-compatible", "my-custom-vlm-9b", Some(true)))
+            .unwrap();
+        assert!(forced.capabilities().image_tool_results);
+        // Explicit false wins over a positive heuristic.
+        let denied = factory
+            .create(config("openai", "gpt-4o", Some(false)))
+            .unwrap();
+        assert!(!denied.capabilities().image_tool_results);
+        assert!(!denied.capabilities().image_input);
+        // Default stays conservative for text models.
+        let text = factory
+            .create(config("ollama", "llama3.1:8b", None))
+            .unwrap();
+        assert!(!text.capabilities().image_tool_results);
+    }
 }

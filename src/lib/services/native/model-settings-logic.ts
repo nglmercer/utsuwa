@@ -11,6 +11,7 @@ export type NativeModelProviderParams = Record<string, unknown> & {
 	base_url: string;
 	model: string;
 	api_key?: string;
+	vision?: boolean;
 };
 
 /** Build the exact bridge payload without importing Svelte stores. */
@@ -19,11 +20,13 @@ export function buildNativeModelProviderParams(config: {
 	baseUrl: string;
 	model: string;
 	apiKey?: string;
+	vision?: boolean;
 }): NativeModelProviderParams {
 	return {
 		provider: config.provider,
 		base_url: normalizeNativeBaseUrl(config.provider, config.baseUrl),
 		model: config.model,
-		...(config.apiKey !== undefined ? { api_key: config.apiKey } : {})
+		...(config.apiKey !== undefined ? { api_key: config.apiKey } : {}),
+		...(config.vision !== undefined ? { vision: config.vision } : {})
 	};
 }

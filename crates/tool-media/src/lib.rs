@@ -24,6 +24,10 @@ const FFMPEG_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_FRAMES_PER_CALL: usize = 12;
 const MAX_CANDIDATE_SECONDS: u64 = 180;
 const DEFAULT_HASH_THRESHOLD: u64 = 8;
+/// Consecutive undecodable keyframe candidates before sampling stops.
+/// Sparse failures are skipped in favor of later timestamps; a run means
+/// the stream is exhausted (or broken) and further seeks waste ffmpeg runs.
+const MAX_CONSECUTIVE_DECODE_FAILURES: u32 = 3;
 
 fn invalid(tool: &str, message: impl Into<String>) -> ToolError {
     ToolError::InvalidArgs {
@@ -775,7 +779,11 @@ impl Tool for MediaVideoKeyframesTool {
         // 1. Low-frequency candidates across the whole duration.
         let step_ms = (duration_ms / 60).max(1_000);
         // 2-4. Fingerprint, detect changes, keep meaningful frames.
+        // Sparse undecodable timestamps are skipped in favor of later
+        // ones; only a consecutive run (past EOS decodes fail together)
+        // ends sampling early.
         let mut kept: Vec<(u64, u64, Vec<u8>)> = Vec::new();
+        let mut consecutive_failures = 0u32;
         let mut timestamp_ms = 0;
         while timestamp_ms < duration_ms && kept.len() < 60 {
             let path_for_task = path.clone();
@@ -785,7 +793,6 @@ impl Tool for MediaVideoKeyframesTool {
             })
             .await
             .map_err(|error| failed("media.video_keyframes", "action_failed", error.to_string()))?;
-            // Undecodable timestamps (past EOS) end sampling, not the call.
             let hash = match bytes {
                 Ok(bytes) => match dhash(&bytes) {
                     Ok(hash) => Some((hash, bytes)),
@@ -795,6 +802,7 @@ impl Tool for MediaVideoKeyframesTool {
             };
             match hash {
                 Some((hash, bytes)) => {
+                    consecutive_failures = 0;
                     let novel = kept.iter().all(|(_, kept_hash, _)| {
                         hash_distance(hash, *kept_hash) as u64 >= threshold
                     });
@@ -805,9 +813,26 @@ impl Tool for MediaVideoKeyframesTool {
                         }
                     }
                 }
-                None => break,
+                None => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_DECODE_FAILURES {
+                        break;
+                    }
+                }
             }
             timestamp_ms += step_ms;
+        }
+        if kept.is_empty() {
+            // Never a successful zero-frame result: the model cannot tell
+            // "empty video" from "extraction broke" from `frames: []`.
+            return Err(failed(
+                "media.video_keyframes",
+                "no_decodable_frame",
+                format!(
+                    "no frame of '{}' could be decoded (sampled to {duration_ms}ms)",
+                    path.display(),
+                ),
+            ));
         }
         // 5-6. Timestamped survivors within the model-frame budget.
         let mut frames = Vec::new();
@@ -1318,5 +1343,33 @@ mod tests {
             live.contains(&"media.video_frame".to_string()),
             ffmpeg_available()
         );
+    }
+
+    #[tokio::test]
+    async fn keyframes_never_succeed_with_zero_frames() {
+        // A non-video file decodes nothing at any timestamp. Without
+        // ffmpeg the tool reports backend_unavailable; with ffmpeg it
+        // must report an explicit decode error — never Ok with frames: [].
+        let path =
+            std::env::temp_dir().join(format!("utsuwa-keyframes-empty-{}.txt", std::process::id()));
+        std::fs::write(&path, b"not a video").unwrap();
+        let tool = MediaVideoKeyframesTool {
+            deps: MediaDeps {
+                artifacts: Arc::new(artifact_core::InMemoryArtifactStore::new()),
+            },
+        };
+        let result = tool
+            .invoke(
+                ctx_for(&path),
+                serde_json::json!({ "path": path.to_string_lossy() }),
+            )
+            .await;
+        let _ = std::fs::remove_file(&path);
+        let error = result.expect_err("undecodable input must not succeed");
+        if ffmpeg_available() {
+            assert_eq!(error.code(), Some("no_decodable_frame"), "{error:?}");
+        } else {
+            assert_eq!(error.code(), Some("backend_unavailable"), "{error:?}");
+        }
     }
 }

@@ -432,6 +432,7 @@ fn run_gtk(
     // it during its own setup — nothing is processed until `gtk::main()`.
     if !register_custom_scheme_cors(&webview) {
         tracing::error!(
+            webkit_runtime = webkit_runtime_version(),
             "custom-scheme CORS registration failed; on WebKitGTK >= 2.46 bundled companion:// navigation is expected to fail"
         );
     }
@@ -597,6 +598,26 @@ fn connect_load_signals(
         // Handled: our diagnostic page replaces WebKit's default error page.
         true
     });
+    // WebKitGTK runs page content in a separate web process. When it dies
+    // (crash, OOM — e.g. under WebGL/GPU pressure from the 3D avatar) the
+    // window would otherwise freeze with the last frame and look exactly
+    // like a wedged Rust host. Name it explicitly instead; the Rust side is
+    // still alive and serving diagnostics.
+    inner.connect_web_process_terminated(move |view, reason| {
+        use webkit2gtk::WebProcessTerminationReason as Termination;
+        let uri = view.uri().as_deref().unwrap_or("?").to_string();
+        tracing::error!(
+            %uri,
+            reason = ?reason,
+            "webview.process.terminated: WebKit web process ended (Rust host still alive)"
+        );
+        if matches!(
+            reason,
+            Termination::Crashed | Termination::ExceededMemoryLimit
+        ) {
+            view.load_html(&process_crash_page_html(&uri, &format!("{reason:?}")), None);
+        }
+    });
 }
 
 /// Register the app custom scheme as CORS-enabled on the WebView's context.
@@ -628,6 +649,22 @@ fn register_custom_scheme_cors(webview: &wry::WebView) -> bool {
     true
 }
 
+/// WebKitGTK version of the loaded runtime library (vs the build-time
+/// pkg-config probe recorded in `UTSUWA_WEBKIT_PC_VERSION`). Optional
+/// evidence only.
+#[cfg(target_os = "linux")]
+fn webkit_runtime_version() -> String {
+    // SAFETY: pure version getters with no preconditions.
+    unsafe {
+        format!(
+            "{}.{}.{}",
+            webkit2gtk::ffi::webkit_get_major_version(),
+            webkit2gtk::ffi::webkit_get_minor_version(),
+            webkit2gtk::ffi::webkit_get_micro_version()
+        )
+    }
+}
+
 /// Debug-only Linux runtime diagnostics. Optional evidence only — nothing
 /// here is a hard requirement for startup.
 #[cfg(target_os = "linux")]
@@ -650,6 +687,7 @@ fn log_linux_runtime_diagnostics() {
         wayland_display_present = std::env::var_os("WAYLAND_DISPLAY").is_some(),
         display_present = std::env::var_os("DISPLAY").is_some(),
         webkit_build = env!("UTSUWA_WEBKIT_PC_VERSION"),
+        webkit_runtime = webkit_runtime_version(),
         app_version = env!("CARGO_PKG_VERSION"),
         "linux.runtime.diagnostics"
     );
@@ -669,7 +707,7 @@ fn fatal_page_html(asset_root: &str, initial_url: &str, error: &str) -> String {
          <h1>Utsuwa failed to load its bundled frontend</h1>\
          <p>Asset root: <code>{root}</code></p>\
          <p>Initial URL: <code>{url}</code></p>\
-         <p>WebKitGTK (build): <code>{webkit}</code> · GTK (build): <code>{gtk}</code></p>\
+         <p>WebKitGTK (build): <code>{webkit}</code> · WebKitGTK (runtime): <code>{webkit_rt}</code> · GTK (build): <code>{gtk}</code></p>\
          <p>Error: <code>{error}</code></p>\
          <p>Run with <code>cargo run -- --trace</code> and look for \
          <code>webview.asset.request</code> lines to see whether document \
@@ -677,8 +715,39 @@ fn fatal_page_html(asset_root: &str, initial_url: &str, error: &str) -> String {
         root = escape_html(asset_root),
         url = escape_html(initial_url),
         webkit = escape_html(env!("UTSUWA_WEBKIT_PC_VERSION")),
+        webkit_rt = escape_html(&webkit_runtime_version()),
         gtk = escape_html(env!("UTSUWA_GTK_PC_VERSION")),
         error = escape_html(error),
+    )
+}
+
+/// Diagnostic page for a dead WebKit web process (crash or OOM), distinct
+/// from a load failure: the app booted, then the content process died. The
+/// Rust host is still alive behind this page — restarting the app (or, for
+/// suspected GPU faults, the compositor diagnostics in
+/// `docs/linux-desktop-startup.md`) is the recovery path.
+#[cfg(target_os = "linux")]
+fn process_crash_page_html(uri: &str, reason: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>Utsuwa web process terminated</title>\
+         <style>body{{font-family:sans-serif;max-width:46rem;margin:4rem auto;padding:0 1rem;\
+         color:#e8e8e8;background:#1a1a1a}}code{{background:#333;padding:.1rem .3rem;\
+         border-radius:.25rem}}h1{{font-size:1.4rem}}</style></head><body>\
+         <h1>Utsuwa's web process terminated</h1>\
+         <p>The page content process ended unexpectedly; the native host is \
+         still running. This is a renderer crash, not a Rust freeze.</p>\
+         <p>Page: <code>{uri}</code></p>\
+         <p>Reason: <code>{reason}</code></p>\
+         <p>WebKitGTK (runtime): <code>{webkit_rt}</code></p>\
+         <p>Check the host log for <code>webview.process.terminated</code> and \
+         any preceding <code>webview diagnostic</code> lines, then restart \
+         the app. If it recurs when the 3D avatar appears, see the \
+         GPU/WebGL notes in <code>docs/linux-desktop-startup.md</code>.</p></body></html>",
+        uri = escape_html(uri),
+        reason = escape_html(reason),
+        webkit_rt = escape_html(&webkit_runtime_version()),
     )
 }
 

@@ -17,7 +17,7 @@ host.boot.begin
 host.runtime.ready
 host.boot.ready
 gtk.init.ok
-linux.runtime.diagnostics        (GTK/GDK versions, session, WebKit build)
+linux.runtime.diagnostics        (GTK/GDK versions, session, WebKit build+runtime)
 gtk.window.created
 webview.build_gtk.begin
 webview.configure.begin
@@ -58,6 +58,38 @@ Find the last checkpoint and work forward:
 After 10s without the initial document, the bundled watchdog logs an error
 and replaces the blank window with a diagnostic page (asset root, URL,
 WebKit build, error). `load_failed` on the main frame does the same.
+
+## Failure classes: page load vs JS vs web-process crash
+
+These look identical (a stuck window) but have different fixes — separate
+them by checkpoint before changing anything:
+
+| Observation | Failure class | Next step |
+|---|---|---|
+| No `asset.first_request` | HTML never loaded (protocol/scheme) | Workaround 1, asset-root checks |
+| `navigation.completed`, no `bootstrap.begin`, `webview diagnostic kind=window.error` | JS modules/exception (CSP, import, runtime error) | Fix the reported error/CSP hash |
+| `bootstrap.ready`, then `webview.process.terminated reason=Crashed` | Web-process crash (often GPU/WebGL) | See below; the Rust host is still alive |
+| `bootstrap.ready`, then silence, `ipc.request` without `ipc.reply` | Wedged backend call | Workaround 2 |
+
+A `webview.process.terminated` line is never a Rust freeze: the content
+process died while the host kept running. When the crash consistently
+follows the first 3D avatar paint (Three.js/VRM WebGL init), suspect the
+GPU path — but confirm the ordering first; do not start with workarounds.
+
+Diagnostic-only environment variables (verified present in WebKitGTK
+2.52; narrow the fault, never ship as defaults, never disable sandboxing
+or acceleration permanently without evidence):
+
+```bash
+# Force software compositing for one run (rules out GPU compositor faults):
+WEBKIT_DISABLE_COMPOSITING_MODE=1 cargo run -- --debug
+# Force the non-DMABuf renderer for one run (rules out DMABuf faults):
+WEBKIT_DISABLE_DMABUF_RENDERER=1 cargo run -- --debug
+```
+
+If either variable turns a deterministic crash into a clean boot, the
+fault is in that GPU path — report it with the `webkit_runtime` version
+from `linux.runtime.diagnostics`, not with a permanent workaround.
 
 ## Workaround 1: custom-scheme CORS registration
 

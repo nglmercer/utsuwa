@@ -40,8 +40,8 @@ pub(crate) use self::providers::configured_tool_profile;
 pub use self::providers::{
     normalize_provider_base_url, tool_profile_for_provider, ToolProfile, SETTING_API_KEY,
     SETTING_AUTONOMOUS_FULL_ACCESS, SETTING_BASE_URL, SETTING_BROWSER_CDP_ENDPOINT,
-    SETTING_MCP_SERVERS, SETTING_MODEL_NAME, SETTING_PLUGIN_DIR, SETTING_PROVIDER,
-    SETTING_TOOL_PROFILE,
+    SETTING_MCP_SERVERS, SETTING_MODEL_NAME, SETTING_MODEL_VISION, SETTING_PLUGIN_DIR,
+    SETTING_PROVIDER, SETTING_TOOL_PROFILE,
 };
 pub(crate) use self::providers::{
     provider_factory_with_secrets, read_autonomous_full_access, read_cdp_endpoint,
@@ -3253,6 +3253,51 @@ mod tests {
             Arc::new(secret_core::MemoryStore::default());
         let factory = provider_factory_with_secrets(Some(storage), secrets);
         assert!(matches!(factory(), Err(RuntimeError::ModelNotConfigured)));
+    }
+
+    #[test]
+    fn provider_factory_resolves_vision_from_stored_settings() {
+        fn factory_for(settings: &[(&str, serde_json::Value)]) -> model_core::ModelCapabilities {
+            let dir = std::env::temp_dir().join(format!(
+                "utsuwa-runtime-vision-{}-{}",
+                std::process::id(),
+                settings.len()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let storage = Arc::new(Mutex::new(
+                storage_core::Storage::open(&dir.join("state.db")).unwrap(),
+            ));
+            {
+                let store = storage.lock().unwrap();
+                for (key, value) in settings {
+                    store.set_setting(key, value).unwrap();
+                }
+            }
+            let secrets: Arc<dyn secret_core::SecretStore> =
+                Arc::new(secret_core::MemoryStore::default());
+            let factory = provider_factory_with_secrets(Some(storage), secrets);
+            factory().unwrap().capabilities()
+        }
+        let local = |model: &str| {
+            vec![
+                (SETTING_PROVIDER, serde_json::json!("ollama")),
+                (
+                    SETTING_BASE_URL,
+                    serde_json::json!("http://localhost:11434/v1"),
+                ),
+                (SETTING_MODEL_NAME, serde_json::json!(model)),
+            ]
+        };
+        // No override: the provider/model-name heuristic decides.
+        assert!(factory_for(&local("llava:13b")).image_tool_results);
+        assert!(!factory_for(&local("llama3.1:8b")).image_tool_results);
+        // Explicit stored override wins over the heuristic either way.
+        let mut forced = local("llama3.1:8b");
+        forced.push((SETTING_MODEL_VISION, serde_json::json!(true)));
+        assert!(factory_for(&forced).image_tool_results);
+        let mut denied = local("llava:13b");
+        denied.push((SETTING_MODEL_VISION, serde_json::json!(false)));
+        assert!(!factory_for(&denied).image_tool_results);
     }
 
     #[test]
