@@ -44,15 +44,25 @@ impl Dispatcher {
             })?;
             normalize_api_key(value)
         } else {
-            self.secrets
-                .as_ref()
-                .and_then(|secrets| {
+            // The secret store is synchronous OS IPC (on Linux it enters a
+            // nested runtime), so it must never run on this async worker.
+            // Read it on the blocking pool; a failed read falls back to an
+            // anonymous catalog rather than failing the whole fetch.
+            let stored = match self.secrets.clone() {
+                None => None,
+                Some(secrets) => tokio::task::spawn_blocking(move || {
                     secrets
                         .get(secret_core::ACCOUNT_MODEL_API_KEY)
                         .ok()
                         .flatten()
                 })
-                .and_then(|key| normalize_api_key(&key))
+                .await
+                .unwrap_or_else(|err| {
+                    tracing::warn!(%err, "secret store read failed; fetching anonymous catalog");
+                    None
+                }),
+            };
+            stored.and_then(|key| normalize_api_key(&key))
         };
 
         tracing::debug!(

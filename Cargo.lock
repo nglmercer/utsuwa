@@ -5495,6 +5495,7 @@ version = "0.1.0"
 dependencies = [
  "keyring",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
 ]
 

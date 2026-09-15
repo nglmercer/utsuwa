@@ -233,17 +233,20 @@ impl AgentRuntime {
         );
     }
     /// Abort the in-flight turn and drop any suspended one. Late worker
-    /// events are suppressed by the generation bump.
+    /// events are suppressed by the generation bump. Cancelling an idle
+    /// runtime is silent: with no worker and no suspended turn there is
+    /// nothing to report, so no `agent.turn_cancelled` is emitted.
     pub fn cancel(self: &Arc<Self>) {
-        let (generation, task_id) = match self.lock_state() {
+        let (task_id, was_active) = match self.lock_state() {
             Ok(mut state) => {
+                let was_active = state.running.is_some() || state.suspended.is_some();
                 state.generation += 1;
                 if let Some(handle) = state.running.take() {
                     handle.abort();
                 }
                 state.suspended = None;
                 state.replay_cache = None;
-                (state.generation, state.task_id.take())
+                (state.task_id.take(), was_active)
             }
             Err(_) => return,
         };
@@ -252,11 +255,13 @@ impl AgentRuntime {
                 queue.end_task(&task_id);
             }
         }
+        if !was_active {
+            return;
+        }
         // The cancelling generation is current by construction.
         (self.emit)(HostEvent {
             event: "agent.turn_cancelled".to_string(),
             data: serde_json::json!({}),
         });
-        let _ = generation;
     }
 }

@@ -39,6 +39,7 @@ tool-process.workspace = true
 tool-sdk.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 storage-core.workspace = true
@@ -72,5 +73,4 @@ desktop-windows.workspace = true
 desktop-macos.workspace = true
 
 [dev-dependencies]
-futures-util = "0.3"
 wat.workspace = true

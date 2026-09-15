@@ -27,6 +27,14 @@ pub enum SecretError {
     Backend(String),
 }
 
+/// Blocking secret contract: every method performs synchronous OS IPC
+/// (Secret Service on Linux, Keychain on macOS, Credential Manager on
+/// Windows). Never call these from a Tokio async worker — on Linux the
+/// Secret Service backend enters a nested runtime and panics with
+/// `Cannot start a runtime from within a runtime`, and even elsewhere a
+/// locked or slow keychain would stall the worker. Async callers must go
+/// through `tokio::task::spawn_blocking` (see the agent turn's provider
+/// factory and `providers.fetch_models` for the pattern).
 pub trait SecretStore: Send + Sync {
     fn get(&self, account: &str) -> Result<Option<String>, SecretError>;
     fn set(&self, account: &str, secret: &str) -> Result<(), SecretError>;
@@ -134,10 +142,15 @@ impl SecretStore for MemoryStore {
 }
 
 /// The host secret store: platform keychain when it probes working,
-/// in-process memory otherwise (warned, never silent).
+/// in-process memory otherwise (warned, never silent). The probe is
+/// synchronous OS IPC, so a (mis)call from inside an async runtime would
+/// panic on Linux; catch that and fail closed to memory rather than
+/// crashing the host.
 pub fn system(service: &str) -> Arc<dyn SecretStore> {
     let keychain = KeyringStore::new(service);
-    if keychain.probe() {
+    let probe_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| keychain.probe()))
+        .unwrap_or(false);
+    if probe_ok {
         Arc::new(keychain)
     } else {
         tracing::warn!("no working OS keychain; secrets stay in process memory only");
@@ -177,6 +190,18 @@ mod tests {
         let store = KeyringStore::new("utsuwa-test");
         assert!(store.get("").is_err());
         assert!(store.get("has\0nul").is_err());
+    }
+
+    // The dangerous execution context: `system()` must never panic when
+    // (mis)called from inside an async runtime. On Linux the keychain probe
+    // would otherwise panic with `Cannot start a runtime from within a
+    // runtime`; it must fail closed to a working memory store instead.
+    #[tokio::test]
+    async fn system_inside_async_runtime_falls_back_without_panicking() {
+        let store = system("utsuwa-test");
+        store.set("probe.account", "v").unwrap();
+        assert_eq!(store.get("probe.account").unwrap(), Some("v".to_string()));
+        store.delete("probe.account").unwrap();
     }
 
     // Hits the real platform keychain when one exists; ignored otherwise

@@ -3369,4 +3369,266 @@ mod tests {
         });
         assert!(result, "test must run inside the agent executor");
     }
+
+    /// Faithful stand-in for the Linux keyring 4 / zbus blocking backend:
+    /// entering a nested runtime panics with `Cannot start a runtime from
+    /// within a runtime` when (incorrectly) invoked on a Tokio async worker,
+    /// and succeeds on a blocking-pool thread.
+    struct NestedRuntimeSecretStore {
+        inner: secret_core::MemoryStore,
+    }
+
+    impl secret_core::SecretStore for NestedRuntimeSecretStore {
+        fn get(&self, account: &str) -> Result<Option<String>, secret_core::SecretError> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("nested runtime builds off async workers");
+            runtime.block_on(async { self.inner.get(account) })
+        }
+
+        fn set(&self, account: &str, secret: &str) -> Result<(), secret_core::SecretError> {
+            self.inner.set(account, secret)
+        }
+
+        fn delete(&self, account: &str) -> Result<(), secret_core::SecretError> {
+            self.inner.delete(account)
+        }
+    }
+
+    #[test]
+    fn secret_store_reads_run_off_the_async_worker() {
+        // Regression test for the turn that died before provider init: the
+        // provider factory reads the API key through the synchronous secret
+        // store, and on Linux that call panics when made on an async worker.
+        // The factory must therefore run on the blocking pool: the turn
+        // completes instead of losing its worker with no terminal event.
+        let provider = QueueProvider::new(vec![text_turn("key read off-worker")]);
+        let secrets: Arc<dyn secret_core::SecretStore> = Arc::new(NestedRuntimeSecretStore {
+            inner: secret_core::MemoryStore::default(),
+        });
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let runtime = AgentRuntime::start_with_factory(
+            Arc::clone(&approvals),
+            None,
+            None,
+            Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }),
+            Arc::new(move || {
+                // What `resolve_api_key` does with the keychain on every turn.
+                let _ = secrets.get(secret_core::ACCOUNT_MODEL_API_KEY);
+                Ok(Arc::clone(&provider) as Arc<dyn ModelProvider>)
+            }),
+        )
+        .unwrap();
+        let harness = Harness {
+            runtime,
+            approvals,
+            events,
+        };
+        harness.runtime.send_message("hi".to_string()).unwrap();
+        let done = wait_for(&harness, "agent.turn_done");
+        assert_eq!(done.data["text"], "key read off-worker");
+        assert!(harness.runtime.lock_state().unwrap().running.is_none());
+    }
+
+    #[test]
+    fn panicking_provider_factory_emits_exactly_one_turn_failed() {
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let runtime = AgentRuntime::start_with_factory(
+            Arc::clone(&approvals),
+            None,
+            None,
+            Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }),
+            Arc::new(|| -> Result<Arc<dyn ModelProvider>, RuntimeError> {
+                panic!("boom in provider factory")
+            }),
+        )
+        .unwrap();
+        let harness = Harness {
+            runtime,
+            approvals,
+            events,
+        };
+        harness.runtime.send_message("hi".to_string()).unwrap();
+        let failed = wait_for(&harness, "agent.turn_failed");
+        assert!(
+            failed.data["error"]
+                .as_str()
+                .unwrap()
+                .contains("provider task failed"),
+            "unexpected error: {}",
+            failed.data["error"]
+        );
+        // Exactly one terminal event: no duplicate, no done/suspended/cancelled.
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let events = harness.events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event == "agent.turn_failed")
+                    .count(),
+                1
+            );
+            assert!(events.iter().all(|event| !matches!(
+                event.event.as_str(),
+                "agent.turn_done" | "agent.turn_suspended" | "agent.turn_cancelled"
+            )));
+        }
+        assert!(harness.runtime.lock_state().unwrap().running.is_none());
+    }
+
+    struct PanicProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PanicProvider {
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+        ) -> Result<model_core::ModelStream, ModelError> {
+            panic!("boom in provider stream")
+        }
+    }
+
+    #[test]
+    fn panicking_provider_stream_emits_exactly_one_turn_failed() {
+        // A panic anywhere else in the turn (model, tool, wiring) is caught
+        // by panic supervision and still resolves the turn — the UI must
+        // never spin forever.
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let runtime = AgentRuntime::start_with_factory(
+            Arc::clone(&approvals),
+            None,
+            None,
+            Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }),
+            Arc::new(|| Ok(Arc::new(PanicProvider) as Arc<dyn ModelProvider>)),
+        )
+        .unwrap();
+        let harness = Harness {
+            runtime,
+            approvals,
+            events,
+        };
+        harness.runtime.send_message("hi".to_string()).unwrap();
+        let failed = wait_for(&harness, "agent.turn_failed");
+        assert!(
+            failed.data["error"]
+                .as_str()
+                .unwrap()
+                .contains("agent worker panicked"),
+            "unexpected error: {}",
+            failed.data["error"]
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let events = harness.events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event == "agent.turn_failed")
+                    .count(),
+                1
+            );
+            assert!(events.iter().all(|event| !matches!(
+                event.event.as_str(),
+                "agent.turn_done" | "agent.turn_suspended" | "agent.turn_cancelled"
+            )));
+        }
+        assert!(harness.runtime.lock_state().unwrap().running.is_none());
+    }
+
+    #[test]
+    fn completed_turn_clears_running_and_makes_cancel_silent() {
+        let provider = QueueProvider::new(vec![text_turn("done")]);
+        let finished = harness(provider);
+        finished.runtime.send_message("hi".to_string()).unwrap();
+        wait_for(&finished, "agent.turn_done");
+        // No stale handle survives a normal completed turn.
+        assert!(finished.runtime.lock_state().unwrap().running.is_none());
+        // Cancelling an idle runtime reports nothing: no worker, no event.
+        finished.runtime.cancel();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(finished
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| event.event != "agent.turn_cancelled"));
+
+        // Same for a runtime that never ran a turn at all. (Only agent
+        // events are asserted: sensor activity is process-global, so a
+        // parallel test's microphone/camera session can land here too.)
+        let provider = QueueProvider::new(vec![text_turn("unused")]);
+        let idle = harness(provider);
+        idle.runtime.cancel();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(idle
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|event| !event.event.starts_with("agent.")));
+    }
+
+    #[test]
+    fn suspended_turn_clears_running_and_still_resumes() {
+        let (dir, path) = temp_project("suspend-running");
+        let provider = QueueProvider::new(vec![
+            read_turn(&path),
+            read_turn(&path),
+            text_turn("done reading"),
+        ]);
+        let harness = harness(provider);
+        harness
+            .runtime
+            .send_message("read my notes".to_string())
+            .unwrap();
+        let suspended = wait_for(&harness, "agent.turn_suspended");
+        let request_id = suspended.data["request_id"].as_str().unwrap().to_string();
+        // A parked turn is not a running turn.
+        assert!(harness.runtime.lock_state().unwrap().running.is_none());
+
+        let pending = harness.approvals.lock().unwrap().list();
+        assert_eq!(pending.len(), 1);
+        harness
+            .approvals
+            .lock()
+            .unwrap()
+            .decide(&pending[0].id, Some(policy_core::GrantLifetime::Session))
+            .unwrap();
+        harness.runtime.notify_decided(&request_id, true);
+        let done = wait_for(&harness, "agent.turn_done");
+        assert_eq!(done.data["text"], "done reading");
+        assert!(harness.runtime.lock_state().unwrap().running.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cancel_while_suspended_still_reports() {
+        // Suspension counts as active work (unlike an idle runtime), so
+        // cancelling it still emits `agent.turn_cancelled`.
+        let (dir, path) = temp_project("cancel-suspended");
+        let provider = QueueProvider::new(vec![read_turn(&path)]);
+        let harness = harness(provider);
+        harness
+            .runtime
+            .send_message("read my notes".to_string())
+            .unwrap();
+        wait_for(&harness, "agent.turn_suspended");
+        harness.runtime.cancel();
+        wait_for(&harness, "agent.turn_cancelled");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

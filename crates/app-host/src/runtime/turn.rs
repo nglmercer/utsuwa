@@ -6,6 +6,7 @@ use super::session::Suspended;
 use super::{AgentRuntime, RuntimeError};
 use agent_core::{Agent, AgentEvent, AgentLimits, ToolReplayCache};
 use file_target::{FileRef, FileResolver, TargetPurpose};
+use futures_util::FutureExt as _;
 use host_core::HostEnvironment;
 use ipc_core::HostEvent;
 use model_core::ModelMessage;
@@ -14,12 +15,22 @@ use tool_sdk::ToolLoadContext;
 use tracing::Instrument as _;
 
 impl AgentRuntime {
-    fn build_agent(
+    async fn build_agent(
         &self,
         generation: u64,
         system_prompt: Option<String>,
     ) -> Result<Agent, RuntimeError> {
-        let provider = (self.provider_factory)()?;
+        // The provider factory performs blocking work (SQLite settings reads
+        // plus synchronous OS-keychain IPC for the API key). On Linux the
+        // keychain backend enters a nested Tokio runtime, which panics with
+        // `Cannot start a runtime from within a runtime` when called on an
+        // async worker — so the whole factory runs on the blocking pool,
+        // keeping the two agent workers free. A factory panic surfaces here
+        // as a `JoinError` and becomes `turn_failed`, never a lost worker.
+        let factory = Arc::clone(&self.provider_factory);
+        let provider = tokio::task::spawn_blocking(move || (factory)())
+            .await
+            .map_err(|err| RuntimeError::Executor(format!("provider task failed: {err}")))??;
         let mut agent = Agent::new(provider)
             .with_agent_id(self.agent_id.clone())
             .with_limits(AgentLimits::default());
@@ -106,17 +117,40 @@ impl AgentRuntime {
         resume_note: Option<String>,
     ) {
         let span = tracing::info_span!("host.turn", generation, resumed = resume_note.is_some());
-        self.run_turn_inner(
+        // Panic supervision: a worker panic (provider, tool, model wiring)
+        // must still resolve the turn. Without this the `JoinHandle` in
+        // `state.running` captures the panic, nobody awaits it, and the UI
+        // spins forever with no terminal event.
+        let outcome = std::panic::AssertUnwindSafe(self.run_turn_inner(
             transcript,
             generation,
-            task_id,
+            task_id.clone(),
             turn_id,
             system_prompt,
             replay_cache,
             resume_note,
-        )
+        ))
+        .catch_unwind()
         .instrument(span)
-        .await
+        .await;
+        // Every exit path parks the worker handle: done, failed, suspended,
+        // and panic alike. Clearing before the panic event below guarantees
+        // an observer that sees the terminal event also sees idle state.
+        self.clear_running_if_current(generation);
+        if let Err(payload) = outcome {
+            let detail = panic_payload_message(&payload);
+            tracing::error!(%detail, "agent worker panicked");
+            if self.is_current(generation) {
+                if let Ok(queue) = self.approvals.lock() {
+                    queue.end_task(&task_id);
+                }
+            }
+            self.emit_if_current(
+                generation,
+                "agent.turn_failed",
+                serde_json::json!({ "error": format!("agent worker panicked: {detail}") }),
+            );
+        }
     }
     #[allow(clippy::too_many_arguments)]
     async fn run_turn_inner(
@@ -160,7 +194,7 @@ impl AgentRuntime {
         {
             transcript[0] = ModelMessage::system(host_system_prompt.clone());
         }
-        let agent = match self.build_agent(generation, Some(host_system_prompt)) {
+        let agent = match self.build_agent(generation, Some(host_system_prompt)).await {
             Ok(agent) => agent,
             Err(err) => {
                 if self.is_current(generation) {
@@ -168,7 +202,7 @@ impl AgentRuntime {
                         queue.end_task(&task_id);
                     }
                 }
-                self.emit_if_current(
+                self.emit_terminal(
                     generation,
                     "agent.turn_failed",
                     serde_json::json!({ "error": err.to_string() }),
@@ -195,7 +229,7 @@ impl AgentRuntime {
                         queue.end_task(&task_id);
                     }
                 }
-                self.emit_if_current(
+                self.emit_terminal(
                     generation,
                     "agent.turn_failed",
                     serde_json::json!({ "error": err.to_string() }),
@@ -230,7 +264,7 @@ impl AgentRuntime {
                         queue.end_task(&task_id);
                     }
                 }
-                self.emit_if_current(
+                self.emit_terminal(
                     generation,
                     "agent.turn_failed",
                     serde_json::json!({ "error": err.to_string() }),
@@ -261,7 +295,7 @@ impl AgentRuntime {
                                 if let Ok(queue) = self.approvals.lock() {
                                     queue.end_task(&task_id);
                                 }
-                                self.emit_if_current(
+                                self.emit_terminal(
                                     generation,
                                     "agent.turn_failed",
                                     serde_json::json!({ "error": "approval queue lock failed" }),
@@ -287,7 +321,7 @@ impl AgentRuntime {
                             }
                             Err(err) => tracing::warn!(%err, "cannot serialize permission request"),
                         }
-                        self.emit_if_current(
+                        self.emit_terminal(
                             generation,
                             "agent.turn_suspended",
                             serde_json::json!({
@@ -317,7 +351,7 @@ impl AgentRuntime {
                             .collect();
                         let tool_steps: Vec<serde_json::Value> =
                             outcome.tool_steps.iter().map(serialize_tool_step).collect();
-                        self.emit_if_current(
+                        self.emit_terminal(
                             generation,
                             "agent.turn_done",
                             serde_json::json!({
@@ -368,6 +402,15 @@ impl AgentRuntime {
                 context.record_success(resolved.file_ref);
             }
         }
+    }
+}
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message.to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 fn serialize_tool_step(step: &agent_core::ToolStep) -> serde_json::Value {

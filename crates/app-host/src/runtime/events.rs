@@ -21,4 +21,23 @@ impl AgentRuntime {
             });
         }
     }
+    /// Clear this generation's worker handle (when still current), then emit
+    /// one terminal turn event. Clearing first guarantees an observer that
+    /// sees `agent.turn_done` / `agent.turn_failed` / `agent.turn_suspended`
+    /// also sees idle `running` state instead of a stale handle.
+    pub(crate) fn emit_terminal(&self, generation: u64, event: &str, data: serde_json::Value) {
+        self.clear_running_if_current(generation);
+        self.emit_if_current(generation, event, data);
+    }
+    /// Park the worker handle for `generation` once its turn has resolved
+    /// (done, failed, suspended, or panicked). A superseding turn bumps the
+    /// generation and owns its own handle, so only the matching generation
+    /// may clear.
+    pub(crate) fn clear_running_if_current(&self, generation: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.generation == generation {
+                state.running = None;
+            }
+        }
+    }
 }
