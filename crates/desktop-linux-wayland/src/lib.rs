@@ -1,7 +1,9 @@
 //! Native Linux Wayland desktop backend.
 //!
-//! Screen visibility is obtained through the XDG ScreenCast portal and the
-//! selected PipeWire node is consumed in a dedicated native capture thread.
+//! Screen visibility is obtained through the XDG portals: still captures
+//! use the Screenshot portal (one D-Bus round trip, no streaming), while
+//! video sessions use the ScreenCast portal with the selected PipeWire
+//! node consumed in a dedicated native capture thread.
 //! Semantic accessibility prefers native AT-SPI2/D-Bus and falls back to
 //! Xwayland only for non-AT-SPI ids; Xwayland is never used to infer that
 //! a portal screen-sharing approval granted control.
@@ -360,6 +362,27 @@ mod linux {
         }
 
         async fn one_shot_portal(&self, config: CaptureConfig) -> Result<Screenshot, DesktopError> {
+            // Still captures prefer the Screenshot portal: one D-Bus round
+            // trip, no PipeWire streaming negotiation, and a natively
+            // compressed PNG. Streaming (ScreenCast + PipeWire) stays as
+            // the fallback for compositors without the Screenshot portal
+            // and as the only path for video sessions (`portal_capture`).
+            match self.screenshot_via_portal().await {
+                Ok(shot) => {
+                    // The Screenshot portal cannot resize: honor an
+                    // explicit max_width by falling through to the
+                    // PipeWire path, which negotiates a smaller format.
+                    // Without a resize request the portal still is final.
+                    let needs_resize =
+                        config.max_width.is_some_and(|max| shot.width > max);
+                    if !needs_resize {
+                        return Ok(shot);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "Screenshot portal still failed; trying PipeWire");
+                }
+            }
             let store: Arc<dyn ArtifactStore> =
                 Arc::new(artifact_core::InMemoryArtifactStore::new());
             let secrets = self.capture_secret_store().await;
@@ -374,6 +397,55 @@ mod linux {
             Ok(Screenshot {
                 width: frame.width,
                 height: frame.height,
+                png_bytes: bytes,
+            })
+        }
+
+        /// One still image through `org.freedesktop.portal.Screenshot`.
+        /// Non-interactive and non-modal: the compositor captures without
+        /// a source picker. Bounded like the ScreenCast negotiation so an
+        /// unanswered OS dialog fails the tool call with an actionable
+        /// message instead of hanging the agent turn. (The wait happens
+        /// inside `send()`: ashpd joins the portal Response signal there,
+        /// while the sync `response()` only takes the arrived value.)
+        async fn screenshot_via_portal(&self) -> Result<Screenshot, DesktopError> {
+            use ashpd::desktop::screenshot::Screenshot as PortalScreenshot;
+            let send = PortalScreenshot::request()
+                .interactive(false)
+                .modal(false)
+                .send();
+            let request = match tokio::time::timeout(PORTAL_APPROVAL_TIMEOUT, send).await {
+                Ok(Ok(request)) => request,
+                Ok(Err(error)) => {
+                    return Err(DesktopError::BackendUnavailable(format!(
+                        "Screenshot portal request: {error}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(DesktopError::ActionFailed(format!(
+                        "screenshot approval timed out after {}s: answer the OS screenshot dialog (or decline it) and try again",
+                        PORTAL_APPROVAL_TIMEOUT.as_secs(),
+                    )));
+                }
+            };
+            let response = request.response().map_err(|error| {
+                DesktopError::BackendUnavailable(format!("Screenshot portal capture: {error}"))
+            })?;
+            let path = response.uri().to_file_path().map_err(|_| {
+                DesktopError::BackendUnavailable(format!(
+                    "Screenshot portal returned a non-file URI: {}",
+                    response.uri()
+                ))
+            })?;
+            let bytes = tokio::fs::read(&path).await.map_err(|error| {
+                DesktopError::ActionFailed(format!("read portal screenshot file: {error}"))
+            })?;
+            // Best-effort cleanup of the portal's temp file.
+            let _ = tokio::fs::remove_file(&path).await;
+            let (width, height) = parse_png_dimensions(&bytes)?;
+            Ok(Screenshot {
+                width,
+                height,
                 png_bytes: bytes,
             })
         }
@@ -1125,7 +1197,7 @@ mod linux {
                         }
                         if tokio::time::Instant::now() >= deadline {
                             return Err(DesktopError::ActionFailed(
-                                "PipeWire capture produced no frame within 5 seconds".to_string(),
+                                "PipeWire capture produced no frame within 5 seconds; the OS screen-share grant may have selected an empty source, PipeWire may not be running, or the compositor negotiated a pixel format the client cannot map (see the host log for stream errors)".to_string(),
                             ));
                         }
                         tokio::time::sleep(Duration::from_millis(8)).await;
@@ -1313,6 +1385,16 @@ mod linux {
                         height,
                         rgb,
                     });
+                })
+                .state_changed(|_, user_data, _old, new| {
+                    // Surface negotiation/stream failures with their cause:
+                    // without this the consumer only sees the 5s "no frame"
+                    // timeout even when PipeWire already knows the reason.
+                    if let pw::stream::StreamState::Error(message) = new {
+                        user_data.slot.report_error(format!(
+                            "PipeWire stream error: {message}"
+                        ));
+                    }
                 })
                 .register()
                 .map_err(|error| error.to_string())?;
@@ -1558,6 +1640,30 @@ mod linux {
             .unwrap_or_default()
     }
 
+    /// Dimensions of a PNG without a decoder: signature plus the IHDR
+    /// width/height (big-endian `u32` at bytes 16..24). The Screenshot
+    /// portal hands back an encoded file, and stills need no pixel
+    /// access — only the size header for the `Screenshot` value.
+    fn parse_png_dimensions(bytes: &[u8]) -> Result<(u32, u32), DesktopError> {
+        const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+        if bytes.len() < 33
+            || bytes[..8] != SIGNATURE[..]
+            || &bytes[12..16] != b"IHDR"
+        {
+            return Err(DesktopError::ActionFailed(
+                "Screenshot portal returned a file that is not a PNG image".to_string(),
+            ));
+        }
+        let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+        let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+        if width == 0 || height == 0 {
+            return Err(DesktopError::ActionFailed(
+                "Screenshot portal returned a PNG with zero width or height".to_string(),
+            ));
+        }
+        Ok((width, height))
+    }
+
     fn encode_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
         fn u32b(value: u32) -> [u8; 4] {
             value.to_be_bytes()
@@ -1701,6 +1807,44 @@ mod linux {
 
         fn memory_secrets() -> Arc<dyn secret_core::SecretStore> {
             Arc::new(secret_core::MemoryStore::default())
+        }
+
+        fn minimal_png(width: u32, height: u32) -> Vec<u8> {
+            let mut bytes = vec![
+                0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, // signature
+                0, 0, 0, 13, // IHDR length
+                b'I', b'H', b'D', b'R', // IHDR kind
+            ];
+            bytes.extend_from_slice(&width.to_be_bytes());
+            bytes.extend_from_slice(&height.to_be_bytes());
+            bytes.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit truecolor
+            bytes.extend_from_slice(&[0, 0, 0, 0]); // CRC placeholder
+            bytes
+        }
+
+        #[test]
+        fn portal_png_dimensions_come_from_ihdr() {
+            assert_eq!(
+                parse_png_dimensions(&minimal_png(1920, 1080)).unwrap(),
+                (1920, 1080)
+            );
+            assert_eq!(parse_png_dimensions(&minimal_png(1, 1)).unwrap(), (1, 1));
+        }
+
+        #[test]
+        fn portal_png_dimensions_reject_non_png() {
+            assert!(parse_png_dimensions(&[]).is_err());
+            assert!(parse_png_dimensions(b"definitely not a png").is_err());
+            let mut truncated = minimal_png(800, 600);
+            truncated.truncate(20);
+            assert!(parse_png_dimensions(&truncated).is_err());
+            // Zero-size images are corrupt captures, not screenshots.
+            assert!(parse_png_dimensions(&minimal_png(0, 600)).is_err());
+            assert!(parse_png_dimensions(&minimal_png(800, 0)).is_err());
+            // Wrong chunk kind where IHDR belongs.
+            let mut bad_kind = minimal_png(800, 600);
+            bad_kind[12..16].copy_from_slice(b"IDAT");
+            assert!(parse_png_dimensions(&bad_kind).is_err());
         }
 
         #[tokio::test]

@@ -34,12 +34,13 @@ pub enum SecretError {
 
 /// Blocking secret contract: every method performs synchronous OS IPC
 /// (Secret Service on Linux, Keychain on macOS, Credential Manager on
-/// Windows). Never call these from a Tokio async worker — on Linux the
-/// Secret Service backend enters a nested runtime and panics with
-/// `Cannot start a runtime from within a runtime`, and even elsewhere a
-/// locked or slow keychain would stall the worker. Async callers must go
-/// through `tokio::task::spawn_blocking` (see the agent turn's provider
-/// factory and `providers.fetch_models` for the pattern).
+/// Windows). `KeyringStore` hops each call to a dedicated plain OS thread
+/// internally, so it is safe from any caller — including Tokio async
+/// workers and `spawn_blocking` closures, which both still count as
+/// "inside" a runtime for the nested keyring D-Bus client. Async callers
+/// should still prefer `tokio::task::spawn_blocking` so a slow or locked
+/// keychain stalls the blocking pool instead of an executor worker.
+/// Custom `SecretStore` implementations that block must do the same.
 pub trait SecretStore: Send + Sync {
     fn get(&self, account: &str) -> Result<Option<String>, SecretError>;
     fn set(&self, account: &str, secret: &str) -> Result<(), SecretError>;
@@ -51,6 +52,29 @@ pub struct KeyringStore {
     service: String,
 }
 
+/// Run blocking keychain IPC on a plain OS thread.
+///
+/// The `keyring` crate's synchronous API drives D-Bus through a nested
+/// Tokio runtime (`zbus::utils::block_on`), which panics with
+/// `Cannot start a runtime from within a runtime` on any thread that
+/// holds a Tokio runtime context — including `spawn_blocking` workers,
+/// which still count as "inside" the runtime. A fresh OS thread never
+/// holds such context, so the same call succeeds (or fails gracefully)
+/// there. Secret operations are rare (once per turn / capture), so one
+/// thread spawn each is negligible.
+fn on_keyring_thread<F, R>(op: F) -> Result<R, SecretError>
+where
+    F: FnOnce() -> Result<R, SecretError> + Send + 'static,
+    R: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name("utsuwa-keyring".to_string())
+        .spawn(op)
+        .map_err(|error| SecretError::Backend(format!("keyring thread: {error}")))?
+        .join()
+        .unwrap_or_else(|_| Err(SecretError::Backend("keyring operation panicked".to_string())))
+}
+
 impl KeyringStore {
     pub fn new(service: impl Into<String>) -> Self {
         Self {
@@ -58,56 +82,80 @@ impl KeyringStore {
         }
     }
 
-    fn entry(&self, account: &str) -> Result<keyring::Entry, SecretError> {
+    /// Direct entry construction. Must run on a plain OS thread (see
+    /// [`on_keyring_thread`]): `Entry::new` lazily initializes the
+    /// credential store, which blocks on D-Bus. There is deliberately no
+    /// same-thread `entry(&self)` helper: every public entry point hops
+    /// threads first, so no caller can accidentally trip the
+    /// nested-runtime panic.
+    fn entry_direct(service: &str, account: &str) -> Result<keyring::Entry, SecretError> {
         if account.is_empty() || account.len() > 256 || account.contains('\0') {
             return Err(SecretError::Backend("invalid secret account".to_string()));
         }
-        keyring::Entry::new(&self.service, account).map_err(|e| SecretError::Backend(e.to_string()))
+        keyring::Entry::new(service, account).map_err(|e| SecretError::Backend(e.to_string()))
     }
 
     /// Probe whether the platform store actually works here (headless
-    /// containers often have no secret service).
+    /// containers often have no secret service). The whole probe runs on
+    /// a plain OS thread so it never trips the nested-runtime panic,
+    /// returning `false` (memory fallback) instead of crashing the caller.
     pub fn probe(&self) -> bool {
         const PROBE_ACCOUNT: &str = "utsuwa.probe";
-        match self.entry(PROBE_ACCOUNT) {
-            Err(_) => false,
-            Ok(entry) => {
-                if entry.set_password("probe").is_err() {
-                    return false;
-                }
-                let ok = entry.get_password().ok().as_deref() == Some("probe");
-                let _ = entry.delete_credential();
-                ok
+        let service = self.service.clone();
+        on_keyring_thread(move || {
+            let entry = match Self::entry_direct(&service, PROBE_ACCOUNT) {
+                Err(_) => return Ok(false),
+                Ok(entry) => entry,
+            };
+            if entry.set_password("probe").is_err() {
+                return Ok(false);
             }
-        }
+            let ok = entry.get_password().ok().as_deref() == Some("probe");
+            let _ = entry.delete_credential();
+            Ok(ok)
+        })
+        .unwrap_or(false)
     }
 }
 
 impl SecretStore for KeyringStore {
     fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
-        let entry = self.entry(account)?;
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(SecretError::Backend(e.to_string())),
-        }
+        let service = self.service.clone();
+        let account = account.to_string();
+        on_keyring_thread(move || {
+            let entry = Self::entry_direct(&service, &account)?;
+            match entry.get_password() {
+                Ok(secret) => Ok(Some(secret)),
+                Err(keyring::Error::NoEntry) => Ok(None),
+                Err(e) => Err(SecretError::Backend(e.to_string())),
+            }
+        })
     }
 
     fn set(&self, account: &str, secret: &str) -> Result<(), SecretError> {
         if secret.len() > 16 * 1024 {
             return Err(SecretError::Backend("secret exceeds 16 KiB".to_string()));
         }
-        self.entry(account)?
-            .set_password(secret)
-            .map_err(|e| SecretError::Backend(e.to_string()))
+        let service = self.service.clone();
+        let account = account.to_string();
+        let secret = secret.to_string();
+        on_keyring_thread(move || {
+            Self::entry_direct(&service, &account)?
+                .set_password(&secret)
+                .map_err(|e| SecretError::Backend(e.to_string()))
+        })
     }
 
     fn delete(&self, account: &str) -> Result<(), SecretError> {
-        match self.entry(account)?.delete_credential() {
-            Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(SecretError::Backend(e.to_string())),
-        }
+        let service = self.service.clone();
+        let account = account.to_string();
+        on_keyring_thread(move || {
+            match Self::entry_direct(&service, &account)?.delete_credential() {
+                Ok(()) => Ok(()),
+                Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(SecretError::Backend(e.to_string())),
+            }
+        })
     }
 }
 
@@ -147,10 +195,10 @@ impl SecretStore for MemoryStore {
 }
 
 /// The host secret store: platform keychain when it probes working,
-/// in-process memory otherwise (warned, never silent). The probe is
-/// synchronous OS IPC, so a (mis)call from inside an async runtime would
-/// panic on Linux; catch that and fail closed to memory rather than
-/// crashing the host.
+/// in-process memory otherwise (warned, never silent). The probe hops to
+/// a plain OS thread internally, so this is safe from any caller; the
+/// `catch_unwind` stays as a last-resort guard that fails closed to
+/// memory rather than crashing the host.
 pub fn system(service: &str) -> Arc<dyn SecretStore> {
     let keychain = KeyringStore::new(service);
     let probe_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| keychain.probe()))
@@ -198,15 +246,43 @@ mod tests {
     }
 
     // The dangerous execution context: `system()` must never panic when
-    // (mis)called from inside an async runtime. On Linux the keychain probe
-    // would otherwise panic with `Cannot start a runtime from within a
-    // runtime`; it must fail closed to a working memory store instead.
+    // (mis)called from inside an async runtime. The keyring client blocks
+    // on D-Bus through a nested runtime, which panics with `Cannot start
+    // a runtime from within a runtime` on any thread holding a Tokio
+    // context; the probe hops to a plain OS thread first, so it either
+    // uses the real keychain or fails closed to a working memory store.
+    // A regression test in `app-host` covers the same pattern through a
+    // stand-in nested-runtime backend.
     #[tokio::test]
     async fn system_inside_async_runtime_falls_back_without_panicking() {
+        // Direct call on the async worker (no spawn_blocking): this is
+        // exactly the context that used to panic.
         let store = system("utsuwa-test");
         store.set("probe.account", "v").unwrap();
         assert_eq!(store.get("probe.account").unwrap(), Some("v".to_string()));
         store.delete("probe.account").unwrap();
+    }
+
+    // Keyring reads/writes from inside an async runtime hop threads
+    // internally instead of panicking. Hits the real keychain when one
+    // exists; without one they fail closed with a `Backend` error.
+    #[tokio::test]
+    async fn keyring_ops_inside_async_runtime_do_not_panic() {
+        let store = KeyringStore::new("utsuwa-test");
+        // Must not panic regardless of backend availability.
+        let probed = store.probe();
+        if probed {
+            store.set("test.runtime", "s3cr3t").unwrap();
+            assert_eq!(
+                store.get("test.runtime").unwrap(),
+                Some("s3cr3t".to_string())
+            );
+            store.delete("test.runtime").unwrap();
+        } else {
+            eprintln!("no working keychain; probe-only coverage");
+        }
+        // Invalid accounts fail fast without touching the backend.
+        assert!(store.get("").is_err());
     }
 
     // Hits the real platform keychain when one exists; ignored otherwise

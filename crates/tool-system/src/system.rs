@@ -75,10 +75,6 @@ pub fn environment_summary() -> serde_json::Value {
 
 fn snapshot(kind: &str) -> Result<serde_json::Value, ToolError> {
     let value = match kind {
-        "time" => {
-            let utc = chrono_now();
-            serde_json::json!({ "unix_timestamp": utc })
-        }
         "os" => serde_json::json!({
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
@@ -156,13 +152,6 @@ fn snapshot(kind: &str) -> Result<serde_json::Value, ToolError> {
     Ok(value)
 }
 
-fn chrono_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 /// Battery state. Linux reads `/sys/class/power_supply` directly;
 /// other platforms report unavailability honestly.
 fn battery_snapshot() -> Option<serde_json::Value> {
@@ -196,6 +185,12 @@ fn battery_snapshot() -> Option<serde_json::Value> {
     }
 }
 
+/// Read-only host-fact tool for one `snapshot` kind. Note: there is
+/// deliberately no `"time"` kind here — `system.time` is owned by the
+/// builtin system pack (`app-host::tooling::SystemToolPack`), which
+/// returns full local/UTC clock facts. Registering another `system.time`
+/// here produced a duplicate tool id every turn (the catalog keeps the
+/// first and warns).
 pub struct SystemInfoTool {
     pub kind: &'static str,
 }
@@ -205,7 +200,6 @@ impl Tool for SystemInfoTool {
     fn metadata(&self) -> ToolMetadata {
         ToolMetadata {
             id: capability_core::ToolId::new(match self.kind {
-                "time" => "system.time",
                 "os" => "system.os",
                 "cpu" => "system.cpu",
                 "memory" => "system.memory",
@@ -356,8 +350,10 @@ impl tool_sdk::ToolPack for SystemToolPack {
     }
 
     fn tools(&self, _ctx: &tool_sdk::ToolLoadContext) -> Vec<Arc<dyn Tool>> {
+        // No `system.time` here by design: the builtin system pack owns
+        // that id (see `SystemInfoTool` docs). Duplicating it produced a
+        // "duplicate tool id" warning on every turn.
         vec![
-            Arc::new(SystemInfoTool { kind: "time" }),
             Arc::new(SystemInfoTool { kind: "os" }),
             Arc::new(SystemInfoTool { kind: "cpu" }),
             Arc::new(SystemInfoTool { kind: "memory" }),
@@ -440,9 +436,14 @@ mod tests {
             "system.process_info",
             "system.processes",
             "system.storage",
-            "system.time",
         ] {
             assert!(ids.contains(&expected.to_string()), "{ids:?}");
         }
+        // `system.time` lives in the builtin system pack, not here:
+        // registering it twice warned on every turn.
+        assert!(
+            !ids.contains(&"system.time".to_string()),
+            "system.time must not duplicate the builtin pack: {ids:?}"
+        );
     }
 }
