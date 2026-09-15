@@ -183,7 +183,10 @@ pub fn tools_for_plugin(plugin: &FsPlugin) -> Vec<Arc<dyn tool_core::Tool>> {
         out.push(Arc::new(super::PatchTool { limits: fs.clone() }));
     }
     if plugin.supports(FsCapability::Write) {
-        out.push(Arc::new(super::WriteTool { limits: fs }));
+        out.push(Arc::new(super::WriteTool {
+            limits: fs,
+            artifacts: None,
+        }));
     }
     out
 }

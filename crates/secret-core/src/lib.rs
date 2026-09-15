@@ -18,6 +18,11 @@ use std::sync::{Arc, Mutex};
 /// Well-known accounts. Services must request exactly the account they
 /// need; the store never hands out more.
 pub const ACCOUNT_MODEL_API_KEY: &str = "model.api_key";
+/// XDG ScreenCast session restore token. The compositor issues it after
+/// the user approves screen sharing; presenting it on later captures
+/// restores the same source without another OS dialog, until the user
+/// revokes the grant in system settings.
+pub const ACCOUNT_PORTAL_RESTORE_TOKEN: &str = "portal.screencast.restore_token";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {

@@ -11,7 +11,7 @@ mod linux {
     use artifact_core::ArtifactStore;
     use ashpd::desktop::{
         remote_desktop::{DeviceType, KeyState, RemoteDesktop},
-        screencast::{CursorMode, Screencast, SourceType},
+        screencast::{CursorMode, Screencast, SourceType, Streams},
         PersistMode, Session,
     };
     use async_trait::async_trait;
@@ -33,6 +33,9 @@ mod linux {
     /// A portal-backed backend is meaningful only in a Wayland session. The
     /// actual portal is still probed when a capture session is started; a
     /// compositor is allowed to reject the request or require a fresh choice.
+    /// Approvals persist: the restore token the compositor issues is kept in
+    /// the OS keychain, so repeat captures restore the approved source
+    /// without another dialog until the user revokes the grant.
     /// The AT-SPI service is supplied by the host so semantic availability is
     /// discovered once and shared with the standalone semantic plugin.
     pub fn plugin_with_atspi(
@@ -95,6 +98,7 @@ mod linux {
                 atspi,
                 remote: Arc::new(tokio::sync::Mutex::new(None)),
                 control_enabled: Arc::new(AtomicBool::new(true)),
+                capture_secrets: Arc::new(Mutex::new(None)),
             }),
         ))
     }
@@ -117,6 +121,10 @@ mod linux {
         atspi: Option<Arc<dyn DesktopBackend>>,
         remote: Arc<tokio::sync::Mutex<Option<PortalRemoteDesktop>>>,
         control_enabled: Arc<AtomicBool>,
+        /// Lazily created secret store for the ScreenCast restore token.
+        /// The OS keychain is touched only when a capture actually
+        /// starts, never at plugin discovery.
+        capture_secrets: Arc<Mutex<Option<Arc<dyn secret_core::SecretStore>>>>,
     }
 
     impl WaylandBackend {
@@ -124,6 +132,45 @@ mod linux {
             DesktopError::BackendUnavailable(format!(
                 "{operation} has no native Wayland implementation in this session"
             ))
+        }
+
+        /// Shared secret store for the ScreenCast restore token, created
+        /// on first capture. `secret_core::system` resolves the OS
+        /// keychain (Secret Service on Linux) and falls back to
+        /// process memory where no keychain exists; either way the
+        /// token survives at least for the life of this backend.
+        ///
+        /// The blocking keychain probe runs on the blocking pool: the
+        /// Linux secret-service client pumps D-Bus through its own
+        /// tokio `block_on`, which panics on an async worker and would
+        /// silently downgrade every capture to a memory-only store.
+        async fn capture_secret_store(&self) -> Arc<dyn secret_core::SecretStore> {
+            {
+                let slot = self
+                    .capture_secrets
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(store) = slot.as_ref() {
+                    return Arc::clone(store);
+                }
+            }
+            let store = tokio::task::spawn_blocking(|| secret_core::system("utsuwa"))
+                .await
+                .unwrap_or_else(|_| {
+                    Arc::new(secret_core::MemoryStore::default())
+                        as Arc<dyn secret_core::SecretStore>
+                });
+            let mut slot = self
+                .capture_secrets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A concurrent capture may have initialized first; prefer the
+            // winner so both agree on one store instance.
+            if let Some(existing) = slot.as_ref() {
+                return Arc::clone(existing);
+            }
+            *slot = Some(Arc::clone(&store));
+            store
         }
 
         fn ensure_control_enabled(&self) -> Result<(), DesktopError> {
@@ -307,14 +354,17 @@ mod linux {
                     "the Wayland portal owns display/window selection; start a Desktop target and choose the exact source in the OS dialog, or use an Xwayland window id explicitly".to_string(),
                 ));
             }
-            let capture = PortalCaptureSession::start(config, artifacts).await?;
+            let secrets = self.capture_secret_store().await;
+            let capture = PortalCaptureSession::start(config, artifacts, Some(secrets)).await?;
             Ok(Box::new(capture))
         }
 
         async fn one_shot_portal(&self, config: CaptureConfig) -> Result<Screenshot, DesktopError> {
             let store: Arc<dyn ArtifactStore> =
                 Arc::new(artifact_core::InMemoryArtifactStore::new());
-            let mut session = PortalCaptureSession::start(config, store.clone()).await?;
+            let secrets = self.capture_secret_store().await;
+            let mut session =
+                PortalCaptureSession::start(config, store.clone(), Some(secrets)).await?;
             let frame = session.next_frame().await?;
             let bytes = store
                 .get(&frame.image.artifact.id)
@@ -841,10 +891,92 @@ mod linux {
         stopped: bool,
     }
 
+    /// Best-effort restore-token persistence. Every keychain failure
+    /// degrades to the pre-token behavior (the OS dialog appears); a
+    /// broken or locked secret store must never break screen capture.
+    /// Each call runs on the blocking pool for the same reason as
+    /// [`WaylandBackend::capture_secret_store`]: the sync secret API
+    /// would panic on an async worker.
+    async fn load_restore_token(store: &Arc<dyn secret_core::SecretStore>) -> Option<String> {
+        let store = Arc::clone(store);
+        tokio::task::spawn_blocking(move || {
+            store
+                .get(secret_core::ACCOUNT_PORTAL_RESTORE_TOKEN)
+                .ok()
+                .flatten()
+                .filter(|token| !token.is_empty())
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    async fn store_restore_token(store: &Arc<dyn secret_core::SecretStore>, token: &str) {
+        if token.is_empty() {
+            return;
+        }
+        let store = Arc::clone(store);
+        let token = token.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            store.set(secret_core::ACCOUNT_PORTAL_RESTORE_TOKEN, &token)
+        })
+        .await;
+    }
+
+    async fn clear_restore_token(store: &Arc<dyn secret_core::SecretStore>) {
+        let store = Arc::clone(store);
+        let _ = tokio::task::spawn_blocking(move || {
+            store.delete(secret_core::ACCOUNT_PORTAL_RESTORE_TOKEN)
+        })
+        .await;
+    }
+
+    /// One source-selection plus approval round trip against the
+    /// ScreenCast portal. With a valid restore token the compositor
+    /// re-selects the previously approved source silently; without one
+    /// (or with a stale one the compositor rejects) the OS dialog
+    /// appears. `ExplicitlyRevoked` asks the compositor to keep the
+    /// grant until the user revokes it in system settings.
+    async fn negotiate_source(
+        proxy: &Screencast<'static>,
+        session: &Session<'static, Screencast<'static>>,
+        cursor: CursorMode,
+        restore_token: Option<&str>,
+    ) -> Result<Streams, DesktopError> {
+        proxy
+            .select_sources(
+                session,
+                cursor,
+                SourceType::Monitor | SourceType::Window,
+                false,
+                restore_token,
+                PersistMode::ExplicitlyRevoked,
+            )
+            .await
+            .map_err(|error| {
+                DesktopError::BackendUnavailable(format!("select portal source: {error}"))
+            })?
+            .response()
+            .map_err(|error| {
+                DesktopError::BackendUnavailable(format!("portal source selection: {error}"))
+            })?;
+        proxy
+            .start(session, None)
+            .await
+            .map_err(|error| {
+                DesktopError::BackendUnavailable(format!("start portal capture: {error}"))
+            })?
+            .response()
+            .map_err(|error| {
+                DesktopError::BackendUnavailable(format!("portal capture approval: {error}"))
+            })
+    }
+
     impl PortalCaptureSession {
         async fn start(
             config: CaptureConfig,
             artifacts: Arc<dyn ArtifactStore>,
+            secrets: Option<Arc<dyn secret_core::SecretStore>>,
         ) -> Result<Self, DesktopError> {
             let proxy: Screencast<'static> = Screencast::new().await.map_err(|error| {
                 DesktopError::BackendUnavailable(format!("ScreenCast portal: {error}"))
@@ -858,42 +990,29 @@ mod linux {
             } else {
                 CursorMode::Hidden
             };
-            // Both steps wait on the OS screen-share dialog, which the user may
-            // never answer. Bound the whole negotiation so an unanswered
-            // dialog fails the tool call with an actionable error instead
-            // of hanging the agent turn forever.
+            // The first attempt presents the stored restore token, if any,
+            // so repeat captures skip the OS dialog. A stale or revoked
+            // token fails the attempt; it is dropped and the negotiation
+            // retries once as a fresh interactive selection, which shows
+            // the dialog again. Both attempts wait on a dialog the user
+            // may never answer, so the whole negotiation stays bounded:
+            // an unanswered dialog fails the tool call with an actionable
+            // error instead of hanging the agent turn forever.
+            let restore_token = match secrets.as_ref() {
+                Some(store) => load_restore_token(store).await,
+                None => None,
+            };
             let negotiation = async {
-                proxy
-                    .select_sources(
-                        &session,
-                        cursor,
-                        SourceType::Monitor | SourceType::Window,
-                        false,
-                        None,
-                        PersistMode::DoNot,
-                    )
-                    .await
-                    .map_err(|error| {
-                        DesktopError::BackendUnavailable(format!("select portal source: {error}"))
-                    })?
-                    .response()
-                    .map_err(|error| {
-                        DesktopError::BackendUnavailable(format!(
-                            "portal source selection: {error}"
-                        ))
-                    })?;
-                proxy
-                    .start(&session, None)
-                    .await
-                    .map_err(|error| {
-                        DesktopError::BackendUnavailable(format!("start portal capture: {error}"))
-                    })?
-                    .response()
-                    .map_err(|error| {
-                        DesktopError::BackendUnavailable(format!(
-                            "portal capture approval: {error}"
-                        ))
-                    })
+                match negotiate_source(&proxy, &session, cursor, restore_token.as_deref()).await {
+                    Ok(streams) => Ok(streams),
+                    Err(_) if restore_token.is_some() => {
+                        if let Some(store) = secrets.as_ref() {
+                            clear_restore_token(store).await;
+                        }
+                        negotiate_source(&proxy, &session, cursor, None).await
+                    }
+                    Err(first) => Err(first),
+                }
             };
             let response = match tokio::time::timeout(PORTAL_APPROVAL_TIMEOUT, negotiation).await {
                 Ok(Ok(response)) => response,
@@ -906,6 +1025,13 @@ mod linux {
                     )));
                 }
             };
+            // Persist the fresh grant before consuming the stream: the next
+            // capture restores silently. Compositors that do not implement
+            // restore return no token, which keeps the old ask-every-time
+            // behavior without any special casing here.
+            if let (Some(store), Some(token)) = (secrets.as_ref(), response.restore_token()) {
+                store_restore_token(store, token).await;
+            }
             let stream = response.streams().first().ok_or_else(|| {
                 DesktopError::BackendUnavailable("portal returned no capture stream".to_string())
             })?;
@@ -1571,6 +1697,53 @@ mod linux {
                 _ => panic!("expected the frame after the error cleared"),
             }
             assert!(matches!(slot.take(), SlotTake::Empty));
+        }
+
+        fn memory_secrets() -> Arc<dyn secret_core::SecretStore> {
+            Arc::new(secret_core::MemoryStore::default())
+        }
+
+        #[tokio::test]
+        async fn restore_token_round_trip_through_secret_store() {
+            let store = memory_secrets();
+            assert_eq!(load_restore_token(&store).await, None);
+            store_restore_token(&store, "token-1").await;
+            assert_eq!(load_restore_token(&store).await.as_deref(), Some("token-1"));
+            store_restore_token(&store, "token-2").await;
+            assert_eq!(load_restore_token(&store).await.as_deref(), Some("token-2"));
+            clear_restore_token(&store).await;
+            assert_eq!(load_restore_token(&store).await, None);
+        }
+
+        #[tokio::test]
+        async fn restore_token_helpers_ignore_empty_and_broken_backends() {
+            struct FailingStore;
+            impl secret_core::SecretStore for FailingStore {
+                fn get(&self, _account: &str) -> Result<Option<String>, secret_core::SecretError> {
+                    Err(secret_core::SecretError::Backend("locked".to_string()))
+                }
+                fn set(
+                    &self,
+                    _account: &str,
+                    _secret: &str,
+                ) -> Result<(), secret_core::SecretError> {
+                    Err(secret_core::SecretError::Backend("locked".to_string()))
+                }
+                fn delete(&self, _account: &str) -> Result<(), secret_core::SecretError> {
+                    Err(secret_core::SecretError::Backend("locked".to_string()))
+                }
+            }
+            // Empty tokens are never persisted or returned: presenting an
+            // empty restore token would be a corrupt negotiation.
+            let store = memory_secrets();
+            store_restore_token(&store, "").await;
+            assert_eq!(load_restore_token(&store).await, None);
+            // A locked or missing keychain degrades to ask-every-time; it
+            // must never panic or poison the capture path.
+            let broken: Arc<dyn secret_core::SecretStore> = Arc::new(FailingStore);
+            assert_eq!(load_restore_token(&broken).await, None);
+            store_restore_token(&broken, "token-1").await;
+            clear_restore_token(&broken).await;
         }
     }
 }

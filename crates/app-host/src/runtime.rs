@@ -993,10 +993,13 @@ impl AgentRuntime {
         let catalog = ToolCatalog::new()
             .with_pack(SystemToolPack::new(environment))
             .with_pack(ProcessToolPack::new(processes))
-            .with_required_pack(tool_filesystem_host::HostFilesystemPack::new(
-                host_environment.clone(),
-                file_context,
-            ))
+            .with_required_pack(
+                tool_filesystem_host::HostFilesystemPack::new(
+                    host_environment.clone(),
+                    file_context,
+                )
+                .with_artifacts(self.artifacts.clone()),
+            )
             // Local-machine packs: each tool enforces its own capability
             // tickets; the profile only controls model visibility.
             .with_pack(tool_http::HttpToolPack::with_artifacts(

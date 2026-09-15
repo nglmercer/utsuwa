@@ -19,9 +19,10 @@ impl CreateUserFileTool {
     pub(crate) fn new(
         limits: tool_filesystem::FilesystemLimits,
         environment: HostEnvironment,
+        artifacts: Option<std::sync::Arc<dyn artifact_core::ArtifactStore>>,
     ) -> Self {
         Self {
-            inner: WriteTool { limits },
+            inner: WriteTool { limits, artifacts },
             environment,
         }
     }
@@ -31,7 +32,7 @@ impl CreateUserFileTool {
         limits: tool_filesystem::FilesystemLimits,
         environment: HostEnvironment,
     ) -> Self {
-        Self::new(limits, environment)
+        Self::new(limits, environment, None)
     }
 }
 

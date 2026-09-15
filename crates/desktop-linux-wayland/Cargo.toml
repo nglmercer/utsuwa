@@ -9,6 +9,7 @@ artifact-core.workspace = true
 ashpd.workspace = true
 async-trait.workspace = true
 pipewire.workspace = true
+secret-core.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

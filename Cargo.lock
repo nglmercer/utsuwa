@@ -1761,6 +1761,7 @@ dependencies = [
  "desktop-linux",
  "desktop-linux-atspi",
  "pipewire",
+ "secret-core",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
@@ -6517,6 +6518,7 @@ dependencies = [
 name = "tool-filesystem"
 version = "0.1.0"
 dependencies = [
+ "artifact-core",
  "async-trait",
  "capability-core",
  "serde",
@@ -6531,6 +6533,7 @@ dependencies = [
 name = "tool-filesystem-host"
 version = "0.1.0"
 dependencies = [
+ "artifact-core",
  "async-trait",
  "capability-core",
  "chrono",

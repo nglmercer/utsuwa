@@ -28,6 +28,7 @@ use tool_sdk::{ToolLoadContext, ToolPack};
 pub struct HostFilesystemPack {
     pub environment: HostEnvironment,
     pub file_context: Option<Arc<Mutex<ConversationFileContext>>>,
+    artifacts: Option<Arc<dyn artifact_core::ArtifactStore>>,
 }
 
 impl HostFilesystemPack {
@@ -38,7 +39,16 @@ impl HostFilesystemPack {
         Self {
             environment,
             file_context,
+            artifacts: None,
         }
+    }
+
+    /// Wire the artifact store so `filesystem.write` (and the user-file
+    /// write tools) can export artifact bytes via `artifact_id`.
+    /// Without it, artifact export fails with an explicit error.
+    pub fn with_artifacts(mut self, artifacts: Arc<dyn artifact_core::ArtifactStore>) -> Self {
+        self.artifacts = Some(artifacts);
+        self
     }
 }
 
@@ -50,6 +60,7 @@ impl ToolPack for HostFilesystemPack {
     fn tools(&self, ctx: &ToolLoadContext) -> Vec<Arc<dyn tool_core::Tool>> {
         let host_environment = self.environment.clone();
         let file_context = self.file_context.clone();
+        let artifacts = self.artifacts.clone();
         let mut fs_plugins = tool_filesystem::plugin::FsPluginRegistry::new();
         fs_plugins.register(tool_filesystem::plugin::FsPlugin::local());
         let selected_fs = fs_plugins.select();
@@ -129,6 +140,7 @@ impl ToolPack for HostFilesystemPack {
                     plugin.limits.clone(),
                     host_environment.clone(),
                     file_context,
+                    artifacts.clone(),
                 )));
             }
             if plugin.supports(tool_filesystem::plugin::FsCapability::Write) {
@@ -139,27 +151,33 @@ impl ToolPack for HostFilesystemPack {
                     tools[index] = Arc::new(HostAwareWriteTool::new(
                         plugin.limits.clone(),
                         host_environment.clone(),
+                        artifacts.clone(),
                     ));
                 }
                 tools.push(Arc::new(CreateUserFileTool::new(
                     plugin.limits.clone(),
                     host_environment.clone(),
+                    artifacts.clone(),
                 )));
                 tools.push(Arc::new(UserDirectoryWriteTool::new(
                     plugin.limits.clone(),
                     host_environment.clone(),
+                    artifacts.clone(),
                 )));
                 tools.push(Arc::new(ReplaceUserFileTool::new(
                     plugin.limits.clone(),
                     host_environment.clone(),
+                    artifacts.clone(),
                 )));
                 tools.push(Arc::new(AppendUserFileTool::new(
                     plugin.limits.clone(),
                     host_environment.clone(),
+                    artifacts.clone(),
                 )));
                 tools.push(Arc::new(AppendFileTool::new(
                     plugin.limits.clone(),
                     host_environment.clone(),
+                    artifacts.clone(),
                 )));
             }
         }

@@ -20,9 +20,10 @@ impl HostAwareWriteTool {
     pub(crate) fn new(
         limits: tool_filesystem::FilesystemLimits,
         environment: HostEnvironment,
+        artifacts: Option<std::sync::Arc<dyn artifact_core::ArtifactStore>>,
     ) -> Self {
         Self {
-            inner: WriteTool { limits },
+            inner: WriteTool { limits, artifacts },
             environment,
         }
     }

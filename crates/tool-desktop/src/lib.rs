@@ -1917,7 +1917,7 @@ pub mod tools {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: capability_core::ToolId::new(Self::TOOL),
-                description: "Capture a PNG screenshot (whole desktop or one window). Vision fallback — accessibility actions come first.".to_string(),
+                description: "Capture a PNG screenshot (whole desktop or one window). Vision fallback — accessibility actions come first. The returned artifact_id can be saved to disk with filesystem.write.".to_string(),
                 input_schema: serde_json::json!({
                     "additionalProperties": false,
                     "type": "object",
@@ -2002,7 +2002,8 @@ pub mod tools {
                 .unwrap_or_default();
             Ok(ToolOutput::multipart(
                 serde_json::json!({
-                    "capture_id": artifact.id,
+                    "capture_id": artifact.id.clone(),
+                    "artifact_id": artifact.id,
                     "width": shot.width,
                     "height": shot.height,
                     "display_id": display_id,
@@ -3146,7 +3147,8 @@ pub mod tools {
                 "timestamp_ms": frame.timestamp_ms,
                 "width": frame.width,
                 "height": frame.height,
-                "capture_id": frame.image.artifact.id,
+                "capture_id": frame.image.artifact.id.clone(),
+                "artifact_id": frame.image.artifact.id.clone(),
             });
             Ok(ToolOutput::multipart(
                 metadata,
@@ -3268,7 +3270,7 @@ pub mod tools {
         fn metadata(&self) -> ToolMetadata {
             ToolMetadata {
                 id: capability_core::ToolId::new("desktop.observe"),
-                description: "Observe the current desktop state: one fresh accessibility snapshot plus, with include_image, exactly one fresh sampled image. The image reuses the single active Share Screen session when one exists, else falls back to one screenshot; pass session_id only to choose among several active sessions. One frame per call — never a stream.".to_string(),
+                description: "Observe the current desktop state: one fresh accessibility snapshot plus, with include_image, exactly one fresh sampled image. The image reuses the single active Share Screen session when one exists, else falls back to one screenshot; pass session_id only to choose among several active sessions. One frame per call — never a stream. The image's artifact_id can be saved to disk with filesystem.write.".to_string(),
                 input_schema: serde_json::json!({
                     "type":"object",
                     "additionalProperties":false,
@@ -3412,6 +3414,8 @@ pub mod tools {
                         if let Some(frame) = observation.frame {
                             content["image_source"] =
                                 serde_json::Value::String("capture_session".to_string());
+                            content["artifact_id"] =
+                                serde_json::Value::String(frame.image.artifact.id.0.clone());
                             content["frame_id"] = serde_json::json!(frame.frame_id);
                             content["timestamp_ms"] = serde_json::json!(frame.timestamp_ms);
                             content["width"] = serde_json::json!(frame.width);
@@ -3447,9 +3451,11 @@ pub mod tools {
                             )
                             .await
                             .map_err(|error| artifact_failed("desktop.observe", error))?;
-                        let image = ImageArtifactRef::new(artifact, shot.width, shot.height);
+                        let image =
+                            ImageArtifactRef::new(artifact.clone(), shot.width, shot.height);
                         content["image_source"] =
                             serde_json::Value::String("screenshot".to_string());
+                        content["artifact_id"] = serde_json::Value::String(artifact.id.0.clone());
                         content["width"] = serde_json::json!(shot.width);
                         content["height"] = serde_json::json!(shot.height);
                         return Ok(ToolOutput::multipart(
@@ -4509,9 +4515,13 @@ mod tests {
             .unwrap();
         assert_eq!(out.content["width"], 2);
         assert!(out.content.get("capture_id").is_some());
+        // Canonical id for filesystem.write export, matching media frames.
+        let artifact_id = out.content["artifact_id"].as_str().unwrap();
+        assert!(!artifact_id.is_empty());
         assert!(matches!(
             out.parts.first(),
-            Some(artifact_core::ContentPart::Image(_))
+            Some(artifact_core::ContentPart::Image(image))
+            if image.artifact.id.0 == artifact_id
         ));
     }
 
@@ -4779,9 +4789,13 @@ mod tests {
         let output = tool.invoke(ctx, args).await.unwrap();
         assert_eq!(output.content["image_source"], "capture_session");
         assert!(output.content.get("frame_id").is_some());
+        // The frame's bytes are referenceable for filesystem.write export.
+        let artifact_id = output.content["artifact_id"].as_str().unwrap();
+        assert!(!artifact_id.is_empty());
         assert!(matches!(
             output.parts.first(),
-            Some(artifact_core::ContentPart::Image(_))
+            Some(artifact_core::ContentPart::Image(image))
+            if image.artifact.id.0 == artifact_id
         ));
         // The session-scoped ticket keeps working for the same call.
         let ctx = observe_ctx_with(
@@ -4819,9 +4833,12 @@ mod tests {
         assert_eq!(output.content["image_source"], "screenshot");
         assert_eq!(output.content["width"], 2);
         assert_eq!(output.content["height"], 2);
+        let artifact_id = output.content["artifact_id"].as_str().unwrap();
+        assert!(!artifact_id.is_empty());
         assert!(matches!(
             output.parts.first(),
-            Some(artifact_core::ContentPart::Image(_))
+            Some(artifact_core::ContentPart::Image(image))
+            if image.artifact.id.0 == artifact_id
         ));
     }
 

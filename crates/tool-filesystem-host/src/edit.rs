@@ -45,19 +45,24 @@ impl EditTool {
         limits: tool_filesystem::FilesystemLimits,
         environment: HostEnvironment,
     ) -> Self {
-        Self::new_with_context(limits, environment, None)
+        Self::new_with_context(limits, environment, None, None)
     }
 
     pub(crate) fn new_with_context(
         limits: tool_filesystem::FilesystemLimits,
         environment: HostEnvironment,
         active_context: Option<Arc<Mutex<ConversationFileContext>>>,
+        artifacts: Option<std::sync::Arc<dyn artifact_core::ArtifactStore>>,
     ) -> Self {
         Self {
             user_file: EditUserFileTool::new(limits.clone(), environment.clone()),
             file: EditFileTool::new(limits.clone(), environment.clone()),
-            append_user_file: AppendUserFileTool::new(limits.clone(), environment.clone()),
-            append_file: AppendFileTool::new(limits, environment),
+            append_user_file: AppendUserFileTool::new(
+                limits.clone(),
+                environment.clone(),
+                artifacts.clone(),
+            ),
+            append_file: AppendFileTool::new(limits, environment, artifacts),
             pending_edit: Arc::new(Mutex::new(None)),
             active_context,
         }

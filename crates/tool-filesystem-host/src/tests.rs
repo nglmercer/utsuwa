@@ -753,6 +753,7 @@ async fn replace_user_file_replaces_whole_contents_but_never_creates() {
     let tool = ReplaceUserFileTool::new(
         tool_filesystem::FilesystemLimits::default(),
         environment(&home, &desktop),
+        None,
     );
     let output = tool
         .invoke(
@@ -796,6 +797,7 @@ async fn append_user_file_appends_without_reproducing_the_file() {
     let tool = AppendUserFileTool::new(
         tool_filesystem::FilesystemLimits::default(),
         environment(&home, &desktop),
+        None,
     );
     let output = tool
         .invoke(
@@ -841,6 +843,7 @@ async fn append_file_appends_at_an_arbitrary_absolute_path() {
     let tool = AppendFileTool::new(
         tool_filesystem::FilesystemLimits::default(),
         environment(&dir, &dir.join("Escritorio")),
+        None,
     );
     let output = tool
         .invoke(
@@ -1208,6 +1211,7 @@ async fn append_file_normalizes_a_stale_conventional_path() {
     let tool = AppendFileTool::new(
         tool_filesystem::FilesystemLimits::default(),
         environment(&home, &desktop),
+        None,
     );
     let requirement = tool
         .required_capability(&serde_json::json!({
@@ -1254,6 +1258,7 @@ async fn append_file_keeps_explicit_path_when_conventional_parent_exists() {
     let tool = AppendFileTool::new(
         tool_filesystem::FilesystemLimits::default(),
         environment(&home, &desktop),
+        None,
     );
     tool.invoke(
         ticketed_context(&conventional),
@@ -1283,6 +1288,7 @@ async fn host_aware_write_normalizes_a_stale_conventional_path() {
     let tool = HostAwareWriteTool::new(
         tool_filesystem::FilesystemLimits::default(),
         environment(&home, &desktop),
+        None,
     );
     let requirement = tool
         .required_capability(&serde_json::json!({
@@ -1325,6 +1331,7 @@ async fn host_aware_write_keeps_explicit_path_when_both_directories_exist() {
     let tool = HostAwareWriteTool::new(
         tool_filesystem::FilesystemLimits::default(),
         environment(&home, &desktop),
+        None,
     );
     tool.invoke(
         ticketed_context(&conventional),
@@ -1500,6 +1507,7 @@ async fn unified_edit_uses_active_file_context_for_a_targetless_follow_up() {
         tool_filesystem::FilesystemLimits::default(),
         environment(&home, &desktop),
         Some(context),
+        None,
     );
     let output = tool
         .invoke(
@@ -1532,6 +1540,7 @@ async fn failed_explicit_target_does_not_replace_the_active_file() {
         tool_filesystem::FilesystemLimits::default(),
         environment(&home, &desktop),
         Some(Arc::clone(&context)),
+        None,
     );
     let failed = tool
         .invoke(
@@ -2393,5 +2402,33 @@ async fn read_on_directory_still_rejected_as_retryable() {
         .unwrap_err();
     assert!(matches!(error, ToolError::Filesystem { .. }));
     assert!(error.model_message().contains("directory"));
+    std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[tokio::test]
+async fn host_write_exports_artifact_bytes_when_store_is_wired() {
+    let (home, desktop) = stale_home("utsuwa-host-artifact-export");
+    let store: Arc<dyn artifact_core::ArtifactStore> =
+        Arc::new(artifact_core::InMemoryArtifactStore::new());
+    let bytes = vec![0x89, b'P', b'N', b'G', 0x00, 0xFF];
+    let artifact = store.put("image/png", bytes.clone()).await.unwrap();
+    let tool = HostAwareWriteTool::new(
+        tool_filesystem::FilesystemLimits::default(),
+        environment(&home, &desktop),
+        Some(store),
+    );
+    let target = desktop.join("shot.png");
+    let output = tool
+        .invoke(
+            ticketed_context(&target),
+            serde_json::json!({
+                "path": target.to_string_lossy(),
+                "artifact_id": artifact.id.0,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), bytes);
+    assert_eq!(output.content["artifact_id"], artifact.id.0);
     std::fs::remove_dir_all(&home).unwrap();
 }

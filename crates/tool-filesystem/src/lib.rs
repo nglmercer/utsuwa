@@ -22,6 +22,10 @@ pub struct FilesystemLimits {
     pub max_list_entries: usize,
     /// Largest single `filesystem.write` payload.
     pub max_write_bytes: usize,
+    /// Largest artifact (screenshot, video frame, …) exportable to disk
+    /// via `filesystem.write`'s `artifact_id` argument. Matches the
+    /// artifact store's own per-item cap.
+    pub max_artifact_write_bytes: usize,
 }
 
 impl Default for FilesystemLimits {
@@ -30,6 +34,7 @@ impl Default for FilesystemLimits {
             max_read_bytes: 256 * 1024,
             max_list_entries: 500,
             max_write_bytes: 256 * 1024,
+            max_artifact_write_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -1015,6 +1020,10 @@ impl tool_core::Tool for PatchTool {
 
 pub struct WriteTool {
     pub limits: FilesystemLimits,
+    /// Artifact store for the `artifact_id` argument (screenshots, video
+    /// frames, …). `None` where no store is wired: artifact export then
+    /// fails with an explicit error instead of silently misbehaving.
+    pub artifacts: Option<std::sync::Arc<dyn artifact_core::ArtifactStore>>,
 }
 
 fn create_parents_arg(args: &serde_json::Value) -> Result<bool, ToolError> {
@@ -1032,7 +1041,7 @@ impl tool_core::Tool for WriteTool {
     fn metadata(&self) -> tool_core::ToolMetadata {
         tool_core::ToolMetadata {
             id: capability_core::ToolId::new("filesystem.write"),
-            description: "Write a UTF-8 file to an absolute host-native path inside the granted scope (capped). The parent directory must already exist unless create_parents=true. For Desktop, Documents, Downloads, and other special directories, use the exact paths supplied by system.environment or host_environment; never guess or translate those directory names. Symlinks are never followed for the target.".to_string(),
+            description: "Write a file to an absolute host-native path inside the granted scope (capped): UTF-8 text via 'content', or the exact bytes of a screenshot/video-frame artifact via 'artifact_id' (use the artifact_id from desktop.screenshot, desktop.observe, or media.* outputs). Exactly one of content/artifact_id is required. The parent directory must already exist unless create_parents=true. For Desktop, Documents, Downloads, and other special directories, use the exact paths supplied by system.environment or host_environment; never guess or translate those directory names. Symlinks are never followed for the target.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1042,7 +1051,11 @@ impl tool_core::Tool for WriteTool {
                     },
                     "content": {
                         "type": "string",
-                        "description": "UTF-8 file contents."
+                        "description": "UTF-8 file contents. Mutually exclusive with artifact_id."
+                    },
+                    "artifact_id": {
+                        "type": "string",
+                        "description": "Artifact id from a previous screenshot/observe/media result; writes its exact bytes (e.g. PNG) to path. Mutually exclusive with content."
                     },
                     "create_parents": {
                         "type": "boolean",
@@ -1050,7 +1063,7 @@ impl tool_core::Tool for WriteTool {
                         "description": "Explicitly create missing parent directories recursively. Omit or set false to require an existing parent directory."
                     },
                 },
-                "required": ["path", "content"],
+                "required": ["path"],
             }),
             effects: vec![tool_core::ToolEffect::FilesystemWrite],
         }
@@ -1065,22 +1078,69 @@ impl tool_core::Tool for WriteTool {
         ctx: ToolContext,
         args: serde_json::Value,
     ) -> Result<ToolOutput, ToolError> {
-        let content = args
-            .get("content")
+        let content = args.get("content").and_then(|v| v.as_str());
+        let artifact_id = args
+            .get("artifact_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidArgs {
-                tool: "filesystem".to_string(),
-                message: "missing string 'content' argument".to_string(),
-            })?;
-        if content.len() > self.limits.max_write_bytes {
-            return Err(ToolError::InvalidArgs {
-                tool: "filesystem".to_string(),
-                message: format!(
-                    "content exceeds the {} byte limit",
-                    self.limits.max_write_bytes
-                ),
-            });
-        }
+            .filter(|id| !id.trim().is_empty());
+        // Exactly one payload source: inline text or a stored artifact's
+        // exact bytes (screenshots, video frames). Binary artifacts bypass
+        // UTF-8 entirely — this is the cross-platform save path that needs
+        // no external screenshot program.
+        let (bytes, from_artifact): (Vec<u8>, Option<String>) = match (content, artifact_id) {
+            (Some(_), Some(_)) => {
+                return Err(ToolError::InvalidArgs {
+                    tool: "filesystem".to_string(),
+                    message: "'content' and 'artifact_id' are mutually exclusive".to_string(),
+                })
+            }
+            (None, None) => {
+                return Err(ToolError::InvalidArgs {
+                    tool: "filesystem".to_string(),
+                    message: "either string 'content' or 'artifact_id' is required".to_string(),
+                })
+            }
+            (Some(text), None) => {
+                if text.len() > self.limits.max_write_bytes {
+                    return Err(ToolError::InvalidArgs {
+                        tool: "filesystem".to_string(),
+                        message: format!(
+                            "content exceeds the {} byte limit",
+                            self.limits.max_write_bytes
+                        ),
+                    });
+                }
+                (text.as_bytes().to_vec(), None)
+            }
+            (None, Some(id)) => {
+                let store = self.artifacts.as_ref().ok_or_else(|| {
+                    failed("artifact export is unavailable: no artifact store is wired")
+                })?;
+                let bytes = store
+                    .get(&artifact_core::ArtifactId::new(id))
+                    .await
+                    .map_err(|error| match error {
+                        artifact_core::ArtifactError::NotFound(_) => ToolError::structured(
+                            "filesystem",
+                            "artifact_not_found",
+                            format!(
+                                "artifact '{id}' is unknown or expired; re-capture it and retry"
+                            ),
+                        ),
+                        other => failed(format!("cannot resolve artifact '{id}': {other}")),
+                    })?;
+                if bytes.len() > self.limits.max_artifact_write_bytes {
+                    return Err(ToolError::InvalidArgs {
+                        tool: "filesystem".to_string(),
+                        message: format!(
+                            "artifact exceeds the {} byte export limit",
+                            self.limits.max_artifact_write_bytes
+                        ),
+                    });
+                }
+                (bytes, Some(id.to_string()))
+            }
+        };
         let create_parents = create_parents_arg(&args)?;
         let (path, created) = authorized_write_path(
             &ctx,
@@ -1108,15 +1168,23 @@ impl tool_core::Tool for WriteTool {
                 parent_created = true;
             }
         }
-        std::fs::write(&path, content.as_bytes()).map_err(|e| failed(e.to_string()))?;
-        let after_hash = sha256_hex(content.as_bytes());
+        std::fs::write(&path, &bytes).map_err(|e| failed(e.to_string()))?;
+        let after_hash = sha256_hex(&bytes);
         let mut result = serde_json::json!({
             "path": path.to_string_lossy(),
             "created": created,
             "parent_created": parent_created,
-            "bytes": content.len(),
+            "bytes": bytes.len(),
             "hash": after_hash,
         });
+        if let Some(artifact_id) = from_artifact {
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "artifact_id".to_string(),
+                    serde_json::Value::String(artifact_id),
+                );
+            }
+        }
         if let Some(object) = result.as_object_mut() {
             if let Some(metadata) = file_metadata(&path).as_object() {
                 object.extend(metadata.clone());
@@ -1632,6 +1700,7 @@ mod tests {
         let dir = TestDir::create();
         let write = WriteTool {
             limits: FilesystemLimits::default(),
+            artifacts: None,
         };
         let target = dir.0.join("note.txt");
         let out = write
@@ -1657,6 +1726,7 @@ mod tests {
         let dir = TestDir::create();
         let write = WriteTool {
             limits: FilesystemLimits::default(),
+            artifacts: None,
         };
         let missing_parent = dir.0.join("Desktop");
         let target = missing_parent.join("hello.txt");
@@ -1686,6 +1756,7 @@ mod tests {
         let dir = TestDir::create();
         let write = WriteTool {
             limits: FilesystemLimits::default(),
+            artifacts: None,
         };
         let parent = dir.0.join("new").join("nested");
         let target = parent.join("note.txt");
@@ -1711,6 +1782,7 @@ mod tests {
         let dir = TestDir::create();
         let write = WriteTool {
             limits: FilesystemLimits::default(),
+            artifacts: None,
         };
         let parent = dir.0.join("new").join("nested");
         let target = parent.join("note.txt");
@@ -1737,6 +1809,7 @@ mod tests {
         let dir = TestDir::create();
         let write = WriteTool {
             limits: FilesystemLimits::default(),
+            artifacts: None,
         };
         let target = dir.0.join("planned.txt");
         let out = write
@@ -1755,6 +1828,7 @@ mod tests {
         let dir = TestDir::create();
         let write = WriteTool {
             limits: FilesystemLimits::default(),
+            artifacts: None,
         };
         let file = dir.0.join("hello.txt");
         let out = write
@@ -1778,6 +1852,7 @@ mod tests {
         let dir = TestDir::create();
         let write = WriteTool {
             limits: FilesystemLimits::default(),
+            artifacts: None,
         };
         // `..` escapes the granted tree.
         let err = write
@@ -1830,6 +1905,111 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::Denied { .. }), "{err:?}");
         assert!(!dir.0.join("nope").exists());
+    }
+
+    #[tokio::test]
+    async fn write_exports_artifact_bytes_verbatim() {
+        let dir = TestDir::create();
+        let store: std::sync::Arc<dyn artifact_core::ArtifactStore> =
+            std::sync::Arc::new(artifact_core::InMemoryArtifactStore::new());
+        // Invalid UTF-8 on purpose: artifact export must be byte-exact,
+        // not text-decoded.
+        let png = vec![0x89, b'P', b'N', b'G', 0xFF, 0xFE, 0x00, 0x01];
+        let artifact = store.put("image/png", png.clone()).await.unwrap();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+            artifacts: Some(store),
+        };
+        let target = dir.0.join("shot.png");
+        let out = write
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": target.to_string_lossy(), "artifact_id": artifact.id.0}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), png);
+        assert_eq!(out.content["artifact_id"], artifact.id.0);
+        assert_eq!(out.content["bytes"], png.len());
+        let evidence = out.mutation.as_ref().expect("export attaches evidence");
+        assert_eq!(
+            evidence.after_sha256.as_deref(),
+            out.content["hash"].as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn write_rejects_ambiguous_or_missing_payload() {
+        let dir = TestDir::create();
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+            artifacts: None,
+        };
+        let target = dir.0.join("note.txt").to_string_lossy().to_string();
+        for args in [
+            serde_json::json!({"path": target}),
+            serde_json::json!({"path": target, "content": "x", "artifact_id": "a"}),
+            serde_json::json!({"path": target, "artifact_id": "  "}),
+        ] {
+            let err = write.invoke(write_ctx(&dir.0), args).await.unwrap_err();
+            assert!(matches!(err, ToolError::InvalidArgs { .. }), "{err:?}");
+        }
+        assert!(!dir.0.join("note.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_export_fails_closed() {
+        let dir = TestDir::create();
+        let target = dir.0.join("shot.png").to_string_lossy().to_string();
+        // Unknown (or expired — same error) artifact id.
+        let store: std::sync::Arc<dyn artifact_core::ArtifactStore> =
+            std::sync::Arc::new(artifact_core::InMemoryArtifactStore::new());
+        let write = WriteTool {
+            limits: FilesystemLimits::default(),
+            artifacts: Some(store),
+        };
+        let err = write
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": target, "artifact_id": "ghost"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some("artifact_not_found"), "{err:?}");
+        assert!(!dir.0.join("shot.png").exists());
+        // No store wired at all: explicit error, not a panic or a write.
+        let unwired = WriteTool {
+            limits: FilesystemLimits::default(),
+            artifacts: None,
+        };
+        let err = unwired
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": target, "artifact_id": "ghost"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("no artifact store"), "{err:?}");
+        // Oversized artifacts never reach the backend.
+        let store: std::sync::Arc<dyn artifact_core::ArtifactStore> =
+            std::sync::Arc::new(artifact_core::InMemoryArtifactStore::new());
+        let big = store.put("image/png", vec![0u8; 8]).await.unwrap();
+        let tiny = WriteTool {
+            limits: FilesystemLimits {
+                max_artifact_write_bytes: 4,
+                ..FilesystemLimits::default()
+            },
+            artifacts: Some(store),
+        };
+        let err = tiny
+            .invoke(
+                write_ctx(&dir.0),
+                serde_json::json!({"path": target, "artifact_id": big.id.0}),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArgs { .. }), "{err:?}");
+        assert!(!dir.0.join("shot.png").exists());
     }
 
     #[tokio::test]

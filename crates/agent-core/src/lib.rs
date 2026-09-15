@@ -2690,6 +2690,7 @@ mod tests {
         registry
             .register(Arc::new(tool_filesystem::WriteTool {
                 limits: tool_filesystem::FilesystemLimits::default(),
+                artifacts: None,
             }))
             .unwrap();
         let grant = policy_core::GrantedScope::new(

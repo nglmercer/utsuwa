@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+artifact-core.workspace = true
 async-trait.workspace = true
 capability-core.workspace = true
 chrono.workspace = true
