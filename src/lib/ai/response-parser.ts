@@ -1,9 +1,24 @@
 import type { StateUpdates, Emotion } from '$lib/types/character';
+import {
+	clamp01,
+	isEmotionalExpression,
+	type EmotionalExpression
+} from '../engine/facial-expressions.ts';
+
+// A one-shot facial direction from the model ("smile while saying this").
+// Deliberately separate from StateUpdates: it never persists, it just stages
+// a temporary expression that melts back into the mood face.
+export interface ExpressionCue {
+	expression: EmotionalExpression;
+	intensity: number;
+	durationMs: number;
+}
 
 // Parsed response structure
 export interface ParsedResponse {
 	dialogue: string;
 	stateUpdates: Partial<StateUpdates> | null;
+	expressionCue: ExpressionCue | null;
 	parseError?: string;
 }
 
@@ -21,6 +36,11 @@ interface LLMStateOutput {
 	new_memory?: string | null;
 	new_inside_joke?: string | null;
 	triggered_event?: string | null;
+	expression_cue?: {
+		expression?: string;
+		intensity?: number;
+		duration_ms?: number;
+	};
 }
 
 // Valid emotions for validation
@@ -109,7 +129,7 @@ function cutHallucinatedTurn(text: string, companionName?: string): string {
 
 // JSON objects we care about carry at least one of these keys.
 const STATE_KEY_RE =
-	/"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|new_memory)"/;
+	/"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|new_memory|expression_cue)"/;
 
 // Reasoning models (R1-style) emit a scratchpad before the answer. Strip it so
 // the trace never reaches the chat bubble or the JSON parser. Handles the
@@ -184,6 +204,7 @@ export function parseResponse(rawResponse: string, companionName?: string): Pars
 	const raw = stripReasoning(rawResponse);
 	let dialogue = raw.trim();
 	let stateUpdates: Partial<StateUpdates> | null = null;
+	let expressionCue: ExpressionCue | null = null;
 	let parseError: string | undefined;
 
 	// Prefer a fenced ```json block; otherwise grab the first bare JSON object
@@ -193,6 +214,7 @@ export function parseResponse(rawResponse: string, companionName?: string): Pars
 		const parsed = tryParseJson(fenced[1]);
 		if (parsed) {
 			stateUpdates = convertLLMOutput(parsed);
+			expressionCue = parseExpressionCue(parsed);
 		} else {
 			parseError = 'Failed to parse JSON state block';
 			console.debug('Failed to parse LLM state updates:', fenced[1]);
@@ -204,13 +226,14 @@ export function parseResponse(rawResponse: string, companionName?: string): Pars
 			const parsed = tryParseJson(obj);
 			if (parsed) {
 				stateUpdates = convertLLMOutput(parsed);
+				expressionCue = parseExpressionCue(parsed);
 				dialogue = raw.replace(obj, '').trim();
 			}
 		}
 	}
 
 	dialogue = cleanDialogue(dialogue, companionName);
-	return { dialogue, stateUpdates, parseError };
+	return { dialogue, stateUpdates, expressionCue, parseError };
 }
 
 // Convert LLM output format to our StateUpdates format
@@ -267,10 +290,29 @@ function clampDelta(value: number | undefined, min: number, max: number): number
 	return Math.max(min, Math.min(max, Math.round(value)));
 }
 
+// Validate an optional one-shot facial direction. Unknown expressions are
+// dropped (never persisted anywhere); intensity and duration are clamped to
+// sane stage ranges.
+function parseExpressionCue(output: LLMStateOutput): ExpressionCue | null {
+	const cue = output.expression_cue;
+	if (!cue || typeof cue !== 'object') return null;
+	const expression = typeof cue.expression === 'string' ? cue.expression.toLowerCase().trim() : '';
+	if (!isEmotionalExpression(expression)) return null;
+	const durationMs =
+		typeof cue.duration_ms === 'number' && Number.isFinite(cue.duration_ms)
+			? Math.min(6000, Math.max(500, Math.round(cue.duration_ms)))
+			: 2000;
+	return {
+		expression,
+		intensity: typeof cue.intensity === 'number' ? clamp01(cue.intensity) : 0.8,
+		durationMs
+	};
+}
+
 // Clean up dialogue text
 // State-block markers used to spot a truncated JSON block leaking into dialogue.
 const STATE_BLOCK_START =
-	/\{[^{}]*"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|energy_delta|new_memory)"/i;
+	/\{[^{}]*"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|energy_delta|new_memory|expression_cue)"/i;
 
 // Cut a trailing state block that was never closed (unterminated ```json fence,
 // or a bare `{...` whose braces never balance) — the mark of a response truncated
@@ -314,7 +356,7 @@ function cleanDialogue(text: string, companionName?: string): string {
 	cleaned = stripTruncatedStateBlock(cleaned);
 
 	// Remove any leftover (closed) JSON-like content
-	cleaned = cleaned.replace(/\{[^}]*"(?:mood|delta|emotion)[^}]*\}/gi, '');
+	cleaned = cleaned.replace(/\{[^}]*"(?:mood|delta|emotion|expression_cue)[^}]*\}/gi, '');
 
 	// Remove markdown formatting without mistaking the inner pair of a bold
 	// span for an action. The old single-asterisk expression matched the

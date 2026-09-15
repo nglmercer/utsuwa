@@ -12,6 +12,16 @@
 	import { pickReaction, stageTier, type TouchZone } from '$lib/engine/photo-reactions';
 	import { characterStore } from '$lib/stores/character.svelte';
 	import {
+		approachWeight,
+		blendTemporaryFace,
+		directTemporaryTarget,
+		emptyWeights,
+		moodToExpressionWeights,
+		reactionEnvelope,
+		resolveExpressionName,
+		resolveTargets
+	} from '$lib/engine/facial-expressions';
+	import {
 		computeSpringJointParams,
 		clampFrameDelta,
 		type SpringJointParams
@@ -48,19 +58,23 @@
 		}
 	} as const;
 
-	// Find a happy expression from available expressions (works with any model)
-	function findHappyExpression(vrmInstance: VRM): string | null {
-		const expressions = vrmInstance.expressionManager?.expressions;
-		if (!expressions) return null;
+	// Smoothing speed for mood-face weights (exponential approach; ~6 reaches
+	// ~99% of a new target in under a second, frame-rate independent).
+	const MOOD_FACE_SPEED = 6;
 
-		// Priority order of happy-like expressions to look for
-		const happyKeywords = ['happy', 'joy', 'smile', 'fun', 'cheerful'];
-
-		for (const keyword of happyKeywords) {
-			const match = expressions.find((e) => e.expressionName.toLowerCase().includes(keyword));
-			if (match) return match.expressionName;
+	// Best-effort expression write: presets were resolved against the model's
+	// snapshot, so a throw only happens on a mid-frame model swap.
+	function safeSetFace(
+		manager: { setValue: (name: string, value: number) => void } | null | undefined,
+		name: string,
+		value: number
+	) {
+		if (!manager) return;
+		try {
+			manager.setValue(name, value);
+		} catch {
+			// Unknown preset on this model; resolution already skipped it.
 		}
-		return null;
 	}
 
 	interface Props {
@@ -492,9 +506,37 @@
 	}
 	let activePulses: ReactionPulse[] = [];
 	let appliedNudges: Array<{ bone: THREE.Object3D; z: number; x: number }> = [];
-	let reactionFace: { name: string; weight: number; t: number; duration: number } | null = null;
+	// In-flight transient face (tap flash, emote grin, AI cue): staged from
+	// vrmStore.expressionRequest and arbitrated against the mood face below.
+	let transientFace: { name: string; weight: number; t: number; duration: number; seq: number } | null =
+		null;
+	// Smoothed weights the mood system owns (emotional presets + custom
+	// transient names like 'shy'). Never includes blink/viseme/jaw channels.
+	const moodWeights = new Map<string, number>();
 	const recentTaps = { zone: null as TouchZone | null, at: 0, count: 0 };
 	const REACTION_REPEAT_WINDOW_MS = 4000;
+
+	$effect(() => {
+		const request = vrmStore.expressionRequest;
+		untrack(() => {
+			if (!request) {
+				// Cleared mid-flight: jump into the release so the face fades
+				// back to mood instead of snapping.
+				if (transientFace) {
+					transientFace.t = Math.max(transientFace.t, transientFace.duration * 0.7);
+				}
+				return;
+			}
+			if (transientFace && transientFace.seq === request.seq) return;
+			transientFace = {
+				name: request.expression,
+				weight: request.intensity,
+				t: 0,
+				duration: Math.max(0.1, request.durationMs / 1000),
+				seq: request.seq
+			};
+		});
+	});
 
 	$effect(() => {
 		const request = vrmStore.reactionRequest;
@@ -515,14 +557,14 @@
 			const tier = stageTier(characterStore.state.relationshipStage);
 			const spec = pickReaction(request.zone, tier, recentTaps.count);
 
+			// The face flash goes through the shared arbitration (no direct
+			// expression writes here): it overlays the mood face, then melts back.
 			const em = targetVrm.expressionManager;
 			if (em) {
-				const name = spec.expressions.find((candidate) =>
-					em.expressions.some((e) => e.expressionName === candidate)
-				);
+				const available = em.expressions.map((e) => e.expressionName);
+				const name = spec.expressions.find((candidate) => available.includes(candidate));
 				if (name) {
-					if (reactionFace && reactionFace.name !== name) em.setValue(reactionFace.name, 0);
-					reactionFace = { name, weight: spec.weight, t: 0, duration: 1.8 };
+					vrmStore.requestExpression({ expression: name, intensity: spec.weight, durationMs: 1800 });
 				}
 			}
 
@@ -650,15 +692,16 @@
 					emoteAction = action;
 					isEmotePlaying = true;
 
-					// Apply happy expression during emote
-					const happyExpr = findHappyExpression(vrm);
+					// Grin for the emote's duration through the shared arbitration;
+					// the envelope ends with the clip, so no manual cleanup is needed.
+					const happyExpr = resolveExpressionName('happy', vrmStore.availableExpressions);
 					if (happyExpr) {
-						vrm.expressionManager?.setValue(happyExpr, 0.7);
+						const clipMs = Math.round((action.getClip().duration / action.timeScale) * 1000);
+						vrmStore.requestExpression({ expression: happyExpr, intensity: 0.7, durationMs: clipMs });
 					}
 
 					// When emote finishes, return to idle
 					const capturedMixer = mixer;
-					const capturedVrm = vrm;
 					const capturedIdleAction = currentIdle;
 					const onFinished = (e: { action: THREE.AnimationAction }) => {
 						if (e.action === action) {
@@ -666,10 +709,7 @@
 							isEmotePlaying = false;
 							emoteAction = null;
 
-							// Clear happy expression
-							if (happyExpr) {
-								capturedVrm.expressionManager?.setValue(happyExpr, 0);
-							}
+							// The emote grin fades out with its own envelope; nothing to clear.
 
 							// Resume idle animation
 							if (capturedIdleAction) {
@@ -845,7 +885,8 @@
 				poseClipCache.clear();
 				activePulses = [];
 				appliedNudges = [];
-				reactionFace = null;
+				transientFace = null;
+				moodWeights.clear();
 				heldExpression = null;
 			}
 		};
@@ -929,24 +970,68 @@
 			prevCamAngles = angles;
 		}
 
-		if (reactionFace && vrm.expressionManager) {
-			reactionFace.t += delta;
-			const progress = reactionFace.t / reactionFace.duration;
+		// === Mood face + transient arbitration ===
+		// Priority: held photo pose (exclusive) > transient reaction (tap flash,
+		// emote grin, AI cue) > persistent mood > resting face. Only emotional
+		// presets are written here; blink, visemes, and jawOpen are owned by
+		// their own systems and the engine's protected set.
+		{
 			const em = vrm.expressionManager;
-			if (progress >= 1) {
-				if (heldExpression === reactionFace.name) {
-					// The reaction borrowed the held expression; hand it back whole
-					em.setValue(heldExpression, 1);
-				} else {
-					em.setValue(reactionFace.name, 0);
-					if (heldExpression) em.setValue(heldExpression, 1);
+			if (em) {
+				if (transientFace) {
+					transientFace.t += delta;
+					if (transientFace.t >= transientFace.duration) {
+						const done = transientFace;
+						transientFace = null;
+						if (done.name === heldExpression) {
+							// The reaction borrowed the held expression; hand it back whole.
+							moodWeights.delete(done.name);
+							safeSetFace(em, done.name, 1);
+						}
+						// Other names melt back into the mood through moodWeights below.
+					}
 				}
-				reactionFace = null;
-			} else {
-				// Quick attack, long release
-				const shape =
-					progress < 0.3 ? progress / 0.3 : 1 - Math.max(0, (progress - 0.5) / 0.5);
-				em.setValue(reactionFace.name, Math.max(0, Math.min(1, reactionFace.weight * shape)));
+
+				const available = vrmStore.availableExpressions;
+				const temp =
+					transientFace && transientFace.weight > 0
+						? {
+								name: transientFace.name,
+								weight: transientFace.weight * reactionEnvelope(transientFace.t, transientFace.duration)
+							}
+						: null;
+				const held = photomodeStore.active ? heldExpression : null;
+				const base = held ? emptyWeights() : moodToExpressionWeights(characterStore.state.mood);
+				const blended = blendTemporaryFace(base, temp);
+				const targets = new Map<string, number>();
+				for (const target of resolveTargets(blended, available)) {
+					targets.set(target.name, target.weight);
+				}
+				if (temp) {
+					const direct = directTemporaryTarget(temp, available);
+					if (direct) targets.set(direct.name, Math.max(targets.get(direct.name) ?? 0, direct.weight));
+				}
+
+				// Drive owned weights toward their targets.
+				for (const [name, weight] of targets) {
+					const next = approachWeight(moodWeights.get(name) ?? 0, weight, delta, MOOD_FACE_SPEED);
+					moodWeights.set(name, next);
+					safeSetFace(em, name, next);
+				}
+				// Decay anything without a target back to rest. A stale entry for
+				// the held preset decays silently (the pose owns the actual value)
+				// so exiting the pose ramps back up instead of snapping.
+				for (const [name, current] of [...moodWeights]) {
+					if (targets.has(name)) continue;
+					const next = approachWeight(current, 0, delta, MOOD_FACE_SPEED);
+					if (next <= 0.001) {
+						moodWeights.delete(name);
+						if (name !== held) safeSetFace(em, name, 0);
+					} else {
+						moodWeights.set(name, next);
+						if (name !== held) safeSetFace(em, name, next);
+					}
+				}
 			}
 		}
 

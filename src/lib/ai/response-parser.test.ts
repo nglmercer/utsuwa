@@ -237,3 +237,39 @@ test('prose with a stray brace but no state keys is left intact', () => {
 	assert.ok(dialogue.includes('coffee'));
 	assert.ok(dialogue.includes('{'));
 });
+
+test('parses an expression_cue alongside state updates', () => {
+	const raw = [
+		'Oh, you remembered!',
+		'```json',
+		'{ "mood_change": { "emotion": "happy", "intensity_delta": 3 }, "expression_cue": { "expression": "happy", "intensity": 0.8, "duration_ms": 2000 } }',
+		'```'
+	].join('\n');
+	const { dialogue, stateUpdates, expressionCue } = parseResponse(raw);
+	assert.equal(dialogue, 'Oh, you remembered!');
+	assert.equal(stateUpdates?.moodChange?.emotion, 'happy');
+	assert.deepEqual(expressionCue, { expression: 'happy', intensity: 0.8, durationMs: 2000 });
+});
+
+test('expression_cue defaults and clamps intensity/duration', () => {
+	const raw = 'Heh.\n```json\n{ "expression_cue": { "expression": "Surprised", "intensity": 5, "duration_ms": 99999 } }\n```';
+	const { dialogue, stateUpdates, expressionCue } = parseResponse(raw);
+	assert.equal(dialogue, 'Heh.');
+	assert.deepEqual(expressionCue, { expression: 'surprised', intensity: 1, durationMs: 6000 });
+	assert.ok(stateUpdates && !('expressionCue' in stateUpdates), 'cue must not leak into state updates');
+
+	const minimal = parseResponse('Hi.\n{ "expression_cue": { "expression": "sad" } }');
+	assert.deepEqual(minimal.expressionCue, { expression: 'sad', intensity: 0.8, durationMs: 2000 });
+});
+
+test('drops an unknown expression_cue expression', () => {
+	const raw = 'Hey.\n```json\n{ "mood_change": { "emotion": "neutral", "intensity_delta": 0 }, "expression_cue": { "expression": "smirk" } }\n```';
+	const { expressionCue, stateUpdates } = parseResponse(raw);
+	assert.equal(expressionCue, null);
+	assert.equal(stateUpdates?.moodChange?.emotion, 'neutral');
+});
+
+test('returns a null expressionCue when the model omits it', () => {
+	const { expressionCue } = parseResponse('Just chatting, no state block at all.');
+	assert.equal(expressionCue, null);
+});

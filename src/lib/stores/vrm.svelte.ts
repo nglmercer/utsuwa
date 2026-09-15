@@ -4,6 +4,7 @@ import localforage from 'localforage';
 
 import { createTempVrmStoreIntegration } from '$lib/utils/temp-vrm-store';
 import type { TouchZone } from '$lib/engine/photo-reactions';
+import { clamp01 } from '$lib/engine/facial-expressions';
 
 export interface VrmModel {
 	id: string;
@@ -12,6 +13,15 @@ export interface VrmModel {
 	previewUrl?: string;
 	isDefault: boolean;
 	createdAt: number;
+}
+
+// A staged temporary facial expression: `expression` is a raw VRM preset name,
+// `intensity` 0..1, `durationMs` clamped to 100..10000.
+export interface ExpressionRequest {
+	expression: string;
+	intensity: number;
+	durationMs: number;
+	seq: number;
 }
 
 // Default models bundled with the app (first one is loaded by default).
@@ -129,6 +139,29 @@ function createVrmStore() {
 	let reactionSeq = 0;
 	function requestReaction(zone: TouchZone) {
 		reactionRequest = { zone, seq: ++reactionSeq };
+	}
+
+	// Temporary facial expression (AI cue, tap flash, emote grin): overlays the
+	// mood face for durationMs, then fades back into it. The model component
+	// arbitrates (temporary > mood > resting) in its frame loop.
+	let expressionRequest = $state<ExpressionRequest | null>(null);
+	let expressionSeq = 0;
+	function requestExpression(input: {
+		expression: string;
+		intensity?: number;
+		durationMs?: number;
+	}) {
+		const expression = input.expression?.trim();
+		if (!expression) return;
+		expressionRequest = {
+			expression,
+			intensity: clamp01(input.intensity ?? 1),
+			durationMs: Math.min(10000, Math.max(100, Math.round(input.durationMs ?? 2000))),
+			seq: ++expressionSeq
+		};
+	}
+	function clearExpression() {
+		expressionRequest = null;
 	}
 
 	// Head position for 3D speech bubble positioning
@@ -512,6 +545,11 @@ function createVrmStore() {
 			return reactionRequest;
 		},
 		requestReaction,
+		get expressionRequest() {
+			return expressionRequest;
+		},
+		requestExpression,
+		clearExpression,
 		get headPosition() {
 			return headPosition;
 		},

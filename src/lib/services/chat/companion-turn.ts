@@ -1,5 +1,10 @@
 import { characterStore } from '$lib/stores/character.svelte';
-import { parseResponse, validateStateUpdates, extractPotentialFacts } from '$lib/ai/response-parser';
+import {
+	parseResponse,
+	validateStateUpdates,
+	extractPotentialFacts,
+	type ExpressionCue
+} from '$lib/ai/response-parser';
 import { buildExtractionSystemPrompt } from '$lib/ai/prompt-builder';
 import { calculateBaselineUpdates, analyzeMessage } from '$lib/engine/heuristics';
 import { mergeUpdates, checkAndApplyStageTransition } from '$lib/engine/state-updates';
@@ -14,6 +19,7 @@ import { allEvents, relationshipStrainEvent } from '$lib/data/events';
 import { extractStateUpdates } from './client-chat';
 import { extractReminderTags } from '$lib/utils/reminders';
 import { reminderStore } from '$lib/stores/reminders.svelte';
+import { vrmStore } from '$lib/stores/vrm.svelte';
 import { ensureSession } from '$lib/engine/memory';
 import type { LLMProvider } from '$lib/types';
 import type { EventDefinition } from '$lib/types/events';
@@ -54,6 +60,22 @@ export interface CompanionTurnResult {
 // overlay so their pipelines can't drift (the overlay previously lacked the
 // extraction fallback). Page-specific side effects — showing the event modal,
 // keeping photos — stay in the pages via the return value.
+
+// Stage a one-shot facial direction from the model. Fire-and-forget: the VRM
+// frame loop arbitrates it against the mood face and melts it back.
+function fireExpressionCue(cue: ExpressionCue | null) {
+	if (!cue) return;
+	try {
+		vrmStore.requestExpression({
+			expression: cue.expression,
+			intensity: cue.intensity,
+			durationMs: cue.durationMs
+		});
+	} catch (e) {
+		console.debug('[Expression] Failed to stage AI cue:', e);
+	}
+}
+
 export async function processCompanionTurn(input: CompanionTurnInput): Promise<CompanionTurnResult> {
 	const { userMessage, companionResponse, llm, systemEvent = false, debug = false } = input;
 
@@ -80,6 +102,7 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 	const parsed = parseResponse(reminderCleaned, state.name);
 	const dialogue = parsed.dialogue;
 	let llmUpdates = parsed.stateUpdates;
+	fireExpressionCue(parsed.expressionCue);
 
 	if (debug) {
 		console.log('%c[LLM raw response]', 'color:#00b2ff;font-weight:bold', companionResponse);
@@ -104,7 +127,9 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 		if (extracted) {
 			// parseResponse handles both bare JSON (OpenAI json_object) and a
 			// model-added ```json fence (Anthropic). Don't re-wrap.
-			llmUpdates = parseResponse(extracted).stateUpdates;
+			const fallback = parseResponse(extracted);
+			llmUpdates = fallback.stateUpdates;
+			fireExpressionCue(fallback.expressionCue);
 			if (debug) {
 				console.log('%c[extraction fallback]', 'color:#f59e0b;font-weight:bold', extracted, '->', llmUpdates);
 			}
