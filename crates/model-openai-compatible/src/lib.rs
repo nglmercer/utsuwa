@@ -137,7 +137,7 @@ impl ModelProvider for OpenAICompatibleClient {
         let byte_stream = response.bytes_stream();
         let state = StreamState {
             buffer: String::new(),
-            assembler: SseAssembler::default(),
+            assembler: SseAssembler::default().with_tool_names(tool_name_map(&request.tools)),
             bytes: Box::pin(byte_stream),
             finished: false,
         };
@@ -212,7 +212,7 @@ impl ModelProvider for AnthropicClient {
         let response = validate_streaming_response(response, &self.url()).await?;
         let state = AnthropicStreamState {
             buffer: String::new(),
-            assembler: AnthropicAssembler::default(),
+            assembler: AnthropicAssembler::default().with_tool_names(tool_name_map(&request.tools)),
             bytes: Box::pin(response.bytes_stream()),
             finished: false,
         };
@@ -399,6 +399,20 @@ struct AnthropicAssembler {
     tools: BTreeMap<u32, AnthropicToolFragment>,
     finish_reason: Option<FinishReason>,
     done: bool,
+    /// Wire-name → registry-name map for this request (see
+    /// [`wire_tool_name`]); unknown names pass through untouched.
+    tool_names: std::collections::HashMap<String, String>,
+}
+
+impl AnthropicAssembler {
+    fn with_tool_names(mut self, names: std::collections::HashMap<String, String>) -> Self {
+        self.tool_names = names;
+        self
+    }
+
+    fn registry_name(&self, wire: String) -> String {
+        self.tool_names.get(&wire).cloned().unwrap_or(wire)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -497,9 +511,10 @@ impl AnthropicAssembler {
         self.done = true;
         for fragment in std::mem::take(&mut self.tools).into_values() {
             if !fragment.name.is_empty() {
+                let name = self.registry_name(fragment.name);
                 self.queued.push_back(ModelStreamEvent::ToolCall(ToolCall {
                     id: fragment.id,
-                    name: fragment.name,
+                    name,
                     arguments: if fragment.input_json.is_empty() {
                         "{}".to_string()
                     } else {
@@ -538,7 +553,7 @@ fn anthropic_request_body(model: &str, request: &ModelRequest) -> Value {
         "max_tokens": request.max_tokens.unwrap_or(1024),
         "messages": anthropic_messages(&request.messages),
         "tools": request.tools.iter().map(|tool| serde_json::json!({
-            "name": tool.name,
+            "name": wire_tool_name(&tool.name),
             "description": tool.description,
             "input_schema": tool.input_schema,
         })).collect::<Vec<_>>(),
@@ -569,7 +584,7 @@ async fn anthropic_request_body_with_artifacts(
         "max_tokens": request.max_tokens.unwrap_or(1024),
         "messages": anthropic_messages_with_artifacts(&request.messages, request.artifact_store.as_ref()).await?,
         "tools": request.tools.iter().map(|tool| serde_json::json!({
-            "name": tool.name,
+            "name": wire_tool_name(&tool.name),
             "description": tool.description,
             "input_schema": tool.input_schema,
         })).collect::<Vec<_>>(),
@@ -659,7 +674,7 @@ async fn anthropic_messages_with_artifacts(
                         blocks.push(serde_json::json!({
                             "type": "tool_use",
                             "id": call.id,
-                            "name": call.name,
+                            "name": wire_tool_name(&call.name),
                             "input": input,
                         }));
                     }
@@ -770,7 +785,7 @@ fn anthropic_assistant_content(message: &ModelMessage) -> Value {
         blocks.push(serde_json::json!({
             "type": "tool_use",
             "id": call.id,
-            "name": call.name,
+            "name": wire_tool_name(&call.name),
             "input": input,
         }));
     }
@@ -897,6 +912,9 @@ struct SseAssembler {
     tool_fragments: BTreeMap<u32, ToolFragment>,
     finish_reason: Option<FinishReason>,
     done: bool,
+    /// Wire-name → registry-name map for this request (see
+    /// [`wire_tool_name`]); unknown names pass through untouched.
+    tool_names: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -907,6 +925,15 @@ struct ToolFragment {
 }
 
 impl SseAssembler {
+    fn with_tool_names(mut self, names: std::collections::HashMap<String, String>) -> Self {
+        self.tool_names = names;
+        self
+    }
+
+    fn registry_name(&self, wire: String) -> String {
+        self.tool_names.get(&wire).cloned().unwrap_or(wire)
+    }
+
     fn pop(&mut self) -> Option<ModelStreamEvent> {
         self.queued.pop_front()
     }
@@ -977,9 +1004,10 @@ impl SseAssembler {
         self.done = true;
         for fragment in std::mem::take(&mut self.tool_fragments).into_values() {
             if !fragment.name.is_empty() {
+                let name = self.registry_name(fragment.name);
                 self.queued.push_back(ModelStreamEvent::ToolCall(ToolCall {
                     id: fragment.id,
-                    name: fragment.name,
+                    name,
                     arguments: fragment.arguments,
                 }));
             }
@@ -999,6 +1027,27 @@ fn map_finish_reason(reason: &str) -> FinishReason {
     }
 }
 
+/// Provider-facing tool name. The registry uses dotted ids
+/// (`desktop.screenshot`), but the OpenAI/Anthropic function-name grammar
+/// only allows `[a-zA-Z0-9_-]` — strict providers (observed: Poolside via
+/// the Kilo gateway) reject dotted names with HTTP 400. Dots become
+/// underscores on the wire; [`tool_name_map`] maps them back per request
+/// so pre-existing underscores (`desktop.press_key`) can never collide.
+fn wire_tool_name(name: &str) -> String {
+    name.replace('.', "_")
+}
+
+/// Wire-name → registry-name map for one request's tool list. The stream
+/// assemblers use it to restore original ids on returned tool calls.
+fn tool_name_map(
+    tools: &[model_core::ToolDefinition],
+) -> std::collections::HashMap<String, String> {
+    tools
+        .iter()
+        .map(|tool| (wire_tool_name(&tool.name), tool.name.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 fn request_body(model: &str, request: &ModelRequest) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -1008,7 +1057,7 @@ fn request_body(model: &str, request: &ModelRequest) -> serde_json::Value {
         "tools": request.tools.iter().map(|t| serde_json::json!({
             "type": "function",
             "function": {
-                "name": t.name,
+                "name": wire_tool_name(&t.name),
                 "description": t.description,
                 "parameters": t.input_schema,
             }
@@ -1038,7 +1087,7 @@ async fn request_body_with_artifacts(
         "tools": request.tools.iter().map(|t| serde_json::json!({
             "type": "function",
             "function": {
-                "name": t.name,
+                "name": wire_tool_name(&t.name),
                 "description": t.description,
                 "parameters": t.input_schema,
             }
@@ -1074,7 +1123,7 @@ fn wire_message(message: &ModelMessage) -> serde_json::Value {
                 serde_json::json!({
                     "id": c.id,
                     "type": "function",
-                    "function": { "name": c.name, "arguments": c.arguments },
+                    "function": { "name": wire_tool_name(&c.name), "arguments": c.arguments },
                 })
             })
             .collect();
@@ -1118,7 +1167,7 @@ async fn wire_message_with_artifacts(
                 serde_json::json!({
                     "id": c.id,
                     "type": "function",
-                    "function": { "name": c.name, "arguments": c.arguments },
+                    "function": { "name": wire_tool_name(&c.name), "arguments": c.arguments },
                 })
             })
             .collect();
@@ -1283,9 +1332,83 @@ mod tests {
 
         let tool = &request_body("test-model", &request)["tools"][0];
         assert_eq!(tool["type"], "function");
-        assert_eq!(tool["function"]["name"], "filesystem.read");
+        assert_eq!(tool["function"]["name"], "filesystem_read");
         assert_eq!(tool["function"]["description"], "Read a file");
         assert_eq!(tool["function"]["parameters"]["required"][0], "path");
+    }
+
+    #[test]
+    fn wire_tool_names_sanitize_dots_and_map_back_per_request() {
+        // Strict providers reject dotted function names (observed HTTP 400
+        // from Poolside via Kilo); dots become underscores on the wire and
+        // the per-request map restores the registry id — including names
+        // that already contain underscores, which a blind string reverse
+        // could not distinguish.
+        assert_eq!(wire_tool_name("desktop.screenshot"), "desktop_screenshot");
+        assert_eq!(wire_tool_name("desktop.press_key"), "desktop_press_key");
+        let tools = vec![
+            model_core::ToolDefinition {
+                name: "desktop.press_key".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            },
+            model_core::ToolDefinition {
+                name: "filesystem.read".to_string(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+            },
+        ];
+        let map = tool_name_map(&tools);
+        assert_eq!(map["desktop_press_key"], "desktop.press_key");
+        assert_eq!(map["filesystem_read"], "filesystem.read");
+        let mut asm = SseAssembler::default().with_tool_names(map);
+        asm.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"desktop_press_key","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        assert_eq!(
+            asm.pop(),
+            Some(ModelStreamEvent::ToolCall(ToolCall {
+                id: "c1".to_string(),
+                name: "desktop.press_key".to_string(),
+                arguments: "{}".to_string(),
+            }))
+        );
+        // Unknown names pass through untouched (forwards-compatible).
+        let mut asm = SseAssembler::default().with_tool_names(std::collections::HashMap::new());
+        asm.feed_line(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c2","function":{"name":"future_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        assert_eq!(
+            asm.pop(),
+            Some(ModelStreamEvent::ToolCall(ToolCall {
+                id: "c2".to_string(),
+                name: "future_tool".to_string(),
+                arguments: "{}".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn anthropic_wire_tool_names_map_back_per_request() {
+        let tools = vec![model_core::ToolDefinition {
+            name: "filesystem.read".to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+        }];
+        let mut assembler = AnthropicAssembler::default().with_tool_names(tool_name_map(&tools));
+        assembler.feed_line(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"c1","name":"filesystem_read","input":{}}}"#,
+        );
+        assembler.feed_line(r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"}}"#);
+        assembler.feed_line(r#"data: {"type":"message_stop"}"#);
+        assert_eq!(
+            assembler.pop(),
+            Some(ModelStreamEvent::ToolCall(ToolCall {
+                id: "c1".to_string(),
+                name: "filesystem.read".to_string(),
+                arguments: "{}".to_string(),
+            }))
+        );
     }
 
     #[test]
@@ -1442,7 +1565,7 @@ mod tests {
         });
         let body = anthropic_request_body("claude-test", &request);
         assert_eq!(body["system"], "system prompt");
-        assert_eq!(body["tools"][0]["name"], "process.spawn");
+        assert_eq!(body["tools"][0]["name"], "process_spawn");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
         assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
@@ -1624,7 +1747,7 @@ mod tests {
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(request["model"], "test-model");
             assert_eq!(request["stream"], true);
-            assert_eq!(request["tools"][0]["function"]["name"], "system.echo");
+            assert_eq!(request["tools"][0]["function"]["name"], "system_echo");
             // Split mid-JSON to prove chunk-boundary buffering works.
             let chunks: &[&[u8]] = &[
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"Hel",
