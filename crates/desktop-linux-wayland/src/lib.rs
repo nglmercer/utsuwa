@@ -858,33 +858,54 @@ mod linux {
             } else {
                 CursorMode::Hidden
             };
-            proxy
-                .select_sources(
-                    &session,
-                    cursor,
-                    SourceType::Monitor | SourceType::Window,
-                    false,
-                    None,
-                    PersistMode::DoNot,
-                )
-                .await
-                .map_err(|error| {
-                    DesktopError::BackendUnavailable(format!("select portal source: {error}"))
-                })?
-                .response()
-                .map_err(|error| {
-                    DesktopError::BackendUnavailable(format!("portal source selection: {error}"))
-                })?;
-            let response = proxy
-                .start(&session, None)
-                .await
-                .map_err(|error| {
-                    DesktopError::BackendUnavailable(format!("start portal capture: {error}"))
-                })?
-                .response()
-                .map_err(|error| {
-                    DesktopError::BackendUnavailable(format!("portal capture approval: {error}"))
-                })?;
+            // Both steps wait on the OS screen-share dialog, which the user may
+            // never answer. Bound the whole negotiation so an unanswered
+            // dialog fails the tool call with an actionable error instead
+            // of hanging the agent turn forever.
+            let negotiation = async {
+                proxy
+                    .select_sources(
+                        &session,
+                        cursor,
+                        SourceType::Monitor | SourceType::Window,
+                        false,
+                        None,
+                        PersistMode::DoNot,
+                    )
+                    .await
+                    .map_err(|error| {
+                        DesktopError::BackendUnavailable(format!("select portal source: {error}"))
+                    })?
+                    .response()
+                    .map_err(|error| {
+                        DesktopError::BackendUnavailable(format!(
+                            "portal source selection: {error}"
+                        ))
+                    })?;
+                proxy
+                    .start(&session, None)
+                    .await
+                    .map_err(|error| {
+                        DesktopError::BackendUnavailable(format!("start portal capture: {error}"))
+                    })?
+                    .response()
+                    .map_err(|error| {
+                        DesktopError::BackendUnavailable(format!(
+                            "portal capture approval: {error}"
+                        ))
+                    })
+            };
+            let response = match tokio::time::timeout(PORTAL_APPROVAL_TIMEOUT, negotiation).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    let _ = session.close().await;
+                    return Err(DesktopError::ActionFailed(format!(
+                        "portal capture approval timed out after {}s: answer the OS screen-share dialog (or decline it) and try again",
+                        PORTAL_APPROVAL_TIMEOUT.as_secs(),
+                    )));
+                }
+            };
             let stream = response.streams().first().ok_or_else(|| {
                 DesktopError::BackendUnavailable("portal returned no capture stream".to_string())
             })?;
@@ -1041,6 +1062,12 @@ mod linux {
     /// Buffers the client may fail to map before the worker reports an
     /// error. At 30fps this is ~1s of consecutive failures.
     const MAX_UNMAPPED_STREAK: u32 = 30;
+
+    /// Bound for the whole portal select+start negotiation, both steps of
+    /// which wait on the OS screen-share dialog. Generous for a human
+    /// answering the dialog; bounded so an agent turn cannot hang forever
+    /// on an unanswered prompt.
+    const PORTAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
     fn run_pipewire(
         node_id: u32,

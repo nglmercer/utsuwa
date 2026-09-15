@@ -29,6 +29,7 @@ struct CliArgs {
     base_url: String,
     api_key: Option<String>,
     vision: Option<bool>,
+    profile: Option<String>,
     auto_approve: bool,
     timeout: Duration,
     verbose: bool,
@@ -36,13 +37,28 @@ struct CliArgs {
 
 fn usage() -> &'static str {
     "usage: model-cli --ask \"question\" [--provider ID] [--model ID] [--base-url URL]\n\
-     \t[--api-key KEY] [--vision auto|on|off] [--yes] [--timeout-secs N] [--verbose]\n\
+     \t[--api-key KEY] [--vision auto|on|off] [--profile NAME] [--yes]\n\
+     \t[--timeout-secs N] [--verbose]\n\
      \n\
      \tDefaults: --provider kilo --model kilo-auto/free\n\
      \t--api-key falls back to $UTSUWA_MODEL_API_KEY (Kilo needs none).\n\
      \t--vision auto omits the override so the provider/model heuristic decides.\n\
+     \t--profile minimal|simple|standard|developer|computeruse|full shrinks the\n\
+     \tmodel-facing tool surface (default full, like the app; small free models\n\
+     \tcope better with developer for shell/file tasks).\n\
      \t--yes auto-approves permission requests with session grants."
 }
+
+const KNOWN_PROFILES: &[&str] = &[
+    "minimal",
+    "simple",
+    "standard",
+    "developer",
+    "computeruse",
+    "computer-use",
+    "computer_use",
+    "full",
+];
 
 fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
     let mut ask = None;
@@ -51,6 +67,7 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
     let mut base_url = None;
     let mut api_key = None;
     let mut vision = None;
+    let mut profile = None;
     let mut auto_approve = false;
     let mut timeout_secs = 300u64;
     let mut verbose = false;
@@ -77,6 +94,15 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
                         return Err(format!("--vision must be auto, on, or off (got {other})"))
                     }
                 };
+            }
+            "--profile" => {
+                let name = flag_value(argv, &mut index, "--profile")?;
+                if !KNOWN_PROFILES.contains(&name.to_ascii_lowercase().as_str()) {
+                    return Err(format!(
+                        "--profile must be one of minimal, simple, standard, developer, computeruse, full (got {name})"
+                    ));
+                }
+                profile = Some(name.to_ascii_lowercase());
             }
             "--yes" => auto_approve = true,
             "--verbose" => verbose = true,
@@ -129,6 +155,7 @@ fn parse_args(argv: &[String]) -> Result<CliArgs, String> {
         base_url,
         api_key,
         vision,
+        profile,
         auto_approve,
         timeout: Duration::from_secs(timeout_secs.max(5)),
         verbose,
@@ -193,6 +220,15 @@ fn run(argv: Vec<String>) -> i32 {
                 &serde_json::json!(vision),
             ) {
                 eprintln!("cannot write temp vision setting: {error}");
+                return 2;
+            }
+        }
+        if let Some(profile) = &args.profile {
+            if let Err(error) = store.set_setting(
+                app_host::runtime::SETTING_TOOL_PROFILE,
+                &serde_json::json!(profile),
+            ) {
+                eprintln!("cannot write temp tool-profile setting: {error}");
                 return 2;
             }
         }
@@ -263,7 +299,7 @@ fn run(argv: Vec<String>) -> i32 {
         }
     };
     println!(
-        "provider={} model={} base_url={} api_key={} vision={:?}",
+        "provider={} model={} base_url={} api_key={} vision={:?} profile={}",
         args.provider,
         args.model,
         args.base_url,
@@ -273,6 +309,7 @@ fn run(argv: Vec<String>) -> i32 {
             "none"
         },
         args.vision,
+        args.profile.as_deref().unwrap_or("full"),
     );
     println!("---");
     if let Err(error) = runtime.send_message(args.ask.clone()) {
@@ -400,6 +437,15 @@ fn run(argv: Vec<String>) -> i32 {
 }
 
 fn main() {
+    // Surface retry backoffs and provider diagnostics on stderr; silent
+    // by default below warnings so normal output stays readable.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_target(false)
+        .init();
     std::process::exit(run(std::env::args().skip(1).collect()));
 }
 
@@ -418,7 +464,15 @@ mod tests {
         assert_eq!(args.model, "kilo-auto/free");
         assert_eq!(args.base_url, KILO_BASE_URL);
         assert_eq!(args.vision, None);
+        assert_eq!(args.profile, None);
         assert!(!args.auto_approve);
+    }
+
+    #[test]
+    fn tool_profile_is_validated_up_front() {
+        let args = parse_args(&argv(&["--ask", "hi", "--profile", "developer"])).unwrap();
+        assert_eq!(args.profile, Some("developer".to_string()));
+        assert!(parse_args(&argv(&["--ask", "hi", "--profile", "everything"])).is_err());
     }
 
     #[test]

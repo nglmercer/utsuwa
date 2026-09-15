@@ -45,6 +45,10 @@ pub struct AgentLimits {
     /// Maximum dimensions accepted for an image artifact.
     pub max_image_width: u32,
     pub max_image_height: u32,
+    /// Maximum retries per model request on transient provider failures
+    /// (rate limits, 5xx). Each retry backs off exponentially; exhausted
+    /// retries fail the turn with the last provider error.
+    pub max_provider_retries: u32,
 }
 
 impl Default for AgentLimits {
@@ -60,8 +64,23 @@ impl Default for AgentLimits {
             max_artifact_bytes: 8 * 1024 * 1024,
             max_image_width: 4096,
             max_image_height: 4096,
+            max_provider_retries: 8,
         }
     }
+}
+
+/// Outcome of one model-request attempt: success, a transient failure
+/// worth retrying, or a fatal failure that must surface immediately.
+enum StreamAttempt {
+    Retryable(ModelError),
+    Fatal(AgentError),
+}
+
+/// Backoff before retry `attempt` (1-based): 2s, 4s, 8s … capped at 30s.
+/// Eight default retries span ~2.5 minutes, enough for free-tier quota
+/// windows to reopen without stalling a turn indefinitely.
+fn provider_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(2u64.saturating_pow(attempt).min(30))
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -715,11 +734,54 @@ impl Agent {
     }
 
     /// Refactored single-turn streaming shared by `turn` and the tool loop.
+    /// Transient provider failures (rate limits, 5xx) retry with backoff
+    /// instead of killing the turn: the request is rebuilt from the
+    /// untouched transcript and no tool has executed yet for this step, so
+    /// a retry is side-effect free. Anything else fails fast.
     async fn stream_turn(
         &self,
         request: ModelRequest,
     ) -> Result<(String, Vec<ToolCall>, bool), AgentError> {
-        let mut stream = self.provider.stream(request).await?;
+        let mut attempt = 0u32;
+        loop {
+            match self.stream_turn_once(request.clone()).await {
+                Ok(ok) => return Ok(ok),
+                Err(StreamAttempt::Retryable(error))
+                    if attempt < self.limits.max_provider_retries =>
+                {
+                    attempt += 1;
+                    let delay = provider_retry_delay(attempt);
+                    tracing::warn!(
+                        attempt,
+                        max_retries = self.limits.max_provider_retries,
+                        delay_ms = delay.as_millis(),
+                        error = %error,
+                        "retryable provider error; backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(StreamAttempt::Retryable(error)) => {
+                    tracing::warn!(
+                        attempts = attempt + 1,
+                        error = %error,
+                        "provider retries exhausted"
+                    );
+                    return Err(error.into());
+                }
+                Err(StreamAttempt::Fatal(error)) => return Err(error),
+            }
+        }
+    }
+
+    async fn stream_turn_once(
+        &self,
+        request: ModelRequest,
+    ) -> Result<(String, Vec<ToolCall>, bool), StreamAttempt> {
+        let mut stream = match self.provider.stream(request).await {
+            Ok(stream) => stream,
+            Err(error) if error.is_retryable() => return Err(StreamAttempt::Retryable(error)),
+            Err(error) => return Err(StreamAttempt::Fatal(error.into())),
+        };
         let mut text = String::new();
         let mut calls = Vec::new();
         let mut events = 0usize;
@@ -727,9 +789,16 @@ impl Agent {
         while let Some(event) = stream.next().await {
             events += 1;
             if events > self.limits.max_stream_events {
-                return Err(AgentError::TooManyEvents(self.limits.max_stream_events));
+                return Err(StreamAttempt::Fatal(AgentError::TooManyEvents(
+                    self.limits.max_stream_events,
+                )));
             }
-            match event? {
+            let event = match event {
+                Ok(event) => event,
+                Err(error) if error.is_retryable() => return Err(StreamAttempt::Retryable(error)),
+                Err(error) => return Err(StreamAttempt::Fatal(error.into())),
+            };
+            match event {
                 ModelStreamEvent::TextDelta(delta) => {
                     if text.len() + delta.len() > self.limits.max_output_bytes {
                         truncated = true;
@@ -1486,6 +1555,137 @@ mod tests {
         Arc::new(ScriptedProvider {
             events: events.into_iter().map(Ok).collect(),
         })
+    }
+
+    /// Provider that fails the first `failures` stream establishments with
+    /// `error`, then serves `events`. Counts every attempt.
+    struct FlakyProvider {
+        failures: std::sync::Mutex<Vec<ModelError>>,
+        events: Vec<ModelStreamEvent>,
+        attempts: std::sync::Mutex<usize>,
+    }
+
+    impl FlakyProvider {
+        fn new(failures: Vec<ModelError>, events: Vec<ModelStreamEvent>) -> Self {
+            Self {
+                failures: std::sync::Mutex::new(failures),
+                events,
+                attempts: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FlakyProvider {
+        async fn stream(
+            &self,
+            _request: ModelRequest,
+        ) -> Result<model_core::ModelStream, ModelError> {
+            *self.attempts.lock().unwrap() += 1;
+            if let Some(error) = self.failures.lock().unwrap().pop() {
+                return Err(error);
+            }
+            let events = self.events.clone().into_iter().map(Ok).collect::<Vec<_>>();
+            Ok(Box::pin(futures_util::stream::iter(events)))
+        }
+    }
+
+    fn done_text(text: &str) -> Vec<ModelStreamEvent> {
+        vec![
+            ModelStreamEvent::TextDelta(text.to_string()),
+            ModelStreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ]
+    }
+
+    fn provider_error(status: u16) -> ModelError {
+        ModelError::Provider {
+            status,
+            message: "x".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_provider_errors_retry_then_succeed() {
+        let provider = Arc::new(FlakyProvider::new(
+            vec![provider_error(429), provider_error(503)],
+            done_text("recovered"),
+        ));
+        let agent = Agent::new(provider.clone());
+        let turn = agent.turn(vec![ModelMessage::user("hi")]).await.unwrap();
+        assert_eq!(turn.text, "recovered");
+        assert_eq!(*provider.attempts.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn fatal_provider_errors_fail_fast_without_retry() {
+        let provider = Arc::new(FlakyProvider::new(
+            vec![provider_error(400)],
+            done_text("nope"),
+        ));
+        let agent = Agent::new(provider.clone());
+        let error = agent
+            .turn(vec![ModelMessage::user("hi")])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::Model(_)), "{error:?}");
+        assert_eq!(*provider.attempts.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_provider_retries_fail_the_turn() {
+        let provider = Arc::new(FlakyProvider::new(
+            vec![provider_error(429); 5],
+            done_text("nope"),
+        ));
+        let agent = Agent::new(provider.clone()).with_limits(AgentLimits {
+            max_provider_retries: 2,
+            ..AgentLimits::default()
+        });
+        let error = agent
+            .turn(vec![ModelMessage::user("hi")])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::Model(_)), "{error:?}");
+        assert_eq!(*provider.attempts.lock().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_retryable_error_restarts_the_request() {
+        struct MidStreamFlaky {
+            first: std::sync::Mutex<bool>,
+            attempts: std::sync::Mutex<usize>,
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for MidStreamFlaky {
+            async fn stream(
+                &self,
+                _request: ModelRequest,
+            ) -> Result<model_core::ModelStream, ModelError> {
+                *self.attempts.lock().unwrap() += 1;
+                let events: Vec<Result<ModelStreamEvent, ModelError>> =
+                    if *self.first.lock().unwrap() {
+                        *self.first.lock().unwrap() = false;
+                        vec![
+                            Ok(ModelStreamEvent::TextDelta("partial-".to_string())),
+                            Err(provider_error(429)),
+                        ]
+                    } else {
+                        done_text("whole").into_iter().map(Ok).collect()
+                    };
+                Ok(Box::pin(futures_util::stream::iter(events)))
+            }
+        }
+        let provider = Arc::new(MidStreamFlaky {
+            first: std::sync::Mutex::new(true),
+            attempts: std::sync::Mutex::new(0),
+        });
+        let agent = Agent::new(provider.clone());
+        let turn = agent.turn(vec![ModelMessage::user("hi")]).await.unwrap();
+        // The partial pre-failure text is discarded, not duplicated.
+        assert_eq!(turn.text, "whole");
+        assert_eq!(*provider.attempts.lock().unwrap(), 2);
     }
 
     #[tokio::test]

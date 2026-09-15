@@ -446,6 +446,23 @@ pub enum ModelError {
     Cancelled,
 }
 
+impl ModelError {
+    /// Whether re-sending the same request later may succeed. Rate limits,
+    /// request timeouts, and server-side failures are transient; transport
+    /// failures stay fatal so a down local server fails fast instead of
+    /// stalling the turn through a backoff ladder, and everything else
+    /// (4xx validation, bad payloads, artifacts, cancellation) is
+    /// deterministic and must surface immediately.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            ModelError::Provider { status, .. } => {
+                *status == 429 || *status == 408 || (500..600).contains(status)
+            }
+            _ => false,
+        }
+    }
+}
+
 pub type ModelStream =
     Pin<Box<dyn futures_core::Stream<Item = Result<ModelStreamEvent, ModelError>> + Send>>;
 
@@ -632,5 +649,33 @@ mod tests {
             }],
         );
         assert_eq!(m.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn retryable_errors_are_only_transient_provider_failures() {
+        for status in [408, 429, 500, 502, 503, 599] {
+            assert!(
+                ModelError::Provider {
+                    status,
+                    message: "x".to_string()
+                }
+                .is_retryable(),
+                "status {status} should be retryable"
+            );
+        }
+        for status in [400, 401, 403, 404, 422] {
+            assert!(
+                !ModelError::Provider {
+                    status,
+                    message: "x".to_string()
+                }
+                .is_retryable(),
+                "status {status} should fail fast"
+            );
+        }
+        assert!(!ModelError::Transport("down".to_string()).is_retryable());
+        assert!(!ModelError::InvalidResponse("x".to_string()).is_retryable());
+        assert!(!ModelError::Artifact("x".to_string()).is_retryable());
+        assert!(!ModelError::Cancelled.is_retryable());
     }
 }
