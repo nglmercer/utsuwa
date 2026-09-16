@@ -58,47 +58,14 @@ fn vision_mode(vision: Option<bool>) -> &'static str {
     }
 }
 
-/// Resolve and print the effective model capabilities using the same
-/// discovery path as the agent runtime (provider `/models` catalog, plus
-/// the `--vision` debug override). Runs before the turn so a misresolved
-/// capability is visible without reading trace logs.
 fn print_resolved_capabilities(args: &CliArgs) {
-    let base_url = if args.provider == "anthropic" {
-        args.base_url.trim_end_matches('/').to_string()
-    } else {
-        app_host::runtime::normalize_provider_base_url(&args.provider, &args.base_url)
-    };
-    let config = app_host::runtime::providers::ProviderConfig {
-        provider: args.provider.clone(),
-        base_url,
-        name: args.model.clone(),
-        api_key: args.api_key.clone(),
-        vision: args.vision,
-    };
-    let resolved = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime.block_on(async {
-            let catalog = model_catalog::ModelCatalogService::new();
-            app_host::runtime::providers::resolve_provider_capabilities(&config, &catalog).await
-        }),
-        Err(error) => {
-            eprintln!("capability discovery unavailable ({error}); assuming text-only");
-            return;
-        }
-    };
-    println!("provider={}", args.provider);
-    println!("model={}", args.model);
-    println!("capabilities_source={}", resolved.info.source);
-    println!("image_input={}", resolved.info.image_input());
-    println!("audio_input={}", resolved.info.audio_input());
-    println!("video_input={}", resolved.info.video_input());
-    println!("pdf_input={}", resolved.info.pdf_input());
-    println!("tool_calls={}", resolved.info.tool_calls);
-    println!("parallel_tool_calls={}", resolved.info.parallel_tool_calls);
-    println!("structured_output={}", resolved.info.structured_output);
-    println!("reasoning={}", resolved.info.reasoning);
+    app_host::runtime::providers::print_resolved_capabilities(
+        &args.provider,
+        &args.model,
+        &args.base_url,
+        args.api_key.as_deref(),
+        args.vision,
+    )
 }
 
 const KNOWN_PROFILES: &[&str] = &[

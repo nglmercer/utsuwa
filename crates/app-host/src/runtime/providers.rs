@@ -345,6 +345,56 @@ pub async fn resolve_provider_capabilities(
     }
 }
 
+/// Resolve and print the effective model capabilities using the same
+/// discovery path as the agent runtime (provider `/models` catalog, plus
+/// the vision debug override). Shared by model-cli and task-cli so both
+/// CLIs report capabilities identically; runs before any turn so a
+/// misresolved capability (notably `tool_calls`) is visible up front.
+pub fn print_resolved_capabilities(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+    vision: Option<bool>,
+) {
+    let normalized = if provider == "anthropic" {
+        base_url.trim_end_matches('/').to_string()
+    } else {
+        normalize_provider_base_url(provider, base_url)
+    };
+    let config = ProviderConfig {
+        provider: provider.to_string(),
+        base_url: normalized,
+        name: model.to_string(),
+        api_key: api_key.map(str::to_string),
+        vision,
+    };
+    let resolved = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(async {
+            let catalog = ModelCatalogService::new();
+            resolve_provider_capabilities(&config, &catalog).await
+        }),
+        Err(error) => {
+            eprintln!("capability discovery unavailable ({error}); assuming text-only");
+            return;
+        }
+    };
+    println!("provider={provider}");
+    println!("model={model}");
+    println!("capabilities_source={}", resolved.info.source);
+    println!("image_input={}", resolved.info.image_input());
+    println!("audio_input={}", resolved.info.audio_input());
+    println!("video_input={}", resolved.info.video_input());
+    println!("pdf_input={}", resolved.info.pdf_input());
+    println!("tool_calls={}", resolved.info.tool_calls);
+    println!("parallel_tool_calls={}", resolved.info.parallel_tool_calls);
+    println!("structured_output={}", resolved.info.structured_output);
+    println!("reasoning={}", resolved.info.reasoning);
+}
+
 /// Constructs one provider family from a resolved [`ProviderConfig`]
 /// plus its API-discovered [`ProviderCapabilities`]. Adding a provider
 /// means adding a factory + one registry line — never touching the
