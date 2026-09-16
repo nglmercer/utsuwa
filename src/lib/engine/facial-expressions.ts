@@ -30,8 +30,8 @@ export function isEmotionalExpression(value: unknown): value is EmotionalExpress
 // to the closest available preset instead of failing.
 export const EXPRESSION_CANDIDATES: Record<EmotionalExpression, string[]> = {
 	happy: ['happy', 'joy', 'smile'],
-	angry: ['angry'],
-	sad: ['sad'],
+	angry: ['angry', 'anger'],
+	sad: ['sad', 'sorrow'],
 	relaxed: ['relaxed', 'neutral'],
 	surprised: ['surprised'],
 	neutral: ['neutral', 'relaxed']
@@ -42,6 +42,10 @@ export const EXPRESSION_CANDIDATES: Record<EmotionalExpression, string[]> = {
 // frame-loop systems.
 const PROTECTED_CHANNELS = new Set([
 	'blink',
+	// VRM runtime names (three-vrm maps 0.x blink_l/blink_r here; 1.0 uses
+	// these directly) plus ARKit-style aliases seen on bridge rigs.
+	'blinkLeft',
+	'blinkRight',
 	'eyeBlinkLeft',
 	'eyeBlinkRight',
 	'aa',
@@ -58,6 +62,7 @@ const PROTECTED_CHANNELS = new Set([
 ]);
 
 export function isProtectedChannel(name: string): boolean {
+	if (typeof name !== 'string') return false;
 	if (PROTECTED_CHANNELS.has(name)) return true;
 	const lower = name.toLowerCase();
 	for (const channel of PROTECTED_CHANNELS) {
@@ -126,7 +131,9 @@ export function resolveExpressionName(
 	for (const candidate of candidates) {
 		if (available.includes(candidate)) return candidate;
 	}
-	const lowered = available.map((name) => name.toLowerCase());
+	// Non-string entries (never produced by three-vrm, but tolerated from
+	// untyped callers) degrade to silence instead of throwing.
+	const lowered = available.map((name) => (typeof name === 'string' ? name.toLowerCase() : ''));
 	for (const candidate of candidates) {
 		const index = lowered.indexOf(candidate.toLowerCase());
 		if (index !== -1) return available[index];
@@ -208,7 +215,11 @@ export function directTemporaryTarget(
 	if (!temporary || !(temporary.weight > 0)) return null;
 	if (isEmotionalExpression(temporary.name) || isProtectedChannel(temporary.name)) return null;
 	const match = available.find((name) => name === temporary.name);
-	const name = match ?? available.find((name) => name.toLowerCase() === temporary.name.toLowerCase());
+	const name =
+		match ??
+		available.find(
+			(name) => typeof name === 'string' && name.toLowerCase() === temporary.name.toLowerCase()
+		);
 	if (!name) return null;
 	return { name, weight: clamp01(temporary.weight) };
 }

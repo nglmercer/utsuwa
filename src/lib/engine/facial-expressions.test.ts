@@ -161,6 +161,144 @@ describe('expression resolution', () => {
 			assert.ok(EXPRESSION_CANDIDATES[expression].length > 0);
 		}
 	});
+
+	it('resolves every mood to at least one expression on a stock VRoid rig', () => {
+		const VROID_PRESETS = ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'neutral'];
+		for (const primary of ALL_MOODS) {
+			for (const intensity of [50, 100]) {
+				const targets = resolveTargets(moodToExpressionWeights({ primary, intensity }), VROID_PRESETS);
+				assert.ok(targets.length > 0, `${primary}@${intensity} resolved to nothing`);
+				for (const target of targets) {
+					assert.ok(VROID_PRESETS.includes(target.name), `${primary} resolved to ${target.name}`);
+					assert.ok(target.weight > 0 && target.weight <= 1, `${primary}.${target.name}=${target.weight}`);
+				}
+			}
+			assert.deepEqual(
+				resolveTargets(moodToExpressionWeights({ primary, intensity: 0 }), VROID_PRESETS),
+				[],
+				`${primary}@0 should stay silent`
+			);
+		}
+	});
+
+	it('degrades VRM 0.x blendshapes to their closest preset', () => {
+		const VRM0X_PRESETS = ['joy', 'sorrow', 'anger', 'fun'];
+		assert.equal(resolveExpressionName('happy', VRM0X_PRESETS), 'joy');
+		assert.equal(resolveExpressionName('sad', VRM0X_PRESETS), 'sorrow');
+		assert.equal(resolveExpressionName('angry', VRM0X_PRESETS), 'anger');
+		// No 0.x counterpart exists for these: they stay silent instead of failing.
+		for (const channel of ['relaxed', 'surprised', 'neutral'] as const) {
+			assert.equal(resolveExpressionName(channel, VRM0X_PRESETS), null, channel);
+		}
+		assert.deepEqual(
+			resolveTargets(moodToExpressionWeights({ primary: 'sad', intensity: 100 }), VRM0X_PRESETS),
+			[{ name: 'sorrow', weight: 1 }]
+		);
+		assert.deepEqual(
+			resolveTargets(moodToExpressionWeights({ primary: 'frustrated', intensity: 100 }), VRM0X_PRESETS),
+			[{ name: 'anger', weight: 1 }]
+		);
+	});
+
+	it('degrades unknown model presets to silence without throwing', () => {
+		const weird = ['shy_custom', 'Blink', '', 'HAPPY_CUSTOM'];
+		assert.equal(resolveExpressionName('surprised', weird), null);
+		assert.deepEqual(
+			resolveTargets(moodToExpressionWeights({ primary: 'excited', intensity: 100 }), weird),
+			[]
+		);
+		assert.deepEqual(
+			resolveTargets(moodToExpressionWeights({ primary: 'happy', intensity: 100 }), []),
+			[]
+		);
+		assert.equal(directTemporaryTarget({ name: 'shy', weight: 1 }, weird), null);
+		assert.equal(directTemporaryTarget({ name: 'shy', weight: 1 }, []), null);
+	});
+
+	it('skips non-string entries in the available list instead of throwing', () => {
+		const dirty = ['joy', 42, null, undefined, { name: 'happy' }] as unknown as string[];
+		assert.equal(resolveExpressionName('happy', dirty), 'joy');
+		assert.equal(resolveExpressionName('sad', dirty), null);
+		assert.deepEqual(
+			resolveTargets(moodToExpressionWeights({ primary: 'happy', intensity: 100 }), dirty),
+			[{ name: 'joy', weight: 1 }]
+		);
+		assert.equal(
+			directTemporaryTarget({ name: 'shy', weight: 0.5 }, [...dirty, 'SHY'])?.name,
+			'SHY'
+		);
+		assert.ok(!isProtectedChannel(42 as unknown as string));
+	});
+});
+
+describe('protected channels', () => {
+	const PROTECTED = [
+		'blink',
+		'blinkLeft',
+		'blinkRight',
+		'eyeBlinkLeft',
+		'eyeBlinkRight',
+		'aa',
+		'ee',
+		'ih',
+		'oh',
+		'ou',
+		'a',
+		'i',
+		'u',
+		'e',
+		'o',
+		'jawOpen'
+	];
+
+	it('recognizes every protected channel in any case', () => {
+		for (const name of PROTECTED) {
+			assert.ok(isProtectedChannel(name), name);
+			assert.ok(isProtectedChannel(name.toUpperCase()), name.toUpperCase());
+			assert.ok(isProtectedChannel(name[0].toUpperCase() + name.slice(1)), name);
+		}
+		for (const name of [...EMOTIONAL_EXPRESSIONS, 'shy']) {
+			assert.ok(!isProtectedChannel(name), `${name} must not be protected`);
+		}
+	});
+
+	it('never emits a protected channel from the mood path', () => {
+		const rig = [...PROTECTED, 'Blink', 'JAWOPEN', 'happy', 'sad'];
+		for (const primary of ALL_MOODS) {
+			const targets = resolveTargets(moodToExpressionWeights({ primary, intensity: 100 }), rig);
+			for (const target of targets) {
+				assert.ok(!isProtectedChannel(target.name), `${primary} wrote ${target.name}`);
+			}
+		}
+	});
+
+	it('drops temporaries that name a protected channel, in any case', () => {
+		const baseline = moodToExpressionWeights({ primary: 'sad', intensity: 80 });
+		for (const name of [...PROTECTED, 'Blink', 'JAWOPEN', 'AA', 'EyeBlinkRight']) {
+			assert.deepEqual(blendTemporaryFace(baseline, { name, weight: 1 }), baseline, name);
+			assert.equal(directTemporaryTarget({ name, weight: 1 }, [name, 'happy', 'shy']), null, name);
+		}
+	});
+});
+
+describe('weight hygiene', () => {
+	it('drives at most two channels per mood', () => {
+		for (const primary of ALL_MOODS) {
+			for (const intensity of [50, 100]) {
+				const weights = moodToExpressionWeights({ primary, intensity });
+				const active = EMOTIONAL_EXPRESSIONS.filter((expression) => weights[expression] > 0);
+				assert.ok(active.length <= 2, `${primary}@${intensity} drives ${active.join(',')}`);
+			}
+		}
+	});
+
+	it('keeps neutral exclusive: no emotional channel stacked under it', () => {
+		const weights = moodToExpressionWeights({ primary: 'neutral', intensity: 100 });
+		for (const expression of ['happy', 'angry', 'sad', 'relaxed', 'surprised'] as const) {
+			assert.equal(weights[expression], 0, `neutral.${expression}`);
+		}
+		assert.ok(weights.neutral > 0);
+	});
 });
 
 describe('approachWeight', () => {
