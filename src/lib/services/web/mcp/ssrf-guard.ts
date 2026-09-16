@@ -13,7 +13,9 @@
  * tests and shared code stay portable. The node-backed resolver lives in
  * the server-only `src/routes/api/mcp/dns` module.
  */
-import { ipv4ToInt } from '../../providers/url-guard.ts';
+import { ipv4ToInt, type HostResolver } from '../../providers/url-guard.ts';
+
+export type { HostResolver } from '../../providers/url-guard.ts';
 
 /** Strip IPv6 brackets and any `%zone` suffix, lowercase. */
 function normalizeHost(hostname: string): string {
@@ -60,9 +62,6 @@ export function isBlockedMcpHost(hostname: string): boolean {
 	// the final word.
 	return false;
 }
-
-/** Resolves a hostname to IP strings (v4 and/or v6 literals). */
-export type HostResolver = (hostname: string) => Promise<string[]>;
 
 /** Validate a full MCP server URL: http(s) scheme, literal check, then DNS
  * resolution with every answer checked. Returns the parsed URL. */

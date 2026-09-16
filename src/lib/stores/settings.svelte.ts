@@ -9,6 +9,18 @@ import { isDesktopBuild } from '$lib/services/platform';
 import { getChatBaseUrl } from '$lib/services/providers/local-endpoints';
 import type { ModelInfo } from '$lib/services/providers/model-capabilities';
 import { parseMcpServerConfigs, type McpServerConfig } from '$lib/services/mcp/types';
+import {
+	createVaultSession,
+	decryptSecrets,
+	decryptSecretsWithKey,
+	deriveSessionKey,
+	encryptSecretsWithKey,
+	isVaultEnvelope,
+	validatePassphrase,
+	VaultError,
+	type VaultEnvelope,
+	type VaultSession
+} from '$lib/services/security/vault';
 
 export type ProviderCategory = 'llm' | 'tts' | 'stt';
 
@@ -40,6 +52,15 @@ function createSettingsStore() {
 	let mcpEnabled = $state(false);
 	let mcpServers = $state<McpServerConfig[]>([]);
 
+	// Settings vault (opt-in passphrase encryption for secrets at rest). The
+	// session key lives in memory only; when set, providerConfigs/mcpServers
+	// persist as an AES-GCM envelope instead of plaintext. While locked the
+	// in-memory secrets are empty and consumers see "not configured".
+	let vaultSet = $state(false);
+	let vaultLocked = $state(false);
+	let vaultSession: VaultSession | null = null;
+	let saveChain: Promise<void> = Promise.resolve();
+
 	// Load from localStorage on init. Keep the reactive reads inside a closure:
 	// Svelte 5 otherwise treats a top-level initialization block as capturing
 	// only the initial value of rune state.
@@ -48,36 +69,17 @@ function createSettingsStore() {
 		if (saved) {
 			try {
 				const parsed = JSON.parse(saved);
-				providerConfigs = parsed.providerConfigs ?? {};
-				addedProviders = parsed.addedProviders ?? {};
-				selectedSttProvider = parseSttProvider(parsed.sttProvider);
-				hotkeys = { ...DEFAULT_HOTKEYS, ...parsed.hotkeys };
-				mcpEnabled = parsed.mcpEnabled === true;
-				mcpServers = parseMcpServerConfigs(parsed.mcpServers).servers;
-
-				// Migrate old settings format if needed
-				if (parsed.anthropicApiKey && !providerConfigs.anthropic) {
-					providerConfigs.anthropic = { apiKey: parsed.anthropicApiKey };
-					addedProviders.anthropic = true;
-				}
-				if (parsed.openaiApiKey && !providerConfigs.openai) {
-					providerConfigs.openai = { apiKey: parsed.openaiApiKey };
-					addedProviders.openai = true;
-				}
-				if (parsed.elevenLabsApiKey && !providerConfigs.elevenlabs) {
-					providerConfigs.elevenlabs = {
-						apiKey: parsed.elevenLabsApiKey,
-						voiceId: parsed.elevenLabsVoiceId
-					};
-					addedProviders.elevenlabs = true;
-				}
-
-				// Migrate old llmProvider/ttsProvider - mark them as added
-				if (parsed.llmProvider && providerConfigs[parsed.llmProvider]?.apiKey) {
-					addedProviders[parsed.llmProvider] = true;
-				}
-				if (parsed.ttsProvider && providerConfigs[parsed.ttsProvider]?.apiKey) {
-					addedProviders[parsed.ttsProvider] = true;
+				if (isVaultEnvelope(parsed.vault)) {
+					// Secrets stay encrypted until the user unlocks; load the
+					// non-secret fields only. Consumers see "not configured".
+					vaultSet = true;
+					vaultLocked = true;
+					addedProviders = parsed.addedProviders ?? {};
+					selectedSttProvider = parseSttProvider(parsed.sttProvider);
+					hotkeys = { ...DEFAULT_HOTKEYS, ...parsed.hotkeys };
+					mcpEnabled = parsed.mcpEnabled === true;
+				} else {
+					loadPlaintextSettings(parsed);
 				}
 			} catch (e) {
 				console.error('Failed to load settings:', e);
@@ -86,29 +88,213 @@ function createSettingsStore() {
 		if (isDesktopBuild()) void hydrateNativeModelSettings();
 	}
 
+	function loadPlaintextSettings(parsed: Record<string, unknown>) {
+		try {
+			providerConfigs = (parsed.providerConfigs as Record<string, ProviderConfig>) ?? {};
+			addedProviders = (parsed.addedProviders as Record<string, boolean>) ?? {};
+			selectedSttProvider = parseSttProvider(parsed.sttProvider);
+			hotkeys = { ...DEFAULT_HOTKEYS, ...(parsed.hotkeys as HotkeyConfig) };
+			mcpEnabled = parsed.mcpEnabled === true;
+			mcpServers = parseMcpServerConfigs(parsed.mcpServers).servers;
+
+		// Migrate old settings format if needed
+		const legacyKey = (value: unknown): string | undefined =>
+			typeof value === 'string' && value ? value : undefined;
+		const legacyAnthropic = legacyKey(parsed.anthropicApiKey);
+		if (legacyAnthropic && !providerConfigs.anthropic) {
+			providerConfigs.anthropic = { apiKey: legacyAnthropic };
+			addedProviders.anthropic = true;
+		}
+		const legacyOpenai = legacyKey(parsed.openaiApiKey);
+		if (legacyOpenai && !providerConfigs.openai) {
+			providerConfigs.openai = { apiKey: legacyOpenai };
+			addedProviders.openai = true;
+		}
+		const legacyEleven = legacyKey(parsed.elevenLabsApiKey);
+		if (legacyEleven && !providerConfigs.elevenlabs) {
+			providerConfigs.elevenlabs = {
+				apiKey: legacyEleven,
+				voiceId: legacyKey(parsed.elevenLabsVoiceId)
+			};
+			addedProviders.elevenlabs = true;
+		}
+
+		// Migrate old llmProvider/ttsProvider - mark them as added
+		const legacyLlm = legacyKey(parsed.llmProvider);
+		if (legacyLlm && providerConfigs[legacyLlm]?.apiKey) {
+			addedProviders[legacyLlm] = true;
+		}
+		const legacyTts = legacyKey(parsed.ttsProvider);
+		if (legacyTts && providerConfigs[legacyTts]?.apiKey) {
+			addedProviders[legacyTts] = true;
+		}
+		} catch (e) {
+			console.error('Failed to load settings:', e);
+		}
+	}
+
 	if (browser) loadPersistedSettings();
 
 	function save() {
-		if (browser) {
-			const persistedProviderConfigs = Object.fromEntries(
-				Object.entries(providerConfigs).map(([providerId, config]) => {
-					if (isDesktopBuild() && LLM_PROVIDERS.some((provider) => provider.id === providerId)) {
-						const { apiKey: _apiKey, ...withoutApiKey } = config;
-						return [providerId, withoutApiKey];
-					}
-					return [providerId, config];
+		if (!browser) return;
+		// Serialize: encryption is async, so chain persists to keep last-write-wins.
+		saveChain = saveChain
+			.then(() => persist())
+			.catch((e) => console.error('Failed to save settings:', e));
+	}
+
+	function persistedProviderConfigs(): Record<string, ProviderConfig> {
+		return Object.fromEntries(
+			Object.entries(providerConfigs).map(([providerId, config]) => {
+				if (isDesktopBuild() && LLM_PROVIDERS.some((provider) => provider.id === providerId)) {
+					const { apiKey: _apiKey, ...withoutApiKey } = config;
+					return [providerId, withoutApiKey];
+				}
+				return [providerId, config];
+			})
+		);
+	}
+
+	async function persist() {
+		const nonSecrets: Record<string, unknown> = {
+			addedProviders,
+			hotkeys,
+			mcpEnabled
+		};
+		if (selectedSttProvider) nonSecrets.sttProvider = selectedSttProvider;
+		if (vaultSession) {
+			// Vault active: secrets persist only as an AES-GCM envelope.
+			const envelope = await encryptSecretsWithKey(
+				JSON.stringify({ providerConfigs: persistedProviderConfigs(), mcpServers }),
+				vaultSession.key,
+				vaultSession.salt
+			);
+			vaultSet = true;
+			localStorage.setItem(
+				'utsuwa-settings',
+				JSON.stringify({ ...nonSecrets, providerConfigs: {}, mcpServers: [], vault: envelope })
+			);
+			return;
+		}
+		if (vaultLocked) {
+			// Locked: persist non-secrets only and preserve the stored envelope
+			// byte-for-byte (in-memory secrets are empty and must not wipe it).
+			let vault: unknown;
+			try {
+				vault = (JSON.parse(localStorage.getItem('utsuwa-settings') ?? '{}') as Record<string, unknown>)
+					.vault;
+			} catch {
+				vault = undefined;
+			}
+			localStorage.setItem(
+				'utsuwa-settings',
+				JSON.stringify({
+					...nonSecrets,
+					providerConfigs: {},
+					mcpServers: [],
+					...(isVaultEnvelope(vault) ? { vault } : {})
 				})
 			);
-			const persistedSettings: Record<string, unknown> = {
-				providerConfigs: persistedProviderConfigs,
-				addedProviders,
-				hotkeys,
-				mcpEnabled,
-				mcpServers
-			};
-			if (selectedSttProvider) persistedSettings.sttProvider = selectedSttProvider;
-			localStorage.setItem('utsuwa-settings', JSON.stringify(persistedSettings));
+			return;
 		}
+		vaultSet = false;
+		localStorage.setItem(
+			'utsuwa-settings',
+			JSON.stringify({ ...nonSecrets, providerConfigs: persistedProviderConfigs(), mcpServers })
+		);
+	}
+
+	function readStoredEnvelope(): VaultEnvelope | null {
+		try {
+			const vault = (
+				JSON.parse(localStorage.getItem('utsuwa-settings') ?? '{}') as Record<string, unknown>
+			).vault;
+			return isVaultEnvelope(vault) ? vault : null;
+		} catch {
+			return null;
+		}
+	}
+
+	function applyDecryptedSecrets(plaintext: string) {
+		const secrets = JSON.parse(plaintext) as {
+			providerConfigs?: Record<string, ProviderConfig>;
+			mcpServers?: unknown;
+		};
+		providerConfigs =
+			secrets.providerConfigs && typeof secrets.providerConfigs === 'object'
+				? secrets.providerConfigs
+				: {};
+		mcpServers = parseMcpServerConfigs(secrets.mcpServers).servers;
+	}
+
+	/** Unlock with the vault passphrase. Returns false on a wrong passphrase. */
+	async function unlockVault(passphrase: string): Promise<boolean> {
+		if (!browser) return false;
+		const envelope = readStoredEnvelope();
+		if (!envelope) return false;
+		try {
+			const session = await deriveSessionKey(passphrase, envelope);
+			applyDecryptedSecrets(await decryptSecretsWithKey(envelope, session.key));
+			vaultSession = session;
+			vaultLocked = false;
+			vaultSet = true;
+			return true;
+		} catch (e) {
+			if (e instanceof VaultError) return false;
+			throw e;
+		}
+	}
+
+	/** Set (or re-key) the vault passphrase. Throws VaultError when too short. */
+	async function setVaultPassphrase(passphrase: string): Promise<void> {
+		validatePassphrase(passphrase);
+		vaultSession = await createVaultSession(passphrase);
+		vaultLocked = false;
+		vaultSet = true;
+		save();
+	}
+
+	/**
+	 * Change the passphrase. The current one is always verified (against the
+	 * stored envelope, or via unlock when locked). Returns false when the
+	 * current passphrase is wrong; throws VaultError when the new one is weak.
+	 */
+	async function changeVaultPassphrase(current: string, next: string): Promise<boolean> {
+		if (vaultLocked) {
+			if (!(await unlockVault(current))) return false;
+		} else if (vaultSet) {
+			const envelope = readStoredEnvelope();
+			if (!envelope) return false;
+			try {
+				await decryptSecrets(envelope, current);
+			} catch (e) {
+				if (e instanceof VaultError) return false;
+				throw e;
+			}
+		}
+		await setVaultPassphrase(next);
+		return true;
+	}
+
+	/**
+	 * Remove the passphrase and return secrets to plaintext storage. Only
+	 * available while unlocked (locked vaults must be unlocked first).
+	 */
+	function removeVaultPassphrase(): boolean {
+		if (vaultLocked) return false;
+		vaultSession = null;
+		vaultSet = false;
+		save();
+		return true;
+	}
+
+	/** Wipe in-memory secrets and the session key. Storage keeps the envelope. */
+	function lockVault() {
+		if (!vaultSet) return;
+		vaultSession = null;
+		providerConfigs = {};
+		mcpServers = [];
+		vaultLocked = true;
 	}
 
 	async function hydrateNativeModelSettings() {
@@ -186,19 +372,50 @@ function createSettingsStore() {
 	if (browser) {
 		window.addEventListener('storage', (e) => {
 			if (e.key === 'utsuwa-settings' && e.newValue) {
-				try {
-					const parsed = JSON.parse(e.newValue);
-					providerConfigs = parsed.providerConfigs ?? {};
-					addedProviders = parsed.addedProviders ?? {};
-					selectedSttProvider = parseSttProvider(parsed.sttProvider);
-					hotkeys = { ...DEFAULT_HOTKEYS, ...parsed.hotkeys };
-					mcpEnabled = parsed.mcpEnabled === true;
-					mcpServers = parseMcpServerConfigs(parsed.mcpServers).servers;
-				} catch {
-					// Ignore malformed data from other window
-				}
+				void syncFromStorageEvent(e.newValue);
 			}
 		});
+	}
+
+	function syncNonSecrets(parsed: Record<string, unknown>) {
+		addedProviders = (parsed.addedProviders as Record<string, boolean>) ?? {};
+		selectedSttProvider = parseSttProvider(parsed.sttProvider);
+		hotkeys = { ...DEFAULT_HOTKEYS, ...(parsed.hotkeys as HotkeyConfig) };
+		mcpEnabled = parsed.mcpEnabled === true;
+	}
+
+	async function syncFromStorageEvent(raw: string) {
+		try {
+			const parsed = JSON.parse(raw) as Record<string, unknown>;
+			syncNonSecrets(parsed);
+			if (isVaultEnvelope(parsed.vault)) {
+				vaultSet = true;
+				// Windows don't share the session key: decrypt when possible,
+				// otherwise mark locked. A decrypt failure means the vault was
+				// re-keyed elsewhere — drop this window to locked as well.
+				if (vaultSession) {
+					try {
+						applyDecryptedSecrets(await decryptSecretsWithKey(parsed.vault, vaultSession.key));
+						vaultLocked = false;
+					} catch {
+						vaultSession = null;
+						providerConfigs = {};
+						mcpServers = [];
+						vaultLocked = true;
+					}
+				} else {
+					vaultLocked = true;
+				}
+				return;
+			}
+			vaultSet = false;
+			if (!vaultLocked) {
+				providerConfigs = (parsed.providerConfigs as Record<string, ProviderConfig>) ?? {};
+				mcpServers = parseMcpServerConfigs(parsed.mcpServers).servers;
+			}
+		} catch {
+			// Ignore malformed data from other window
+		}
 	}
 
 	// Provider configuration
@@ -445,6 +662,19 @@ function createSettingsStore() {
 		},
 		setHotkey,
 		resetHotkeys,
+
+		// Settings vault (passphrase encryption for secrets at rest)
+		get vaultSet() {
+			return vaultSet;
+		},
+		get vaultLocked() {
+			return vaultLocked;
+		},
+		unlockVault,
+		setVaultPassphrase,
+		changeVaultPassphrase,
+		removeVaultPassphrase,
+		lockVault,
 
 		// MCP servers
 		get mcpEnabled() {

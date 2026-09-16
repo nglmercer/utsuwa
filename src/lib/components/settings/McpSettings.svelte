@@ -189,6 +189,10 @@
 
 	async function saveDraft() {
 		if (saving) return;
+		if (!native && settingsStore.vaultLocked) {
+			formError = 'Unlock the vault below before editing servers.';
+			return;
+		}
 		const config = draftToConfig();
 		if (!native) {
 			const error =
@@ -557,8 +561,10 @@
 							Spawned by the native host with a default-deny environment (only the
 							variables below are passed).
 						{:else}
-							Must be on the server's <code>MCP_STDIO_ALLOWED_COMMANDS</code> allowlist, or the
-							proxy refuses to run it.
+							Web stdio servers must be pinned by the server operator in
+							<code>MCP_STDIO_SERVERS</code> (matched by server id) — command,
+							arguments, and environment from the browser are ignored by the
+							proxy.
 						{/if}
 					</p>
 

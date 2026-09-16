@@ -251,7 +251,11 @@ export async function sendCompanionMessage(
 		const requiresApiKey =
 			providerMeta?.authentication === 'required' || providerMeta?.requiresApiKey === true;
 		if (!nativeRuntime && requiresApiKey && !hasApiKey(apiKey)) {
-			throw new Error(`Please configure API key for ${providerMeta.name} in Settings > Providers`);
+			throw new Error(
+				settingsStore.vaultLocked
+					? 'The key vault is locked — unlock it in Settings to use providers.'
+					: `Please configure API key for ${providerMeta.name} in Settings > Providers`
+			);
 		}
 
 		// Prompt building (memory retrieval) is done; the model call starts now

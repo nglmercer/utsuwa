@@ -24,6 +24,8 @@ import {
 	type ToolLoopMessage
 } from '$lib/services/web/mcp/tool-loop';
 import type { FetchImpl } from '$lib/services/web/mcp/http-client';
+import { nodeHostResolver } from '../dns.ts';
+import { asGlobalFetch, createProviderFetch } from '../provider-fetch.ts';
 
 // Providers that don't require API keys
 const LOCAL_PROVIDERS: LLMProvider[] = ['ollama', 'lmstudio'];
@@ -52,6 +54,7 @@ async function runServerMcpLoop(args: {
 	system: string;
 	messages: ToolLoopMessage[];
 	proxyFetch: FetchImpl;
+	providerFetch: FetchImpl;
 }): Promise<ServerMcpLoop | null> {
 	const record = args.mcp && typeof args.mcp === 'object' ? (args.mcp as Record<string, unknown>) : null;
 	if (!record || !isMcpProxyEnabled(env.MCP_ENABLED)) return null;
@@ -73,7 +76,7 @@ async function runServerMcpLoop(args: {
 		: args.system;
 	const auth = normalizeOptionalApiKey(args.apiKey);
 	const adapter = openaiToolAdapter({
-		fetchImpl: (url, init) => fetch(url, init),
+		fetchImpl: (url, init) => args.providerFetch(url, init),
 		url: `${args.providerBaseURL.replace(/\/+$/, '')}/chat/completions`,
 		headers: auth ? { Authorization: `Bearer ${auth}` } : {},
 		model: args.model
@@ -124,6 +127,21 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
 		});
 	}
 
+	// Backstop for chunked bodies without a content-length (the hook caps the
+	// declared size): bound turn count and bytes before the provider call.
+	if (messages.length > 500) {
+		return new Response(JSON.stringify({ error: 'Too many messages (max 500)' }), {
+			status: 400,
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+	if (JSON.stringify(messages).length > 12 * 1024 * 1024) {
+		return new Response(JSON.stringify({ error: 'Request body too large' }), {
+			status: 413,
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+
 	const typedProvider = provider as LLMProvider;
 
 	const providerMeta = getLLMProvider(typedProvider);
@@ -164,14 +182,20 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
 		}
 
 		// Block SSRF: the base URL is client-supplied and fetched server-side.
+		// The string check rejects obvious abuse up front; the guarded
+		// transport below additionally resolves DNS (rebinding protection)
+		// and re-validates every redirect hop.
+		const allowLocalHosts = env.ALLOW_LOCAL_PROVIDER_HOSTS === 'true';
 		try {
-			assertSafeProviderUrl(providerBaseURL, env.ALLOW_LOCAL_PROVIDER_HOSTS === 'true');
+			assertSafeProviderUrl(providerBaseURL, allowLocalHosts);
 		} catch (e) {
 			return new Response(
 				JSON.stringify({ error: e instanceof Error ? e.message : 'Invalid provider URL' }),
 				{ status: 400, headers: { 'Content-Type': 'application/json' } }
 			);
 		}
+		const providerFetch = createProviderFetch(nodeHostResolver, allowLocalHosts);
+		const xsaiFetch = asGlobalFetch(providerFetch);
 
 		// Add system message (use provided systemPrompt or default)
 		const defaultSystemPrompt =
@@ -197,7 +221,8 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
 				model,
 				system: systemPrompt || defaultSystemPrompt,
 				messages: messages as ToolLoopMessage[],
-				proxyFetch: (url, init) => eventFetch(url, init)
+				proxyFetch: (url, init) => eventFetch(url, init),
+				providerFetch
 			});
 			if (loop) {
 				if (loop.error) return sseErrorResponse(loop.prefixText, loop.error);
@@ -208,11 +233,14 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
 
 		let result;
 		try {
-			result = streamText({
+			// xsai honors `options.fetch` at runtime (`options.fetch ??
+			// globalThis.fetch`) although its generated types omit it.
+			const streamOptions = {
 				// xsai omits Authorization when apiKey is undefined. This is
 				// essential for anonymous Kilo/free-gateway requests.
 				apiKey: normalizeOptionalApiKey(apiKey),
 				baseURL: providerBaseURL,
+				fetch: xsaiFetch,
 				model,
 				messages: messagesWithSystem,
 				headers,
@@ -223,7 +251,10 @@ export const POST: RequestHandler = async ({ request, fetch: eventFetch }) => {
 					...(presencePenalty !== undefined && { presence_penalty: presencePenalty }),
 					...(frequencyPenalty !== undefined && { frequency_penalty: frequencyPenalty })
 				})
-				});
+			};
+			// Passed by reference (not as a fresh literal) so the runtime-only
+			// `fetch` option doesn't trip the generated xsai types.
+			result = streamText(streamOptions);
 		} catch (err) {
 			const msg = describeChatError(err, typedProvider, providerBaseURL);
 			return new Response(JSON.stringify({ error: msg }), {

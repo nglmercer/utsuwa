@@ -81,6 +81,18 @@ export function isPrivateHost(hostname: string): boolean {
 	return false;
 }
 
+/** Resolves a hostname to IP strings (v4 and/or v6 literals). */
+export type HostResolver = (hostname: string) => Promise<string[]>;
+
+/** True when the host is already a numeric IP literal (fully judged by string checks). */
+function isNumericProviderHost(hostname: string): boolean {
+	const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+	if (ipv4ToInt(host) !== null) return true;
+	if (host.startsWith('::ffff:') && ipv4ToInt(host.slice(7)) !== null) return true;
+	// Any colon means IPv6 literal form (hostnames never contain ':').
+	return host.includes(':');
+}
+
 // Validate a resolved provider base URL before the server fetches it. Returns the
 // parsed URL, or throws if it uses a non-HTTP scheme or targets a private host.
 // Set allowPrivate (self-hosters running local models behind the web server) to
@@ -101,5 +113,33 @@ export function assertSafeProviderUrl(rawUrl: string, allowPrivate = false): URL
 		throw new Error('Provider URL host is not allowed');
 	}
 
+	return url;
+}
+
+/**
+ * `assertSafeProviderUrl` plus DNS resolution: every answer for a non-numeric
+ * hostname must also clear the private-host check, so a hostile name cannot
+ * launder a blocked address (DNS rebinding). Use with a redirect-guarded
+ * fetch so 3xx targets are re-validated hop by hop.
+ */
+export async function assertSafeProviderUrlResolved(
+	rawUrl: string,
+	resolveHost: HostResolver,
+	allowPrivate = false
+): Promise<URL> {
+	const url = assertSafeProviderUrl(rawUrl, allowPrivate);
+	if (allowPrivate || isNumericProviderHost(url.hostname)) return url;
+	let answers: string[];
+	try {
+		answers = await resolveHost(url.hostname);
+	} catch {
+		throw new Error('Provider hostname did not resolve');
+	}
+	if (answers.length === 0) throw new Error('Provider hostname did not resolve');
+	for (const answer of answers) {
+		if (isPrivateHost(answer)) {
+			throw new Error('Provider hostname resolves to a blocked address');
+		}
+	}
 	return url;
 }

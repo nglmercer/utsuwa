@@ -218,6 +218,17 @@ pub fn system(service: &str) -> Arc<dyn SecretStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ACCOUNT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Unique keyring account per test: the OS keychain is shared across
+    /// test threads (and across workspace test binaries running in parallel),
+    /// so a fixed account name turns set/get/delete round-trips into a race.
+    fn unique_account(prefix: &str) -> String {
+        let n = ACCOUNT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("{prefix}.{}.{n}", std::process::id())
+    }
 
     #[test]
     fn memory_store_round_trip() {
@@ -237,9 +248,10 @@ mod tests {
     #[test]
     fn system_always_returns_a_working_store() {
         let store = system("utsuwa-test");
-        store.set("probe.account", "v").unwrap();
-        assert_eq!(store.get("probe.account").unwrap(), Some("v".to_string()));
-        store.delete("probe.account").unwrap();
+        let account = unique_account("probe.account");
+        store.set(&account, "v").unwrap();
+        assert_eq!(store.get(&account).unwrap(), Some("v".to_string()));
+        store.delete(&account).unwrap();
     }
 
     #[test]
@@ -262,9 +274,10 @@ mod tests {
         // Direct call on the async worker (no spawn_blocking): this is
         // exactly the context that used to panic.
         let store = system("utsuwa-test");
-        store.set("probe.account", "v").unwrap();
-        assert_eq!(store.get("probe.account").unwrap(), Some("v".to_string()));
-        store.delete("probe.account").unwrap();
+        let account = unique_account("probe.account");
+        store.set(&account, "v").unwrap();
+        assert_eq!(store.get(&account).unwrap(), Some("v".to_string()));
+        store.delete(&account).unwrap();
     }
 
     // Keyring reads/writes from inside an async runtime hop threads
@@ -276,12 +289,10 @@ mod tests {
         // Must not panic regardless of backend availability.
         let probed = store.probe();
         if probed {
-            store.set("test.runtime", "s3cr3t").unwrap();
-            assert_eq!(
-                store.get("test.runtime").unwrap(),
-                Some("s3cr3t".to_string())
-            );
-            store.delete("test.runtime").unwrap();
+            let account = unique_account("test.runtime");
+            store.set(&account, "s3cr3t").unwrap();
+            assert_eq!(store.get(&account).unwrap(), Some("s3cr3t".to_string()));
+            store.delete(&account).unwrap();
         } else {
             eprintln!("no working keychain; probe-only coverage");
         }
@@ -299,12 +310,10 @@ mod tests {
             eprintln!("no working keychain; skipping");
             return;
         }
-        store.set("test.roundtrip", "s3cr3t").unwrap();
-        assert_eq!(
-            store.get("test.roundtrip").unwrap(),
-            Some("s3cr3t".to_string())
-        );
-        store.delete("test.roundtrip").unwrap();
-        assert_eq!(store.get("test.roundtrip").unwrap(), None);
+        let account = unique_account("test.roundtrip");
+        store.set(&account, "s3cr3t").unwrap();
+        assert_eq!(store.get(&account).unwrap(), Some("s3cr3t".to_string()));
+        store.delete(&account).unwrap();
+        assert_eq!(store.get(&account).unwrap(), None);
     }
 }

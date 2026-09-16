@@ -1,5 +1,6 @@
 <script lang="ts">
 	import McpSettings from '$lib/components/settings/McpSettings.svelte';
+	import VaultSettings from '$lib/components/settings/VaultSettings.svelte';
 	import '../settings-page.css';
 </script>
 
@@ -10,6 +11,9 @@
 	</div>
 	<div class="section">
 		<McpSettings />
+	</div>
+	<div class="section">
+		<VaultSettings />
 	</div>
 </div>
 

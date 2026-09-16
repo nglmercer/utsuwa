@@ -3628,17 +3628,22 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         {
             let events = harness.events.lock().unwrap();
+            let names: Vec<&str> = events.iter().map(|event| event.event.as_str()).collect();
             assert_eq!(
                 events
                     .iter()
                     .filter(|event| event.event == "agent.turn_failed")
                     .count(),
-                1
+                1,
+                "event timeline: {names:?}"
             );
-            assert!(events.iter().all(|event| !matches!(
-                event.event.as_str(),
-                "agent.turn_done" | "agent.turn_suspended" | "agent.turn_cancelled"
-            )));
+            assert!(
+                events.iter().all(|event| !matches!(
+                    event.event.as_str(),
+                    "agent.turn_done" | "agent.turn_suspended" | "agent.turn_cancelled"
+                )),
+                "event timeline: {names:?}"
+            );
         }
         assert!(harness.runtime.lock_state().unwrap().running.is_none());
     }

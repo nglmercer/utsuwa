@@ -3,12 +3,20 @@
  * request (no process pool): each call pays one spawn, and no child outlives
  * its request.
  *
- * Fail-closed command policy: `MCP_STDIO_ALLOWED_COMMANDS` (comma-separated)
- * must list the command or its basename, otherwise the call is refused
- * without spawning. Unset/empty = nothing is allowed.
+ * Fail-closed server policy, two layers:
  *
- * Child environment is minimal: a tiny fixed base plus the server's
- * configured `env`. The parent environment is never inherited.
+ * 1. Operator inventory (`MCP_STDIO_SERVERS`, JSON). Clients only name a
+ *    server `id`; the command, argv, and env come from the operator's
+ *    inventory entry. Client-supplied command/args/env are discarded, so an
+ *    internet caller can never turn an allowlisted interpreter (`uvx`, `npx`,
+ *    `python3`) into arbitrary code execution via argv. No entry = refused.
+ * 2. Command backstop (`MCP_STDIO_ALLOWED_COMMANDS`, comma-separated): the
+ *    resolved command (or its basename) must additionally be listed.
+ *    Unset/empty = nothing is allowed.
+ *
+ * Child environment is minimal: a tiny fixed base plus the inventory entry's
+ * `env`. The parent environment is never inherited and the client cannot
+ * override `PATH` or inject loader variables.
  */
 import { McpError, type McpStdioServerConfig } from '../../../lib/services/mcp/types.ts';
 
@@ -39,6 +47,128 @@ export function isCommandAllowed(command: string, allowed: string[] | null): boo
 	if (!allowed) return false;
 	if (allowed.includes(command)) return true;
 	return allowed.includes(baseName(command));
+}
+
+/** One operator-pinned stdio server: exact argv, exact env. */
+export interface StdioInventoryEntry {
+	id: string;
+	command: string;
+	args: string[];
+	env: Record<string, string>;
+}
+
+const MAX_INVENTORY_ENTRIES = 64;
+const MAX_INVENTORY_ARGS = 128;
+const MAX_INVENTORY_ENV_KEYS = 64;
+const MAX_INVENTORY_ARG_CHARS = 4096;
+const MAX_INVENTORY_ENV_VALUE_CHARS = 8192;
+const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+function cleanInventoryString(value: unknown, maxChars: number): string | null {
+	if (typeof value !== 'string') return null;
+	if (value.includes('\0') || value.length === 0 || value.length > maxChars) return null;
+	return value;
+}
+
+/**
+ * Parse the operator's stdio inventory (`MCP_STDIO_SERVERS`, a JSON array of
+ * `{id, command, args?, env?}`). Malformed entries are dropped; malformed
+ * JSON yields an empty inventory. Empty inventory = every stdio server
+ * refused. Never throws.
+ */
+export function parseStdioInventory(raw: string | undefined): StdioInventoryEntry[] {
+	if (!raw || !raw.trim()) return [];
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return [];
+	}
+	if (!Array.isArray(parsed)) return [];
+	const entries: StdioInventoryEntry[] = [];
+	const seen = new Set<string>();
+	for (const item of parsed) {
+		if (entries.length >= MAX_INVENTORY_ENTRIES) break;
+		if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+		const record = item as Record<string, unknown>;
+		const id = cleanInventoryString(record.id, 128);
+		const command = cleanInventoryString(record.command, 512);
+		if (!id || !command || seen.has(id)) continue;
+		let args: string[] = [];
+		if (record.args !== undefined) {
+			if (!Array.isArray(record.args) || record.args.length > MAX_INVENTORY_ARGS) continue;
+			const cleaned: string[] = [];
+			let valid = true;
+			for (const arg of record.args) {
+				if (typeof arg !== 'string' || arg.includes('\0') || arg.length > MAX_INVENTORY_ARG_CHARS) {
+					valid = false;
+					break;
+				}
+				cleaned.push(arg);
+			}
+			if (!valid) continue;
+			args = cleaned;
+		}
+		const env: Record<string, string> = {};
+		if (record.env !== undefined) {
+			if (!record.env || typeof record.env !== 'object' || Array.isArray(record.env)) continue;
+			const pairs = Object.entries(record.env as Record<string, unknown>);
+			if (pairs.length > MAX_INVENTORY_ENV_KEYS) continue;
+			let valid = true;
+			for (const [key, value] of pairs) {
+				if (!ENV_KEY_PATTERN.test(key) || typeof value !== 'string' || value.includes('\0') || value.length > MAX_INVENTORY_ENV_VALUE_CHARS) {
+					valid = false;
+					break;
+				}
+				env[key] = value;
+			}
+			if (!valid) continue;
+		}
+		seen.add(id);
+		entries.push({ id, command, args, env });
+	}
+	return entries;
+}
+
+/**
+ * Resolve a client-named stdio server against the operator inventory. The
+ * returned config carries the inventory's pinned command/argv/env — the
+ * client's values are discarded. Throws `McpError` (forbidden) when the id
+ * has no entry.
+ */
+export function resolveStdioServer(
+	server: McpStdioServerConfig,
+	inventory: StdioInventoryEntry[]
+): McpStdioServerConfig {
+	const entry = inventory.find((candidate) => candidate.id === server.id);
+	if (!entry) {
+		throw new McpError(
+			server.id,
+			'forbidden',
+			`MCP server '${server.id}' is not in the server's stdio inventory`
+		);
+	}
+	return {
+		...server,
+		command: entry.command,
+		args: [...entry.args],
+		env: { ...entry.env }
+	};
+}
+
+/**
+ * Route choke point: parse the raw inventory env var, warn when it yields
+ * nothing usable, and resolve the client-named server to its pinned argv/env.
+ */
+export function pinnedStdioServer(
+	server: McpStdioServerConfig,
+	rawInventory: string | undefined
+): McpStdioServerConfig {
+	const inventory = parseStdioInventory(rawInventory);
+	if (rawInventory && inventory.length === 0) {
+		console.warn('MCP proxy: MCP_STDIO_SERVERS parsed to zero entries; refusing stdio servers');
+	}
+	return resolveStdioServer(server, inventory);
 }
 
 export interface StdioCallOptions {

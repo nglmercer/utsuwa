@@ -1,8 +1,8 @@
-/** Server-only node DNS resolver for the MCP SSRF guard.
+/** Server-only node DNS resolver for the SSRF guards (MCP + provider routes).
  * Lives beside the routes (never imported by browser code) so the
  * `node:dns` import can never leak into a client bundle.
  */
-import type { HostResolver } from '../../../lib/services/web/mcp/ssrf-guard.ts';
+import type { HostResolver } from '../../lib/services/web/mcp/ssrf-guard.ts';
 
 export const nodeHostResolver: HostResolver = async (hostname: string): Promise<string[]> => {
 	const dns = await import('node:dns/promises');

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { createTtsSettingsState } from '$lib/stores/ai-services-settings.svelte';
 	import TtsSettings from '$lib/components/settings/TtsSettings.svelte';
+	import VaultSettings from '$lib/components/settings/VaultSettings.svelte';
 	import '../settings-page.css';
 
 	const state = createTtsSettingsState();
@@ -14,5 +15,9 @@
 
 	<section class="section">
 		<TtsSettings {state} />
+	</section>
+
+	<section class="section">
+		<VaultSettings />
 	</section>
 </div>

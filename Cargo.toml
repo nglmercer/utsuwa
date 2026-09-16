@@ -83,7 +83,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rmcp = { version = "3.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 rusqlite = { version = "0.32", default-features = false }
 toml = "0.8"
-wasmtime = { version = "34", default-features = false, features = ["runtime", "cranelift", "wat"] }
+wasmtime = { version = "36", default-features = false, features = ["runtime", "cranelift", "wat"] }
 serde = { version = "1", features = ["derive"] }
 storage-core = { path = "crates/storage-core" }
 serde_json = "1"

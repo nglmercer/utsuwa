@@ -84,6 +84,7 @@
 						value={settingsStore.getProviderConfig(provider.id).apiKey ?? ''}
 						oninput={(e) => state.handleApiKeyChange(provider.id, e.currentTarget.value)}
 						onblur={provider?.custom ? undefined : state.handleLLMApiKeyBlur}
+					disabled={settingsStore.vaultLocked}
 					/>
 				</div>
 			{/if}

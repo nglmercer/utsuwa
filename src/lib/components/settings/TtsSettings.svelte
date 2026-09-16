@@ -48,6 +48,7 @@ import { checkTTSProviderHealth } from '$lib/services/providers/health-check';
 						value={settingsStore.getProviderConfig(provider.id).apiKey ?? ''}
 						oninput={(e) => state.handleApiKeyChange(provider.id, e.currentTarget.value)}
 						onblur={state.handleTTSApiKeyBlur}
+					disabled={settingsStore.vaultLocked}
 					/>
 				</div>
 			{/if}

@@ -1,9 +1,9 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
 import { isMcpProxyEnabled, mcpErrorResponse } from '../shared.ts';
-import { nodeHostResolver } from '../dns.ts';
+import { nodeHostResolver } from '../../dns.ts';
 import { createGuardedFetch } from '../guarded-fetch.ts';
-import { parseAllowedCommands, runStdioMethod } from '../stdio.ts';
+import { parseAllowedCommands, pinnedStdioServer, runStdioMethod } from '../stdio.ts';
 import {
 	McpError,
 	parseMcpServerConfigs,
@@ -33,6 +33,10 @@ export const POST: RequestHandler = async ({ request }) => {
 	} catch {
 		return json({ error: 'Request body must be JSON' }, { status: 400 });
 	}
+	// Backstop for chunked bodies without a content-length.
+	if (JSON.stringify(body).length > 512 * 1024) {
+		return json({ error: 'Request body too large' }, { status: 413 });
+	}
 	try {
 		const server = singleServer(body);
 		if (!server.enabled) {
@@ -50,8 +54,9 @@ export const POST: RequestHandler = async ({ request }) => {
 			throw new McpError(server.id, 'protocol', 'Tool arguments exceed the size cap');
 		}
 		if (server.transport === 'stdio') {
+			const pinned = pinnedStdioServer(server, env.MCP_STDIO_SERVERS);
 			const result = await runStdioMethod<McpToolResult>(
-				server,
+				pinned,
 				'tools/call',
 				{ name: tool, arguments: args },
 				{ allowedCommands: parseAllowedCommands(env.MCP_STDIO_ALLOWED_COMMANDS) }

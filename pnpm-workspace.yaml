@@ -1,0 +1,7 @@
+packages:
+  - '.'
+
+# Security overrides for transitive dependencies (see report.md MEDIUM-5).
+overrides:
+  lodash-es: 4.18.1
+  sharp: 0.35.4

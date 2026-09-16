@@ -39,6 +39,9 @@ jobs:
       - name: Build native bundle
         run: pnpm build:native
 
+      - name: Dependency audit gate
+        run: node scripts/audit-gate.mjs
+
   rust:
     env:
       # The native host serves the frontend in production. Rust-only matrix

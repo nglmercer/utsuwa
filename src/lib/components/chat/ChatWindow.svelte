@@ -281,6 +281,9 @@
 	{#each RESIZE_DIRS as dir}
 		<div
 			class="resize-handle {dir}"
+			role="separator"
+			aria-label="Resize chat window"
+			aria-orientation={dir === 'n' || dir === 's' ? 'horizontal' : dir === 'e' || dir === 'w' ? 'vertical' : undefined}
 			onpointerdown={(e) => onResizeDown(e, dir)}
 			onpointermove={onResizeMove}
 			onpointerup={onResizeUp}
@@ -289,6 +292,9 @@
 	{/each}
 	<div
 		class="window-header"
+		role="toolbar"
+		aria-label="Chat window controls"
+		tabindex="0"
 		onpointerdown={onHeaderDown}
 		onpointermove={onHeaderMove}
 		onpointerup={onHeaderUp}

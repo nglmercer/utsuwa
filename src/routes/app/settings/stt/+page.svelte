@@ -1,6 +1,7 @@
 <script lang="ts">
 	import SttSettings from '$lib/components/settings/SttSettings.svelte';
 	import SttDiagnostics from '$lib/components/settings/SttDiagnostics.svelte';
+	import VaultSettings from '$lib/components/settings/VaultSettings.svelte';
 	import '../settings-page.css';
 </script>
 
@@ -12,6 +13,10 @@
 
 	<section class="section">
 		<SttSettings />
+	</section>
+
+	<section class="section">
+		<VaultSettings />
 	</section>
 
 	<section class="section">

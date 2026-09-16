@@ -78,3 +78,32 @@ test('public integer-form IPs are still allowed', () => {
 	// 8.8.8.8 = 134744072
 	assert.equal(isPrivateHost('134744072'), false);
 });
+
+test('assertSafeProviderUrlResolved blocks DNS rebinding to private addresses', async () => {
+	const { assertSafeProviderUrlResolved } = await import('./url-guard.ts');
+	const rebind = async (host: string) =>
+		host === 'evil.example' ? ['93.184.216.34', '169.254.169.254'] : ['93.184.216.34'];
+	await assert.rejects(
+		assertSafeProviderUrlResolved('https://evil.example/v1', rebind),
+		/blocked address/
+	);
+	const url = await assertSafeProviderUrlResolved('https://good.example/v1', rebind);
+	assert.equal(url.hostname, 'good.example');
+});
+
+test('assertSafeProviderUrlResolved skips DNS for numerics and opt-in locals', async () => {
+	const { assertSafeProviderUrlResolved } = await import('./url-guard.ts');
+	let calls = 0;
+	const counting = async (host: string) => {
+		calls++;
+		return [host];
+	};
+	await assert.rejects(assertSafeProviderUrlResolved('http://127.0.0.1:11434', counting));
+	assert.equal(calls, 0);
+	const local = await assertSafeProviderUrlResolved('http://127.0.0.1:11434', counting, true);
+	assert.equal(local.hostname, '127.0.0.1');
+	assert.equal(calls, 0);
+	await assert.rejects(assertSafeProviderUrlResolved('https://unresolvable.invalid', async () => {
+		throw new Error('NXDOMAIN');
+	}));
+});

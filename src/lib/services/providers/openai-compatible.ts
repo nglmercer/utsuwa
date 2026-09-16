@@ -183,6 +183,11 @@ export interface OpenAICompatibleModelParserOptions {
 	includeCapabilities?: boolean;
 	/** Preserve provider-specific display names when supplied. */
 	normalizeName?: (id: string, raw: RawOpenAIModel) => string;
+	/**
+	 * Transport override for the fetch step (server routes pass a guarded
+	 * fetch; browsers use the global fetch). Parsing-only callers ignore it.
+	 */
+	fetchImpl?: typeof fetch;
 }
 
 /** Parse the standard `{ data: [{ id, name, ... }] }` model response. */
@@ -295,7 +300,8 @@ export async function fetchOpenAICompatibleModels(
 	providerId = 'openai-compatible',
 	options: OpenAICompatibleModelParserOptions = {}
 ): Promise<ModelInfo[]> {
-	const response = await fetch(openAICompatibleModelsUrl(baseUrl), {
+	const httpFetch = options.fetchImpl ?? fetch;
+	const response = await httpFetch(openAICompatibleModelsUrl(baseUrl), {
 		headers: optionalBearerHeaders(apiKey)
 	});
 	if (!response.ok) {

@@ -63,6 +63,7 @@
 					placeholder="Gemini API Key"
 					value={settingsStore.getProviderConfig('gemini-stt').apiKey ?? ''}
 					oninput={(e) => updateApiKey('gemini-stt', e.currentTarget.value)}
+				disabled={settingsStore.vaultLocked}
 				/>
 			</div>
 			<div class="stt-model-value" aria-label="Gemini STT model">gemini-3.5-transcribe</div>
@@ -78,6 +79,7 @@
 					placeholder="Groq API Key"
 					value={settingsStore.getProviderConfig('groq-stt').apiKey ?? ''}
 					oninput={(e) => updateApiKey('groq-stt', e.currentTarget.value)}
+				disabled={settingsStore.vaultLocked}
 				/>
 			</div>
 		</div>
@@ -91,6 +93,7 @@
 					placeholder="OpenAI API Key"
 					value={settingsStore.getProviderConfig('openai-stt').apiKey ?? ''}
 					oninput={(e) => updateApiKey('openai-stt', e.currentTarget.value)}
+				disabled={settingsStore.vaultLocked}
 				/>
 			</div>
 		</div>

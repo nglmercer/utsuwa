@@ -11,7 +11,10 @@ function safeEndpointReference(baseURL?: string): string {
 		const url = new URL(baseURL);
 		return `${url.origin}${url.pathname}`.replace(/\/+$/, '');
 	} catch {
-		return baseURL.split(/[?#]/, 1)[0];
+		// Unparseable: drop query/fragment and any `user:pass@` userinfo.
+		return baseURL
+			.split(/[?#]/, 1)[0]
+			.replace(/^(https?:\/\/)[^/@]*@/i, '$1');
 	}
 }
 
