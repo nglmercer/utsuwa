@@ -4,6 +4,7 @@
 //! The renderer (TypeScript) decides HOW the VRM looks while doing it — it
 //! produces routine receipts; this host verifies them before completing.
 
+pub mod demo;
 pub mod runners;
 
 use runners::TICKET_STASH_TTL;
