@@ -3,7 +3,8 @@ import {
 	parseResponse,
 	validateStateUpdates,
 	extractPotentialFacts,
-	type ExpressionCue
+	type ExpressionCue,
+	type GestureCue
 } from '$lib/ai/response-parser';
 import { calculateBaselineUpdates, analyzeMessage } from '$lib/engine/heuristics';
 import { mergeUpdates, checkAndApplyStageTransition } from '$lib/engine/state-updates';
@@ -18,6 +19,7 @@ import { allEvents, relationshipStrainEvent } from '$lib/data/events';
 import { extractReminderTags } from '$lib/utils/reminders';
 import { reminderStore } from '$lib/stores/reminders.svelte';
 import { vrmStore } from '$lib/stores/vrm.svelte';
+import { photomodeStore } from '$lib/stores/photomode.svelte';
 import { ensureSession } from '$lib/engine/memory';
 import type { LLMProvider } from '$lib/types';
 import type { EventDefinition } from '$lib/types/events';
@@ -74,6 +76,23 @@ function fireExpressionCue(cue: ExpressionCue | null) {
 	}
 }
 
+// Stage a one-shot body direction from the model. Emotes play through the
+// existing one-shot effect (which auto-resets); reactions reuse the tap path
+// (face flash + decaying bone nudge). Suppressed in photo mode: the held pose
+// owns the body there, and a cue mid-shot would stomp it.
+function fireGestureCue(cue: GestureCue | null) {
+	if (!cue || photomodeStore.active) return;
+	try {
+		if (cue.type === 'emote') {
+			vrmStore.setCurrentAnimation(cue.id);
+		} else {
+			vrmStore.requestReaction(cue.zone);
+		}
+	} catch (e) {
+		console.debug('[Gesture] Failed to stage AI cue:', e);
+	}
+}
+
 export async function processCompanionTurn(input: CompanionTurnInput): Promise<CompanionTurnResult> {
 	const { userMessage, companionResponse, llm, systemEvent = false, debug = false } = input;
 
@@ -97,10 +116,11 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 		}
 	}
 
-	const parsed = parseResponse(reminderCleaned, state.name);
+	const parsed = parseResponse(reminderCleaned, state.name, vrmStore.availableExpressions);
 	const dialogue = parsed.dialogue;
 	let llmUpdates = parsed.stateUpdates;
 	fireExpressionCue(parsed.expressionCue);
+	fireGestureCue(parsed.gestureCue);
 
 	if (debug) {
 		console.log('%c[LLM raw response]', 'color:#00b2ff;font-weight:bold', companionResponse);
@@ -128,9 +148,10 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 		if (extracted) {
 			// parseResponse handles both bare JSON (OpenAI json_object) and a
 			// model-added ```json fence (Anthropic). Don't re-wrap.
-			const fallback = parseResponse(extracted);
+			const fallback = parseResponse(extracted, state.name, vrmStore.availableExpressions);
 			llmUpdates = fallback.stateUpdates;
 			fireExpressionCue(fallback.expressionCue);
+			fireGestureCue(fallback.gestureCue);
 			if (debug) {
 				console.log('%c[extraction fallback]', 'color:#f59e0b;font-weight:bold', extracted, '->', llmUpdates);
 			}
