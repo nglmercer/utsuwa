@@ -334,10 +334,7 @@ impl TypedTool for CreateIntervalTaskTool {
             "steps": created.steps.len(),
             "repetitions": times,
             "gap_ms": gap_ms,
-            "execute_with": format!(
-                "leave the app running, or headless: task-cli run {} --yes --timings",
-                created.id
-            ),
+            "execute_with": "leave the app running",
         }))
     }
 }
@@ -919,6 +916,28 @@ mod tests {
                     Some(3_000)
                 );
             }
+        }
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn create_interval_result_mentions_no_test_cli() {
+        let db = scratch_db("no-cli-hint");
+        let tool = tool_at(db.clone());
+        let out = tool
+            .call(ctx(), args("use system.time to get the date"))
+            .await
+            .expect("call");
+        assert_eq!(
+            out.get("execute_with").and_then(serde_json::Value::as_str),
+            Some("leave the app running")
+        );
+        let rendered = serde_json::to_string(&out).expect("render");
+        for leak in ["task-cli", "headless"] {
+            assert!(
+                !rendered.contains(leak),
+                "tool result shown to the desktop agent must not advertise test CLIs ({leak})"
+            );
         }
         let _ = std::fs::remove_file(&db);
     }

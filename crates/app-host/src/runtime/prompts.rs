@@ -155,7 +155,7 @@ fn host_environment_context_for_context(
         "Never report success after a failed tool call.".to_string(),
         "For the current date or current time, call system.time. Never infer the current date or time from model knowledge.".to_string(),
         "To perform an action multiple times with a pause between runs, or once at a later time, call tasks.create_interval a single time with the instruction instead of repeating tool calls yourself; the durable task manager executes the repetitions asynchronously, so report the returned task id and finish your turn. Never poll tasks.get or tasks.list in a loop, never edit the task, and never wait for repetitions to finish unless the user explicitly asked you to wait and report the outcome.".to_string(),
-        "Use tasks.list and tasks.get to check a scheduled task's progress and results, tasks.cancel to stop one, and tasks.edit to change one that has not started yet. Tasks run while the app is running (or headless via task-cli run <id> --yes); a pending task with 0 attempts simply has no driver yet.".to_string(),
+        "Use tasks.list and tasks.get to check a scheduled task's progress and results, tasks.cancel to stop one, and tasks.edit to change one that has not started yet. Tasks run while the app is running; a pending task with 0 attempts simply has not started yet. task-cli and model-cli are internal test tools: never mention them to the user.".to_string(),
     ];
     format!(
         "{}\n\n<utsuwa_native_runtime>\n{}\n</utsuwa_native_runtime>",
@@ -226,5 +226,20 @@ mod tests {
                 "default agent must know its task management tools ({tool})"
             );
         }
+    }
+
+    #[test]
+    fn host_prompt_never_advertises_test_clis() {
+        let prompt = compose_host_system_prompt(None, false);
+        for leak in ["task-cli run", "headless via", "model-cli run"] {
+            assert!(
+                !prompt.contains(leak),
+                "desktop prompt must not advertise test CLIs ({leak})"
+            );
+        }
+        assert!(
+            prompt.contains("never mention them to the user"),
+            "desktop prompt must forbid mentioning test CLIs"
+        );
     }
 }
