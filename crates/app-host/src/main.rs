@@ -10,7 +10,9 @@
 //! Pass `--debug` to enable structured diagnostics for the native host and
 //! write them to the rolling log under the Utsuwa state directory. `--trace`
 //! enables the more verbose per-module trace filter. `RUST_LOG` remains
-//! supported for normal runs.
+//! supported for normal runs, and is honored as an override layer in
+//! `--debug`/`--trace` runs too (e.g. `RUST_LOG='app_host::ipc=warn'`
+//! silences per-request IPC spam while keeping everything else verbose).
 
 use app_host::{
     ipc::{emit_script, Dispatcher},
@@ -124,6 +126,8 @@ const DEBUG_LOG_MODULES: &[&str] = &[
     "storage_core",
     "secret_core",
     "audio_capture",
+    "task_core",
+    "task_host",
     "model_openai_compatible",
 ];
 
@@ -133,6 +137,27 @@ fn debug_filter(level: &str) -> String {
         .map(|module| format!("{module}={level}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Debug filter with the user's `RUST_LOG` appended as an override layer.
+/// EnvFilter resolves same-target directives last-wins, so e.g.
+/// `RUST_LOG='app_host::ipc::dispatcher=warn'` quiets IPC spam while the
+/// rest stays at the debug/trace level. Pure over its inputs for testing;
+/// callers fall back to the base filter when the combined spec is invalid.
+fn debug_filter_with_overrides(level: &str, rust_log: Option<&str>) -> String {
+    let base = debug_filter(level);
+    match rust_log.map(str::trim).filter(|spec| !spec.is_empty()) {
+        Some(extra) => format!("{base},{extra}"),
+        None => base,
+    }
+}
+
+fn debug_env_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    let spec = debug_filter_with_overrides(level, std::env::var("RUST_LOG").ok().as_deref());
+    tracing_subscriber::EnvFilter::try_new(&spec).unwrap_or_else(|err| {
+        eprintln!("invalid RUST_LOG override ({err}); using default {level} filter");
+        tracing_subscriber::EnvFilter::new(debug_filter(level))
+    })
 }
 
 /// Native policy for permissions requested by the embedded frontend.
@@ -167,14 +192,14 @@ fn init_logging(options: CliOptions) -> Option<tracing_appender::non_blocking::W
     }
 
     let level = if options.trace { "trace" } else { "debug" };
-    let filter = tracing_subscriber::EnvFilter::new(debug_filter(level));
+    let filter = debug_env_filter(level);
     let log_dir = storage_core::default_state_dir("utsuwa").join("logs");
     let appender = match std::fs::create_dir_all(&log_dir) {
         Ok(()) => tracing_appender::rolling::daily(&log_dir, "utsuwa.log"),
         Err(error) => {
             eprintln!("could not create native debug log directory {log_dir:?}: {error}");
             tracing_subscriber::fmt()
-                .with_env_filter(filter)
+                .with_env_filter(debug_env_filter(level))
                 .with_target(true)
                 .with_thread_ids(true)
                 .with_file(options.trace)
@@ -1184,5 +1209,26 @@ mod tests {
         assert!(html.contains("&lt;oops&gt;&amp;&quot;"), "{html}");
         assert!(!html.contains("<oops>"), "{html}");
         assert!(!html.contains("<script"), "{html}");
+    }
+
+    #[test]
+    fn debug_filter_covers_task_modules() {
+        let spec = debug_filter_with_overrides("debug", None);
+        assert!(spec.contains("task_core=debug"), "{spec}");
+        assert!(spec.contains("task_host=debug"), "{spec}");
+        assert!(spec.contains("app_host=debug"), "{spec}");
+    }
+
+    #[test]
+    fn rust_log_override_appends_last_so_it_wins() {
+        let spec = debug_filter_with_overrides("debug", Some("app_host::ipc::dispatcher=warn"));
+        assert!(spec.ends_with(",app_host::ipc::dispatcher=warn"), "{spec}");
+        // Blank overrides leave the base filter untouched.
+        assert_eq!(
+            debug_filter_with_overrides("trace", Some("  ")),
+            debug_filter("trace")
+        );
+        // The combined spec must parse as a real EnvFilter.
+        tracing_subscriber::EnvFilter::try_new(&spec).expect("valid filter");
     }
 }

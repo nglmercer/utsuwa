@@ -26,6 +26,7 @@
 		expressionForAnimationUrl,
 		jumpArcHeight
 	} from '$lib/engine/avatar-actions';
+	import { WALK_DURATION_DEFAULT_MS, clampWalkDuration } from '$lib/engine/avatar-commands';
 	import {
 		computeSpringJointParams,
 		clampFrameDelta,
@@ -736,10 +737,13 @@
 
 	function startWalkAction(direction: string, durationMs?: number): void {
 		const dir = walkDirectionVector(direction);
+		// clampWalkDuration (not inline min/max): NaN/Infinity must fall back
+		// to the default instead of freezing the step — NaN remainingMs never
+		// reaches zero AND the watchdog comparison never fires.
 		locomotion = {
 			dirX: dir.x,
 			dirZ: dir.z,
-			remainingMs: Math.min(3000, Math.max(300, Math.round(durationMs ?? 1200))),
+			remainingMs: clampWalkDuration(durationMs ?? WALK_DURATION_DEFAULT_MS),
 			phase: 0
 		};
 		console.debug('[AvatarCue] action started', `walk:${direction}`);
@@ -869,7 +873,7 @@
 		} else if (step.kind === 'walk') {
 			startWalkAction(step.direction ?? 'forward', step.durationMs);
 			started = true;
-			deadline = Math.min(3000, Math.max(300, Math.round(step.durationMs ?? 1200))) + 1500;
+			deadline = clampWalkDuration(step.durationMs ?? WALK_DURATION_DEFAULT_MS) + 1500;
 		} else if (step.kind === 'emote' && step.url) {
 			routineAwaitingEmote = step.url;
 			vrmStore.setCurrentAnimation(step.url);

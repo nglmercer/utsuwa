@@ -282,7 +282,13 @@ impl<S: TaskStore> Executor<S> {
             event_type::REVIEW_REQUIRED,
             serde_json::json!({ "reason": reason }),
         )
-        .await
+        .await?;
+        tracing::info!(
+            task_id = %task.id,
+            reason = %reason,
+            "task needs review"
+        );
+        Ok(())
     }
 
     /// Returns true when the task reached a resting state (requeued or failed).
@@ -342,6 +348,12 @@ impl<S: TaskStore> Executor<S> {
             serde_json::json!({ "message": message }),
         )
         .await?;
+        tracing::info!(
+            task_id = %task.id,
+            attempts = task.attempts,
+            error = %message,
+            "task failed"
+        );
         Ok(true)
     }
 
@@ -356,6 +368,11 @@ impl<S: TaskStore> Executor<S> {
                 self.store.update(&task, now).await?;
                 self.emit(&task, None, event_type::COMPLETED, serde_json::json!({}))
                     .await?;
+                tracing::info!(
+                    task_id = %task.id,
+                    attempts = task.attempts,
+                    "task completed"
+                );
                 Ok(task)
             }
             Err(err) => {
@@ -387,19 +404,31 @@ impl<S: TaskStore> Executor<S> {
                         serde_json::json!({ "message": message, "will_retry": true }),
                     )
                     .await?;
+                    tracing::info!(
+                        task_id = %task.id,
+                        attempts = task.attempts,
+                        error = %message,
+                        "task verification failed, retrying failed step"
+                    );
                     Ok(task)
                 } else {
                     task.status = TaskStatus::Failed;
                     task.finished_at = Some(now);
                     task.lease_until = None;
                     task.last_error = Some(TaskError {
-                        message,
+                        message: message.clone(),
                         retryable: false,
                         timestamp: now,
                     });
                     self.store.update(&task, now).await?;
                     self.emit(&task, None, event_type::FAILED, serde_json::json!({}))
                         .await?;
+                    tracing::info!(
+                        task_id = %task.id,
+                        attempts = task.attempts,
+                        error = %message,
+                        "task failed verification, attempts exhausted"
+                    );
                     Ok(task)
                 }
             }

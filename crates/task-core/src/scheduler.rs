@@ -116,8 +116,25 @@ impl<S: TaskStore> Scheduler<S> {
             .find_waiter(event_type, correlation_id, now)
             .await?
         else {
+            tracing::debug!(
+                event_type = %event_type,
+                correlation_id = ?correlation_id,
+                "task event arrived with no waiter"
+            );
             return Ok(None);
         };
+        // Receipt content summary (never the full payload): the one line
+        // that shows what the renderer actually reported. Computed before
+        // the payload moves into the step result.
+        let receipt_status = payload
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string();
+        let completed_steps = payload
+            .get("completed_steps")
+            .and_then(serde_json::Value::as_array)
+            .map(|steps| steps.len());
         if let Some(step) = task.steps.get_mut(task.current_step_index) {
             step.status = TaskStepStatus::Completed;
             step.result = Some(payload);
@@ -128,6 +145,13 @@ impl<S: TaskStore> Scheduler<S> {
         task.status = TaskStatus::Ready;
         task.next_attempt_at = Some(now);
         self.store.update(&task, now).await?;
+        tracing::info!(
+            task_id = %task.id,
+            event_type = %event_type,
+            receipt_status = %receipt_status,
+            completed_steps = ?completed_steps,
+            "task event delivered, step advanced"
+        );
         Ok(Some(task))
     }
 

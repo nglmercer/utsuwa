@@ -1,7 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseAvatarCommand } from './avatar-commands.ts';
+import {
+	WALK_DURATION_DEFAULT_MS,
+	WALK_DURATION_MAX_MS,
+	WALK_DURATION_MIN_MS,
+	clampWalkDuration,
+	parseAvatarCommand
+} from './avatar-commands.ts';
 
 test('parses single-step avatar commands', () => {
 	assert.deepEqual(parseAvatarCommand('Jump!'), {
@@ -92,4 +98,15 @@ test('ignores ordinary chat and near-miss words', () => {
 		assert.equal(parseAvatarCommand(text), null, text);
 	}
 	assert.equal(parseAvatarCommand(null as unknown as string), null);
+});
+
+test('clampWalkDuration locks renderer-safe bounds', () => {
+	assert.equal(clampWalkDuration(1200), 1200);
+	assert.equal(clampWalkDuration(50), WALK_DURATION_MIN_MS);
+	assert.equal(clampWalkDuration(99999), WALK_DURATION_MAX_MS);
+	// Non-finite durations must fall back, never propagate: NaN remainingMs
+	// freezes a walk step (never <= 0) AND defeats the watchdog (NaN compare).
+	assert.equal(clampWalkDuration(NaN), WALK_DURATION_DEFAULT_MS);
+	assert.equal(clampWalkDuration(Infinity), WALK_DURATION_DEFAULT_MS);
+	assert.equal(clampWalkDuration(-Infinity), WALK_DURATION_DEFAULT_MS);
 });

@@ -270,6 +270,11 @@ impl TaskHost {
         if task.status != TaskStatus::NeedsReview {
             return Err(TaskHostError::NotParked(task_id.to_string()));
         }
+        let capability_gated = task
+            .last_error
+            .as_ref()
+            .and_then(|err| CapabilityReviewRequest::parse(&err.message))
+            .is_some();
         if approved {
             if let Some(request) = task
                 .last_error
@@ -293,10 +298,18 @@ impl TaskHost {
                     .stash_ticket(task_id, &step_id, ticket, invocation_id);
             }
         }
-        Ok(self
+        let resolved = self
             .scheduler
             .resume_from_review(task_id, approved, note)
-            .await?)
+            .await?;
+        tracing::info!(
+            task_id = %task_id,
+            approved,
+            capability_gated,
+            status = %resolved.status.as_str(),
+            "task review resolved"
+        );
+        Ok(resolved)
     }
 
     /// Inspect a parked review without resolving it: returns the structured
