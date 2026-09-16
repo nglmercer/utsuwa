@@ -23,9 +23,24 @@
 	import {
 		actionForAnimationUrl,
 		clampWalkOffset,
+		computeSitOffsetY,
+		DEFAULT_SEAT_HEIGHT,
 		expressionForAnimationUrl,
-		jumpArcHeight
+		GOTO_ARRIVE_DIST,
+		GOTO_SPEED_MPS,
+		jumpArcHeight,
+		RUN_SPEED_MPS,
+		RUN_STEP_HZ,
+		shortAngleDelta,
+		TURN_ARRIVE_RAD,
+		TURN_SPEED_RPS,
+		turnTargetYaw,
+		WALK_MAX_RADIUS,
+		WALK_SPEED_MPS,
+		WALK_STEP_HZ,
+		yawToFacePoint
 	} from '$lib/engine/avatar-actions';
+	import { resolveSceneAnchor } from '$lib/engine/scene-anchors';
 	import { WALK_DURATION_DEFAULT_MS, clampWalkDuration } from '$lib/engine/avatar-commands';
 	import {
 		computeSpringJointParams,
@@ -614,11 +629,10 @@
 		nod: 0.9,
 		shake_head: 0.9,
 		bow: 1.3,
-		shrug: 0.8
+		shrug: 0.8,
+		sit: 1.1,
+		stand: 0.9
 	};
-	const WALK_SPEED = 0.45; // m/s: gentle, stays framed
-	const WALK_STEP_HZ = 1.7;
-	const WALK_MAX_RADIUS = 2.0; // m from origin; walks clamp onto this rim
 	const JUMP_DURATION = 0.65; // s
 	const JUMP_HEIGHT = 0.28; // m at the apex
 	interface LocomotionState {
@@ -626,37 +640,72 @@
 		dirZ: number;
 		remainingMs: number;
 		phase: number;
+		speed: number;
+		stepHz: number;
 	}
 	let locomotion: LocomotionState | null = null;
+	// Goto/return-home: steered translation toward a clamped plane target with
+	// a walk swing underneath. Shares the arrival/completion path for both.
+	interface GotoState {
+		targetX: number;
+		targetZ: number;
+		phase: number;
+	}
+	let gotoState: GotoState | null = null;
+	// In-place yaw. Routine steps report completion; ambient re-facing (the
+	// automatic face-camera after a walk) clears silently and never holds busy.
+	interface TurnState {
+		targetYaw: number;
+		routineStep: boolean;
+	}
+	let turnState: TurnState | null = null;
 	let jumpState: { t: number } | null = null;
 	let procedural: { name: string; t: number; duration: number } | null = null;
+	// Held sitting posture: the sit step blends in over its duration, then
+	// these persist until stand (or any locomotion auto-stands). The root-Y
+	// drop plus the bent-knee pose reads as sitting on the seat height.
+	let sitting = false;
+	let sitOffsetY = 0;
+	let sitTargetY = 0;
 	let actionSeqSeen = 0;
 
 	function syncActionBusy() {
 		vrmStore.setActionBusy(
-			isEmotePlaying || locomotion !== null || jumpState !== null || procedural !== null
+			isEmotePlaying ||
+				locomotion !== null ||
+				gotoState !== null ||
+				(turnState !== null && turnState.routineStep) ||
+				jumpState !== null ||
+				procedural !== null
 		);
 	}
 
 	function cancelAvatarActions() {
 		locomotion = null;
+		gotoState = null;
+		turnState = null;
 		procedural = null;
 		if (jumpState) {
 			jumpState = null;
-			avatarRoot.position.y = 0;
+			avatarRoot.position.y = sitting ? sitOffsetY : 0;
 		}
 		syncActionBusy();
+	}
+
+	// Standing up is implicit in every translation and jump: she stands, then
+	// moves. Only an explicit sit step (or a reset/model swap) changes the
+	// seated baseline otherwise.
+	function autoStand(): void {
+		if (!sitting) return;
+		sitting = false;
+		sitOffsetY = 0;
+		sitTargetY = 0;
+		avatarRoot.position.y = 0;
 	}
 
 	function smoothstep(edge0: number, edge1: number, x: number): number {
 		const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
 		return t * t * (3 - 2 * t);
-	}
-
-	function shortAngle(delta: number): number {
-		while (delta > Math.PI) delta -= Math.PI * 2;
-		while (delta < -Math.PI) delta += Math.PI * 2;
-		return delta;
 	}
 
 	function nudge(bone: THREE.Object3D | null, x: number, z: number, y = 0) {
@@ -692,7 +741,40 @@
 				if (bone) nudge(bone, 0, (Math.sign(bone.rotation.z) || 1) * 0.28 * k);
 			}
 			nudge(humanoid.getNormalizedBoneNode('head'), -0.06 * k, 0.1 * k);
+		} else if (name === 'sit') {
+			applySittingPose(smoothstep(0, 0.8, p));
+		} else if (name === 'stand') {
+			applySittingPose(1 - smoothstep(0, 0.8, p));
 		}
+	}
+
+	// Seated lower body at blend k (0 standing, 1 fully seated): thighs swing
+	// forward, shins hang down, spine stays upright. The root-Y drop (handled
+	// in the frame loop) puts the hips at seat height so the feet stay near
+	// the floor instead of dangling.
+	function applySittingPose(k: number) {
+		const targetVrm = vrm;
+		if (!targetVrm || k <= 0) return;
+		const humanoid = targetVrm.humanoid;
+		nudge(humanoid.getNormalizedBoneNode('leftUpperLeg'), -1.25 * k, 0);
+		nudge(humanoid.getNormalizedBoneNode('rightUpperLeg'), -1.25 * k, 0);
+		nudge(humanoid.getNormalizedBoneNode('leftLowerLeg'), 1.35 * k, 0);
+		nudge(humanoid.getNormalizedBoneNode('rightLowerLeg'), 1.35 * k, 0);
+		nudge(humanoid.getNormalizedBoneNode('spine'), -0.06 * k, 0);
+	}
+
+	// Shared step swing for walk, run, and steered goto arrivals: opposing
+	// leg/arm swing at the caller's phase. Rides appliedNudges like the rest.
+	function applyWalkSwing(swing: number) {
+		const targetVrm = vrm;
+		if (!targetVrm) return;
+		const humanoid = targetVrm.humanoid;
+		nudge(humanoid.getNormalizedBoneNode('leftUpperLeg'), -0.38 * swing, 0);
+		nudge(humanoid.getNormalizedBoneNode('rightUpperLeg'), 0.38 * swing, 0);
+		nudge(humanoid.getNormalizedBoneNode('leftLowerLeg'), 0.45 * Math.max(0, -swing), 0);
+		nudge(humanoid.getNormalizedBoneNode('rightLowerLeg'), 0.45 * Math.max(0, swing), 0);
+		nudge(humanoid.getNormalizedBoneNode('leftUpperArm'), 0.2 * swing, 0);
+		nudge(humanoid.getNormalizedBoneNode('rightUpperArm'), -0.2 * swing, 0);
 	}
 
 	const scratchWalkDir = new THREE.Vector3();
@@ -722,21 +804,38 @@
 		return { x: 0, z: 1 };
 	}
 
-	function startProceduralAction(name: string): boolean {
+	function startProceduralAction(name: string, anchorId?: string): boolean {
 		const duration = PROCEDURAL_DURATIONS[name];
 		if (!duration) return false;
+		if (name === 'sit') {
+			// Seat height comes from the anchor when the plan traveled to one
+			// ("sit on the chair"); otherwise the default chair height.
+			const seatHeight = (anchorId && resolveSceneAnchor(anchorId)?.seatHeight) || DEFAULT_SEAT_HEIGHT;
+			sitTargetY = computeSitOffsetY(measureHipsWorldY(), seatHeight);
+		}
 		procedural = { name, t: 0, duration };
 		console.debug('[AvatarCue] action started', `procedural:${name}`);
 		return true;
 	}
 
+	function measureHipsWorldY(): number {
+		const hips = vrm?.humanoid.getNormalizedBoneNode('hips');
+		if (!hips) return 0.9;
+		const p = new THREE.Vector3();
+		hips.getWorldPosition(p);
+		return p.y;
+	}
+
 	function startJumpAction(): void {
+		autoStand();
 		jumpState = { t: 0 };
 		console.debug('[AvatarCue] action started', 'jump');
 	}
 
-	function startWalkAction(direction: string, durationMs?: number): void {
+	function startWalkAction(direction: string, durationMs?: number, action = 'walk'): void {
+		autoStand();
 		const dir = walkDirectionVector(direction);
+		const running = action === 'run';
 		// clampWalkDuration (not inline min/max): NaN/Infinity must fall back
 		// to the default instead of freezing the step — NaN remainingMs never
 		// reaches zero AND the watchdog comparison never fires.
@@ -744,9 +843,61 @@
 			dirX: dir.x,
 			dirZ: dir.z,
 			remainingMs: clampWalkDuration(durationMs ?? WALK_DURATION_DEFAULT_MS),
-			phase: 0
+			phase: 0,
+			speed: running ? RUN_SPEED_MPS : WALK_SPEED_MPS,
+			stepHz: running ? RUN_STEP_HZ : WALK_STEP_HZ
 		};
-		console.debug('[AvatarCue] action started', `walk:${direction}`);
+		console.debug('[AvatarCue] action started', `${running ? 'run' : 'walk'}:${direction}`);
+	}
+
+	function startGotoAction(targetX: number, targetZ: number, label: string): void {
+		autoStand();
+		const clamped = clampWalkOffset(targetX, targetZ, WALK_MAX_RADIUS);
+		gotoState = { targetX: clamped.x, targetZ: clamped.z, phase: 0 };
+		console.debug('[AvatarCue] action started', label);
+	}
+
+	function startReturnHomeAction(): void {
+		startGotoAction(0, 0, 'return_home');
+	}
+
+	function startTurnAction(direction: string, routineStep: boolean): boolean {
+		if (direction !== 'left' && direction !== 'right' && direction !== 'back') return false;
+		turnState = { targetYaw: turnTargetYaw(avatarRoot.rotation.y, direction), routineStep };
+		console.debug('[AvatarCue] action started', `turn:${direction}`);
+		return true;
+	}
+
+	// Yaw toward the live scene camera. Routine steps report completion; the
+	// ambient post-walk re-face clears silently.
+	function startFaceCameraAction(routineStep: boolean): boolean {
+		if (!camera.current) return false;
+		camera.current.getWorldPosition(scratchWalkDir);
+		turnState = {
+			targetYaw: yawToFacePoint(
+				avatarRoot.position.x,
+				avatarRoot.position.z,
+				scratchWalkDir.x,
+				scratchWalkDir.z
+			),
+			routineStep
+		};
+		console.debug('[AvatarCue] action started', 'face_camera');
+		return true;
+	}
+
+	function startAmbientFaceCamera(): void {
+		if (photomodeStore.active || !camera.current || !vrm) return;
+		camera.current.getWorldPosition(scratchWalkDir);
+		const target = yawToFacePoint(
+			avatarRoot.position.x,
+			avatarRoot.position.z,
+			scratchWalkDir.x,
+			scratchWalkDir.z
+		);
+		// Already facing: skip the turn entirely instead of micro-rotating.
+		if (Math.abs(shortAngleDelta(target - avatarRoot.rotation.y)) < TURN_ARRIVE_RAD * 2) return;
+		turnState = { targetYaw: target, routineStep: false };
 	}
 
 	function handleAvatarActionRequest(req: {
@@ -754,6 +905,9 @@
 		action: string;
 		direction?: string;
 		durationMs?: number;
+		anchorId?: string;
+		x?: number;
+		z?: number;
 	}) {
 		if (req.kind === 'stop') {
 			cancelRoutine('stopped');
@@ -762,6 +916,9 @@
 		}
 		if (req.kind === 'reset') {
 			cancelRoutine('reset');
+			sitting = false;
+			sitOffsetY = 0;
+			sitTargetY = 0;
 			avatarRoot.position.set(0, 0, 0);
 			avatarRoot.rotation.set(0, 0, 0);
 			return;
@@ -770,15 +927,43 @@
 		// program below is absolute per-frame, so interruption strands nothing.
 		cancelRoutine('superseded');
 		if (req.kind === 'procedural') {
-			if (!startProceduralAction(req.action)) return;
+			if (!startProceduralAction(req.action, req.anchorId)) return;
 		} else if (req.kind === 'jump') {
 			startJumpAction();
 		} else if (req.kind === 'walk') {
-			startWalkAction(req.direction ?? 'forward', req.durationMs);
+			startWalkAction(req.direction ?? 'forward', req.durationMs, req.action);
+		} else if (req.kind === 'return_home') {
+			startReturnHomeAction();
+		} else if (req.kind === 'turn') {
+			if (!startTurnAction(req.direction ?? 'back', false)) return;
+		} else if (req.kind === 'face_camera') {
+			if (!startFaceCameraAction(false)) return;
+		} else if (req.kind === 'goto') {
+			const target = resolveGotoTarget(req);
+			if (!target) return;
+			startGotoAction(target.x, target.z, `goto:${target.label}`);
 		} else {
 			return;
 		}
 		syncActionBusy();
+	}
+
+	// Goto target resolution, shared by single actions and routine steps:
+	// named anchor first, explicit x/z second, nothing for anything else.
+	function resolveGotoTarget(req: {
+		anchorId?: string;
+		x?: number;
+		z?: number;
+	}): { x: number; z: number; label: string } | null {
+		if (req.anchorId) {
+			const anchor = resolveSceneAnchor(req.anchorId);
+			if (!anchor) return null;
+			return { x: anchor.x, z: anchor.z, label: anchor.id };
+		}
+		if (typeof req.x === 'number' && typeof req.z === 'number') {
+			return { x: req.x, z: req.z, label: `${req.x.toFixed(2)},${req.z.toFixed(2)}` };
+		}
+		return null;
 	}
 
 	// === Avatar routines: ordered step sequences with completion ===
@@ -789,7 +974,16 @@
 	// fails stuck steps instead of hanging the routine forever.
 	interface ActiveRoutine {
 		id: string;
-		steps: Array<{ kind: string; action: string; direction?: string; durationMs?: number; url?: string }>;
+		steps: Array<{
+			kind: string;
+			action: string;
+			direction?: string;
+			durationMs?: number;
+			url?: string;
+			anchorId?: string;
+			x?: number;
+			z?: number;
+		}>;
 		index: number;
 		completed: string[];
 		failures: Array<{ stepIndex: number; key: string; reason: string }>;
@@ -864,16 +1058,33 @@
 		let started = false;
 		let deadline = 5000;
 		if (step.kind === 'procedural') {
-			started = startProceduralAction(step.action);
+			started = startProceduralAction(step.action, step.anchorId);
 			deadline = (PROCEDURAL_DURATIONS[step.action] ?? 1) * 1000 + 1500;
 		} else if (step.kind === 'jump') {
 			startJumpAction();
 			started = true;
 			deadline = JUMP_DURATION * 1000 + 1500;
 		} else if (step.kind === 'walk') {
-			startWalkAction(step.direction ?? 'forward', step.durationMs);
+			startWalkAction(step.direction ?? 'forward', step.durationMs, step.action);
 			started = true;
 			deadline = clampWalkDuration(step.durationMs ?? WALK_DURATION_DEFAULT_MS) + 1500;
+		} else if (step.kind === 'return_home') {
+			startReturnHomeAction();
+			started = true;
+			deadline = gotoDeadlineMs(0, 0);
+		} else if (step.kind === 'turn') {
+			started = startTurnAction(step.direction ?? 'back', true);
+			deadline = 4000;
+		} else if (step.kind === 'face_camera') {
+			started = startFaceCameraAction(true);
+			deadline = 4000;
+		} else if (step.kind === 'goto') {
+			const target = resolveGotoTarget(step);
+			if (target) {
+				startGotoAction(target.x, target.z, `goto:${target.label}`);
+				started = true;
+				deadline = gotoDeadlineMs(target.x, target.z);
+			}
 		} else if (step.kind === 'emote' && step.url) {
 			routineAwaitingEmote = step.url;
 			vrmStore.setCurrentAnimation(step.url);
@@ -895,6 +1106,13 @@
 		syncActionBusy();
 	}
 
+	// Watchdog budget for a steered arrival: travel time at goto speed plus
+	// a fixed margin, floored so adjacent anchors never starve the step.
+	function gotoDeadlineMs(targetX: number, targetZ: number): number {
+		const dist = Math.hypot(targetX - avatarRoot.position.x, targetZ - avatarRoot.position.z);
+		return Math.min(15000, Math.max(3500, (dist / GOTO_SPEED_MPS) * 1000 + 2500));
+	}
+
 	function failCurrentStep(reason: string, timedOut = false) {
 		if (!routine) return;
 		const step = routine.steps[routine.index];
@@ -912,9 +1130,11 @@
 		});
 		// Stop the half-played motion.
 		if (step.kind === 'walk') locomotion = null;
+		if (step.kind === 'return_home' || step.kind === 'goto') gotoState = null;
+		if (step.kind === 'turn' || step.kind === 'face_camera') turnState = null;
 		if (step.kind === 'jump') {
 			jumpState = null;
-			avatarRoot.position.y = 0;
+			avatarRoot.position.y = sitting ? sitOffsetY : 0;
 		}
 		if (step.kind === 'procedural') procedural = null;
 		if (step.kind === 'emote') {
@@ -1223,6 +1443,11 @@
 				vrm = loadedVrm;
 				avatarRoot.position.set(0, 0, 0);
 				avatarRoot.rotation.set(0, 0, 0);
+				sitting = false;
+				sitOffsetY = 0;
+				sitTargetY = 0;
+				gotoState = null;
+				turnState = null;
 				avatarRoot.add(loadedVrm.scene);
 				const newMixer = new THREE.AnimationMixer(loadedVrm.scene);
 				mixer = newMixer;
@@ -1318,6 +1543,9 @@
 				avatarRoot.remove(vrm.scene);
 				avatarRoot.position.set(0, 0, 0);
 				avatarRoot.rotation.set(0, 0, 0);
+				sitting = false;
+				sitOffsetY = 0;
+				sitTargetY = 0;
 				cancelRoutine('model-unloaded');
 				// Frees geometries, materials, and textures (manual traverse missed textures)
 				VRMUtils.deepDispose(vrm.scene);
@@ -1400,12 +1628,13 @@
 			activePulses = remaining;
 		}
 
-		// Intentional world-motion actions: walk translation with a procedural
-		// step swing, and the jump parabola. Root motion is absolute per-frame;
+		// Intentional world-motion actions: walk/run translation, steered
+		// goto/return-home arrivals, and in-place turns with a procedural step
+		// swing, plus the jump parabola. Root motion is absolute per-frame;
 		// bone offsets ride appliedNudges and unwind automatically.
 		if (locomotion) {
 			const step = Math.min(delta, 0.1);
-			const dist = WALK_SPEED * step;
+			const dist = locomotion.speed * step;
 			const clamped = clampWalkOffset(
 				avatarRoot.position.x + locomotion.dirX * dist,
 				avatarRoot.position.z + locomotion.dirZ * dist,
@@ -1414,22 +1643,62 @@
 			avatarRoot.position.x = clamped.x;
 			avatarRoot.position.z = clamped.z;
 			const targetYaw = Math.atan2(locomotion.dirX, locomotion.dirZ);
-			avatarRoot.rotation.y += shortAngle(targetYaw - avatarRoot.rotation.y) * Math.min(1, delta * 6);
-			locomotion.phase += delta * Math.PI * 2 * WALK_STEP_HZ;
-			const swing = Math.sin(locomotion.phase);
-			const humanoid = vrm.humanoid;
-			nudge(humanoid.getNormalizedBoneNode('leftUpperLeg'), -0.38 * swing, 0);
-			nudge(humanoid.getNormalizedBoneNode('rightUpperLeg'), 0.38 * swing, 0);
-			nudge(humanoid.getNormalizedBoneNode('leftLowerLeg'), 0.45 * Math.max(0, -swing), 0);
-			nudge(humanoid.getNormalizedBoneNode('rightLowerLeg'), 0.45 * Math.max(0, swing), 0);
-			nudge(humanoid.getNormalizedBoneNode('leftUpperArm'), 0.2 * swing, 0);
-			nudge(humanoid.getNormalizedBoneNode('rightUpperArm'), -0.2 * swing, 0);
+			avatarRoot.rotation.y +=
+				shortAngleDelta(targetYaw - avatarRoot.rotation.y) * Math.min(1, delta * 6);
+			locomotion.phase += delta * Math.PI * 2 * locomotion.stepHz;
+			applyWalkSwing(Math.sin(locomotion.phase));
 			locomotion.remainingMs -= delta * 1000;
 			if (locomotion.remainingMs <= 0) {
 				locomotion = null;
 				completeRoutineStep();
 				syncActionBusy();
-				console.debug('[AvatarCue] action finished', 'locomotion:walk');
+				// Walks end in profile; ease back to the viewer unless a queued
+				// routine step (or photo mode) owns the body next.
+				if (!routine) startAmbientFaceCamera();
+				console.debug('[AvatarCue] action finished', 'locomotion');
+			}
+		}
+		if (gotoState) {
+			const dx = gotoState.targetX - avatarRoot.position.x;
+			const dz = gotoState.targetZ - avatarRoot.position.z;
+			const dist = Math.hypot(dx, dz);
+			if (dist <= GOTO_ARRIVE_DIST) {
+				gotoState = null;
+				completeRoutineStep();
+				syncActionBusy();
+				if (!routine) startAmbientFaceCamera();
+				console.debug('[AvatarCue] action finished', 'goto');
+			} else {
+				const step = Math.min(delta, 0.1);
+				const move = Math.min(dist, GOTO_SPEED_MPS * step);
+				const clamped = clampWalkOffset(
+					avatarRoot.position.x + (dx / dist) * move,
+					avatarRoot.position.z + (dz / dist) * move,
+					WALK_MAX_RADIUS
+				);
+				avatarRoot.position.x = clamped.x;
+				avatarRoot.position.z = clamped.z;
+				const targetYaw = Math.atan2(dx, dz);
+				avatarRoot.rotation.y +=
+					shortAngleDelta(targetYaw - avatarRoot.rotation.y) * Math.min(1, delta * 6);
+				gotoState.phase += delta * Math.PI * 2 * WALK_STEP_HZ;
+				applyWalkSwing(Math.sin(gotoState.phase));
+			}
+		}
+		if (turnState) {
+			const diff = shortAngleDelta(turnState.targetYaw - avatarRoot.rotation.y);
+			const maxStep = TURN_SPEED_RPS * Math.min(delta, 0.1);
+			if (Math.abs(diff) <= Math.max(TURN_ARRIVE_RAD, maxStep)) {
+				const wasRoutine = turnState.routineStep;
+				const arrived = turnState.targetYaw;
+				turnState = null;
+				// Snap to the target, normalized so long sessions never stack spins.
+				avatarRoot.rotation.y = shortAngleDelta(arrived);
+				if (wasRoutine) completeRoutineStep();
+				syncActionBusy();
+				console.debug('[AvatarCue] action finished', 'turn');
+			} else {
+				avatarRoot.rotation.y += Math.sign(diff) * maxStep;
 			}
 		}
 		if (jumpState) {
@@ -1449,14 +1718,46 @@
 			procedural.t += delta;
 			const progress = procedural.t / procedural.duration;
 			if (progress >= 1) {
+				// Sit/stand hand a persistent posture to the frame loop; every
+				// other procedural fully unwinds via appliedNudges.
+				if (procedural.name === 'sit') {
+					sitting = true;
+					sitOffsetY = sitTargetY;
+					avatarRoot.position.y = sitOffsetY;
+				} else if (procedural.name === 'stand') {
+					sitting = false;
+					sitOffsetY = 0;
+					sitTargetY = 0;
+					avatarRoot.position.y = 0;
+				}
 				console.debug('[AvatarCue] action finished', `procedural:${procedural.name}`);
 				procedural = null;
 				completeRoutineStep();
 				syncActionBusy();
 			} else {
+				if (procedural.name === 'sit') {
+					avatarRoot.position.y = sitTargetY * smoothstep(0, 0.8, progress);
+				} else if (procedural.name === 'stand') {
+					avatarRoot.position.y = sitOffsetY * (1 - smoothstep(0, 0.8, progress));
+				}
 				applyProceduralAction(procedural.name, progress);
 			}
 		}
+		// Held sitting posture: re-applied every frame once the sit transition
+		// hands off, until stand or any locomotion (which auto-stands first).
+		if (sitting && !procedural && !locomotion && !gotoState && !jumpState) {
+			avatarRoot.position.y = sitOffsetY;
+			applySittingPose(1);
+		}
+		// Live root pose for the prompt and camera follow. The store skips
+		// the write unless something moved, so this stays cheap per frame.
+		vrmStore.setAvatarPose({
+			x: avatarRoot.position.x,
+			y: avatarRoot.position.y,
+			z: avatarRoot.position.z,
+			yaw: avatarRoot.rotation.y,
+			sitting
+		});
 		// Routine watchdog: a step that never reports completion fails instead
 		// of hanging the routine (and its promise) forever.
 		if (routine) {

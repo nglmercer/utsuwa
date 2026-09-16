@@ -4,13 +4,16 @@
 // (+ `runtime/` for session/turn/authorization/prompts/providers).
 //
 // Turn lifecycle over the bridge:
-//   invoke('agent.send_message', { text }) -> { accepted: true }
-//   ... `agent.turn_done` { text, executed, tool_steps, truncated }
-//   ... `agent.turn_suspended` { text, request_id } (a `permission.requested`
-//       event carries the matching approval request for the dialog)
-//   ... `agent.turn_failed` { error }
-//   ... `agent.turn_cancelled` {}
+//   invoke('agent.send_message', { text }) -> { accepted: true, turn_id }
+//   ... `agent.turn_done` { turn_id, text, executed, tool_steps, truncated }
+//   ... `agent.turn_suspended` { turn_id, text, request_id } (a
+//       `permission.requested` event carries the matching approval request
+//       for the dialog)
+//   ... `agent.turn_failed` { turn_id, error }
+//   ... `agent.turn_cancelled` { turn_id }
 // invoke('agent.cancel', {}) abandons the in-flight turn.
+// Every event carries the originating turn id; promises ignore events for
+// other turns (a cancelled turn id never resolves a bystander).
 
 export interface ExecutedStep {
 	id: string;
@@ -55,28 +58,36 @@ export interface AgentSendOptions {
 }
 
 export type AgentTurnEvent =
-	| { kind: 'delta'; delta: string }
-	| { kind: 'tool_started'; id: string; name: string }
-	| { kind: 'tool_finished'; id: string; name: string; ok: boolean }
-	| { kind: 'done'; done: TurnDone }
-	| { kind: 'suspended'; suspended: TurnSuspended }
-	| { kind: 'failed'; error: string }
-	| { kind: 'cancelled' };
+	| { kind: 'delta'; delta: string; turnId: string | null }
+	| { kind: 'tool_started'; id: string; name: string; turnId: string | null }
+	| { kind: 'tool_finished'; id: string; name: string; ok: boolean; turnId: string | null }
+	| { kind: 'done'; done: TurnDone; turnId: string | null }
+	| { kind: 'suspended'; suspended: TurnSuspended; turnId: string | null }
+	| { kind: 'failed'; error: string; turnId: string | null }
+	| { kind: 'cancelled'; turnId: string | null };
+
+// Watchdog budgets for an interactive turn. The hard budget bounds the whole
+// turn; the no-progress budget bounds silence between progress signals.
+// Suspension (awaiting the user's approval) pauses both: a turn waiting on
+// the user is not stuck, and killing it would strand the approval dialog.
+export const AGENT_HARD_TIMEOUT_MS = 180_000;
+export const AGENT_NO_PROGRESS_TIMEOUT_MS = 45_000;
 
 /** Parse one host turn event into typed state. Returns null for anything
  * else (permission requests, app events, garbage) — the caller ignores it. */
 export function parseAgentTurnEvent(event: string, data: unknown): AgentTurnEvent | null {
 	const d = data as Record<string, unknown> | null;
+	const turnId = typeof d?.turn_id === 'string' ? d.turn_id : null;
 	switch (event) {
 		case 'agent.text_delta':
-			return typeof d?.delta === 'string' ? { kind: 'delta', delta: d.delta } : null;
+			return typeof d?.delta === 'string' ? { kind: 'delta', delta: d.delta, turnId } : null;
 		case 'agent.tool_started':
 			return typeof d?.id === 'string' && typeof d?.name === 'string'
-				? { kind: 'tool_started', id: d.id, name: d.name }
+				? { kind: 'tool_started', id: d.id, name: d.name, turnId }
 				: null;
 		case 'agent.tool_finished':
 			return typeof d?.id === 'string' && typeof d?.name === 'string' && typeof d?.ok === 'boolean'
-				? { kind: 'tool_finished', id: d.id, name: d.name, ok: d.ok }
+				? { kind: 'tool_finished', id: d.id, name: d.name, ok: d.ok, turnId }
 				: null;
 		case 'agent.turn_done': {
 			if (typeof d?.text !== 'string') return null;
@@ -87,7 +98,8 @@ export function parseAgentTurnEvent(event: string, data: unknown): AgentTurnEven
 					executed: parseExecutedSteps(d.executed),
 					toolSteps: parseToolSteps(d.tool_steps, d.executed),
 					truncated: d.truncated === true
-				}
+				},
+				turnId
 			};
 		}
 		case 'agent.turn_suspended': {
@@ -98,16 +110,35 @@ export function parseAgentTurnEvent(event: string, data: unknown): AgentTurnEven
 					text: d.text,
 					request_id: d.request_id,
 					toolSteps: parseToolSteps(d.tool_steps, [])
-				}
+				},
+				turnId
 			};
 		}
 		case 'agent.turn_failed':
-			return { kind: 'failed', error: typeof d?.error === 'string' ? d.error : 'unknown error' };
+			return {
+				kind: 'failed',
+				error: typeof d?.error === 'string' ? d.error : 'unknown error',
+				turnId
+			};
 		case 'agent.turn_cancelled':
-			return { kind: 'cancelled' };
+			return { kind: 'cancelled', turnId };
 		default:
 			return null;
 	}
+}
+
+/** True when this event belongs to `turnId`. Events without an id (older
+ * hosts) and unknown ids (unparseable send response) match anything, so a
+ * missing id degrades to the old unfiltered behavior instead of a hang. */
+export function eventMatchesTurn(event: AgentTurnEvent, turnId: string | null): boolean {
+	if (turnId === null || event.turnId === null) return true;
+	return event.turnId === turnId;
+}
+
+/** True for events that prove the turn is alive: text, tool start/finish.
+ * Suspension is handled separately (it pauses the watchdogs, not resets). */
+export function isProgressEvent(event: AgentTurnEvent): boolean {
+	return event.kind === 'delta' || event.kind === 'tool_started' || event.kind === 'tool_finished';
 }
 
 function parseExecutedSteps(value: unknown): ExecutedStep[] {

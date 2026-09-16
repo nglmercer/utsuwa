@@ -18,6 +18,7 @@ impl AgentRuntime {
     async fn build_agent(
         &self,
         generation: u64,
+        turn_id: String,
         system_prompt: Option<String>,
     ) -> Result<Agent, RuntimeError> {
         // The factory is async: it hops blocking settings/keychain reads to
@@ -62,16 +63,17 @@ impl AgentRuntime {
                 return;
             }
             let (name, data) = match event {
-                AgentEvent::TextDelta(delta) => {
-                    ("agent.text_delta", serde_json::json!({ "delta": delta }))
-                }
+                AgentEvent::TextDelta(delta) => (
+                    "agent.text_delta",
+                    serde_json::json!({ "turn_id": turn_id, "delta": delta }),
+                ),
                 AgentEvent::ToolStarted { id, name } => (
                     "agent.tool_started",
-                    serde_json::json!({ "id": id, "name": name }),
+                    serde_json::json!({ "turn_id": turn_id, "id": id, "name": name }),
                 ),
                 AgentEvent::ToolFinished { id, name, ok } => (
                     "agent.tool_finished",
-                    serde_json::json!({ "id": id, "name": name, "ok": ok }),
+                    serde_json::json!({ "turn_id": turn_id, "id": id, "name": name, "ok": ok }),
                 ),
             };
             emit(HostEvent {
@@ -80,6 +82,22 @@ impl AgentRuntime {
             });
         }));
         Ok(agent)
+    }
+    /// Admit this interactive turn through the shared model gate (when the
+    /// host installed one). None means ungated (tests, headless drivers).
+    async fn acquire_model_permit(&self, turn_id: &str) -> Option<super::model_gate::ModelPermit> {
+        let gate = self.model_gate.lock().ok().and_then(|slot| slot.clone())?;
+        let started = std::time::Instant::now();
+        let permit = gate
+            .acquire(super::model_gate::ModelTurnKind::Interactive)
+            .await;
+        tracing::info!(
+            turn_id = %turn_id,
+            kind = "interactive",
+            provider_wait_ms = started.elapsed().as_millis() as u64,
+            "model permit acquired"
+        );
+        Some(permit)
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_turn(
@@ -141,7 +159,7 @@ impl AgentRuntime {
             transcript,
             generation,
             task_id.clone(),
-            turn_id,
+            turn_id.clone(),
             system_prompt,
             replay_cache,
             resume_note,
@@ -164,7 +182,10 @@ impl AgentRuntime {
             self.emit_if_current(
                 generation,
                 "agent.turn_failed",
-                serde_json::json!({ "error": format!("agent worker panicked: {detail}") }),
+                serde_json::json!({
+                    "turn_id": turn_id,
+                    "error": format!("agent worker panicked: {detail}"),
+                }),
             );
         }
     }
@@ -210,7 +231,10 @@ impl AgentRuntime {
         {
             transcript[0] = ModelMessage::system(host_system_prompt.clone());
         }
-        let agent = match self.build_agent(generation, Some(host_system_prompt)).await {
+        let agent = match self
+            .build_agent(generation, turn_id.clone(), Some(host_system_prompt))
+            .await
+        {
             Ok(agent) => agent,
             Err(err) => {
                 if self.is_current(generation) {
@@ -220,8 +244,9 @@ impl AgentRuntime {
                 }
                 self.emit_terminal(
                     generation,
+                    &turn_id,
                     "agent.turn_failed",
-                    serde_json::json!({ "error": err.to_string() }),
+                    serde_json::json!({ "turn_id": turn_id, "error": err.to_string() }),
                 );
                 return;
             }
@@ -247,8 +272,9 @@ impl AgentRuntime {
                 }
                 self.emit_terminal(
                     generation,
+                    &turn_id,
                     "agent.turn_failed",
-                    serde_json::json!({ "error": err.to_string() }),
+                    serde_json::json!({ "turn_id": turn_id, "error": err.to_string() }),
                 );
                 return;
             }
@@ -270,6 +296,9 @@ impl AgentRuntime {
             turn_id: turn_id.clone(),
             autonomous_full_access: Arc::clone(&self.autonomous_full_access),
         };
+        // Serialize against background task-agent turns on the shared gate
+        // (when installed). Held for the whole tool loop, not per call.
+        let _model_permit = self.acquire_model_permit(&turn_id).await;
         match agent
             .turn_with_tools_authorized(transcript, &registry, &authorizer)
             .await
@@ -282,8 +311,9 @@ impl AgentRuntime {
                 }
                 self.emit_terminal(
                     generation,
+                    &turn_id,
                     "agent.turn_failed",
-                    serde_json::json!({ "error": err.to_string() }),
+                    serde_json::json!({ "turn_id": turn_id, "error": err.to_string() }),
                 );
             }
             Ok(outcome) => {
@@ -313,8 +343,9 @@ impl AgentRuntime {
                                 }
                                 self.emit_terminal(
                                     generation,
+                                    &turn_id,
                                     "agent.turn_failed",
-                                    serde_json::json!({ "error": "approval queue lock failed" }),
+                                    serde_json::json!({ "turn_id": turn_id, "error": "approval queue lock failed" }),
                                 );
                                 return;
                             }
@@ -339,8 +370,10 @@ impl AgentRuntime {
                         }
                         self.emit_terminal(
                             generation,
+                            &turn_id,
                             "agent.turn_suspended",
                             serde_json::json!({
+                                "turn_id": turn_id,
                                 "text": outcome.text,
                                 "request_id": request.id,
                                 "tool_steps": outcome.tool_steps.iter().map(serialize_tool_step).collect::<Vec<_>>(),
@@ -369,8 +402,10 @@ impl AgentRuntime {
                             outcome.tool_steps.iter().map(serialize_tool_step).collect();
                         self.emit_terminal(
                             generation,
+                            &turn_id,
                             "agent.turn_done",
                             serde_json::json!({
+                                "turn_id": turn_id,
                                 "text": outcome.text,
                                 "executed": executed,
                                 "tool_steps": tool_steps,

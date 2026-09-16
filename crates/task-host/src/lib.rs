@@ -9,12 +9,15 @@ pub mod runners;
 
 use runners::TICKET_STASH_TTL;
 pub use runners::{
-    AgentRunner, AgentStepBackend, AvatarRoutineRunner, CapabilityReviewRequest,
+    AgentRunner, AgentStepBackend, AvatarRoutineRunner, CapabilityReviewRequest, LimitedRunner,
     NotificationRunner, ToolRunner,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 use task_core::{
     Clock, Executor, Ms, NewTask, Runners, Scheduler, SqliteTaskStore, SystemClock, Task,
@@ -128,11 +131,54 @@ pub struct ConsumedTicket {
     pub invocation_id: capability_core::InvocationId,
 }
 
+/// Step-type concurrency bounds across all workers. Agent turns are the
+/// long pole (model latency); avatar dispatches park immediately after
+/// emitting their request.
+pub const AGENT_STEP_CONCURRENCY: usize = 1;
+pub const AVATAR_STEP_CONCURRENCY: usize = 1;
+pub const TOOL_STEP_CONCURRENCY: usize = 2;
+pub const NOTIFICATION_STEP_CONCURRENCY: usize = 2;
+/// Dispatch queue depth. A full queue leaves tasks `Ready` for the next
+/// tick instead of stalling it — the tick loop must never block.
+pub const DISPATCH_CHANNEL_SIZE: usize = 64;
+
+/// One ready task handed from the tick loop to a worker.
+#[derive(Debug, Clone)]
+pub struct DispatchRequest {
+    pub task_id: String,
+    pub queued_at: Ms,
+}
+
+/// Worker pool sizing. Step-type bounds live on the runners (see the
+/// `*_STEP_CONCURRENCY` constants); this only sizes the task-driving loops.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerConfig {
+    pub task_workers: usize,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self { task_workers: 4 }
+    }
+}
+
 pub struct TaskHost {
     store: Arc<SqliteTaskStore>,
     scheduler: Scheduler<SqliteTaskStore>,
     services: Arc<HostServices>,
     clock: Arc<SystemClock>,
+    /// Wake signal for the single background tick loop. Mutating IPC calls
+    /// notify instead of ticking inline, so responses return immediately.
+    wake: Arc<tokio::sync::Notify>,
+    dispatch_tx: tokio::sync::mpsc::Sender<DispatchRequest>,
+    /// Taken exactly once by [`run_worker_pool`]; `None` afterwards.
+    dispatch_rx: Mutex<Option<tokio::sync::mpsc::Receiver<DispatchRequest>>>,
+    /// True once workers run. Ticks dispatch only when set; without
+    /// workers (tests, task-cli) ticks execute inline, as before.
+    dispatch_active: AtomicBool,
+    /// Task ids already queued or executing. Prevents double-dispatch
+    /// between ticks while a worker is still running the task.
+    in_flight: Mutex<HashSet<String>>,
 }
 
 impl TaskHost {
@@ -185,15 +231,37 @@ impl TaskHost {
         agent_backend: Option<Arc<dyn AgentStepBackend>>,
     ) -> TaskResult<Self> {
         let clock = Arc::new(SystemClock);
+        let agent_inner = match agent_backend {
+            Some(backend) => AgentRunner::new(backend),
+            None => AgentRunner::not_wired(),
+        }
+        .with_lease_renewal(
+            store.clone(),
+            clock.clone() as Arc<dyn Clock>,
+            task_core::recovery::DEFAULT_LEASE_MS,
+        );
         let runners = Runners {
             wait: Arc::new(task_core::WaitRunner),
-            notification: Arc::new(NotificationRunner::new(services.clone())),
-            avatar_routine: Arc::new(AvatarRoutineRunner::new(emit)),
-            tool: Arc::new(ToolRunner::new(services.clone())),
-            agent: Arc::new(match agent_backend {
-                Some(backend) => AgentRunner::new(backend),
-                None => AgentRunner::not_wired(),
-            }),
+            notification: Arc::new(LimitedRunner::new(
+                Arc::new(NotificationRunner::new(services.clone())),
+                NOTIFICATION_STEP_CONCURRENCY,
+                "notification",
+            )),
+            avatar_routine: Arc::new(LimitedRunner::new(
+                Arc::new(AvatarRoutineRunner::new(emit)),
+                AVATAR_STEP_CONCURRENCY,
+                "avatar",
+            )),
+            tool: Arc::new(LimitedRunner::new(
+                Arc::new(ToolRunner::new(services.clone())),
+                TOOL_STEP_CONCURRENCY,
+                "tool",
+            )),
+            agent: Arc::new(LimitedRunner::new(
+                Arc::new(agent_inner),
+                AGENT_STEP_CONCURRENCY,
+                "agent",
+            )),
             approval: Arc::new(task_core::ApprovalRunner),
         };
         let executor = Executor::new(
@@ -208,11 +276,17 @@ impl TaskHost {
             clock.clone() as Arc<dyn Clock>,
             task_core::scheduler::DEFAULT_BATCH_LIMIT,
         );
+        let (dispatch_tx, dispatch_rx) = tokio::sync::mpsc::channel(DISPATCH_CHANNEL_SIZE);
         Ok(Self {
             store,
             scheduler,
             services,
             clock,
+            wake: Arc::new(tokio::sync::Notify::new()),
+            dispatch_tx,
+            dispatch_rx: Mutex::new(Some(dispatch_rx)),
+            dispatch_active: AtomicBool::new(false),
+            in_flight: Mutex::new(HashSet::new()),
         })
     }
 
@@ -220,8 +294,87 @@ impl TaskHost {
         self.clock.now_ms()
     }
 
+    /// Wake the background tick loop. Mutating IPC calls notify instead of
+    /// ticking inline, so the response returns without waiting on recovery,
+    /// promotion, or any other task's execution.
+    pub fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// True once [`run_worker_pool`] runs. IPC uses this to decide between
+    /// wake-only (production) and the degraded inline tick (no workers).
+    pub fn has_workers(&self) -> bool {
+        self.dispatch_active.load(Ordering::SeqCst)
+    }
+
+    /// One scheduling pass. With workers running this is dispatch-only:
+    /// bookkeeping plus enqueue, returning before any step executes. Without
+    /// workers (tests, task-cli) it executes inline, as before.
     pub async fn tick(&self) -> TaskResult<TickReport> {
-        Ok(self.scheduler.tick().await?)
+        if !self.dispatch_active.load(Ordering::SeqCst) {
+            return Ok(self.scheduler.tick().await?);
+        }
+        let (mut report, batch) = self.scheduler.collect_ready().await?;
+        for task_id in batch {
+            if !self.mark_in_flight(&task_id) {
+                continue;
+            }
+            let queued_at = self.now_ms();
+            match self.dispatch_tx.try_send(DispatchRequest {
+                task_id: task_id.clone(),
+                queued_at,
+            }) {
+                Ok(()) => {
+                    tracing::info!(task_id = %task_id, queued_at, "task queued for worker");
+                    report.dispatched.push(task_id);
+                }
+                Err(_) => {
+                    self.unmark_in_flight(&task_id);
+                    tracing::warn!(task_id = %task_id, "dispatch queue full; task stays ready");
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// Execute one task outside the tick loop (worker path). Clears the
+    /// in-flight mark on every exit so a later tick can redispatch retries.
+    pub async fn execute_task(&self, task_id: &str) -> TaskResult<Task> {
+        let started_at = self.now_ms();
+        tracing::info!(task_id = %task_id, started_at, "task dispatched to worker");
+        let outcome = self.scheduler.execute_task(task_id).await;
+        self.unmark_in_flight(task_id);
+        let finished_at = self.now_ms();
+        match &outcome {
+            Ok(task) => tracing::info!(
+                task_id = %task_id,
+                status = %task.status.as_str(),
+                started_at,
+                finished_at,
+                "task worker finished"
+            ),
+            Err(err) => tracing::warn!(
+                task_id = %task_id,
+                %err,
+                started_at,
+                finished_at,
+                "task worker ended with error"
+            ),
+        }
+        Ok(outcome?)
+    }
+
+    fn mark_in_flight(&self, task_id: &str) -> bool {
+        self.in_flight
+            .lock()
+            .map(|mut set| set.insert(task_id.to_string()))
+            .unwrap_or(false)
+    }
+
+    fn unmark_in_flight(&self, task_id: &str) {
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(task_id);
+        }
     }
 
     /// Scheduling pass that executes ONLY `task_id` (see
@@ -350,10 +503,16 @@ impl From<TaskHostError> for task_core::TaskCoreError {
     }
 }
 
-/// Background tick loop: recover, expire, promote, execute, sleep. Logs and
-/// continues on tick errors — a poisoned tick must never kill the loop.
+/// Background tick loop: recover, expire, promote, dispatch, sleep. The
+/// single scheduling authority — mutating IPC calls only wake it via
+/// [`TaskHost::wake`], never tick inline. Logs and continues on tick
+/// errors: a poisoned tick must never kill the loop.
 pub async fn run_tick_loop(host: Arc<TaskHost>, interval: Duration) {
     loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {},
+            _ = host.wake.notified() => {},
+        }
         match host.tick().await {
             Ok(report) => {
                 if !report.errors.is_empty() {
@@ -369,7 +528,51 @@ pub async fn run_tick_loop(host: Arc<TaskHost>, interval: Duration) {
             }
             Err(err) => tracing::warn!(%err, "task tick failed"),
         }
-        tokio::time::sleep(interval).await;
+    }
+}
+
+/// Worker pool: the only task executor in production. Takes the dispatch
+/// receiver exactly once (a second pool logs and exits), activates
+/// dispatch-mode ticks, then drives ready tasks independently of the tick
+/// loop until the host drops. Runs forever by design.
+pub async fn run_worker_pool(host: Arc<TaskHost>, config: WorkerConfig) {
+    let rx = host
+        .dispatch_rx
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    let Some(rx) = rx else {
+        tracing::error!("task worker pool already started; ignoring second pool");
+        return;
+    };
+    host.dispatch_active.store(true, Ordering::SeqCst);
+    let shared = Arc::new(tokio::sync::Mutex::new(rx));
+    let mut joins = Vec::new();
+    for id in 0..config.task_workers.max(1) {
+        let host = Arc::clone(&host);
+        let shared = Arc::clone(&shared);
+        joins.push(tokio::spawn(async move {
+            loop {
+                let request = { shared.lock().await.recv().await };
+                let Some(request) = request else { break };
+                tracing::debug!(
+                    task_id = %request.task_id,
+                    worker = id,
+                    queued_at = request.queued_at,
+                    "worker picked up task"
+                );
+                if let Err(err) = host.execute_task(&request.task_id).await {
+                    tracing::debug!(
+                        task_id = %request.task_id,
+                        %err,
+                        "worker execution ended"
+                    );
+                }
+            }
+        }));
+    }
+    for join in joins {
+        let _ = join.await;
     }
 }
 
@@ -618,5 +821,54 @@ mod tests {
         host.tick().await.expect("tick2");
         let done = host.get(&created.id).await.expect("get").expect("task");
         assert_eq!(done.status, TaskStatus::Completed, "{done:?}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_tick_enqueues_and_worker_executes() {
+        let host =
+            Arc::new(TaskHost::open_in_memory(registry(), silent_emit(), None).expect("host"));
+        let mut task = gated_task();
+        task.steps = vec![NewTaskStep {
+            step_type: TaskStepType::Wait,
+            input: serde_json::json!({ "duration_ms": 0 }),
+            max_attempts: Some(1),
+        }];
+        task.max_attempts = Some(1);
+        let created = host.create(task).await.expect("create");
+        assert!(!host.has_workers());
+
+        tokio::spawn(run_worker_pool(
+            Arc::clone(&host),
+            WorkerConfig { task_workers: 2 },
+        ));
+        let start = Instant::now();
+        while !host.has_workers() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "worker pool did not activate"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Dispatch-only: the tick enqueues without executing.
+        let report = host.tick().await.expect("tick");
+        assert_eq!(report.dispatched, vec![created.id.clone()]);
+        assert!(report.executed.is_empty());
+        let queued = host.get(&created.id).await.expect("get").expect("task");
+        assert_ne!(queued.status, TaskStatus::Completed);
+
+        // The worker executes independently of the tick loop.
+        let start = Instant::now();
+        loop {
+            let current = host.get(&created.id).await.expect("get").expect("task");
+            if current.status == TaskStatus::Completed {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "worker did not finish: {current:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

@@ -168,3 +168,28 @@ test('gesture keys are stable per cue shape', () => {
 	assert.equal(gestureKey(headTap), 'reaction:head');
 	assert.equal(gestureKey({ type: 'emote', id: 'vrma_03' }), 'emote:vrma_03');
 });
+
+test('parameterized cues key by their parameter', () => {
+	assert.equal(
+		gestureKey({ type: 'animation', action: 'turn', direction: 'left' }),
+		'animation:turn:left'
+	);
+	assert.equal(
+		gestureKey({ type: 'animation', action: 'goto', anchorId: 'chair' }),
+		'animation:goto:chair'
+	);
+	assert.equal(
+		gestureKey({ type: 'locomotion', action: 'run', direction: 'left', durationMs: 1200 }),
+		'locomotion:run:left'
+	);
+	// Same turn twice is a duplicate; a different direction is not.
+	const state = createGestureGateState();
+	const left: GestureCue = { type: 'animation', action: 'turn', direction: 'left' };
+	const right: GestureCue = { type: 'animation', action: 'turn', direction: 'right' };
+	recordGestureExecution(state, left, 0);
+	assert.equal(evaluateGestureGate(ctxAt(left, 5000, state, { explicitRequest: true })).allowed, true);
+	assert.equal(state.lastKey, 'animation:turn:left');
+	assert.deepEqual(evaluateGestureGate(ctxAt(right, 20000, state, { explicitRequest: true })), {
+		allowed: true
+	});
+});

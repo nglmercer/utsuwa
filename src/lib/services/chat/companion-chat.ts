@@ -71,6 +71,8 @@ async function buildCompanionPrompt(
 	nativeRuntime = false
 ): Promise<string> {
 	const workingMemory = getWorkingMemory();
+	const avatarPose = vrmStore.avatarPose;
+	const cameraPose = vrmStore.cameraPose;
 	const context: PromptContext = {
 		persona: personaStore.activeCard,
 		state: characterStore.state,
@@ -83,7 +85,9 @@ async function buildCompanionPrompt(
 		sessionStartedAt: workingMemory.sessionStartedAt,
 		systemEvent,
 		nativeRuntime,
-		availableExpressions: vrmStore.availableExpressions
+		availableExpressions: vrmStore.availableExpressions,
+		avatarPose: { x: avatarPose.x, z: avatarPose.z, yaw: avatarPose.yaw, sitting: avatarPose.sitting },
+		cameraPose: { x: cameraPose.x, z: cameraPose.z }
 	};
 	return buildSystemPrompt(context);
 }
@@ -187,15 +191,21 @@ export interface SendCompanionMessageOptions {
 }
 
 function describeRoutineStep(key: string): string {
-	const [kind, action, direction] = key.split(':');
-	if (kind === 'walk') return `walked ${direction ?? 'forward'}`;
+	const [kind, action, detail] = key.split(':');
+	if (kind === 'walk') return `${action === 'run' ? 'ran' : 'walked'} ${detail ?? 'forward'}`;
 	if (kind === 'jump') return 'jumped';
+	if (kind === 'return_home') return 'came back to the center';
+	if (kind === 'face_camera') return 'faced you';
+	if (kind === 'turn') return `turned ${detail === 'back' || !detail ? 'around' : detail}`;
+	if (kind === 'goto') return `went to the ${detail ?? 'spot'}`;
 	if (kind === 'emote') return { wave: 'waved', celebrate: 'celebrated', dance: 'danced' }[action] ?? action;
 	const verbs: Record<string, string> = {
 		nod: 'nodded',
 		shake_head: 'shook my head',
 		bow: 'bowed',
-		shrug: 'shrugged'
+		shrug: 'shrugged',
+		sit: 'sat down',
+		stand: 'stood up'
 	};
 	return verbs[action] ?? key.replaceAll(':', ' ');
 }

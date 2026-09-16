@@ -6,8 +6,11 @@ import {
 	AVATAR_ACTIONS,
 	type AvatarActionName,
 	type AvatarRoutineStep,
-	type LocomotionDirection
+	type LocomotionActionName,
+	type LocomotionDirection,
+	type TurnDirection
 } from './avatar-actions.ts';
+import { resolveSceneAnchor } from './scene-anchors.ts';
 
 export interface AvatarCommandPlan {
 	steps: AvatarRoutineStep[];
@@ -26,7 +29,7 @@ const MAX_PLAN_STEPS = 8;
 const SEGMENT_SPLIT_RE = /\b(?:and then|then|after that|and)\b|[;,.\n、。！？]|!|\?/i;
 // Polite filler that does not make a segment conversational.
 const FILLER_RE = /\b(?:please|thanks|thank you|can you|could you|would you)\b|おねがい|ください/gi;
-// Durations: "3 seconds", "3s", "3秒". Applies to walk steps.
+// Durations: "3 seconds", "3s", "3秒". Applies to walk/run steps.
 const DURATION_RE = /(\d+)\s*(seconds?|secs?|s|秒)\b/i;
 
 function actionStep(action: AvatarActionName): AvatarRoutineStep {
@@ -35,13 +38,19 @@ function actionStep(action: AvatarActionName): AvatarRoutineStep {
 		return { kind: 'emote', action, url: def.source.url };
 	}
 	if (action === 'jump') return { kind: 'jump', action };
+	if (action === 'return_home') return { kind: 'return_home', action };
+	if (action === 'face_camera') return { kind: 'face_camera', action };
+	if (action === 'sit' || action === 'stand') return { kind: 'procedural', action };
 	return { kind: 'procedural', action };
 }
 
-function walkStep(direction: LocomotionDirection): (durationMs?: number) => AvatarRoutineStep {
+function locomotionStep(
+	direction: LocomotionDirection,
+	action: LocomotionActionName = 'walk'
+): (durationMs?: number) => AvatarRoutineStep {
 	return (durationMs?: number) => ({
 		kind: 'walk',
-		action: 'walk',
+		action,
 		direction,
 		durationMs: clampWalkDuration(durationMs ?? WALK_DURATION_DEFAULT_MS)
 	});
@@ -59,6 +68,26 @@ const WALK_DIRS: Array<{ re: RegExp; direction: LocomotionDirection }> = [
 	{ re: /\bback(wards?)?\b|後ろ|バック/, direction: 'back' }
 ];
 
+const TURN_DIRS: Array<{ re: RegExp; direction: TurnDirection }> = [
+	{ re: /\bleft\b|左/, direction: 'left' },
+	{ re: /\bright\b|右/, direction: 'right' },
+	{ re: /\b(back|around)\b|後ろ|バック/, direction: 'back' }
+];
+
+function findWalkDirection(text: string): LocomotionDirection | null {
+	for (const { re, direction } of WALK_DIRS) {
+		if (re.test(text)) return direction;
+	}
+	return null;
+}
+
+function findTurnDirection(text: string): TurnDirection | null {
+	for (const { re, direction } of TURN_DIRS) {
+		if (re.test(text)) return direction;
+	}
+	return null;
+}
+
 const VERBS: Array<{ re: RegExp; action: AvatarActionName }> = [
 	{ re: /\bjump(ing|ed)?\b|跳んで|ジャンプ/, action: 'jump' },
 	{ re: /\bwav(e|ing)\b|手を振/, action: 'wave' },
@@ -70,28 +99,91 @@ const VERBS: Array<{ re: RegExp; action: AvatarActionName }> = [
 	{ re: /\bshrug(ged|s)?\b|肩をすくめ/, action: 'shrug' }
 ];
 
+// "Come back" phrasing means the room center — never a walk-back step, which
+// lands nowhere near the origin. "Go back" alone stays a walk (see below).
+const RETURN_HOME_RE =
+	/\bcome\s+back\b|\breturn\b|\bback\s+to\s+(the\s+)?(center|middle|home)\b|\bgo\s+home\b|\b(original\s+position|home|center)\b|戻って|元の位置/;
+// Facing the viewer is its own step: walks leave her in profile. The verb
+// needs its target ("face me", "face the camera") so "my face hurts" stays chat.
+const FACE_CAMERA_RE =
+	/\bface\s+(me|the|toward|towards|forward)\b|\bface\b[^.?!]*\bcamera\b|\blook\s+at\s+me\b|こっちを見/;
+
 function parseDurationMs(segment: string): number | undefined {
 	const match = DURATION_RE.exec(segment);
 	if (!match) return undefined;
 	return clampWalkDuration(Number(match[1]) * 1000);
 }
 
-function parseSegment(segment: string, inheritWalk: boolean): AvatarRoutineStep | null {
+// Text after "go to" / "sit on": the anchor label ("the chair" -> chair).
+function anchorLabelAfter(text: string, marker: RegExp): string | null {
+	const match = marker.exec(text);
+	if (!match || match.index === undefined) return null;
+	return text.slice(match.index + match[0].length).trim() || null;
+}
+
+function parseSegment(
+	segment: string,
+	inheritLocomotion: LocomotionActionName | null
+): AvatarRoutineStep | AvatarRoutineStep[] | null {
 	const text = segment.toLowerCase();
-	if (/\bwalk\b|歩/.test(text)) {
-		for (const { re, direction } of WALK_DIRS) {
-			if (re.test(text)) return walkStep(direction)(parseDurationMs(text));
+
+	// "Go to the chair" resolves against the scene registry. A "go to"
+	// phrasing with an unresolvable place is NOT a walk: stepping forward
+	// would be the wrong motion, so the segment stays conversational — unless
+	// the remainder is itself a direction ("go to the left" walks left).
+	const gotoMarker = /\b(?:go|move|walk|run)\s+to\b/.exec(text);
+	if (gotoMarker && gotoMarker.index !== undefined) {
+		const label = text.slice(gotoMarker.index + gotoMarker[0].length).trim();
+		const anchor = label ? resolveSceneAnchor(label) : null;
+		if (anchor) return { kind: 'goto', action: 'goto', anchorId: anchor.id };
+		// "Go to the left" walks left; "go to mars" is not a walk at all.
+		const bare = label.replace(/^(the|a)\s+/, '').trim();
+		if (!/^(left|right|forward|forwards|forth|ahead|back|backwards?|左|右|前|後ろ|バック)$/.test(bare)) {
+			return null;
 		}
-		return walkStep('forward')(parseDurationMs(text));
+	}
+
+	// "Sit on the chair" is two steps: travel, then sit with that seat height.
+	// An unknown seat degrades to sitting in place.
+	if (/\bsit\b|座/.test(text)) {
+		const label = anchorLabelAfter(text, /\bsit\b[^a-z]*\b(?:on|in)\b/);
+		if (label) {
+			const anchor = resolveSceneAnchor(label);
+			if (anchor) {
+				return [
+					{ kind: 'goto', action: 'goto', anchorId: anchor.id },
+					{ kind: 'procedural', action: 'sit', anchorId: anchor.id }
+				];
+			}
+		}
+		return { kind: 'procedural', action: 'sit' };
+	}
+	if (/\bstand\b|立/.test(text)) return { kind: 'procedural', action: 'stand' };
+
+	if (RETURN_HOME_RE.test(text)) return { kind: 'return_home', action: 'return_home' };
+	if (FACE_CAMERA_RE.test(text)) return { kind: 'face_camera', action: 'face_camera' };
+	if (/\bturn\b|\bspin\b|回って/.test(text)) {
+		return { kind: 'turn', action: 'turn', direction: findTurnDirection(text) ?? 'back' };
+	}
+
+	// Walk/run accept a bare verb ("walk" steps forward); move/go are too
+	// chatty for that ("go on", "move along") and need a direction.
+	if (/\bwalk\b|\brun\b|歩|走/.test(text)) {
+		const action: LocomotionActionName = /\brun\b|走/.test(text) ? 'run' : 'walk';
+		return locomotionStep(findWalkDirection(text) ?? 'forward', action)(parseDurationMs(text));
+	}
+	if (/\bmove\b|\bgo\b/.test(text)) {
+		const direction = findWalkDirection(text);
+		if (direction) return locomotionStep(direction)(parseDurationMs(text));
 	}
 	for (const { re, action } of VERBS) {
 		if (re.test(text)) return actionStep(action);
 	}
-	// "walk left then right": a bare direction continues the previous walk.
-	if (inheritWalk) {
-		for (const { re, direction } of WALK_DIRS) {
-			if (re.test(text)) return walkStep(direction)(parseDurationMs(text));
-		}
+	// "walk left then right": a bare direction continues the previous
+	// locomotion, preserving walk vs run.
+	if (inheritLocomotion) {
+		const direction = findWalkDirection(text);
+		if (direction) return locomotionStep(direction, inheritLocomotion)(parseDurationMs(text));
 	}
 	return null;
 }
@@ -106,10 +198,17 @@ export function parseAvatarCommand(message: string): AvatarCommandPlan | null {
 	for (const raw of message.split(SEGMENT_SPLIT_RE)) {
 		const cleaned = raw.replace(FILLER_RE, ' ').replace(/\s+/g, ' ').trim();
 		if (!cleaned) continue;
-		const inheritWalk = steps.length > 0 && steps[steps.length - 1].action === 'walk';
-		const step = parseSegment(cleaned, inheritWalk);
-		if (step) {
-			if (steps.length < MAX_PLAN_STEPS) steps.push(step);
+		const last = steps.length > 0 ? steps[steps.length - 1] : null;
+		const inheritLocomotion: LocomotionActionName | null =
+			last && last.kind === 'walk' && (last.action === 'walk' || last.action === 'run')
+				? last.action
+				: null;
+		const parsed = parseSegment(cleaned, inheritLocomotion);
+		if (parsed) {
+			const list = Array.isArray(parsed) ? parsed : [parsed];
+			for (const step of list) {
+				if (steps.length < MAX_PLAN_STEPS) steps.push(step);
+			}
 		} else {
 			leftovers.push(raw.trim());
 		}

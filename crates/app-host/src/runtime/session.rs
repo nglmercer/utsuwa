@@ -98,11 +98,14 @@ impl AgentRuntime {
             append_user_message: true,
             ..AgentRequest::default()
         })
+        .map(|_| ())
     }
     /// Start a turn with optional frontend history and prompt context. The
     /// host becomes the owner of the transcript as soon as this request is
     /// accepted; history is only an initial synchronization payload.
-    pub fn send_request(self: &Arc<Self>, request: AgentRequest) -> Result<(), RuntimeError> {
+    /// Returns the turn id so callers can correlate the turn's events
+    /// (`agent.*` payloads all carry `turn_id`).
+    pub fn send_request(self: &Arc<Self>, request: AgentRequest) -> Result<String, RuntimeError> {
         let (transcript, generation, task_id, turn_id, system_prompt, replay_cache, old_task) = {
             let mut state = self.lock_state()?;
             state.generation += 1;
@@ -169,11 +172,12 @@ impl AgentRuntime {
             transcript,
             generation,
             task_id,
-            turn_id,
+            turn_id.clone(),
             system_prompt,
             replay_cache,
             None,
-        )
+        )?;
+        Ok(turn_id)
     }
     /// Resume a suspended turn after its permission request was resolved.
     /// Approving re-runs the turn so the call executes under the new
@@ -237,7 +241,7 @@ impl AgentRuntime {
     /// runtime is silent: with no worker and no suspended turn there is
     /// nothing to report, so no `agent.turn_cancelled` is emitted.
     pub fn cancel(self: &Arc<Self>) {
-        let (task_id, was_active) = match self.lock_state() {
+        let (task_id, turn_id, was_active) = match self.lock_state() {
             Ok(mut state) => {
                 let was_active = state.running.is_some() || state.suspended.is_some();
                 state.generation += 1;
@@ -246,7 +250,7 @@ impl AgentRuntime {
                 }
                 state.suspended = None;
                 state.replay_cache = None;
-                (state.task_id.take(), was_active)
+                (state.task_id.take(), state.turn_id.take(), was_active)
             }
             Err(_) => return,
         };
@@ -258,10 +262,16 @@ impl AgentRuntime {
         if !was_active {
             return;
         }
-        // The cancelling generation is current by construction.
+        // The cancelling generation is current by construction. The turn id
+        // lets the frontend resolve exactly the promise that owned this
+        // turn instead of any bystander.
+        let data = match turn_id {
+            Some(turn_id) => serde_json::json!({ "turn_id": turn_id }),
+            None => serde_json::json!({}),
+        };
         (self.emit)(HostEvent {
             event: "agent.turn_cancelled".to_string(),
-            data: serde_json::json!({}),
+            data,
         });
     }
 }

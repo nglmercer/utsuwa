@@ -7,10 +7,13 @@ import {
 } from '../engine/facial-expressions.ts';
 import {
 	isAvatarActionName,
+	isLocomotionActionName,
 	isLocomotionDirection,
+	isTurnDirection,
 	resolveLegacyEmote,
 	type GestureCue as EngineGestureCue
 } from '../engine/avatar-actions.ts';
+import { resolveSceneAnchor } from '../engine/scene-anchors.ts';
 
 // Re-exported so turn staging keeps one import site.
 export type GestureCue = EngineGestureCue;
@@ -60,6 +63,7 @@ interface LLMStateOutput {
 		id?: string;
 		zone?: string;
 		direction?: string;
+		anchor_id?: string;
 		duration_ms?: number;
 	};
 }
@@ -366,19 +370,37 @@ function parseGestureCue(output: LLMStateOutput): GestureCue | null {
 	const type = typeof cue.type === 'string' ? cue.type.toLowerCase().trim() : '';
 	if (type === 'animation') {
 		const action = typeof cue.action === 'string' ? cue.action.toLowerCase().trim() : '';
-		if (!isAvatarActionName(action) || action === 'walk') return null;
+		if (!isAvatarActionName(action) || isLocomotionActionName(action)) return null;
+		// Parameterized world-motion: turn needs its direction, goto its anchor.
+		if (action === 'turn') {
+			const direction =
+				typeof cue.direction === 'string' ? cue.direction.toLowerCase().trim() : '';
+			if (!isTurnDirection(direction)) return null;
+			return { type: 'animation', action, direction };
+		}
+		if (action === 'goto') {
+			const anchor =
+				typeof cue.anchor_id === 'string' ? resolveSceneAnchor(cue.anchor_id) : null;
+			if (!anchor) return null;
+			return { type: 'animation', action, anchorId: anchor.id };
+		}
+		if (action === 'sit' && typeof cue.anchor_id === 'string' && cue.anchor_id.trim()) {
+			const anchor = resolveSceneAnchor(cue.anchor_id);
+			if (!anchor) return null;
+			return { type: 'animation', action, anchorId: anchor.id };
+		}
 		return { type: 'animation', action };
 	}
 	if (type === 'locomotion') {
 		const action = typeof cue.action === 'string' ? cue.action.toLowerCase().trim() : '';
 		const direction =
 			typeof cue.direction === 'string' ? cue.direction.toLowerCase().trim() : '';
-		if (action !== 'walk' || !isLocomotionDirection(direction)) return null;
+		if (!isLocomotionActionName(action) || !isLocomotionDirection(direction)) return null;
 		const durationMs =
 			typeof cue.duration_ms === 'number' && Number.isFinite(cue.duration_ms)
 				? Math.min(WALK_DURATION_MAX_MS, Math.max(WALK_DURATION_MIN_MS, Math.round(cue.duration_ms)))
 				: WALK_DURATION_DEFAULT_MS;
-		return { type: 'locomotion', action: 'walk', direction, durationMs };
+		return { type: 'locomotion', action, direction, durationMs };
 	}
 	if (type === 'reaction') {
 		const zone = typeof cue.zone === 'string' ? cue.zone.toLowerCase().trim() : '';

@@ -1,9 +1,12 @@
 //! Durable task IPC (`task.*`): the native host is the task authority.
 //!
-//! Every mutating call (create/review/event) also drives one scheduler
-//! tick, so tasks progress even when the background tick loop is down
-//! (degraded mode without the agent executor). The 2s background loop in
-//! `main.rs` covers time-based progress (leases, waits, schedules).
+//! Every mutating call (create/review/event) persists, wakes the single
+//! background tick loop, and returns immediately. The loop dispatches ready
+//! tasks to workers, so a slow model turn can never stall an IPC response
+//! or the WebView chat. The 2s loop in `main.rs` also covers time-based
+//! progress (leases, waits, schedules) when nothing wakes it. Degraded mode
+//! (no agent executor, hence no loop or workers) falls back to one inline
+//! tick per mutation, so tasks still progress without the runtime.
 
 use crate::ipc::dispatcher::Dispatcher;
 use ipc_core::{ErrorCode, IpcErrorBody, IpcRequest};
@@ -55,16 +58,16 @@ impl Dispatcher {
             .ok_or_else(|| internal("task host unavailable (tasks.db could not be opened)"))
     }
 
-    /// Drive one scheduler tick after a mutating call. Tick failures are
-    /// logged, never fatal to the call itself.
-    async fn tick_after_mutation(&self, host: &task_host::TaskHost) {
-        match host.tick().await {
-            Ok(report) => {
-                if !report.errors.is_empty() {
-                    tracing::warn!(errors = ?report.errors, "task tick errors after ipc");
-                }
-            }
-            Err(err) => tracing::warn!(%err, "task tick failed after ipc"),
+    /// Notify the tick loop after a mutation. With workers running this
+    /// returns without executing anything; in degraded mode (no loop, no
+    /// workers) it drives one inline tick so tasks still progress.
+    async fn wake_after_mutation(&self, host: &task_host::TaskHost) {
+        host.wake();
+        if host.has_workers() {
+            return;
+        }
+        if let Err(err) = host.tick().await {
+            tracing::warn!(%err, "task tick failed after ipc (degraded mode)");
         }
     }
 
@@ -74,7 +77,7 @@ impl Dispatcher {
             .map_err(|err| invalid_params(format!("invalid task body: {err}")))?;
         let task = host.create(input).await.map_err(task_error)?;
         let result = serde_json::to_value(&task).map_err(|err| internal(err.to_string()))?;
-        self.tick_after_mutation(&host).await;
+        self.wake_after_mutation(&host).await;
         Ok(result)
     }
 
@@ -137,7 +140,7 @@ impl Dispatcher {
             .await
             .map_err(task_error)?;
         let result = serde_json::to_value(&task).map_err(|err| internal(err.to_string()))?;
-        self.tick_after_mutation(&host).await;
+        self.wake_after_mutation(&host).await;
         Ok(result)
     }
 
@@ -158,7 +161,7 @@ impl Dispatcher {
             .deliver_event(&event_type, correlation_id.as_deref(), payload)
             .await
             .map_err(task_error)?;
-        self.tick_after_mutation(&host).await;
+        self.wake_after_mutation(&host).await;
         Ok(serde_json::json!({
             "delivered": task.is_some(),
             "task": task,
@@ -171,12 +174,13 @@ mod tests {
     use super::*;
     use ipc_core::{IpcMethod, IpcRequest};
 
-    fn dispatcher() -> Dispatcher {
+    fn dispatcher() -> (Dispatcher, Arc<task_host::TaskHost>) {
         let registry = Arc::new(tool_core::ToolRegistry::new());
         let emit: task_host::EmitFn = Arc::new(|_| {});
-        let host =
-            task_host::TaskHost::open_in_memory(registry, emit, None).expect("in-memory tasks");
-        Dispatcher::new("test").with_tasks(Arc::new(host))
+        let host = Arc::new(
+            task_host::TaskHost::open_in_memory(registry, emit, None).expect("in-memory tasks"),
+        );
+        (Dispatcher::new("test").with_tasks(Arc::clone(&host)), host)
     }
 
     fn request(method: IpcMethod, params: serde_json::Value) -> IpcRequest {
@@ -185,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_ipc_round_trip() {
-        let dispatcher = dispatcher();
+        let (dispatcher, host) = dispatcher();
         let created = dispatcher
             .dispatch_async(&request(
                 IpcMethod::TaskCreate,
@@ -197,9 +201,12 @@ mod tests {
             ))
             .await
             .expect("create");
-        // Zero-duration wait is a no-op: the piggyback tick completes it.
+        // Create persists and wakes only: no inline execution anymore.
         assert_eq!(created["title"], "ipc-task");
+        assert_eq!(created["status"], "pending");
         let task_id = created["id"].as_str().expect("id").to_string();
+        // The background loop's scoped tick completes the zero-duration wait.
+        host.tick_one(&task_id).await.expect("tick");
 
         let listed = dispatcher
             .dispatch_async(&request(IpcMethod::TaskList, serde_json::json!({})))
@@ -219,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_review_and_cancel_flow() {
-        let dispatcher = dispatcher();
+        let (dispatcher, host) = dispatcher();
         let created = dispatcher
             .dispatch_async(&request(
                 IpcMethod::TaskCreate,
@@ -232,7 +239,8 @@ mod tests {
             .await
             .expect("create");
         let task_id = created["id"].as_str().expect("id").to_string();
-        // Piggyback tick parks it in needs_review immediately.
+        // The background loop's scoped tick parks it in needs_review.
+        host.tick_one(&task_id).await.expect("tick");
         let parked = dispatcher
             .dispatch_async(&request(
                 IpcMethod::TaskGet,
@@ -250,6 +258,8 @@ mod tests {
             .await
             .expect("review");
         assert_eq!(approved["status"], "ready");
+        // Review only resumes: the loop's tick runs the approved step.
+        host.tick_one(&task_id).await.expect("tick");
 
         let done = dispatcher
             .dispatch_async(&request(
@@ -273,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_create_rejects_invalid_bodies() {
-        let dispatcher = dispatcher();
+        let (dispatcher, _host) = dispatcher();
         let err = dispatcher
             .dispatch_async(&request(IpcMethod::TaskCreate, serde_json::json!({})))
             .await

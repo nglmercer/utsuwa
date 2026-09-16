@@ -57,11 +57,17 @@ export type GestureGateRejection =
 export type GestureGateResult = { allowed: true } | { allowed: false; reason: GestureGateRejection };
 
 // Stable identity for deduplication. Legacy numbered emotes keep their own
-// namespace so they never collide with semantic actions.
+// namespace so they never collide with semantic actions. Parameterized
+// animation cues (turn direction, goto anchor) include their parameter so
+// "turn left" never suppresses "turn right".
 export function gestureKey(cue: GestureCue): string {
 	switch (cue.type) {
-		case 'animation':
-			return `animation:${cue.action}`;
+		case 'animation': {
+			let key = `animation:${cue.action}`;
+			if (cue.direction) key += `:${cue.direction}`;
+			if (cue.anchorId) key += `:${cue.anchorId}`;
+			return key;
+		}
 		case 'locomotion':
 			return `locomotion:${cue.action}:${cue.direction}`;
 		case 'reaction':

@@ -9,7 +9,7 @@ use crate::{EmitFn, HostServices};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
-use task_core::{Ms, StepContext, StepOutcome, StepRunner, Task, TaskStep, TaskWait};
+use task_core::{Ms, StepContext, StepOutcome, StepRunner, Task, TaskStep, TaskStore, TaskWait};
 use tool_core::{ToolContext, ToolError};
 
 pub const AVATAR_ROUTINE_REQUESTED_EVENT: &str = "avatar.routine.requested";
@@ -261,24 +261,143 @@ pub trait AgentStepBackend: Send + Sync {
 
 pub struct AgentRunner {
     backend: Arc<dyn AgentStepBackend>,
+    lease_renewal: Option<LeaseRenewal>,
+}
+
+/// Lease-renewal context: long agent steps must keep their task lease alive
+/// while the model turn runs, or a later recovery pass requeues the task
+/// and the step runs twice.
+#[derive(Clone)]
+pub struct LeaseRenewal {
+    store: Arc<task_core::SqliteTaskStore>,
+    clock: Arc<dyn task_core::Clock>,
+    lease_ms: Ms,
 }
 
 impl AgentRunner {
     pub fn new(backend: Arc<dyn AgentStepBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            lease_renewal: None,
+        }
     }
 
     pub fn not_wired() -> Self {
         Self {
             backend: Arc::new(NotWiredAgentBackend),
+            lease_renewal: None,
         }
+    }
+
+    /// Renew the task lease periodically while the backend runs. Without
+    /// this, any agent step outliving the lease is recovered and retried
+    /// while the original turn is still executing.
+    pub fn with_lease_renewal(
+        mut self,
+        store: Arc<task_core::SqliteTaskStore>,
+        clock: Arc<dyn task_core::Clock>,
+        lease_ms: Ms,
+    ) -> Self {
+        self.lease_renewal = Some(LeaseRenewal {
+            store,
+            clock,
+            lease_ms,
+        });
+        self
     }
 }
 
 #[async_trait]
 impl StepRunner for AgentRunner {
     async fn run(&self, ctx: &StepContext, task: &Task, step: &TaskStep) -> StepOutcome {
+        // Held to the end of the step: dropping it aborts the renew loop.
+        let _renew = self
+            .lease_renewal
+            .as_ref()
+            .map(|renewal| renewal.spawn(&ctx.task_id, &step.id));
         self.backend.run_agent_step(ctx, task, step).await
+    }
+}
+
+impl LeaseRenewal {
+    /// Spawn a renewal loop; the returned guard aborts it on drop. Only
+    /// extends the lease while the task is still `Running` — a cancelled
+    /// or finished task is left alone so recovery semantics stay intact.
+    fn spawn(&self, task_id: &str, step_id: &str) -> RenewGuard {
+        let store = Arc::clone(&self.store);
+        let clock = Arc::clone(&self.clock);
+        let task_id = task_id.to_string();
+        let step_id = step_id.to_string();
+        // Renew well before expiry: a quarter of the lease, at least 10s so
+        // short test leases don't spin.
+        let period = Duration::from_millis((self.lease_ms / 4).max(10_000) as u64);
+        let lease_ms = self.lease_ms;
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                let now = clock.now_ms();
+                match store.get(&task_id).await {
+                    Ok(Some(mut task)) if task.status == task_core::TaskStatus::Running => {
+                        task.lease_until = Some(now + lease_ms);
+                        if store.update(&task, now).await.is_ok() {
+                            tracing::debug!(
+                                task_id = %task_id,
+                                step_id = %step_id,
+                                lease_until = task.lease_until,
+                                "agent step lease renewed"
+                            );
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
+        RenewGuard { handle }
+    }
+}
+
+struct RenewGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RenewGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+/// Bounds concurrent executions of one step type across all workers.
+/// Agent turns are the long pole (model latency); tool and notification
+/// calls are short but numerous; avatar dispatches park immediately.
+pub struct LimitedRunner {
+    inner: Arc<dyn StepRunner>,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    label: &'static str,
+}
+
+impl LimitedRunner {
+    pub fn new(inner: Arc<dyn StepRunner>, max_concurrent: usize, label: &'static str) -> Self {
+        Self {
+            inner,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
+            label,
+        }
+    }
+}
+
+#[async_trait]
+impl StepRunner for LimitedRunner {
+    async fn run(&self, ctx: &StepContext, task: &Task, step: &TaskStep) -> StepOutcome {
+        let _permit = match self.semaphore.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                return StepOutcome::Failed {
+                    message: format!("{} runner shut down", self.label),
+                    retryable: true,
+                }
+            }
+        };
+        self.inner.run(ctx, task, step).await
     }
 }
 
@@ -583,5 +702,52 @@ mod tests {
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
+    }
+
+    struct ConcurrencyProbe {
+        current: Arc<std::sync::atomic::AtomicUsize>,
+        max: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StepRunner for ConcurrencyProbe {
+        async fn run(&self, _ctx: &StepContext, _task: &Task, _step: &TaskStep) -> StepOutcome {
+            let held = self
+                .current
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.max
+                .fetch_max(held, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.current
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            StepOutcome::Completed(serde_json::json!({}))
+        }
+    }
+
+    #[tokio::test]
+    async fn limited_runner_serializes_one_slot() {
+        let probe = Arc::new(ConcurrencyProbe {
+            current: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            max: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        });
+        let runner = Arc::new(LimitedRunner::new(probe.clone(), 1, "probe"));
+        let ctx_a = ctx();
+        let task_a = task();
+        let step_a = step(serde_json::json!({}));
+        let ctx_b = ctx();
+        let task_b = task();
+        let step_b = step(serde_json::json!({}));
+        let (first, second) = tokio::join!(
+            runner.run(&ctx_a, &task_a, &step_a),
+            runner.run(&ctx_b, &task_b, &step_b)
+        );
+        assert!(matches!(first, StepOutcome::Completed(_)));
+        assert!(matches!(second, StepOutcome::Completed(_)));
+        assert_eq!(
+            probe.max.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "single slot must never overlap executions"
+        );
     }
 }

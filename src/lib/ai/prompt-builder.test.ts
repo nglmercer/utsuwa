@@ -448,6 +448,42 @@ test('avatar catalog falls back to the emotional six with no model loaded', () =
 	}
 });
 
+test('avatar catalog documents locomotion and places', () => {
+	const prompt = buildSystemPrompt(makeContext());
+	assert.ok(prompt.includes('- run: only when the user asks you to run or hurry'));
+	assert.ok(prompt.includes('- turn: turn in place'));
+	assert.ok(prompt.includes('- goto: go to a named place'));
+	assert.ok(prompt.includes('- return_home: go back to the center of the room'));
+	assert.ok(prompt.includes('- sit: sit down in place until you stand'));
+	assert.ok(prompt.includes('forward means toward the viewer'));
+	assert.ok(prompt.includes('walk|run'), 'locomotion schema covers run');
+	assert.ok(prompt.includes('anchor_id'), 'goto/sit schema carries the anchor');
+});
+
+test('avatar state layer reports position, facing, and places', () => {
+	const centered = buildSystemPrompt(
+		makeContext({ avatarPose: { x: 0, z: 0, yaw: 0 }, cameraPose: { x: 0, z: 2 } })
+	);
+	assert.ok(centered.includes('<avatar_state>'));
+	assert.ok(centered.includes('at the center of the room, facing you'));
+	assert.ok(centered.includes('chair (sit)'));
+
+	const away = buildSystemPrompt(
+		makeContext({ avatarPose: { x: 1.5, z: 0, yaw: 0, sitting: true }, cameraPose: { x: 1.5, z: -2 } })
+	);
+	assert.ok(away.includes('1.5m from the center'));
+	assert.ok(away.includes('facing away from you'));
+	assert.ok(away.includes('She is sitting.'));
+
+	const rim = buildSystemPrompt(
+		makeContext({ avatarPose: { x: 2, z: 0, yaw: 0 }, cameraPose: { x: 2, z: 2 } })
+	);
+	assert.ok(rim.includes('at the edge of her space'));
+
+	// No pose yet (pre-first-frame): the layer stays out, never stale.
+	assert.ok(!buildSystemPrompt(makeContext()).includes('<avatar_state>'));
+});
+
 test('extraction prompt requests both stage-direction cues', () => {
 	const prompt = buildExtractionSystemPrompt();
 	assert.ok(prompt.includes('"expression_cue"'));

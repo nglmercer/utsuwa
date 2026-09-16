@@ -95,7 +95,7 @@ impl Dispatcher {
                 message: "agent.send_message 'system_prompt' exceeds 128 KiB".to_string(),
             });
         }
-        agent
+        let turn_id = agent
             .send_request(AgentRequest {
                 text: text.to_string(),
                 history,
@@ -106,7 +106,7 @@ impl Dispatcher {
                 code: ErrorCode::Internal,
                 message: err.to_string(),
             })?;
-        Ok(serde_json::json!({ "ok": true, "accepted": true }))
+        Ok(serde_json::json!({ "ok": true, "accepted": true, "turn_id": turn_id }))
     }
     pub(crate) fn agent_cancel(&self) -> Result<Value, IpcErrorBody> {
         let agent = self.agent.as_ref().ok_or_else(|| IpcErrorBody {

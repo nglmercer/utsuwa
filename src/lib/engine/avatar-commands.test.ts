@@ -93,11 +93,69 @@ test('ignores ordinary chat and near-miss words', () => {
 		'the microwave beeped',
 		'I walked to school',
 		'',
-		'bowling night was great'
+		'bowling night was great',
+		'go on, tell me more',
+		'move along with the story',
+		'my face hurts today',
+		'I understand how you feel',
+		'go to mars right now'
 	]) {
 		assert.equal(parseAvatarCommand(text), null, text);
 	}
 	assert.equal(parseAvatarCommand(null as unknown as string), null);
+});
+
+test('parses run, move, and go-with-direction as locomotion', () => {
+	assert.deepEqual(parseAvatarCommand('run left 2s')?.steps, [
+		{ kind: 'walk', action: 'run', direction: 'left', durationMs: 2000 }
+	]);
+	assert.deepEqual(parseAvatarCommand('move right')?.steps, [
+		{ kind: 'walk', action: 'walk', direction: 'right', durationMs: 1200 }
+	]);
+	assert.deepEqual(parseAvatarCommand('go to the left')?.steps, [
+		{ kind: 'walk', action: 'walk', direction: 'left', durationMs: 1200 }
+	]);
+	// Bare-direction inheritance preserves run.
+	const plan = parseAvatarCommand('run left then right');
+	assert.deepEqual(
+		plan?.steps.map((s) => s.action),
+		['run', 'run']
+	);
+	assert.equal(plan?.steps[1].direction, 'right');
+});
+
+test('parses return-home, face-camera, and turns', () => {
+	assert.deepEqual(parseAvatarCommand('come back!')?.steps, [
+		{ kind: 'return_home', action: 'return_home' }
+	]);
+	assert.deepEqual(parseAvatarCommand('go home')?.steps, [
+		{ kind: 'return_home', action: 'return_home' }
+	]);
+	assert.deepEqual(parseAvatarCommand('face me')?.steps, [
+		{ kind: 'face_camera', action: 'face_camera' }
+	]);
+	assert.deepEqual(parseAvatarCommand('turn left')?.steps, [
+		{ kind: 'turn', action: 'turn', direction: 'left' }
+	]);
+	assert.deepEqual(parseAvatarCommand('turn around')?.steps, [
+		{ kind: 'turn', action: 'turn', direction: 'back' }
+	]);
+});
+
+test('parses goto and sit-on-anchor sequences', () => {
+	assert.deepEqual(parseAvatarCommand('go to the chair')?.steps, [
+		{ kind: 'goto', action: 'goto', anchorId: 'chair' }
+	]);
+	assert.deepEqual(parseAvatarCommand('sit down')?.steps, [
+		{ kind: 'procedural', action: 'sit' }
+	]);
+	assert.deepEqual(parseAvatarCommand('sit on the chair')?.steps, [
+		{ kind: 'goto', action: 'goto', anchorId: 'chair' },
+		{ kind: 'procedural', action: 'sit', anchorId: 'chair' }
+	]);
+	assert.deepEqual(parseAvatarCommand('stand up')?.steps, [
+		{ kind: 'procedural', action: 'stand' }
+	]);
 });
 
 test('clampWalkDuration locks renderer-safe bounds', () => {

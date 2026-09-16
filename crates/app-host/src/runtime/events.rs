@@ -24,9 +24,19 @@ impl AgentRuntime {
     /// Clear this generation's worker handle (when still current), then emit
     /// one terminal turn event. Clearing first guarantees an observer that
     /// sees `agent.turn_done` / `agent.turn_failed` / `agent.turn_suspended`
-    /// also sees idle `running` state instead of a stale handle.
-    pub(crate) fn emit_terminal(&self, generation: u64, event: &str, data: serde_json::Value) {
+    /// also sees idle `running` state instead of a stale handle. The
+    /// lifecycle log fires only when the event actually emits (current).
+    pub(crate) fn emit_terminal(
+        &self,
+        generation: u64,
+        turn_id: &str,
+        event: &str,
+        data: serde_json::Value,
+    ) {
         self.clear_running_if_current(generation);
+        if self.is_current(generation) {
+            tracing::info!(turn_id = %turn_id, event = %event, "turn terminal event emitted");
+        }
         self.emit_if_current(generation, event, data);
     }
     /// Park the worker handle for `generation` once its turn has resolved

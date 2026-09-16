@@ -155,10 +155,18 @@
 		const def = AVATAR_ACTIONS[name];
 		if (def.source.kind === 'vrma') {
 			vrmStore.setCurrentAnimation(def.source.url);
-		} else if (name === 'walk') {
-			vrmStore.requestAvatarAction({ kind: 'walk', action: 'walk', direction: 'forward', durationMs: 1200 });
+		} else if (name === 'walk' || name === 'run') {
+			vrmStore.requestAvatarAction({ kind: 'walk', action: name, direction: 'forward', durationMs: 1200 });
 		} else if (name === 'jump') {
 			vrmStore.requestAvatarAction({ kind: 'jump', action: 'jump' });
+		} else if (name === 'return_home') {
+			vrmStore.requestAvatarAction({ kind: 'return_home', action: name });
+		} else if (name === 'face_camera') {
+			vrmStore.requestAvatarAction({ kind: 'face_camera', action: name });
+		} else if (name === 'turn') {
+			vrmStore.requestAvatarAction({ kind: 'turn', action: name, direction: 'left' });
+		} else if (name === 'goto') {
+			vrmStore.requestAvatarAction({ kind: 'goto', action: name, anchorId: 'chair' });
 		} else {
 			vrmStore.requestAvatarAction({ kind: 'procedural', action: name });
 		}
@@ -166,6 +174,34 @@
 
 	function walkAvatar(direction: 'left' | 'right' | 'forward' | 'back') {
 		vrmStore.requestAvatarAction({ kind: 'walk', action: 'walk', direction, durationMs: 1500 });
+	}
+
+	function runAvatar(direction: 'left' | 'right' | 'forward' | 'back') {
+		vrmStore.requestAvatarAction({ kind: 'walk', action: 'run', direction, durationMs: 1500 });
+	}
+
+	function turnAvatar(direction: 'left' | 'right' | 'back') {
+		vrmStore.requestAvatarAction({ kind: 'turn', action: 'turn', direction });
+	}
+
+	function gotoAnchor(anchorId: string) {
+		vrmStore.requestAvatarAction({ kind: 'goto', action: 'goto', anchorId });
+	}
+
+	function faceCamera() {
+		vrmStore.requestAvatarAction({ kind: 'face_camera', action: 'face_camera' });
+	}
+
+	function returnHome() {
+		vrmStore.requestAvatarAction({ kind: 'return_home', action: 'return_home' });
+	}
+
+	function sitDown() {
+		vrmStore.requestAvatarAction({ kind: 'procedural', action: 'sit' });
+	}
+
+	function standUp() {
+		vrmStore.requestAvatarAction({ kind: 'procedural', action: 'stand' });
 	}
 
 	function stopAvatarAction() {
@@ -528,8 +564,21 @@
 				<button class="event-btn" onclick={() => walkAvatar('right')}>Walk Right</button>
 				<button class="event-btn" onclick={() => walkAvatar('forward')}>Walk Forward</button>
 				<button class="event-btn" onclick={() => walkAvatar('back')}>Walk Back</button>
+				<button class="event-btn" onclick={() => runAvatar('forward')}>Run Forward</button>
 				<button class="event-btn" onclick={stopAvatarAction}>Stop</button>
 				<button class="event-btn" onclick={resetAvatarRoot}>Reset Position</button>
+			</div>
+			<p class="hint">Turns, places, facing, home, and posture.</p>
+			<div class="event-buttons">
+				<button class="event-btn" onclick={() => turnAvatar('left')}>Turn Left</button>
+				<button class="event-btn" onclick={() => turnAvatar('right')}>Turn Right</button>
+				<button class="event-btn" onclick={() => turnAvatar('back')}>Turn Around</button>
+				<button class="event-btn" onclick={() => gotoAnchor('chair')}>Go to Chair</button>
+				<button class="event-btn" onclick={() => gotoAnchor('cushion')}>Go to Cushion</button>
+				<button class="event-btn" onclick={faceCamera}>Face Camera</button>
+				<button class="event-btn" onclick={returnHome}>Return Home</button>
+				<button class="event-btn" onclick={sitDown}>Sit Down</button>
+				<button class="event-btn" onclick={standUp}>Stand Up</button>
 			</div>
 			<p class="hint">Routine self-test: plays walk L/R/F/B in order with completion tracking.</p>
 			<div class="event-buttons">

@@ -126,8 +126,9 @@ function fireGestureCue(cue: GestureCue | null, handledKeys: readonly string[] =
 
 // Execute a gate-approved cue. Semantic animations resolve through the
 // registry (VRMA clips play through the one-shot effect; procedural and
-// world-motion actions go through the action request); reactions reuse the
-// tap path; legacy emotes resolve to their shipped clip, nothing else.
+// world-motion actions go through the action request with their parameters);
+// reactions reuse the tap path; legacy emotes resolve to their shipped clip,
+// nothing else.
 function stageGestureCue(cue: GestureCue) {
 	switch (cue.type) {
 		case 'animation': {
@@ -135,16 +136,24 @@ function stageGestureCue(cue: GestureCue) {
 			if (def.source.kind === 'vrma') {
 				vrmStore.setCurrentAnimation(def.source.url);
 			} else if (def.source.kind === 'procedural') {
-				vrmStore.requestAvatarAction({ kind: 'procedural', action: cue.action });
-			} else {
+				vrmStore.requestAvatarAction({ kind: 'procedural', action: cue.action, anchorId: cue.anchorId });
+			} else if (cue.action === 'jump') {
 				vrmStore.requestAvatarAction({ kind: 'jump', action: cue.action });
+			} else if (cue.action === 'return_home') {
+				vrmStore.requestAvatarAction({ kind: 'return_home', action: cue.action });
+			} else if (cue.action === 'face_camera') {
+				vrmStore.requestAvatarAction({ kind: 'face_camera', action: cue.action });
+			} else if (cue.action === 'turn') {
+				vrmStore.requestAvatarAction({ kind: 'turn', action: cue.action, direction: cue.direction });
+			} else if (cue.action === 'goto' && cue.anchorId) {
+				vrmStore.requestAvatarAction({ kind: 'goto', action: cue.action, anchorId: cue.anchorId });
 			}
 			return;
 		}
 		case 'locomotion':
 			vrmStore.requestAvatarAction({
 				kind: 'walk',
-				action: 'walk',
+				action: cue.action,
 				direction: cue.direction,
 				durationMs: cue.durationMs
 			});
@@ -165,8 +174,15 @@ function stageGestureCue(cue: GestureCue) {
 // elapsed-time cooldowns, which cannot span a slow model round-trip).
 export function planStepGestureKeys(plan: AvatarCommandPlan): string[] {
 	return plan.steps.map((step) => {
-		if (step.kind === 'walk') return `locomotion:walk:${step.direction ?? 'forward'}`;
+		if (step.kind === 'walk') return `locomotion:${step.action}:${step.direction ?? 'forward'}`;
 		if (step.kind === 'jump') return 'animation:jump';
+		if (step.kind === 'return_home') return 'animation:return_home';
+		if (step.kind === 'face_camera') return 'animation:face_camera';
+		if (step.kind === 'turn') return `animation:turn:${step.direction ?? 'back'}`;
+		if (step.kind === 'goto') return `animation:goto:${step.anchorId ?? ''}`;
+		if (step.kind === 'procedural' && step.action === 'sit' && step.anchorId) {
+			return `animation:sit:${step.anchorId}`;
+		}
 		return `animation:${step.action}`;
 	});
 }

@@ -66,6 +66,10 @@ function createDisplayStore() {
 	let chatBarAlignment = $state<ChatBarAlignment>(DEFAULT_CHAT_BAR_ALIGNMENT);
 	// Session-only counter; the chat window clears its saved rect when it changes
 	let chatWindowResetToken = $state(0);
+	// Camera follow: the orbit target tracks the avatar as she walks so she
+	// stays framed instead of stranding at the edge. Photo mode always opts
+	// out (the user owns that framing).
+	let followAvatar = $state(true);
 
 	if (browser) {
 		const saved = localStorage.getItem(STORAGE_KEY);
@@ -81,6 +85,7 @@ function createDisplayStore() {
 			waitToneEnabled = parsed.waitToneEnabled;
 			textRevealSpeed = parsed.textRevealSpeed;
 			chatBarAlignment = parsed.chatBarAlignment;
+			followAvatar = parsed.followAvatar;
 		}
 	}
 
@@ -98,7 +103,8 @@ function createDisplayStore() {
 					typingIndicatorDelayMs,
 					waitToneEnabled,
 					textRevealSpeed,
-					chatBarAlignment
+					chatBarAlignment,
+					followAvatar
 				})
 			);
 		}
@@ -184,6 +190,11 @@ function createDisplayStore() {
 		save();
 	}
 
+	function setFollowAvatar(enabled: boolean) {
+		followAvatar = enabled;
+		save();
+	}
+
 	return {
 		get camera() {
 			return camera;
@@ -218,6 +229,9 @@ function createDisplayStore() {
 		get chatWindowResetToken() {
 			return chatWindowResetToken;
 		},
+		get followAvatar() {
+			return followAvatar;
+		},
 		setCamera,
 		resetCamera,
 		setPhysicsIntensity,
@@ -229,6 +243,7 @@ function createDisplayStore() {
 		setWaitToneEnabled,
 		setTextRevealSpeed,
 		setChatBarAlignment,
+		setFollowAvatar,
 		requestChatWindowReset
 	};
 }

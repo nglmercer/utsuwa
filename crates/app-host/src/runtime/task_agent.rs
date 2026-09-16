@@ -25,6 +25,7 @@ use std::time::Duration;
 use task_core::{StepContext, StepOutcome, Task, TaskStep};
 use task_host::{AgentStepBackend, HostServices};
 
+use super::model_gate::{ModelExecutionGate, ModelTurnKind};
 use super::providers::ProviderFactory;
 use super::EmitFn;
 
@@ -44,6 +45,7 @@ pub struct TaskAgentBackend {
     emit: EmitFn,
     services: Arc<HostServices>,
     transcripts: Mutex<HashMap<(String, String), Vec<ModelMessage>>>,
+    model_gate: Mutex<Option<Arc<ModelExecutionGate>>>,
 }
 
 impl TaskAgentBackend {
@@ -61,7 +63,35 @@ impl TaskAgentBackend {
             emit,
             services,
             transcripts: Mutex::new(HashMap::new()),
+            model_gate: Mutex::new(None),
         }
+    }
+
+    /// Install the process-shared model gate (same instance as the
+    /// interactive runtime). Background turns take it with lower priority.
+    /// Unset backends run ungated (tests, task-cli).
+    pub fn set_model_gate(&self, gate: Arc<ModelExecutionGate>) {
+        if let Ok(mut slot) = self.model_gate.lock() {
+            *slot = Some(gate);
+        }
+    }
+
+    async fn acquire_model_permit(
+        &self,
+        task_id: &str,
+        step_id: &str,
+    ) -> Option<super::model_gate::ModelPermit> {
+        let gate = self.model_gate.lock().ok().and_then(|slot| slot.clone())?;
+        let started = std::time::Instant::now();
+        let permit = gate.acquire(ModelTurnKind::Background).await;
+        tracing::info!(
+            task_id = %task_id,
+            step_id = %step_id,
+            kind = "background",
+            provider_wait_ms = started.elapsed().as_millis() as u64,
+            "model permit acquired"
+        );
+        Some(permit)
     }
 
     fn policy_snapshot(&self) -> Option<AuthorizationContext> {
@@ -188,10 +218,25 @@ impl AgentStepBackend for TaskAgentBackend {
             task_id: ctx.task_id.clone(),
             step_id: step.id.clone(),
         };
-        match agent
+        tracing::info!(
+            task_id = %ctx.task_id,
+            step_id = %step.id,
+            "agent step started"
+        );
+        // Serialize against interactive chat turns on the shared gate (when
+        // installed). Held for the whole bounded turn, not per call.
+        let _model_permit = self.acquire_model_permit(&ctx.task_id, &step.id).await;
+        let model_started = std::time::Instant::now();
+        let outcome = agent
             .turn_with_tools_authorized(messages, &self.registry, &authorizer)
-            .await
-        {
+            .await;
+        tracing::info!(
+            task_id = %ctx.task_id,
+            step_id = %step.id,
+            model_ms = model_started.elapsed().as_millis() as u64,
+            "agent step completed"
+        );
+        match outcome {
             Ok(outcome) => match outcome.pending_approval {
                 Some(pending) => {
                     self.stash_transcript(&ctx.task_id, &step.id, outcome.messages);

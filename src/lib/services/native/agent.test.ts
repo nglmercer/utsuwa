@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+	AGENT_HARD_TIMEOUT_MS,
+	AGENT_NO_PROGRESS_TIMEOUT_MS,
+	eventMatchesTurn,
 	initialAgentChatState,
+	isProgressEvent,
 	parseAgentTurnEvent,
 	reduceAgentEvent,
 	reduceAgentSend,
@@ -165,6 +169,43 @@ test('state machine runs the send → suspend → done arc', () => {
 	assert.equal(state.phase, 'idle');
 	assert.equal(state.latest, 'final');
 	assert.equal(state.requestId, null);
+});
+
+test('turn events carry their turn id; others are ignored by match', () => {
+	const done = parseAgentTurnEvent('agent.turn_done', { text: 'hi', turn_id: 't1' });
+	assert.equal(done?.kind, 'done');
+	if (done?.kind !== 'done') throw new Error('unreachable');
+	assert.equal(done.turnId, 't1');
+	assert.equal(eventMatchesTurn(done, 't1'), true);
+	assert.equal(eventMatchesTurn(done, 't2'), false);
+
+	const cancelled = parseAgentTurnEvent('agent.turn_cancelled', { turn_id: 't9' });
+	assert.equal(cancelled?.kind, 'cancelled');
+	if (cancelled?.kind !== 'cancelled') throw new Error('unreachable');
+	assert.equal(eventMatchesTurn(cancelled, 't1'), false);
+
+	// Missing ids degrade to unfiltered instead of hanging.
+	const legacy = parseAgentTurnEvent('agent.turn_done', { text: 'hi' });
+	assert.equal(legacy?.kind, 'done');
+	if (legacy?.kind !== 'done') throw new Error('unreachable');
+	assert.equal(legacy.turnId, null);
+	assert.equal(eventMatchesTurn(legacy, 't1'), true);
+	assert.equal(eventMatchesTurn(done, null), true);
+});
+
+test('progress events reset the no-progress watchdog; terminal ones do not', () => {
+	const delta = parseAgentTurnEvent('agent.text_delta', { delta: 'hi' })!;
+	const started = parseAgentTurnEvent('agent.tool_started', { id: 'c1', name: 'x.y' })!;
+	const finished = parseAgentTurnEvent('agent.tool_finished', { id: 'c1', name: 'x.y', ok: true })!;
+	const done = parseAgentTurnEvent('agent.turn_done', { text: 'hi' })!;
+	const suspended = parseAgentTurnEvent('agent.turn_suspended', { text: 'p', request_id: 'r' })!;
+	assert.equal(isProgressEvent(delta), true);
+	assert.equal(isProgressEvent(started), true);
+	assert.equal(isProgressEvent(finished), true);
+	assert.equal(isProgressEvent(done), false);
+	assert.equal(isProgressEvent(suspended), false);
+	assert.equal(AGENT_HARD_TIMEOUT_MS, 180_000);
+	assert.equal(AGENT_NO_PROGRESS_TIMEOUT_MS, 45_000);
 });
 
 test('send params target the native agent method', () => {

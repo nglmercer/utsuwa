@@ -34,13 +34,27 @@ export interface AvatarReceipt {
  * Canonical routine step key shared by the renderer (receipts) and task
  * creators (verification specs). Keep in sync: changing this format breaks
  * in-flight `avatar_routine` verification expectations.
+ *
+ * Parameterized steps append their parameter: turn direction
+ * (`turn:turn:left`), run speed (`walk:run:left`), goto anchor
+ * (`goto:goto:chair`) or raw coordinate (`goto:goto:0.90,0.35`).
  */
 export function routineStepKey(step: {
 	kind: string;
 	action: string;
 	direction?: string;
+	anchorId?: string;
+	x?: number;
+	z?: number;
 }): string {
-	return `${step.kind}:${step.action}${step.direction ? `:${step.direction}` : ''}`;
+	let key = `${step.kind}:${step.action}`;
+	if (step.direction) key += `:${step.direction}`;
+	if (typeof step.anchorId === 'string' && step.anchorId) {
+		key += `:${step.anchorId}`;
+	} else if (typeof step.x === 'number' && typeof step.z === 'number') {
+		key += `:${step.x.toFixed(2)},${step.z.toFixed(2)}`;
+	}
+	return key;
 }
 
 const DEFAULT_RUN_TIMEOUT_MS = 55_000;

@@ -25,25 +25,63 @@ export interface ExpressionRequest {
 }
 
 // A staged intentional body action for the model component: a procedural
-// bone-pulse routine (nod/shake/bow/shrug), a root-motion jump arc, a bounded
-// walk, or a control (stop the current action / reset root transform).
-export type AvatarActionRequestKind = 'procedural' | 'jump' | 'walk' | 'stop' | 'reset';
+// bone-pulse routine (nod/shake/bow/shrug/sit/stand), a root-motion jump arc,
+// a bounded walk/run, a return-home, an in-place turn, a face-camera, a goto,
+// or a control (stop the current action / reset root transform).
+export type AvatarActionRequestKind =
+	| 'procedural'
+	| 'jump'
+	| 'walk'
+	| 'return_home'
+	| 'turn'
+	| 'face_camera'
+	| 'goto'
+	| 'stop'
+	| 'reset';
 
 export interface AvatarActionRequest {
 	kind: AvatarActionRequestKind;
-	// Semantic action name (procedural/jump) or 'walk'.
+	// Semantic action name (procedural/jump/world-motion) or 'walk'/'run'.
 	action: string;
 	direction?: 'left' | 'right' | 'forward' | 'back';
 	durationMs?: number;
+	// Goto/sit target: a scene anchor id, or an explicit plane coordinate
+	// (programmatic/dev only; the model addresses anchors, never raw x/z).
+	anchorId?: string;
+	x?: number;
+	z?: number;
 	seq: number;
 }
 
 export interface RoutineStepInput {
-	kind: 'procedural' | 'jump' | 'walk' | 'emote';
+	kind: 'procedural' | 'jump' | 'walk' | 'emote' | 'return_home' | 'turn' | 'face_camera' | 'goto';
 	action: string;
 	direction?: 'left' | 'right' | 'forward' | 'back';
 	durationMs?: number;
 	url?: string;
+	anchorId?: string;
+	x?: number;
+	z?: number;
+}
+
+// Live avatar root transform, published by the renderer (throttled): plane
+// position, facing yaw in radians (0 faces the default camera), and whether
+// a sitting posture is currently held. The prompt reads this so the model
+// knows where she is instead of walking blind.
+export interface AvatarPose {
+	x: number;
+	y: number;
+	z: number;
+	yaw: number;
+	sitting: boolean;
+}
+
+// Live scene-camera position, published by the scene (throttled). The prompt
+// derives viewer-relative directions and facing error from avatar + camera.
+export interface CameraPose {
+	x: number;
+	y: number;
+	z: number;
 }
 
 export interface AvatarRoutinePolicy {
@@ -220,6 +258,9 @@ function createVrmStore() {
 		action: string;
 		direction?: 'left' | 'right' | 'forward' | 'back';
 		durationMs?: number;
+		anchorId?: string;
+		x?: number;
+		z?: number;
 	}) {
 		actionRequest = { ...input, seq: ++actionSeq };
 	}
@@ -511,6 +552,37 @@ function createVrmStore() {
 		headScreenPosition = pos;
 	}
 
+	// Live root/camera poses (see interfaces above). Written every frame by
+	// the render loop; the write is skipped unless something moved enough to
+	// matter, so a near-still scene doesn't churn prompt-bound derivations.
+	let avatarPose = $state<AvatarPose>({ x: 0, y: 0, z: 0, yaw: 0, sitting: false });
+	function setAvatarPose(pos: AvatarPose) {
+		const p = avatarPose;
+		if (
+			Math.abs(p.x - pos.x) < 0.02 &&
+			Math.abs(p.y - pos.y) < 0.02 &&
+			Math.abs(p.z - pos.z) < 0.02 &&
+			Math.abs(p.yaw - pos.yaw) < 0.03 &&
+			p.sitting === pos.sitting
+		) {
+			return;
+		}
+		avatarPose = { ...pos };
+	}
+
+	let cameraPose = $state<CameraPose>({ x: 0, y: 1.1, z: 2 });
+	function setCameraPose(pos: CameraPose) {
+		const p = cameraPose;
+		if (
+			Math.abs(p.x - pos.x) < 0.05 &&
+			Math.abs(p.y - pos.y) < 0.05 &&
+			Math.abs(p.z - pos.z) < 0.05
+		) {
+			return;
+		}
+		cameraPose = { ...pos };
+	}
+
 	function setCurrentAnimation(animationIdOrPath: string | null) {
 		// Accept either an animation ID or a direct path
 		// If it's a path (starts with /), use it directly
@@ -721,6 +793,12 @@ function createVrmStore() {
 		get headScreenPosition() {
 			return headScreenPosition;
 		},
+		get avatarPose() {
+			return avatarPose;
+		},
+		get cameraPose() {
+			return cameraPose;
+		},
 		get tempModelActive() {
 			return tempModelActive;
 		},
@@ -733,6 +811,8 @@ function createVrmStore() {
 		setModelUrl,
 		setHeadPosition,
 		setHeadScreenPosition,
+		setAvatarPose,
+		setCameraPose,
 		setVrm,
 		setLoading,
 		setError,

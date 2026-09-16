@@ -344,14 +344,43 @@ test('parses locomotion cues and clamps duration', () => {
 	assert.equal(lo.gestureCue?.type === 'locomotion' ? lo.gestureCue.durationMs : -1, 300);
 });
 
+test('parses run locomotion and world-motion animation cues', () => {
+	const run = parseResponse(
+		'Fast.\n{ "gesture_cue": { "type": "locomotion", "action": "run", "direction": "left" } }'
+	);
+	assert.deepEqual(run.gestureCue, {
+		type: 'locomotion',
+		action: 'run',
+		direction: 'left',
+		durationMs: 1200
+	});
+	const turn = parseResponse(
+		'Spin.\n{ "gesture_cue": { "type": "animation", "action": "turn", "direction": "back" } }'
+	);
+	assert.deepEqual(turn.gestureCue, { type: 'animation', action: 'turn', direction: 'back' });
+	const goto = parseResponse(
+		'Over there.\n{ "gesture_cue": { "type": "animation", "action": "goto", "anchor_id": "Chair" } }'
+	);
+	assert.deepEqual(goto.gestureCue, { type: 'animation', action: 'goto', anchorId: 'chair' });
+	const home = parseResponse(
+		'Back.\n{ "gesture_cue": { "type": "animation", "action": "return_home" } }'
+	);
+	assert.deepEqual(home.gestureCue, { type: 'animation', action: 'return_home' });
+});
+
 test('drops unknown actions, directions, and shape mismatches', () => {
 	const cases = [
 		'{ "gesture_cue": { "type": "animation", "action": "moonwalk" } }',
 		'{ "gesture_cue": { "type": "animation", "action": "walk" } }',
+		'{ "gesture_cue": { "type": "animation", "action": "run" } }',
 		'{ "gesture_cue": { "type": "animation", "action": "/animations/evil.vrma" } }',
 		'{ "gesture_cue": { "type": "animation" } }',
+		'{ "gesture_cue": { "type": "animation", "action": "turn" } }',
+		'{ "gesture_cue": { "type": "animation", "action": "turn", "direction": "forward" } }',
+		'{ "gesture_cue": { "type": "animation", "action": "goto" } }',
+		'{ "gesture_cue": { "type": "animation", "action": "goto", "anchor_id": "mars" } }',
 		'{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "up" } }',
-		'{ "gesture_cue": { "type": "locomotion", "action": "run", "direction": "left" } }',
+		'{ "gesture_cue": { "type": "locomotion", "action": "jump", "direction": "left" } }',
 		'{ "gesture_cue": { "type": "locomotion", "action": "walk" } }',
 		'{ "gesture_cue": { "type": "dance", "action": "dance" } }'
 	];

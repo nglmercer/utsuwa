@@ -23,6 +23,9 @@ pub struct TickReport {
     pub exhausted: Vec<String>,
     pub waits_released: usize,
     pub executed: Vec<String>,
+    /// Ready tasks handed to workers instead of executed inline. Only the
+    /// dispatching host path fills this; inline ticks leave it empty.
+    pub dispatched: Vec<String>,
     pub errors: Vec<String>,
 }
 
@@ -68,9 +71,62 @@ impl<S: TaskStore> Scheduler<S> {
         let released = crate::recovery::expire_waits(self.store.as_ref(), now).await?;
         self.promote_due(now).await?;
 
-        let batch = self.store.ready_batch(now, self.batch_limit).await?;
+        let batch = self.collect_ready_batch(only).await?;
         let mut executed = Vec::new();
         let mut errors = Vec::new();
+        for task_id in batch {
+            match self.executor.execute_task(&task_id).await {
+                Ok(done) => executed.push(done.id),
+                Err(err) => errors.push(format!("{task_id}: {err}")),
+            }
+        }
+        Ok(TickReport {
+            recovered: recovery.recovered,
+            exhausted: recovery.exhausted,
+            waits_released: released.len(),
+            executed,
+            dispatched: Vec::new(),
+            errors,
+        })
+    }
+
+    /// Fast bookkeeping pass for dispatching hosts: recover, expire, promote,
+    /// then return due-and-ready task ids WITHOUT executing them. Workers
+    /// execute each id independently via [`Scheduler::execute_task`], so a
+    /// slow model turn never stalls the tick loop or the IPC response.
+    pub async fn collect_ready(&self) -> TaskCoreResult<(TickReport, Vec<String>)> {
+        let now = self.clock.now_ms();
+        let recovery = crate::recovery::recover_stale(
+            self.store.as_ref(),
+            now,
+            crate::recovery::DEFAULT_LEASE_MS,
+        )
+        .await?;
+        let released = crate::recovery::expire_waits(self.store.as_ref(), now).await?;
+        self.promote_due(now).await?;
+        let batch = self.collect_ready_batch(None).await?;
+        let report = TickReport {
+            recovered: recovery.recovered,
+            exhausted: recovery.exhausted,
+            waits_released: released.len(),
+            executed: Vec::new(),
+            dispatched: Vec::new(),
+            errors: Vec::new(),
+        };
+        Ok((report, batch))
+    }
+
+    /// Execute one task outside the tick loop (worker path).
+    pub async fn execute_task(&self, task_id: &str) -> TaskCoreResult<Task> {
+        self.executor.execute_task(task_id).await
+    }
+
+    /// Due-and-ready task ids, re-read so a concurrent execution that
+    /// already claimed one is skipped. Pure selection, no side effects.
+    async fn collect_ready_batch(&self, only: Option<&str>) -> TaskCoreResult<Vec<String>> {
+        let now = self.clock.now_ms();
+        let batch = self.store.ready_batch(now, self.batch_limit).await?;
+        let mut ready = Vec::with_capacity(batch.len());
         for task in batch {
             if only.is_some_and(|id| id != task.id) {
                 continue;
@@ -82,18 +138,9 @@ impl<S: TaskStore> Scheduler<S> {
             if fresh.status != TaskStatus::Ready {
                 continue;
             }
-            match self.executor.execute_task(&task.id).await {
-                Ok(done) => executed.push(done.id),
-                Err(err) => errors.push(format!("{}: {err}", task.id)),
-            }
+            ready.push(task.id);
         }
-        Ok(TickReport {
-            recovered: recovery.recovered,
-            exhausted: recovery.exhausted,
-            waits_released: released.len(),
-            executed,
-            errors,
-        })
+        Ok(ready)
     }
 
     /// Move due `pending`/`scheduled` tasks to `ready`.

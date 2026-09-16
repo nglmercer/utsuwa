@@ -21,6 +21,7 @@
 
 pub mod authorization;
 pub mod events;
+pub mod model_gate;
 pub mod prompts;
 pub mod providers;
 pub mod session;
@@ -203,6 +204,7 @@ pub struct AgentRuntime {
     file_context: Arc<Mutex<ConversationFileContext>>,
     state: Arc<Mutex<State>>,
     executor: tokio::runtime::Runtime,
+    model_gate: Mutex<Option<Arc<model_gate::ModelExecutionGate>>>,
 }
 
 impl AgentRuntime {
@@ -339,6 +341,7 @@ impl AgentRuntime {
                 replay_cache: None,
             })),
             executor,
+            model_gate: Mutex::new(None),
         });
         // Host-owned privacy publication: synchronous listeners on the hub
         // forward activity changes to the frontend without depending on the
@@ -440,6 +443,14 @@ impl AgentRuntime {
     pub fn set_memory_store(&self, store: Arc<memory::MemoryStore>) {
         if let Ok(mut slot) = self.memory.lock() {
             *slot = store;
+        }
+    }
+    /// Install the process-shared model gate so this runtime's interactive
+    /// turns serialize against background task-agent turns (which take the
+    /// same gate with lower priority). Unset runtimes run ungated (tests).
+    pub fn set_model_gate(&self, gate: Arc<model_gate::ModelExecutionGate>) {
+        if let Ok(mut slot) = self.model_gate.lock() {
+            *slot = Some(gate);
         }
     }
 
@@ -1822,6 +1833,26 @@ mod tests {
                 finish_reason: FinishReason::ToolCalls,
             },
         ]
+    }
+
+    #[test]
+    fn send_request_returns_turn_id_carried_by_events() {
+        let provider = QueueProvider::new(vec![text_turn("ok")]);
+        let harness = harness(Arc::clone(&provider));
+        let turn_id = harness
+            .runtime
+            .send_request(AgentRequest {
+                text: "hello".to_string(),
+                append_user_message: true,
+                ..AgentRequest::default()
+            })
+            .unwrap();
+        assert!(!turn_id.is_empty());
+        let done = wait_for(&harness, "agent.turn_done");
+        assert_eq!(
+            done.data.get("turn_id").and_then(|v| v.as_str()),
+            Some(turn_id.as_str())
+        );
     }
 
     #[test]

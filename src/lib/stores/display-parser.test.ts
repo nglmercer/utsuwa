@@ -213,3 +213,10 @@ test('defaults reveal speed and alignment when absent', () => {
 	assert.equal(result.textRevealSpeed, DEFAULT_TEXT_REVEAL_SPEED);
 	assert.equal(result.chatBarAlignment, DEFAULT_CHAT_BAR_ALIGNMENT);
 });
+
+test('camera follow defaults on and round-trips', () => {
+	assert.equal(parseDisplaySettings({}).followAvatar, true);
+	assert.equal(parseDisplaySettings(null).followAvatar, true);
+	assert.equal(parseDisplaySettings({ followAvatar: false }).followAvatar, false);
+	assert.equal(parseDisplaySettings({ followAvatar: 'yes' }).followAvatar, true);
+});

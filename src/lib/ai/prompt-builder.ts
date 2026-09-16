@@ -5,7 +5,8 @@ import type { PersonaCard } from '$lib/stores/persona.svelte';
 // Relative imports keep this module runnable under the node test runner
 import { STAGE_BEHAVIORS, STAGE_INSTRUCTIONS } from '../engine/stages.ts';
 import { isProtectedChannel } from '../engine/facial-expressions.ts';
-import { aiAllowedActions } from '../engine/avatar-actions.ts';
+import { aiAllowedActions, computeAvatarSpatial, WALK_MAX_RADIUS } from '../engine/avatar-actions.ts';
+import { DEFAULT_SCENE_ANCHORS, type SceneAnchor } from '../engine/scene-anchors.ts';
 
 // Prompt context for building
 export interface PromptContext {
@@ -33,6 +34,14 @@ export interface PromptContext {
 	// Expression presets on the loaded 3D model. Shown to the model (minus
 	// protected channels) so cues can address model-specific customs.
 	availableExpressions?: string[];
+	// Live avatar root pose (meters + yaw radians + sitting), published by
+	// the renderer. Powers the spatial layer so walks stop being blind.
+	avatarPose?: { x: number; z: number; yaw: number; sitting?: boolean };
+	// Live scene-camera position. Viewer-relative directions ("walk left")
+	// and facing error derive from avatar + camera together.
+	cameraPose?: { x: number; z: number };
+	// Named places she can go to. Defaults to the standard room.
+	anchors?: SceneAnchor[];
 }
 
 function getContextMemoryBudget(contextSize?: number): MemoryBudget | undefined {
@@ -88,8 +97,11 @@ function buildAvatarCatalogLayer(ctx: PromptContext): string {
 		ctx.availableExpressions && ctx.availableExpressions.length > 0
 			? [...new Set(ctx.availableExpressions)].filter((name) => !isProtectedChannel(name))
 			: ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'neutral'];
+	// Locomotion and parameterized moves carry their own usage line below;
+	// everything else renders straight from the action registry.
+	const manual = new Set(['walk', 'run', 'turn', 'goto']);
 	const actions = aiAllowedActions()
-		.filter((def) => def.id !== 'walk')
+		.filter((def) => !manual.has(def.id))
 		.map((def) => `- ${def.id}: ${def.description}`)
 		.join('\n');
 	return `<avatar>
@@ -97,10 +109,45 @@ Your 3D avatar's face can show: ${faces.join(', ')}.
 Your 3D avatar's body can perform these intentional actions:
 ${actions}
 - walk: only when the user asks you to move (direction left, right, forward, or back)
+- run: only when the user asks you to run or hurry (same directions, faster)
+- turn: turn in place (direction left, right, or back)
+- goto: go to a named place (anchor_id center, chair, or cushion)
 - reaction: flinch toward being touched (zone head, face, shoulder, torso, or hip)
+Walk directions are viewer-relative: forward means toward the viewer. After a walk she faces the viewer again on her own.
 Direct the face with expression_cue and the body with gesture_cue in your JSON block. Blinking, lip-sync, and jaw motion happen on their own — never name those presets.
 Most replies use no body gesture: gesture_cue defaults to null.
 </avatar>`;
+}
+
+// Where she is and where she can go, from the live renderer poses. Absent
+// (null) before the first frame publishes, so the prompt never carries stale
+// coordinates. Kept to two sentences: position/facing plus the place list.
+function buildAvatarStateLayer(ctx: PromptContext): string | null {
+	const pose = ctx.avatarPose;
+	if (!pose || !Number.isFinite(pose.x) || !Number.isFinite(pose.z) || !Number.isFinite(pose.yaw)) {
+		return null;
+	}
+	const cam = ctx.cameraPose ?? { x: 0, z: 2 };
+	const spatial = computeAvatarSpatial(pose.x, pose.z, pose.yaw, cam.x, cam.z, WALK_MAX_RADIUS);
+	const where =
+		spatial.distFromHome < 0.15
+			? 'at the center of the room'
+			: `${spatial.distFromHome.toFixed(1)}m from the center${spatial.atRim ? ', at the edge of her space' : ''}`;
+	const err = spatial.facingErrorDeg;
+	const facing =
+		err < 25
+			? 'facing you'
+			: err < 60
+				? `turned ${Math.round(err)}° from you`
+				: err < 120
+					? 'in profile to you'
+					: 'facing away from you';
+	const anchors = ctx.anchors ?? [...DEFAULT_SCENE_ANCHORS];
+	const places = anchors
+		.map((a) => (a.sittable ? `${a.label} (sit)` : a.label))
+		.join(', ');
+	const posture = pose.sitting ? ' She is sitting.' : '';
+	return `<avatar_state>\nShe is ${where}, ${facing}.${posture} Places she can go: ${places}.\n</avatar_state>`;
 }
 
 // Build the complete system prompt
@@ -118,6 +165,7 @@ export function buildSystemPrompt(context: PromptContext): string {
 		buildEventLayer(context),
 		...(context.nativeRuntime ? [buildNativeAgentLayer()] : []),
 		buildAvatarCatalogLayer(context),
+		buildAvatarStateLayer(context),
 		buildInstructionLayer(context)
 	].filter((layer): layer is string => layer !== null);
 
@@ -187,6 +235,8 @@ Energy: ${energyDesc} (${ctx.state.energy}/100)
 	if (eventLayer) parts.push(eventLayer);
 	if (ctx.nativeRuntime) parts.push(buildNativeAgentLayer());
 	parts.push(buildAvatarCatalogLayer(ctx));
+	const avatarState = buildAvatarStateLayer(ctx);
+	if (avatarState) parts.push(avatarState);
 
 	// Simple instructions (no relationship mechanics)
 	parts.push(`<instructions>
@@ -201,7 +251,7 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "energy_delta": number,
   "new_memory": null | "something specific worth remembering about them",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump" } | { "type": "locomotion", "action": "walk", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 \`\`\`
 
@@ -209,7 +259,7 @@ expression_cue is optional stage direction for your avatar's face: a brief flash
 
 gesture_cue is optional stage direction for your avatar's body: a named action performance, a short walk, or a physical startle or lean as if touched at that zone.
 
-BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, or walk only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
+BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, walk, run, turn, goto, sit, stand, or any position move only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
 
 COMPLETION HONESTY: never claim an action, task, message send, avatar routine, or external effect completed unless the runtime result confirms it. Your own text is never evidence. Do not say done, finished, moved, sent, or completed unless the corresponding receipt says completed.
 
@@ -401,7 +451,7 @@ Shape:
   "comfort_delta": -10 to 10,
   "new_memory": null | "a fact about the user",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump" } | { "type": "locomotion", "action": "walk", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 
 The four *_delta values are small numbers for how this exchange moved the relationship: positive when they open up, share, or warm to the companion; near 0 for neutral chat; negative if it went badly. Usually between -3 and 5.
@@ -459,7 +509,7 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "new_memory": null | "something specific worth remembering about them",
   "triggered_event": null | "event_id",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump" } | { "type": "locomotion", "action": "walk", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 \`\`\`
 
@@ -467,7 +517,7 @@ expression_cue is optional stage direction for your avatar's face: a brief flash
 
 gesture_cue is optional stage direction for your avatar's body: a named action performance, a short walk, or a physical startle or lean as if touched at that zone.
 
-BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, or walk only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
+BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, walk, run, turn, goto, sit, stand, or any position move only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
 
 COMPLETION HONESTY: never claim an action, task, message send, avatar routine, or external effect completed unless the runtime result confirms it. Your own text is never evidence. Do not say done, finished, moved, sent, or completed unless the corresponding receipt says completed.
 

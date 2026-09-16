@@ -318,12 +318,16 @@
 		const distance = fit.halfSpan / Math.tan((s.fov * Math.PI) / 360) / s.zoom;
 		const targetY = fit.center + s.height;
 
-		cam.position.set(0, targetY, distance);
+		// With follow enabled the fitted frame centers on where she actually
+		// stands (walks carry her off-origin); otherwise the classic origin.
+		const ax = displayStore.followAvatar ? vrmStore.avatarPose.x : 0;
+		const az = displayStore.followAvatar ? vrmStore.avatarPose.z : 0;
+		cam.position.set(ax, targetY, az + distance);
 		if (controls) {
-			controls.target.set(0, targetY, 0);
+			controls.target.set(ax, targetY, az);
 			controls.update();
 		} else {
-			cam.lookAt(0, targetY, 0);
+			cam.lookAt(ax, targetY, az);
 		}
 	}
 
@@ -406,8 +410,36 @@
 		if (!$isPresenting) applyCamera();
 	});
 
-	useTask(() => {
+	// Scratch for the per-frame camera publish below (no per-frame allocs).
+	const followCamPos = new Vector3();
+
+	useTask((delta) => {
 		if (controls?.enabled) controls.update();
+		const cam = camera.current;
+		if (!cam) return;
+		// Live camera pose for viewer-relative walk math and the prompt's
+		// spatial layer. The store skips the write unless it moved.
+		cam.getWorldPosition(followCamPos);
+		vrmStore.setCameraPose({ x: followCamPos.x, y: followCamPos.y, z: followCamPos.z });
+		// Camera follow: pan target AND camera together toward her plane
+		// position, preserving the orbit offset. Photo mode and XR own their
+		// framing, so they opt out.
+		if (
+			!displayStore.followAvatar ||
+			!controls?.enabled ||
+			photomodeStore.active ||
+			renderer?.xr.isPresenting
+		) {
+			return;
+		}
+		const dx = vrmStore.avatarPose.x - controls.target.x;
+		const dz = vrmStore.avatarPose.z - controls.target.z;
+		if (Math.hypot(dx, dz) < 0.005) return;
+		const k = Math.min(1, delta * 3);
+		controls.target.x += dx * k;
+		controls.target.z += dz * k;
+		cam.position.x += dx * k;
+		cam.position.z += dz * k;
 	});
 </script>
 

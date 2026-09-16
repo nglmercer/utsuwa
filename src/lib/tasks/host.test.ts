@@ -133,6 +133,20 @@ describe('host avatar listener', () => {
 		assert.equal(routineStepKey({ kind: 'walk', action: 'walk', direction: 'left' }), 'walk:walk:left');
 		assert.equal(routineStepKey({ kind: 'emote', action: 'wave' }), 'emote:wave');
 		assert.equal(routineStepKey({ kind: 'jump', action: 'jump' }), 'jump:jump');
+		assert.equal(routineStepKey({ kind: 'walk', action: 'run', direction: 'left' }), 'walk:run:left');
+		assert.equal(
+			routineStepKey({ kind: 'turn', action: 'turn', direction: 'back' }),
+			'turn:turn:back'
+		);
+		assert.equal(routineStepKey({ kind: 'return_home', action: 'return_home' }), 'return_home:return_home');
+		assert.equal(
+			routineStepKey({ kind: 'goto', action: 'goto', anchorId: 'chair' }),
+			'goto:goto:chair'
+		);
+		assert.equal(
+			routineStepKey({ kind: 'goto', action: 'goto', x: 0.9, z: 0.35 }),
+			'goto:goto:0.90,0.35'
+		);
 	});
 
 	it('maps only completed to success receipts', () => {

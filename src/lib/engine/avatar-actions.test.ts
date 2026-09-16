@@ -7,11 +7,18 @@ import {
 	actionForAnimationUrl,
 	aiAllowedActions,
 	clampWalkOffset,
+	computeAvatarSpatial,
+	computeSitOffsetY,
 	expressionForAnimationUrl,
 	isAvatarActionName,
+	isLocomotionActionName,
 	isLocomotionDirection,
+	isTurnDirection,
 	jumpArcHeight,
-	resolveLegacyEmote
+	resolveLegacyEmote,
+	shortAngleDelta,
+	turnTargetYaw,
+	yawToFacePoint
 } from './avatar-actions.ts';
 
 test('every action has sane metadata', () => {
@@ -34,7 +41,18 @@ test('every action has sane metadata', () => {
 });
 
 test('large gestures require an explicit request', () => {
-	for (const name of ['jump', 'dance', 'walk'] as const) {
+	for (const name of [
+		'jump',
+		'dance',
+		'walk',
+		'run',
+		'return_home',
+		'face_camera',
+		'turn',
+		'goto',
+		'sit',
+		'stand'
+	] as const) {
 		assert.equal(AVATAR_ACTIONS[name].explicitRequestOnly, true, name);
 	}
 	assert.equal(AVATAR_ACTIONS.wave.explicitRequestOnly, undefined);
@@ -51,12 +69,22 @@ test('prompt catalog only exposes AI-allowed actions', () => {
 test('name and direction guards accept only known values', () => {
 	assert.ok(isAvatarActionName('wave'));
 	assert.ok(isAvatarActionName('walk'));
+	assert.ok(isAvatarActionName('run'));
+	assert.ok(isAvatarActionName('return_home'));
+	assert.ok(isAvatarActionName('goto'));
 	assert.ok(!isAvatarActionName('vrma_01'));
 	assert.ok(!isAvatarActionName('/animations/evil.vrma'));
 	assert.ok(!isAvatarActionName(null));
 	assert.ok(isLocomotionDirection('left'));
 	assert.ok(!isLocomotionDirection('up'));
 	assert.ok(!isLocomotionDirection(null));
+	assert.ok(isLocomotionActionName('walk'));
+	assert.ok(isLocomotionActionName('run'));
+	assert.ok(!isLocomotionActionName('jump'));
+	assert.ok(isTurnDirection('left'));
+	assert.ok(isTurnDirection('back'));
+	assert.ok(!isTurnDirection('forward'));
+	assert.ok(!isTurnDirection('up'));
 });
 
 test('legacy emote ids resolve to shipped clips, never to model input', () => {
@@ -80,6 +108,40 @@ test('walk clamp keeps the avatar inside its radius', () => {
 	const rim = clampWalkOffset(3, 4, 2);
 	assert.ok(Math.abs(Math.hypot(rim.x, rim.z) - 2) < 1e-9);
 	assert.ok(rim.x > 0 && rim.z > 0, 'direction preserved');
+});
+
+test('yaw helpers agree on facing and turns', () => {
+	// Avatar at origin, camera at +Z: facing yaw is 0.
+	assert.ok(Math.abs(yawToFacePoint(0, 0, 0, 2)) < 1e-9);
+	// Camera to screen-right (+X): yaw +90°.
+	assert.ok(Math.abs(yawToFacePoint(0, 0, 2, 0) - Math.PI / 2) < 1e-9);
+	assert.ok(Math.abs(shortAngleDelta(Math.PI * 3) - Math.PI) < 1e-9);
+	assert.ok(Math.abs(shortAngleDelta(-Math.PI * 3) + Math.PI) < 1e-9);
+	assert.ok(Math.abs(turnTargetYaw(0, 'left') - Math.PI / 2) < 1e-9);
+	assert.ok(Math.abs(turnTargetYaw(0, 'right') + Math.PI / 2) < 1e-9);
+	assert.ok(Math.abs(shortAngleDelta(turnTargetYaw(0.5, 'back') - 0.5 - Math.PI)) < 1e-9);
+});
+
+test('spatial snapshot reports rim and facing error', () => {
+	const centered = computeAvatarSpatial(0, 0, 0, 0, 2);
+	assert.equal(centered.distFromHome, 0);
+	assert.equal(centered.atRim, false);
+	assert.ok(centered.facingErrorDeg < 1);
+	const rim = computeAvatarSpatial(2, 0, 0, 0, 2);
+	assert.equal(rim.atRim, true);
+	// Facing +Z while the viewer stands at −Z: 180° away.
+	const away = computeAvatarSpatial(0, 0, 0, 0, -2);
+	assert.ok(Math.abs(away.facingErrorDeg - 180) < 1e-6);
+	// Garbage never poisons the prompt.
+	const nan = computeAvatarSpatial(NaN, NaN, NaN, NaN, NaN);
+	assert.equal(nan.distFromHome, 0);
+	assert.equal(nan.atRim, false);
+});
+
+test('sit offset drops the hips to seat height, clamped', () => {
+	assert.ok(Math.abs(computeSitOffsetY(0.9, 0.45) + 0.45) < 1e-9);
+	assert.equal(computeSitOffsetY(0.9, 1.5), 0);
+	assert.equal(computeSitOffsetY(1.5, 0.1), -0.8);
 });
 
 test('animation URLs reverse-map to their semantic face', () => {

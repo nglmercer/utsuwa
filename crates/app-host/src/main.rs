@@ -1005,6 +1005,10 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
     // Cloned (not moved) so the task agent backend below can snapshot the
     // same standing grants for its step-scoped authorizer.
     let task_approvals = Arc::clone(&approvals);
+    // One model gate for the process: interactive chat turns and background
+    // task-agent turns serialize here (interactive first) instead of
+    // contending for provider rate limits.
+    let model_gate = Arc::new(app_host::runtime::model_gate::ModelExecutionGate::new());
     let runtime = match app_host::runtime::AgentRuntime::start_with_secrets_and_sensors(
         approvals,
         storage.clone(),
@@ -1063,6 +1067,7 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
             Arc::clone(&emit),
             Arc::clone(&services),
         ));
+        agent_backend.set_model_gate(Arc::clone(&model_gate));
         match task_host::TaskHost::open_with_services(
             &tasks_path,
             services,
@@ -1082,6 +1087,7 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
     if let Some(runtime) = runtime {
         // MCP Bearer [REDACTED] resolve from the same keychain-backed store.
         runtime.set_secret_store(Arc::clone(&secrets));
+        runtime.set_model_gate(Arc::clone(&model_gate));
         // Durable memory beside state.db; an unopenable file falls
         // back to the runtime's isolated in-memory store (logged).
         let memory_path = storage_core::default_state_dir("utsuwa").join("memory.db");
@@ -1091,13 +1097,18 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
                 tracing::error!(%err, "failed to open memory.db; using in-memory memory")
             }
         }
-        // Background task tick: recovery, wait expiry, schedules, retries.
-        // Without the agent executor (degraded mode) tasks still progress
-        // via the piggyback tick inside mutating task.* IPC calls.
+        // Background task tick (the single scheduling authority) plus the
+        // worker pool that executes dispatched tasks off the tick path.
+        // Without the agent executor (degraded mode) neither runs and
+        // mutating task.* IPC calls fall back to one inline tick each.
         if let Some(tasks) = task_host {
             runtime.executor_handle().spawn(task_host::run_tick_loop(
-                tasks,
+                Arc::clone(&tasks),
                 std::time::Duration::from_secs(2),
+            ));
+            runtime.executor_handle().spawn(task_host::run_worker_pool(
+                tasks,
+                task_host::WorkerConfig::default(),
             ));
         }
         dispatcher = dispatcher.with_agent(runtime);
