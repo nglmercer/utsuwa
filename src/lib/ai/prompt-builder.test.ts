@@ -406,9 +406,13 @@ test('both modes document gesture_cue in the JSON block', () => {
 	for (const appMode of ['dating_sim', 'companion'] as const) {
 		const prompt = buildSystemPrompt(makeContext({ state: makeState({ appMode }) }));
 		assert.ok(prompt.includes('"gesture_cue"'), appMode);
-		assert.ok(prompt.includes('"type": "emote"'), appMode);
-		assert.ok(prompt.includes('vrma_01'), appMode);
+		assert.ok(prompt.includes('"type": "animation"'), appMode);
+		assert.ok(prompt.includes('wave|nod|shake_head'), appMode);
+		assert.ok(prompt.includes('"type": "locomotion"'), appMode);
 		assert.ok(prompt.includes('"type": "reaction"'), appMode);
+		assert.ok(prompt.includes('BODY GESTURE RULES'), appMode);
+		assert.ok(prompt.includes('gesture_cue MUST be null'), appMode);
+		assert.ok(!prompt.includes('vrma_'), `${appMode} must not advertise numbered emotes`);
 	}
 });
 
@@ -428,8 +432,11 @@ test('avatar catalog lists model presets minus protected channels', () => {
 	assert.ok(prompt.includes('Surprised'));
 	assert.ok(!prompt.includes('blinkLeft'), 'protected channels must not be offered');
 	assert.ok(!prompt.includes('jawOpen'));
-	assert.ok(prompt.includes('vrma_01') && prompt.includes('vrma_07'));
-	assert.ok(prompt.includes('head, face, shoulder, torso, hip'));
+	assert.ok(prompt.includes('- wave: greeting or goodbye'), 'semantic actions from the registry');
+	assert.ok(prompt.includes('- nod: clear agreement or acknowledgement'));
+	assert.ok(prompt.includes('- walk: only when the user asks you to move'));
+	assert.ok(!prompt.includes('vrma_'), 'numbered emotes stay internal');
+	assert.ok(prompt.includes('head, face, shoulder, torso, or hip'));
 });
 
 test('avatar catalog falls back to the emotional six with no model loaded', () => {

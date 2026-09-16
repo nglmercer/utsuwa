@@ -5,6 +5,7 @@ import type { PersonaCard } from '$lib/stores/persona.svelte';
 // Relative imports keep this module runnable under the node test runner
 import { STAGE_BEHAVIORS, STAGE_INSTRUCTIONS } from '../engine/stages.ts';
 import { isProtectedChannel } from '../engine/facial-expressions.ts';
+import { aiAllowedActions } from '../engine/avatar-actions.ts';
 
 // Prompt context for building
 export interface PromptContext {
@@ -78,18 +79,27 @@ function buildEventLayer(ctx: PromptContext): string | null {
 
 // Avatar capability catalog: the face and body moves the model can stage via
 // expression_cue / gesture_cue. Face presets come from the loaded model minus
-// protected channels (blink, visemes, jaw move on their own); emotes and
-// reaction zones are fixed capabilities. Falls back to the emotional six
-// before a model has loaded.
+// protected channels (blink, visemes, jaw move on their own); body actions
+// come from the avatar-action registry so the prompt can never drift from
+// what the runtime can execute. Falls back to the emotional six before a
+// model has loaded.
 function buildAvatarCatalogLayer(ctx: PromptContext): string {
 	const faces =
 		ctx.availableExpressions && ctx.availableExpressions.length > 0
 			? [...new Set(ctx.availableExpressions)].filter((name) => !isProtectedChannel(name))
 			: ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'neutral'];
+	const actions = aiAllowedActions()
+		.filter((def) => def.id !== 'walk')
+		.map((def) => `- ${def.id}: ${def.description}`)
+		.join('\n');
 	return `<avatar>
 Your 3D avatar's face can show: ${faces.join(', ')}.
-Your 3D avatar's body can play one-shot emotes (vrma_01, vrma_02, vrma_03, vrma_04, vrma_05, vrma_06, vrma_07) or react physically, startling or leaning as if touched at: head, face, shoulder, torso, hip.
+Your 3D avatar's body can perform these intentional actions:
+${actions}
+- walk: only when the user asks you to move (direction left, right, forward, or back)
+- reaction: flinch toward being touched (zone head, face, shoulder, torso, or hip)
 Direct the face with expression_cue and the body with gesture_cue in your JSON block. Blinking, lip-sync, and jaw motion happen on their own — never name those presets.
+Most replies use no body gesture: gesture_cue defaults to null.
 </avatar>`;
 }
 
@@ -191,13 +201,15 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "energy_delta": number,
   "new_memory": null | "something specific worth remembering about them",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "emote", "id": "vrma_01|vrma_02|vrma_03|vrma_04|vrma_05|vrma_06|vrma_07" } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump" } | { "type": "locomotion", "action": "walk", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 \`\`\`
 
 expression_cue is optional stage direction for your avatar's face: a brief flash of expression while your reply lands, which then melts back into your mood. Omit it (null) when your mood's resting face already fits.
 
-gesture_cue is optional stage direction for your avatar's body: a one-shot emote performance, or a physical startle or lean as if touched at that zone. Use it rarely, only when the reply clearly calls for a visible gesture — most replies need none. Omit it (null) otherwise.
+gesture_cue is optional stage direction for your avatar's body: a named action performance, a short walk, or a physical startle or lean as if touched at that zone.
+
+BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, or walk only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
 
 Use new_memory whenever they reveal something about themselves: a preference, a plan, a feeling, someone in their life, or a moment you shared (like a photo they show you). Write it in third person about them (they/them, never assume gender), one short factual sentence stating only what they actually said. Never invent details. Use null only when nothing meaningful came up.
 
@@ -387,7 +399,7 @@ Shape:
   "comfort_delta": -10 to 10,
   "new_memory": null | "a fact about the user",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "emote", "id": "vrma_01|vrma_02|vrma_03|vrma_04|vrma_05|vrma_06|vrma_07" } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump" } | { "type": "locomotion", "action": "walk", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 
 The four *_delta values are small numbers for how this exchange moved the relationship: positive when they open up, share, or warm to the companion; near 0 for neutral chat; negative if it went badly. Usually between -3 and 5.
@@ -445,13 +457,15 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "new_memory": null | "something specific worth remembering about them",
   "triggered_event": null | "event_id",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "emote", "id": "vrma_01|vrma_02|vrma_03|vrma_04|vrma_05|vrma_06|vrma_07" } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump" } | { "type": "locomotion", "action": "walk", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 \`\`\`
 
 expression_cue is optional stage direction for your avatar's face: a brief flash of expression while your reply lands (a smile, a gasp, a softening), which then melts back into your mood. Omit it (null) when your mood's resting face already fits.
 
-gesture_cue is optional stage direction for your avatar's body: a one-shot emote performance, or a physical startle or lean as if touched at that zone. Use it rarely, only when the reply clearly calls for a visible gesture — most replies need none. Omit it (null) otherwise.
+gesture_cue is optional stage direction for your avatar's body: a named action performance, a short walk, or a physical startle or lean as if touched at that zone.
+
+BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, or walk only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
 
 Keep deltas small (-10 to +10 for most interactions). Use new_memory whenever they reveal something about themselves: a preference, a plan, a feeling, someone in their life, or a moment you shared (like a photo they show you). Write it in third person about them (they/them, never assume gender), one short factual sentence stating only what they actually said. Never invent details. Use null only when nothing meaningful came up.
 
