@@ -16,7 +16,7 @@ import { personaStore } from '$lib/stores/persona.svelte';
 import { vrmStore } from '$lib/stores/vrm.svelte';
 import { getLLMProvider, getTTSProvider } from '$lib/services/providers/registry';
 import { hasApiKey } from '$lib/services/providers/openai-compatible';
-import { processCompanionTurn } from '$lib/services/chat/companion-turn';
+import { processCompanionTurn, handleDirectAvatarCommand } from '$lib/services/chat/companion-turn';
 import { retrieveRelevantContext } from '$lib/engine/memory';
 import { buildSystemPrompt, truncateChatHistory, type PromptContext } from '$lib/ai/prompt-builder';
 import { keepImage, type PreparedImage } from '$lib/services/storage/keepsakes';
@@ -207,6 +207,13 @@ export async function sendCompanionMessage(
 	hooks.setLatestResponse('');
 	hooks.setPhase?.('remembering');
 	hooks.beforeStream?.();
+
+	// Direct avatar commands ("jump!", "walk left") execute immediately on the
+	// user's text instead of depending on the chat model emitting the right
+	// JSON. The conversational reply still streams normally afterwards.
+	if (!systemEvent) {
+		handleDirectAvatarCommand(content);
+	}
 
 	// Only touch relationship-time state once the character has loaded, or an
 	// early message would mutate the default state that load then discards.

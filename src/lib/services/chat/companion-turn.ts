@@ -6,6 +6,14 @@ import {
 	type ExpressionCue,
 	type GestureCue
 } from '$lib/ai/response-parser';
+import { AVATAR_ACTIONS, resolveLegacyEmote } from '$lib/engine/avatar-actions';
+import {
+	createGestureGateState,
+	evaluateGestureGate,
+	gestureKey,
+	recordGestureExecution
+} from '$lib/engine/avatar-action-gate';
+import { detectExplicitAvatarCommand } from '$lib/engine/avatar-commands';
 import { calculateBaselineUpdates, analyzeMessage } from '$lib/engine/heuristics';
 import { mergeUpdates, checkAndApplyStageTransition } from '$lib/engine/state-updates';
 import {
@@ -76,21 +84,93 @@ function fireExpressionCue(cue: ExpressionCue | null) {
 	}
 }
 
-// Stage a one-shot body direction from the model. Emotes play through the
-// existing one-shot effect (which auto-resets); reactions reuse the tap path
-// (face flash + decaying bone nudge). Suppressed in photo mode: the held pose
-// owns the body there, and a cue mid-shot would stomp it.
-function fireGestureCue(cue: GestureCue | null) {
-	if (!cue || photomodeStore.active) return;
+// Runtime gate state: one per session. Only EXECUTED gestures are recorded,
+// so rejected cues never extend cooldowns or consume rate budget.
+const gestureGateState = createGestureGateState();
+
+// Stage a one-shot body direction through the runtime gesture gate. The gate
+// (not the model's obedience) enforces cooldowns, duplicates, rate limits,
+// busy/photo guards, and the explicit-request rule for large gestures.
+function fireGestureCue(cue: GestureCue | null, explicitRequest: boolean) {
+	if (!cue) return;
 	try {
-		if (cue.type === 'emote') {
-			vrmStore.setCurrentAnimation(cue.id);
-		} else {
-			vrmStore.requestReaction(cue.zone);
+		const gate = evaluateGestureGate({
+			cue,
+			now: Date.now(),
+			state: gestureGateState,
+			motion: photomodeStore.active ? 'photo_mode' : 'idle',
+			busy: vrmStore.actionBusy || vrmStore.currentAnimation !== null,
+			explicitRequest
+		});
+		if (!gate.allowed) {
+			console.debug(`[AvatarCue] rejected: ${gate.reason}`, gestureKey(cue));
+			return;
 		}
+		stageGestureCue(cue);
+		recordGestureExecution(gestureGateState, cue, Date.now());
+		console.debug('[AvatarCue] accepted', gestureKey(cue));
 	} catch (e) {
-		console.debug('[Gesture] Failed to stage AI cue:', e);
+		console.debug('[AvatarCue] failed to stage cue:', e);
 	}
+}
+
+// Execute a gate-approved cue. Semantic animations resolve through the
+// registry (VRMA clips play through the one-shot effect; procedural and
+// world-motion actions go through the action request); reactions reuse the
+// tap path; legacy emotes resolve to their shipped clip, nothing else.
+function stageGestureCue(cue: GestureCue) {
+	switch (cue.type) {
+		case 'animation': {
+			const def = AVATAR_ACTIONS[cue.action];
+			if (def.source.kind === 'vrma') {
+				vrmStore.setCurrentAnimation(def.source.url);
+			} else if (def.source.kind === 'procedural') {
+				vrmStore.requestAvatarAction({ kind: 'procedural', action: cue.action });
+			} else {
+				vrmStore.requestAvatarAction({ kind: 'jump', action: cue.action });
+			}
+			return;
+		}
+		case 'locomotion':
+			vrmStore.requestAvatarAction({
+				kind: 'walk',
+				action: 'walk',
+				direction: cue.direction,
+				durationMs: cue.durationMs
+			});
+			return;
+		case 'reaction':
+			vrmStore.requestReaction(cue.zone);
+			return;
+		case 'emote': {
+			const url = resolveLegacyEmote(cue.id);
+			if (url) vrmStore.setCurrentAnimation(url);
+			return;
+		}
+	}
+}
+
+// A model cue counts as explicit only when the user actually asked for that
+// same action this turn ("jump" + wave cue stays an ordinary gated cue).
+function cueMatchesExplicitCommand(cue: GestureCue, userMessage: string): boolean {
+	const direct = detectExplicitAvatarCommand(userMessage);
+	if (!direct) return false;
+	if (direct.type !== cue.type) return false;
+	if (direct.type === 'animation' && cue.type === 'animation') return direct.action === cue.action;
+	if (direct.type === 'locomotion' && cue.type === 'locomotion') {
+		return direct.action === cue.action && direct.direction === cue.direction;
+	}
+	return false;
+}
+
+// Handle a direct avatar command in the user's message ("jump!", "walk
+// left") immediately, without depending on the chat model emitting the right
+// JSON. Returns true when a command was detected (staged or gate-rejected).
+export function handleDirectAvatarCommand(userMessage: string): boolean {
+	const cue = detectExplicitAvatarCommand(userMessage);
+	if (!cue) return false;
+	fireGestureCue(cue, true);
+	return true;
 }
 
 export async function processCompanionTurn(input: CompanionTurnInput): Promise<CompanionTurnResult> {
@@ -120,7 +200,10 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 	const dialogue = parsed.dialogue;
 	let llmUpdates = parsed.stateUpdates;
 	fireExpressionCue(parsed.expressionCue);
-	fireGestureCue(parsed.gestureCue);
+	fireGestureCue(
+		parsed.gestureCue,
+		parsed.gestureCue ? cueMatchesExplicitCommand(parsed.gestureCue, userMessage) : false
+	);
 
 	if (debug) {
 		console.log('%c[LLM raw response]', 'color:#00b2ff;font-weight:bold', companionResponse);
@@ -151,7 +234,10 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 			const fallback = parseResponse(extracted, state.name, vrmStore.availableExpressions);
 			llmUpdates = fallback.stateUpdates;
 			fireExpressionCue(fallback.expressionCue);
-			fireGestureCue(fallback.gestureCue);
+			fireGestureCue(
+				fallback.gestureCue,
+				fallback.gestureCue ? cueMatchesExplicitCommand(fallback.gestureCue, userMessage) : false
+			);
 			if (debug) {
 				console.log('%c[extraction fallback]', 'color:#f59e0b;font-weight:bold', extracted, '->', llmUpdates);
 			}

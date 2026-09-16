@@ -24,6 +24,20 @@ export interface ExpressionRequest {
 	seq: number;
 }
 
+// A staged intentional body action for the model component: a procedural
+// bone-pulse routine (nod/shake/bow/shrug), a root-motion jump arc, a bounded
+// walk, or a control (stop the current action / reset root transform).
+export type AvatarActionRequestKind = 'procedural' | 'jump' | 'walk' | 'stop' | 'reset';
+
+export interface AvatarActionRequest {
+	kind: AvatarActionRequestKind;
+	// Semantic action name (procedural/jump) or 'walk'.
+	action: string;
+	direction?: 'left' | 'right' | 'forward' | 'back';
+	durationMs?: number;
+	seq: number;
+}
+
 // Default models bundled with the app (first one is loaded by default).
 // See static/models/README.md for each model's license.
 const DEFAULT_MODELS: VrmModel[] = [
@@ -139,6 +153,24 @@ function createVrmStore() {
 	let reactionSeq = 0;
 	function requestReaction(zone: TouchZone) {
 		reactionRequest = { zone, seq: ++reactionSeq };
+	}
+
+	// Intentional body actions (AI gesture cues, explicit user commands, dev
+	// controls). The model component consumes by seq and reports busyness back
+	// so the runtime gesture gate can arbitrate overlapping requests.
+	let actionRequest = $state<AvatarActionRequest | null>(null);
+	let actionSeq = 0;
+	function requestAvatarAction(input: {
+		kind: AvatarActionRequestKind;
+		action: string;
+		direction?: 'left' | 'right' | 'forward' | 'back';
+		durationMs?: number;
+	}) {
+		actionRequest = { ...input, seq: ++actionSeq };
+	}
+	let actionBusy = $state(false);
+	function setActionBusy(busy: boolean) {
+		actionBusy = busy;
 	}
 
 	// Temporary facial expression (AI cue, tap flash, emote grin): overlays the
@@ -545,6 +577,14 @@ function createVrmStore() {
 			return reactionRequest;
 		},
 		requestReaction,
+		get actionRequest() {
+			return actionRequest;
+		},
+		requestAvatarAction,
+		get actionBusy() {
+			return actionBusy;
+		},
+		setActionBusy,
 		get expressionRequest() {
 			return expressionRequest;
 		},
