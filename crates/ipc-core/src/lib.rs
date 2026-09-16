@@ -127,6 +127,22 @@ pub enum IpcMethod {
     /// privileged data and performs no host action.
     #[serde(rename = "diagnostics.report")]
     DiagnosticsReport,
+    /// Durable task authority (Rust owns WHAT/WHEN/whether-it-succeeded).
+    /// `task.create` takes a `NewTask` body; `task.event` delivers receipts
+    /// (avatar routine completions, agent callbacks) to parked tasks;
+    /// `task.review` resolves `needs_review` with `{approved, note?}`.
+    #[serde(rename = "task.create")]
+    TaskCreate,
+    #[serde(rename = "task.get")]
+    TaskGet,
+    #[serde(rename = "task.list")]
+    TaskList,
+    #[serde(rename = "task.cancel")]
+    TaskCancel,
+    #[serde(rename = "task.review")]
+    TaskReview,
+    #[serde(rename = "task.event")]
+    TaskEvent,
 }
 
 /// Request envelope: frontend → host.
@@ -268,6 +284,38 @@ mod tests {
             (
                 r#"{"id":"3","method":"diagnostics.report","params":{"kind":"window.error"}}"#,
                 IpcMethod::DiagnosticsReport,
+            ),
+        ] {
+            assert_eq!(IpcRequest::parse(raw).unwrap().method, method);
+        }
+    }
+
+    #[test]
+    fn task_methods_parse() {
+        for (raw, method) in [
+            (
+                r#"{"id":"1","method":"task.create","params":{"title":"t"}}"#,
+                IpcMethod::TaskCreate,
+            ),
+            (
+                r#"{"id":"2","method":"task.get","params":{"task_id":"x"}}"#,
+                IpcMethod::TaskGet,
+            ),
+            (
+                r#"{"id":"3","method":"task.list","params":{}}"#,
+                IpcMethod::TaskList,
+            ),
+            (
+                r#"{"id":"4","method":"task.cancel","params":{"task_id":"x"}}"#,
+                IpcMethod::TaskCancel,
+            ),
+            (
+                r#"{"id":"5","method":"task.review","params":{"task_id":"x","approved":true}}"#,
+                IpcMethod::TaskReview,
+            ),
+            (
+                r#"{"id":"6","method":"task.event","params":{"event_type":"e"}}"#,
+                IpcMethod::TaskEvent,
             ),
         ] {
             assert_eq!(IpcRequest::parse(raw).unwrap().method, method);

@@ -245,6 +245,8 @@ dependencies = [
  "serde",
  "serde_json",
  "storage-core",
+ "task-core",
+ "task-host",
  "thiserror 2.0.20",
  "tokio",
  "tool-archive",
@@ -6210,6 +6212,23 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "task-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capability-core",
+ "ipc-core",
+ "serde",
+ "serde_json",
+ "task-core",
+ "thiserror 2.0.20",
+ "tokio",
+ "tool-core",
  "tracing",
  "uuid",
 ]

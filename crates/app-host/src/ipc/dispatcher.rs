@@ -38,6 +38,9 @@ pub struct Dispatcher {
     pub(crate) storage: Option<Arc<Mutex<storage_core::Storage>>>,
     pub(crate) audit: Option<Arc<audit_core::InMemorySink>>,
     pub(crate) secrets: Option<Arc<dyn secret_core::SecretStore>>,
+    /// Durable task authority (`task.*`). Missing only when tasks.db
+    /// could not be opened; task methods then fail with a typed error.
+    pub(crate) tasks: Option<Arc<task_host::TaskHost>>,
     /// Set when the frontend completes the deterministic handshake
     /// (`host.frontend_ready`) after registering its event listeners.
     pub(crate) frontend_ready: Arc<AtomicBool>,
@@ -55,6 +58,7 @@ impl Clone for Dispatcher {
             storage: self.storage.clone(),
             audit: self.audit.clone(),
             secrets: self.secrets.clone(),
+            tasks: self.tasks.clone(),
             frontend_ready: Arc::clone(&self.frontend_ready),
         }
     }
@@ -72,6 +76,7 @@ impl Dispatcher {
             storage: None,
             audit: None,
             secrets: None,
+            tasks: None,
             frontend_ready: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -153,6 +158,12 @@ impl Dispatcher {
 
     pub fn media_registry(&self) -> Arc<crate::audio::MediaRegistry> {
         self.media_registry.clone()
+    }
+
+    /// Attach the durable task host (`task.*` methods).
+    pub fn with_tasks(mut self, tasks: Arc<task_host::TaskHost>) -> Self {
+        self.tasks = Some(tasks);
+        self
     }
 
     /// Parse one raw frontend message. Returns the script payloads the host
@@ -290,6 +301,12 @@ impl Dispatcher {
             IpcMethod::McpStatus => self.mcp_status().await,
             IpcMethod::McpConnect => self.mcp_connect(request).await,
             IpcMethod::McpSetServerToken => self.mcp_set_server_token(request).await,
+            IpcMethod::TaskCreate => self.task_create(request).await,
+            IpcMethod::TaskGet => self.task_get(request).await,
+            IpcMethod::TaskList => self.task_list(request).await,
+            IpcMethod::TaskCancel => self.task_cancel(request).await,
+            IpcMethod::TaskReview => self.task_review(request).await,
+            IpcMethod::TaskEvent => self.task_event(request).await,
             _ => self.dispatch(request),
         }
     }
@@ -365,6 +382,15 @@ impl Dispatcher {
                     message: "mcp.* methods must be dispatched asynchronously".to_string(),
                 })
             }
+            IpcMethod::TaskCreate
+            | IpcMethod::TaskGet
+            | IpcMethod::TaskList
+            | IpcMethod::TaskCancel
+            | IpcMethod::TaskReview
+            | IpcMethod::TaskEvent => Err(IpcErrorBody {
+                code: ipc_core::ErrorCode::Internal,
+                message: "task.* methods must be dispatched asynchronously".to_string(),
+            }),
             IpcMethod::AudioCaptureStart => self.audio_capture_start(request),
             IpcMethod::AudioCaptureStop => self.audio_capture_stop(),
             IpcMethod::AudioCaptureCancel => self.audio_capture_cancel(),
@@ -482,6 +508,12 @@ fn runs_on_dedicated_worker(method: &IpcMethod) -> bool {
             | IpcMethod::McpStatus
             | IpcMethod::McpConnect
             | IpcMethod::McpSetServerToken
+            | IpcMethod::TaskCreate
+            | IpcMethod::TaskGet
+            | IpcMethod::TaskList
+            | IpcMethod::TaskCancel
+            | IpcMethod::TaskReview
+            | IpcMethod::TaskEvent
     )
 }
 

@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_os = "linux"))]
 use std::sync::mpsc::Receiver;
 use std::sync::{mpsc::Sender, Arc, Mutex};
+use tool_sdk::ToolPack as _;
 use wry::{PermissionKind, PermissionResponse, WebViewBuilder};
 
 #[cfg(not(target_os = "linux"))]
@@ -1001,6 +1002,36 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
     if let Some(store) = &storage {
         dispatcher = dispatcher.with_storage(Arc::clone(store));
     }
+    // Durable task authority (tasks.db beside state.db): Rust owns
+    // WHAT/WHEN/whether-it-succeeded; the renderer only produces receipts.
+    // Focused registry: read-only system facts + notifications. Privileged
+    // tools arrive through the same approval-ticket flow as agent turns.
+    let task_host = {
+        let tasks_path = storage_core::default_state_dir("utsuwa").join("tasks.db");
+        let mut registry = tool_core::ToolRegistry::new();
+        let load_ctx = tool_sdk::ToolLoadContext::default();
+        let system_pack =
+            app_host::tooling::SystemToolPack::new(host_core::HostEnvironment::snapshot());
+        for tool in system_pack
+            .tools(&load_ctx)
+            .into_iter()
+            .chain(tool_notification::NotificationToolPack.tools(&load_ctx))
+        {
+            if let Err(err) = registry.register(tool) {
+                tracing::warn!(%err, "task registry: skipping duplicate tool");
+            }
+        }
+        match task_host::TaskHost::open(&tasks_path, Arc::new(registry), Arc::clone(&emit), None) {
+            Ok(host) => Some(Arc::new(host)),
+            Err(err) => {
+                tracing::error!(%err, "failed to open tasks.db; task.* methods will fail");
+                None
+            }
+        }
+    };
+    if let Some(tasks) = &task_host {
+        dispatcher = dispatcher.with_tasks(Arc::clone(tasks));
+    }
     if let Some(runtime) = runtime {
         // MCP Bearer [REDACTED] resolve from the same keychain-backed store.
         runtime.set_secret_store(Arc::clone(&secrets));
@@ -1012,6 +1043,15 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
             Err(err) => {
                 tracing::error!(%err, "failed to open memory.db; using in-memory memory")
             }
+        }
+        // Background task tick: recovery, wait expiry, schedules, retries.
+        // Without the agent executor (degraded mode) tasks still progress
+        // via the piggyback tick inside mutating task.* IPC calls.
+        if let Some(tasks) = task_host {
+            runtime.executor_handle().spawn(task_host::run_tick_loop(
+                tasks,
+                std::time::Duration::from_secs(2),
+            ));
         }
         dispatcher = dispatcher.with_agent(runtime);
     }
