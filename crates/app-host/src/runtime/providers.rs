@@ -184,7 +184,10 @@ pub(crate) fn read_autonomous_full_access(storage: Option<&Arc<Mutex<Storage>>>)
     Some(value.and_then(|value| value.as_bool()).unwrap_or(false))
 }
 
-pub(crate) fn provider_factory_with_secrets(
+/// Async provider constructor from stored settings + OS keychain secrets.
+/// Shared by chat turns and durable task agent steps so both use the same
+/// configured model.
+pub fn provider_factory_with_secrets(
     storage: Option<Arc<Mutex<Storage>>>,
     secrets: Arc<dyn secret_core::SecretStore>,
 ) -> ProviderFactory {

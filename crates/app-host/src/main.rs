@@ -977,6 +977,9 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
         .with_audit(Arc::clone(&audit))
         .with_sensors(Arc::clone(&sensors))
         .with_secret_store(Arc::clone(&secrets));
+    // Cloned (not moved) so the task agent backend below can snapshot the
+    // same standing grants for its step-scoped authorizer.
+    let task_approvals = Arc::clone(&approvals);
     let runtime = match app_host::runtime::AgentRuntime::start_with_secrets_and_sensors(
         approvals,
         storage.clone(),
@@ -1005,7 +1008,8 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
     // Durable task authority (tasks.db beside state.db): Rust owns
     // WHAT/WHEN/whether-it-succeeded; the renderer only produces receipts.
     // Focused registry: read-only system facts + notifications. Privileged
-    // tools arrive through the same approval-ticket flow as agent turns.
+    // tools arrive through the task-review approval-ticket flow. Agent steps
+    // run bounded turns on the configured provider via TaskAgentBackend.
     let task_host = {
         let tasks_path = storage_core::default_state_dir("utsuwa").join("tasks.db");
         let mut registry = tool_core::ToolRegistry::new();
@@ -1021,7 +1025,25 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
                 tracing::warn!(%err, "task registry: skipping duplicate tool");
             }
         }
-        match task_host::TaskHost::open(&tasks_path, Arc::new(registry), Arc::clone(&emit), None) {
+        let registry = Arc::new(registry);
+        let services = Arc::new(task_host::HostServices::new(Arc::clone(&registry)));
+        let providers = app_host::runtime::providers::provider_factory_with_secrets(
+            storage.clone(),
+            Arc::clone(&secrets),
+        );
+        let agent_backend = Arc::new(app_host::runtime::task_agent::TaskAgentBackend::new(
+            providers,
+            registry,
+            task_approvals,
+            Arc::clone(&emit),
+            Arc::clone(&services),
+        ));
+        match task_host::TaskHost::open_with_services(
+            &tasks_path,
+            services,
+            Arc::clone(&emit),
+            Some(agent_backend),
+        ) {
             Ok(host) => Some(Arc::new(host)),
             Err(err) => {
                 tracing::error!(%err, "failed to open tasks.db; task.* methods will fail");

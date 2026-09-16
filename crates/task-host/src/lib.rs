@@ -6,9 +6,10 @@
 
 pub mod runners;
 
-use runners::{
+use runners::TICKET_STASH_TTL;
+pub use runners::{
     AgentRunner, AgentStepBackend, AvatarRoutineRunner, CapabilityReviewRequest,
-    NotificationRunner, ToolRunner, TICKET_STASH_TTL,
+    NotificationRunner, ToolRunner,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -76,6 +77,29 @@ impl HostServices {
         }
     }
 
+    /// Check whether a stashed ticket covers a request, without consuming
+    /// it. The agent backend's authorizer peeks during `authorize` (which
+    /// may run once per requirement) and consumes during `commit` (which
+    /// runs once per call).
+    pub fn peek_ticket_allows(
+        &self,
+        task_id: &str,
+        step_id: &str,
+        capability: &capability_core::Capability,
+        resource: &capability_core::Resource,
+    ) -> bool {
+        let Ok(tickets) = self.tickets.lock() else {
+            return false;
+        };
+        let Some(stashed) = tickets.get(&(task_id.to_string(), step_id.to_string())) else {
+            return false;
+        };
+        if stashed.stored_at.elapsed() > TICKET_STASH_TTL {
+            return false;
+        }
+        stashed.ticket.capability == *capability && stashed.ticket.scope.allows(resource)
+    }
+
     /// Take (consume) a stashed ticket. Expired or missing tickets return
     /// `None` and the step parks for review again — fail closed.
     pub fn take_ticket(
@@ -118,7 +142,8 @@ impl TaskHost {
         agent_backend: Option<Arc<dyn AgentStepBackend>>,
     ) -> TaskResult<Self> {
         let store = Arc::new(SqliteTaskStore::open(db_path)?);
-        Self::from_store(store, registry, emit, agent_backend)
+        let services = Arc::new(HostServices::new(registry));
+        Self::from_store(store, services, emit, agent_backend)
     }
 
     pub fn open_in_memory(
@@ -127,16 +152,37 @@ impl TaskHost {
         agent_backend: Option<Arc<dyn AgentStepBackend>>,
     ) -> TaskResult<Self> {
         let store = Arc::new(SqliteTaskStore::open_in_memory()?);
-        Self::from_store(store, registry, emit, agent_backend)
+        let services = Arc::new(HostServices::new(registry));
+        Self::from_store(store, services, emit, agent_backend)
+    }
+
+    /// Open with externally built services, so an agent backend can share
+    /// the same ticket stash the runners and review handler use.
+    pub fn open_with_services(
+        db_path: &Path,
+        services: Arc<HostServices>,
+        emit: EmitFn,
+        agent_backend: Option<Arc<dyn AgentStepBackend>>,
+    ) -> TaskResult<Self> {
+        let store = Arc::new(SqliteTaskStore::open(db_path)?);
+        Self::from_store(store, services, emit, agent_backend)
+    }
+
+    pub fn open_in_memory_with_services(
+        services: Arc<HostServices>,
+        emit: EmitFn,
+        agent_backend: Option<Arc<dyn AgentStepBackend>>,
+    ) -> TaskResult<Self> {
+        let store = Arc::new(SqliteTaskStore::open_in_memory()?);
+        Self::from_store(store, services, emit, agent_backend)
     }
 
     fn from_store(
         store: Arc<SqliteTaskStore>,
-        registry: Arc<tool_core::ToolRegistry>,
+        services: Arc<HostServices>,
         emit: EmitFn,
         agent_backend: Option<Arc<dyn AgentStepBackend>>,
     ) -> TaskResult<Self> {
-        let services = Arc::new(HostServices::new(registry));
         let clock = Arc::new(SystemClock);
         let runners = Runners {
             wait: Arc::new(task_core::WaitRunner),
@@ -387,6 +433,42 @@ mod tests {
                 max_attempts: Some(3),
             }],
         }
+    }
+
+    #[test]
+    fn peek_checks_scope_without_consuming() {
+        let services = HostServices::new(registry());
+        let invocation = capability_core::InvocationId::fresh();
+        let ticket = capability_core::CapabilityTicket::mint(
+            services.task_principal(),
+            capability_core::Capability::NotificationSend,
+            capability_core::ResourceScope::new(vec![
+                capability_core::Resource::NotificationService,
+            ]),
+            invocation,
+            Duration::from_secs(60),
+        );
+        services.stash_ticket("t", "s", ticket, invocation);
+        assert!(services.peek_ticket_allows(
+            "t",
+            "s",
+            &capability_core::Capability::NotificationSend,
+            &capability_core::Resource::NotificationService,
+        ));
+        assert!(!services.peek_ticket_allows(
+            "t",
+            "s",
+            &capability_core::Capability::DesktopControl,
+            &capability_core::Resource::NotificationService,
+        ));
+        // Peeked twice, still present for the real consume.
+        assert!(services.take_ticket("t", "s", invocation).is_some());
+        assert!(!services.peek_ticket_allows(
+            "t",
+            "s",
+            &capability_core::Capability::NotificationSend,
+            &capability_core::Resource::NotificationService,
+        ));
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ pub mod events;
 pub mod prompts;
 pub mod providers;
 pub mod session;
+pub mod task_agent;
 pub mod turn;
 
 #[cfg(test)]
