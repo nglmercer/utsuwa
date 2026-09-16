@@ -54,7 +54,7 @@ pub(crate) use file_target::{ConversationFileContext, FileRef};
 pub(crate) use host_core::HostEnvironment;
 pub(crate) use tool_process::{ProcessLimits, ProcessManager};
 
-use crate::tooling::{ProcessToolPack, SystemToolPack};
+use crate::tooling::{ProcessToolPack, SystemToolPack, TasksToolPack};
 use audit_core::AuditSink;
 use capability_core::AgentId;
 use ipc_core::HostEvent;
@@ -1017,6 +1017,10 @@ impl AgentRuntime {
             .with_pack(tool_archive::ArchiveToolPack::new())
             .with_pack(tool_git::GitToolPack)
             .with_pack(tool_notification::NotificationToolPack)
+            // Durable tasks for the default agent only: the model
+            // schedules interval work through the same builder the CLI
+            // verification uses. Never in task-agent registries.
+            .with_pack(TasksToolPack::new())
             // The CDP endpoint is host configuration (loopback-only,
             // sanitized), read fresh every turn; the pack hides control
             // tools while no browser answers there.

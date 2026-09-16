@@ -43,6 +43,21 @@ impl<S: TaskStore> Scheduler<S> {
 
     /// Run one scheduling pass. Safe to call on a timer and at startup.
     pub async fn tick(&self) -> TaskCoreResult<TickReport> {
+        self.tick_filtered(None).await
+    }
+
+    /// Scheduling pass that executes ONLY `task_id`. Recovery, wait
+    /// expiry, and promotion stay global (cheap bookkeeping, no model
+    /// calls), but no other task's steps run — so a stranger's slow
+    /// model turn can never delay this task's wait expiry. Single-task
+    /// drivers (`task-cli run`/`demo-time`) must use this instead of
+    /// `tick`: executing strangers is both a side effect and a timing
+    /// pollutant (a 12s foreign turn once stretched a 3s wait to 13s).
+    pub async fn tick_one(&self, task_id: &str) -> TaskCoreResult<TickReport> {
+        self.tick_filtered(Some(task_id)).await
+    }
+
+    async fn tick_filtered(&self, only: Option<&str>) -> TaskCoreResult<TickReport> {
         let now = self.clock.now_ms();
         let recovery = crate::recovery::recover_stale(
             self.store.as_ref(),
@@ -57,6 +72,9 @@ impl<S: TaskStore> Scheduler<S> {
         let mut executed = Vec::new();
         let mut errors = Vec::new();
         for task in batch {
+            if only.is_some_and(|id| id != task.id) {
+                continue;
+            }
             // Re-read: a previous execution in this batch may have touched it.
             let Some(fresh) = self.store.get(&task.id).await? else {
                 continue;
@@ -304,6 +322,22 @@ mod tests {
         assert_eq!(report.executed, vec![created.id.clone()]);
         let done = store.get(&created.id).await.expect("get").expect("task");
         assert_eq!(done.status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn tick_one_executes_only_the_target() {
+        let (store, _, scheduler) = setup();
+        let first = store.create(notify_task(), 1_000).await.expect("create");
+        let second = store.create(notify_task(), 1_000).await.expect("create2");
+        let report = scheduler.tick_one(&first.id).await.expect("tick_one");
+        assert_eq!(report.executed, vec![first.id.clone()]);
+        let done = store.get(&first.id).await.expect("get").expect("task");
+        assert_eq!(done.status, TaskStatus::Completed);
+        // The stranger is promoted (global bookkeeping) but never
+        // executed: no foreign model turn may run inside this tick.
+        let stranger = store.get(&second.id).await.expect("get").expect("task");
+        assert_eq!(stranger.status, TaskStatus::Ready);
+        assert_eq!(stranger.steps[0].status, TaskStepStatus::Pending);
     }
 
     #[tokio::test]

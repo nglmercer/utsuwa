@@ -154,6 +154,7 @@ fn host_environment_context_for_context(
         "Never claim an operation succeeded until the tool confirms success.".to_string(),
         "Never report success after a failed tool call.".to_string(),
         "For the current date or current time, call system.time. Never infer the current date or time from model knowledge.".to_string(),
+        "To perform an action multiple times with a pause between runs, or once at a later time, call tasks.create_interval a single time with the instruction instead of repeating tool calls yourself; the durable task manager executes the repetitions asynchronously, so report the returned task id rather than waiting for them.".to_string(),
     ];
     format!(
         "{}\n\n<utsuwa_native_runtime>\n{}\n</utsuwa_native_runtime>",
@@ -204,5 +205,19 @@ pub(crate) fn compose_host_system_prompt_for_context(
     match user_prompt {
         Some(prompt) => format!("{prompt}\n\n{host_context}"),
         None => host_context,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_prompt_teaches_interval_scheduling() {
+        let prompt = compose_host_system_prompt(None, false);
+        assert!(
+            prompt.contains("tasks.create_interval"),
+            "default agent must know how to schedule interval work"
+        );
     }
 }

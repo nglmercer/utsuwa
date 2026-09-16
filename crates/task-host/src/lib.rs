@@ -4,7 +4,7 @@
 //! The renderer (TypeScript) decides HOW the VRM looks while doing it — it
 //! produces routine receipts; this host verifies them before completing.
 
-pub mod demo;
+pub mod interval;
 pub mod runners;
 
 use runners::TICKET_STASH_TTL;
@@ -222,6 +222,13 @@ impl TaskHost {
 
     pub async fn tick(&self) -> TaskResult<TickReport> {
         Ok(self.scheduler.tick().await?)
+    }
+
+    /// Scheduling pass that executes ONLY `task_id` (see
+    /// `Scheduler::tick_one`). Single-task headless drivers use this so
+    /// a stranger's slow model turn can never delay wait expiry.
+    pub async fn tick_one(&self, task_id: &str) -> TaskResult<TickReport> {
+        Ok(self.scheduler.tick_one(task_id).await?)
     }
 
     pub async fn create(&self, task: NewTask) -> TaskResult<Task> {
