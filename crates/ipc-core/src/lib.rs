@@ -48,6 +48,17 @@ pub enum IpcMethod {
     /// client. This is needed when a provider does not enable WebView CORS.
     #[serde(rename = "providers.fetch_models")]
     ProvidersFetchModels,
+    /// MCP server connection state for settings UIs (never credentials).
+    #[serde(rename = "mcp.status")]
+    McpStatus,
+    /// Connect one MCP server now and return its discovered tool names
+    /// (settings "test" path; agent turns connect lazily otherwise).
+    #[serde(rename = "mcp.connect")]
+    McpConnect,
+    /// Store (or, when empty, delete) one HTTP MCP server's Bearer [REDACTED]
+    /// the OS secret store. Write-only: tokens are never returned.
+    #[serde(rename = "mcp.set_server_token")]
+    McpSetServerToken,
     #[serde(rename = "audio_capture.start")]
     AudioCaptureStart,
     #[serde(rename = "audio_capture.stop")]

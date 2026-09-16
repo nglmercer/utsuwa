@@ -146,3 +146,51 @@ test('LM Studio health falls back to the legacy metadata endpoint', async () => 
 	assert.equal(health.modelAvailable, true);
 	assert.equal(health.toolCalling, 'unknown');
 });
+
+test('LM Studio health falls back to the OpenAI-compatible models endpoint', async () => {
+	const requests: string[] = [];
+	globalThis.fetch = (input: string | URL | Request) => {
+		const url = String(input);
+		requests.push(url);
+		if (url.endsWith('/api/v1/models') || url.endsWith('/api/v0/models')) {
+			return Promise.resolve(new Response('not found', { status: 404 }));
+		}
+		return Promise.resolve(
+			new Response(JSON.stringify({ data: [{ id: 'openai-compat-model' }] }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' }
+			})
+		);
+	};
+
+	const health = await checkLLMProviderHealth('lmstudio', undefined, 'http://localhost:1234', 'openai-compat-model');
+
+	assert.deepEqual(requests, [
+		'http://localhost:1234/api/v1/models',
+		'http://localhost:1234/api/v0/models',
+		'http://localhost:1234/v1/models'
+	]);
+	assert.equal(health.reachable, true);
+	assert.equal(health.modelAvailable, true);
+});
+
+test('LLM health reports reachable-but-rejected on HTTP auth failures', async () => {
+	globalThis.fetch = () => Promise.resolve(new Response('denied', { status: 401 }));
+
+	const health = await checkLLMProviderHealth('lmstudio', undefined, 'http://localhost:1234', 'qwen');
+
+	assert.equal(health.reachable, true);
+	assert.equal(health.endpointValid, false);
+	assert.equal(health.modelAvailable, false);
+	assert.match(health.error ?? '', /HTTP 401/);
+});
+
+test('LLM health reports unreachable when the host refuses the connection', async () => {
+	globalThis.fetch = () => Promise.reject(new TypeError('fetch failed'));
+
+	const health = await checkLLMProviderHealth('ollama', undefined, 'http://localhost:11434', 'llama3');
+
+	assert.equal(health.reachable, false);
+	assert.equal(health.endpointValid, false);
+	assert.match(health.error ?? '', /Could not reach Ollama/);
+});

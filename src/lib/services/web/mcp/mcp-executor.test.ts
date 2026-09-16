@@ -9,7 +9,7 @@ import {
 	toolResultToText,
 	MAX_TOOL_RESULT_CHARS
 } from './mcp-executor.ts';
-import type { McpServerConfig } from './types.ts';
+import type { McpServerConfig } from '../../mcp/types.ts';
 
 const HTTP_SERVER: McpServerConfig = {
 	transport: 'http',
@@ -79,7 +79,7 @@ describe('toolResultToText + capResultText', () => {
 
 describe('McpToolExecutor via proxy', () => {
 	it('lists definitions from proxy tools', async () => {
-		const ex = new McpToolExecutor([HTTP_SERVER], { mode: 'proxy', fetchImpl: proxyFetch() });
+		const ex = new McpToolExecutor([HTTP_SERVER], { fetchImpl: proxyFetch() });
 		const defs = await ex.definitions();
 		assert.equal(defs.length, 1);
 		assert.equal(defs[0].name, 'home__get_weather');
@@ -88,14 +88,14 @@ describe('McpToolExecutor via proxy', () => {
 	});
 
 	it('executes a tool and returns capped text', async () => {
-		const ex = new McpToolExecutor([HTTP_SERVER], { mode: 'proxy', fetchImpl: proxyFetch() });
+		const ex = new McpToolExecutor([HTTP_SERVER], { fetchImpl: proxyFetch() });
 		await ex.definitions();
 		const text = await ex.execute('home__get_weather', JSON.stringify({ city: 'Oslo' }));
 		assert.equal(text, 'sunny');
 	});
 
 	it('throws on unknown tool names, returns text on bad args', async () => {
-		const ex = new McpToolExecutor([HTTP_SERVER], { mode: 'proxy', fetchImpl: proxyFetch() });
+		const ex = new McpToolExecutor([HTTP_SERVER], { fetchImpl: proxyFetch() });
 		await ex.definitions();
 		await assert.rejects(() => ex.execute('home__nope', '{}'), /Unknown tool/);
 		const bad = await ex.execute('home__get_weather', 'not json');
@@ -107,7 +107,6 @@ describe('McpToolExecutor via proxy', () => {
 	it('never auto-executes confirm-list tools', async () => {
 		let calls = 0;
 		const ex = new McpToolExecutor([HTTP_SERVER], {
-			mode: 'proxy',
 			fetchImpl: (async (url: unknown, init?: { body?: unknown }) => {
 				if (String(url).endsWith('/api/mcp/call')) calls++;
 				return proxyFetch()(url, init);
@@ -122,7 +121,6 @@ describe('McpToolExecutor via proxy', () => {
 
 	it('matches confirm list by bare tool name too', async () => {
 		const ex = new McpToolExecutor([HTTP_SERVER], {
-			mode: 'proxy',
 			fetchImpl: proxyFetch(),
 			confirmTools: ['get_weather']
 		});
@@ -133,7 +131,6 @@ describe('McpToolExecutor via proxy', () => {
 	it('skips disabled servers and records per-server errors', async () => {
 		const failing: McpServerConfig = { ...HTTP_SERVER, id: 'down' };
 		const ex = new McpToolExecutor([failing], {
-			mode: 'proxy',
 			fetchImpl: async () => Response.json({ error: 'boom' }, { status: 500 })
 		});
 		const defs = await ex.definitions();
@@ -141,21 +138,29 @@ describe('McpToolExecutor via proxy', () => {
 		assert.match(ex.errors.get('down') ?? '', /boom/);
 
 		const disabled: McpServerConfig = { ...HTTP_SERVER, id: 'off', enabled: false };
-		const ex2 = new McpToolExecutor([disabled], { mode: 'proxy', fetchImpl: proxyFetch() });
+		const ex2 = new McpToolExecutor([disabled], { fetchImpl: proxyFetch() });
 		assert.equal((await ex2.definitions()).length, 0);
 		assert.equal(ex2.errors.size, 0);
 	});
 
-	it('refuses stdio servers in direct mode', async () => {
+	it('passes stdio servers through to the proxy transport', async () => {
 		const stdio: McpServerConfig = { transport: 'stdio', id: 'local', command: 'x', enabled: true };
-		const ex = new McpToolExecutor([stdio], { mode: 'direct', fetchImpl: proxyFetch() });
-		assert.equal((await ex.definitions()).length, 0);
-		assert.match(ex.errors.get('local') ?? '', /proxy/);
+		const seen: unknown[] = [];
+		const ex = new McpToolExecutor([stdio], {
+			fetchImpl: (async (url: unknown, init?: { body?: unknown }) => {
+				if (String(url).endsWith('/api/mcp/tools')) {
+					seen.push(JSON.parse(String(init?.body)).server);
+					return Response.json({ tools: [{ name: 'run', inputSchema: { type: 'object' } }] });
+				}
+				return Response.json({ error: 'not found' }, { status: 404 });
+			})
+		});
+		assert.equal((await ex.definitions()).length, 1);
+		assert.deepEqual((seen[0] as McpServerConfig).transport, 'stdio');
 	});
 
 	it('reports execution failures as text and records the error', async () => {
 		const ex = new McpToolExecutor([HTTP_SERVER], {
-			mode: 'proxy',
 			fetchImpl: async (url: unknown) =>
 				String(url).endsWith('/api/mcp/tools')
 					? Response.json({ tools: [{ name: 'get_weather' }] })

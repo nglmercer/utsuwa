@@ -80,7 +80,7 @@ model-catalog = { path = "crates/model-catalog" }
 model-openai-compatible = { path = "crates/model-openai-compatible" }
 policy-core = { path = "crates/policy-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-rmcp = { version = "3.2", default-features = false, features = ["client", "transport-child-process"] }
+rmcp = { version = "3.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 rusqlite = { version = "0.32", default-features = false }
 toml = "0.8"
 wasmtime = { version = "34", default-features = false, features = ["runtime", "cranelift", "wat"] }

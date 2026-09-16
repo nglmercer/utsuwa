@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { McpHttpClient, toggleTrailingSlash, type FetchImpl } from './http-client.ts';
-import { McpError } from './types.ts';
+import { McpError } from '../../mcp/types.ts';
 
 function jsonResponse(payload: unknown, headers: Record<string, string> = {}): Response {
 	return new Response(JSON.stringify(payload), {

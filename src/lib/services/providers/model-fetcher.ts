@@ -10,6 +10,8 @@ export interface FetchModelsResult {
 	models: ModelInfo[];
 	error?: string;
 	fromCache?: boolean;
+	/** HTTP status when the provider was reached but rejected the request. */
+	status?: number;
 }
 
 const FETCH_TIMEOUT_MS = 10000;

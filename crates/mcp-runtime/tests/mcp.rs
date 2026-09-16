@@ -24,11 +24,13 @@ fn server_script(tag: &str) -> PathBuf {
 fn config(script: &std::path::Path, extra_env: HashMap<String, String>) -> McpServerConfig {
     McpServerConfig {
         id: capability_core::ServerId::new("fake"),
+        name: None,
         transport: McpTransport::Stdio {
             command: "python3".to_string(),
             args: vec![script.to_string_lossy().to_string()],
             env_allowlist: vec!["PATH".to_string()],
             extra_env,
+            cwd: None,
         },
         enabled: true,
         trust: TrustLevel::Untrusted,
@@ -65,6 +67,7 @@ fn config_validation_and_tool_id_mapping() {
     cfg.id = capability_core::ServerId::new("ok");
     match &mut cfg.transport {
         McpTransport::Stdio { command, .. } => *command = String::new(),
+        McpTransport::Http { .. } => panic!("test config must be stdio"),
     }
     assert!(cfg.validate().is_err());
 

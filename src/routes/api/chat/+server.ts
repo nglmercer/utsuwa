@@ -14,7 +14,7 @@ import {
 } from '$lib/services/providers/openai-compatible';
 import { isMcpProxyEnabled } from '../mcp/shared';
 import { parseMcpServerConfigs } from '$lib/services/mcp/types';
-import { resolveMcpChatTools, mergeConfirmTools } from '$lib/services/mcp/chat-tools';
+import { resolveMcpChatTools, mergeConfirmTools } from '$lib/services/web/mcp/chat-tools';
 import {
 	runMcpToolLoop,
 	openaiToolAdapter,
@@ -22,8 +22,8 @@ import {
 	parsePromptHardeningEnv,
 	parseConfirmToolsEnv,
 	type ToolLoopMessage
-} from '$lib/services/mcp/tool-loop';
-import type { FetchImpl } from '$lib/services/mcp/http-client';
+} from '$lib/services/web/mcp/tool-loop';
+import type { FetchImpl } from '$lib/services/web/mcp/http-client';
 
 // Providers that don't require API keys
 const LOCAL_PROVIDERS: LLMProvider[] = ['ollama', 'lmstudio'];
@@ -63,7 +63,6 @@ async function runServerMcpLoop(args: {
 	const tools = await resolveMcpChatTools({
 		enabled: true,
 		servers,
-		mode: 'proxy',
 		proxyAvailable: true,
 		confirmTools: mergeConfirmTools(clientConfirm, parseConfirmToolsEnv(env.PUBLIC_MCP_CONFIRM_TOOLS)),
 		fetchImpl: args.proxyFetch

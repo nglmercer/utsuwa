@@ -5,7 +5,6 @@ import {
 	extractPotentialFacts,
 	type ExpressionCue
 } from '$lib/ai/response-parser';
-import { buildExtractionSystemPrompt } from '$lib/ai/prompt-builder';
 import { calculateBaselineUpdates, analyzeMessage } from '$lib/engine/heuristics';
 import { mergeUpdates, checkAndApplyStageTransition } from '$lib/engine/state-updates';
 import {
@@ -16,7 +15,6 @@ import {
 } from '$lib/engine/memory';
 import { checkAllEvents, checkEvent, eventsApi } from '$lib/engine/events';
 import { allEvents, relationshipStrainEvent } from '$lib/data/events';
-import { extractStateUpdates } from './client-chat';
 import { extractReminderTags } from '$lib/utils/reminders';
 import { reminderStore } from '$lib/stores/reminders.svelte';
 import { vrmStore } from '$lib/stores/vrm.svelte';
@@ -113,14 +111,17 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 	}
 
 	// Decoupled fallback: the model skipped the inline JSON, so ask a dedicated
-	// forced-JSON call to extract mood + memory from the exchange.
+	// forced-JSON call to extract mood + memory from the exchange. Web-only and
+	// dynamically imported so the native bundle never includes the direct
+	// provider runtime; the native turn owns extraction host-side.
 	if (!llmUpdates && !llm.nativeRuntime) {
-		const extracted = await extractStateUpdates({
+		const { extractStateUpdatesFallback } = await import('./web-turn');
+		const extracted = await extractStateUpdatesFallback({
 			provider: llm.provider as LLMProvider,
 			model: llm.model,
 			apiKey: llm.apiKey,
 			baseURL: llm.baseURL,
-			system: buildExtractionSystemPrompt(llm.hasImages),
+			hasImages: llm.hasImages,
 			userMessage,
 			reply: dialogue
 		});

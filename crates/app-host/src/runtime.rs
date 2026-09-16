@@ -441,6 +441,16 @@ impl AgentRuntime {
             *slot = store;
         }
     }
+
+    /// Install the host secret store so HTTP MCP servers can resolve their
+    /// Bearer [REDACTED] at connect time. The native host calls this at
+    /// startup; resolution runs off the async worker inside the manager.
+    pub fn set_secret_store(&self, secrets: Arc<dyn secret_core::SecretStore>) {
+        self.mcp
+            .set_secret_resolver(std::sync::Arc::new(move |account: &str| {
+                secrets.get(account).ok().flatten()
+            }));
+    }
     /// The current memory store (tests and diagnostics).
     pub fn memory_store(&self) -> Arc<memory::MemoryStore> {
         self.memory
@@ -2979,11 +2989,13 @@ mod tests {
         let storage = Arc::new(Mutex::new(storage_core::Storage::open(&db).unwrap()));
         let config = McpServerConfig {
             id: capability_core::ServerId::new("fake"),
+            name: None,
             transport: McpTransport::Stdio {
                 command: "python3".to_string(),
                 args: vec![script.to_string_lossy().to_string()],
                 env_allowlist: vec!["PATH".to_string()],
                 extra_env: HashMap::new(),
+                cwd: None,
             },
             enabled: true,
             trust: TrustLevel::Untrusted,
@@ -3083,11 +3095,13 @@ mod tests {
         // Configure the server directly (no settings involved here).
         let config = McpServerConfig {
             id: capability_core::ServerId::new("fake"),
+            name: None,
             transport: McpTransport::Stdio {
                 command: "python3".to_string(),
                 args: vec![script.to_string_lossy().to_string()],
                 env_allowlist: vec!["PATH".to_string()],
                 extra_env: HashMap::new(),
+                cwd: None,
             },
             enabled: true,
             trust: TrustLevel::Untrusted,

@@ -373,8 +373,7 @@ mod linux {
                     // explicit max_width by falling through to the
                     // PipeWire path, which negotiates a smaller format.
                     // Without a resize request the portal still is final.
-                    let needs_resize =
-                        config.max_width.is_some_and(|max| shot.width > max);
+                    let needs_resize = config.max_width.is_some_and(|max| shot.width > max);
                     if !needs_resize {
                         return Ok(shot);
                     }
@@ -1646,10 +1645,7 @@ mod linux {
     /// access — only the size header for the `Screenshot` value.
     fn parse_png_dimensions(bytes: &[u8]) -> Result<(u32, u32), DesktopError> {
         const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-        if bytes.len() < 33
-            || bytes[..8] != SIGNATURE[..]
-            || &bytes[12..16] != b"IHDR"
-        {
+        if bytes.len() < 33 || bytes[..8] != SIGNATURE[..] || &bytes[12..16] != b"IHDR" {
             return Err(DesktopError::ActionFailed(
                 "Screenshot portal returned a file that is not a PNG image".to_string(),
             ));

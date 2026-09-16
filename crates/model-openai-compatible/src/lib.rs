@@ -114,6 +114,12 @@ impl OpenAICompatibleClient {
         Self::new("http://localhost:1234/v1", None, model)
     }
 
+    /// Normalized base URL (trailing slashes trimmed) for endpoint
+    /// selection by callers.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     fn url(&self) -> String {
         format!("{}{}", self.base_url, CHAT_COMPLETIONS_PATH)
     }
@@ -127,14 +133,125 @@ impl OpenAICompatibleClient {
     /// The native desktop host uses this method for providers whose public
     /// model endpoint does not enable browser CORS (for example Kilo). The
     /// frontend still owns model classification and presentation; this layer
-    /// only owns HTTP transport, optional Bearer authentication, and useful
+    /// only owns HTTP transport, optional Bearer [REDACTED], and useful
     /// provider errors.
     pub async fn fetch_models(&self) -> Result<Value, ModelError> {
-        let endpoint = self.models_url();
-        let mut request = self.http.get(&endpoint);
+        let data = self
+            .get_catalog(&self.models_url(), &self.bearer_headers())
+            .await?;
+        if !data.get("data").is_some_and(|models| models.is_array()) {
+            return Err(ModelError::InvalidResponse(
+                "model provider returned an invalid OpenAI-compatible catalog".to_string(),
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Anthropic's `/models` uses key headers instead of Bearer [REDACTED]
+    /// same `{data: [...]}` envelope as OpenAI.
+    pub async fn fetch_anthropic_models(&self) -> Result<Value, ModelError> {
+        let key = self.api_key.as_deref().unwrap_or_default();
+        let data = self
+            .get_catalog(
+                &self.models_url(),
+                &[
+                    ("x-api-key".to_string(), key.to_string()),
+                    ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                ],
+            )
+            .await?;
+        if !data.get("data").is_some_and(|models| models.is_array()) {
+            return Err(ModelError::InvalidResponse(
+                "anthropic returned an invalid model catalog".to_string(),
+            ));
+        }
+        Ok(data)
+    }
+
+    /// Ollama's model list lives at `/api/tags` (not `/v1/models`) with a
+    /// `{models: [...]}` envelope. A trailing `/v1` on the base is stripped
+    /// because tags are served from the server root.
+    pub async fn fetch_ollama_tags(&self) -> Result<Value, ModelError> {
+        let root = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
+        let data = self
+            .get_catalog(&format!("{root}/api/tags"), &self.bearer_headers())
+            .await?;
+        if !data.get("models").is_some_and(|models| models.is_array()) {
+            return Err(ModelError::InvalidResponse(
+                "ollama returned an invalid tag list".to_string(),
+            ));
+        }
+        Ok(data)
+    }
+
+    /// LM Studio serves the newer `/api/v1/models` metadata endpoint, the
+    /// legacy `/api/v0/models`, or the OpenAI-compatible `/v1/models` —
+    /// tried in that order. Only a missing endpoint falls through;
+    /// auth/server failures stay visible.
+    pub async fn fetch_lmstudio_models(&self) -> Result<Value, ModelError> {
+        let root = self.base_url.strip_suffix("/v1").unwrap_or(&self.base_url);
+        for path in ["/api/v1/models", "/api/v0/models", "/v1/models"] {
+            let endpoint = format!("{root}{path}");
+            match self.get_catalog(&endpoint, &self.bearer_headers()).await {
+                Ok(data) => return Ok(data),
+                Err(ModelError::Provider { status: 404, .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ModelError::Provider {
+            status: 404,
+            message: "lm studio model endpoint was not found".to_string(),
+        })
+    }
+
+    /// Google AI Studio's `/models` authenticates via header and returns a
+    /// `{models: [{name: "models/..."}]}` envelope.
+    pub async fn fetch_google_models(&self) -> Result<Value, ModelError> {
+        let key = self.api_key.as_deref().unwrap_or_default();
+        let data = self
+            .get_catalog(
+                &self.models_url(),
+                &[("x-goog-api-key".to_string(), key.to_string())],
+            )
+            .await?;
+        if !data.get("models").is_some_and(|models| models.is_array()) {
+            return Err(ModelError::InvalidResponse(
+                "google returned an invalid model catalog".to_string(),
+            ));
+        }
+        Ok(data)
+    }
+
+    /// ElevenLabs `/models` returns a top-level array of voice models.
+    pub async fn fetch_elevenlabs_models(&self) -> Result<Value, ModelError> {
+        let key = self.api_key.as_deref().unwrap_or_default();
+        let data = self
+            .get_catalog(
+                &self.models_url(),
+                &[("xi-api-key".to_string(), key.to_string())],
+            )
+            .await?;
+        if !data.is_array() {
+            return Err(ModelError::InvalidResponse(
+                "elevenlabs returned an invalid model catalog".to_string(),
+            ));
+        }
+        Ok(data)
+    }
+
+    /// GET one catalog URL with explicit headers. Status failures map to
+    /// classified provider errors; the body must be JSON.
+    async fn get_catalog(
+        &self,
+        endpoint: &str,
+        headers: &[(String, String)],
+    ) -> Result<Value, ModelError> {
+        let mut request = self.http.get(endpoint);
         request = request.timeout(Duration::from_secs(10));
-        if let Some(key) = self.api_key.as_deref() {
-            request = request.bearer_auth(key);
+        for (name, value) in headers {
+            if !value.is_empty() {
+                request = request.header(name, value);
+            }
         }
         let response = request
             .send()
@@ -148,17 +265,19 @@ impl OpenAICompatibleClient {
                 message: classify_provider_error(status.as_u16(), &body),
             });
         }
-
-        let data = response
+        response
             .json::<Value>()
             .await
-            .map_err(|e| ModelError::InvalidResponse(e.to_string()))?;
-        if !data.get("data").is_some_and(|models| models.is_array()) {
-            return Err(ModelError::InvalidResponse(
-                "model provider returned an invalid OpenAI-compatible catalog".to_string(),
-            ));
+            .map_err(|e| ModelError::InvalidResponse(e.to_string()))
+    }
+
+    fn bearer_headers(&self) -> Vec<(String, String)> {
+        match self.api_key.as_deref() {
+            Some(key) if !key.is_empty() => {
+                vec![("authorization".to_string(), format!("Bearer {key}"))]
+            }
+            _ => Vec::new(),
         }
-        Ok(data)
     }
 }
 

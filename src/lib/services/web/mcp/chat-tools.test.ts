@@ -4,10 +4,9 @@ import {
 	clearMcpProxyCache,
 	isMcpProxyAvailable,
 	mergeConfirmTools,
-	resolveMcpChatTools,
-	selectMcpExecutorMode
+	resolveMcpChatTools
 } from './chat-tools.ts';
-import type { McpServerConfig } from './types.ts';
+import type { McpServerConfig } from '../../mcp/types.ts';
 
 const SERVER: McpServerConfig = {
 	transport: 'http',
@@ -27,24 +26,23 @@ function proxyFetch(tools: unknown[] = [{ name: 't', description: 'T' }]) {
 describe('resolveMcpChatTools', () => {
 	it('returns null when disabled, serverless, or proxyless', async () => {
 		assert.equal(
-			await resolveMcpChatTools({ enabled: false, servers: [SERVER], mode: 'proxy', proxyAvailable: true }),
+			await resolveMcpChatTools({ enabled: false, servers: [SERVER], proxyAvailable: true }),
 			null
 		);
 		assert.equal(
-			await resolveMcpChatTools({ enabled: true, servers: [], mode: 'proxy', proxyAvailable: true }),
+			await resolveMcpChatTools({ enabled: true, servers: [], proxyAvailable: true }),
 			null
 		);
 		assert.equal(
 			await resolveMcpChatTools({
 				enabled: true,
 				servers: [{ ...SERVER, enabled: false }],
-				mode: 'proxy',
 				proxyAvailable: true
 			}),
 			null
 		);
 		assert.equal(
-			await resolveMcpChatTools({ enabled: true, servers: [SERVER], mode: 'proxy', proxyAvailable: false }),
+			await resolveMcpChatTools({ enabled: true, servers: [SERVER], proxyAvailable: false }),
 			null
 		);
 	});
@@ -53,7 +51,6 @@ describe('resolveMcpChatTools', () => {
 		const tools = await resolveMcpChatTools({
 			enabled: true,
 			servers: [SERVER],
-			mode: 'proxy',
 			proxyAvailable: true,
 			fetchImpl: proxyFetch()
 		});
@@ -67,7 +64,6 @@ describe('resolveMcpChatTools', () => {
 		const tools = await resolveMcpChatTools({
 			enabled: true,
 			servers: [SERVER],
-			mode: 'proxy',
 			proxyAvailable: true,
 			fetchImpl: proxyFetch([])
 		});
@@ -78,7 +74,6 @@ describe('resolveMcpChatTools', () => {
 		const tools = await resolveMcpChatTools({
 			enabled: true,
 			servers: [SERVER],
-			mode: 'proxy',
 			proxyAvailable: true,
 			confirmTools: ['home__t'],
 			fetchImpl: proxyFetch()
@@ -88,12 +83,7 @@ describe('resolveMcpChatTools', () => {
 	});
 });
 
-describe('selectMcpExecutorMode + mergeConfirmTools', () => {
-	it('selects direct mode only for desktop builds', () => {
-		assert.equal(selectMcpExecutorMode(true), 'direct');
-		assert.equal(selectMcpExecutorMode(false), 'proxy');
-	});
-
+describe('mergeConfirmTools', () => {
 	it('merges confirm lists without duplicates', () => {
 		assert.deepEqual(mergeConfirmTools(['a', 'b'], ['b', 'c'], undefined), ['a', 'b', 'c']);
 		assert.deepEqual(mergeConfirmTools(undefined), []);

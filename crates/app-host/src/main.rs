@@ -981,7 +981,7 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
         storage.clone(),
         Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
         Arc::clone(&emit),
-        secrets,
+        Arc::clone(&secrets),
         Arc::clone(&sensors),
     ) {
         Ok(runtime) => Some(runtime),
@@ -1002,6 +1002,8 @@ fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
         dispatcher = dispatcher.with_storage(Arc::clone(store));
     }
     if let Some(runtime) = runtime {
+        // MCP Bearer [REDACTED] resolve from the same keychain-backed store.
+        runtime.set_secret_store(Arc::clone(&secrets));
         // Durable memory beside state.db; an unopenable file falls
         // back to the runtime's isolated in-memory store (logged).
         let memory_path = storage_core::default_state_dir("utsuwa").join("memory.db");

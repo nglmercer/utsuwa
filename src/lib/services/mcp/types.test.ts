@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseMcpServerConfigs, McpError } from './types.ts';
+import { parseMcpServerConfigs, McpError, toRustMcpConfig, fromRustMcpConfigs } from './types.ts';
 
 test('valid http and stdio servers parse with trimmed ids', () => {
 	const { servers, dropped } = parseMcpServerConfigs([
@@ -41,4 +41,60 @@ test('McpError carries server id and kind without secrets', () => {
 	assert.equal(error.status, 500);
 	assert.equal(error.rpcCode, -32603);
 	assert.ok(!error.message.includes('tok'));
+});
+
+test('toRustMcpConfig emits the canonical Rust shape without tokens', () => {
+	const http = toRustMcpConfig({
+		transport: 'http',
+		id: 'ha',
+		name: 'Home',
+		url: 'https://ha.example.com/mcp',
+		bearerToken: 'secret',
+		enabled: true
+	});
+	assert.deepEqual(http, {
+		id: 'ha',
+		name: 'Home',
+		enabled: true,
+		trust: 'Untrusted',
+		transport: { type: 'http', url: 'https://ha.example.com/mcp' }
+	});
+	const stdio = toRustMcpConfig({
+		transport: 'stdio',
+		id: 'fs',
+		command: 'npx',
+		args: ['-y', 'x'],
+		env: { A: 'b' },
+		enabled: false
+	});
+	assert.deepEqual(stdio, {
+		id: 'fs',
+		enabled: false,
+		trust: 'Untrusted',
+		transport: { type: 'stdio', command: 'npx', args: ['-y', 'x'], extra_env: { A: 'b' } }
+	});
+});
+
+test('fromRustMcpConfigs parses canonical Rust configs and drops malformed rows', () => {
+	const { servers, dropped } = fromRustMcpConfigs([
+		{ id: 'ha', name: 'Home', transport: { type: 'http', url: 'https://x/mcp' }, enabled: true },
+		{ id: 'fs', transport: { type: 'stdio', command: 'npx' }, enabled: false },
+		{ id: 'bad id!', transport: { type: 'http', url: 'https://x' } },
+		{ id: 'nope', transport: { type: 'websocket' } },
+		null
+	]);
+	assert.equal(servers.length, 2);
+	assert.equal(servers[0].transport, 'http');
+	assert.equal(servers[1].transport, 'stdio');
+	assert.equal(servers[1].enabled, false);
+	assert.equal(dropped.length, 3);
+});
+
+test('Rust translators round-trip', () => {
+	const { servers } = fromRustMcpConfigs([
+		toRustMcpConfig({ transport: 'http', id: 'a', url: 'https://x/mcp', enabled: true }),
+		toRustMcpConfig({ transport: 'stdio', id: 'b', command: 'uvx', enabled: true })
+	]);
+	assert.equal(servers.length, 2);
+	assert.deepEqual(toRustMcpConfig(servers[0]).transport, { type: 'http', url: 'https://x/mcp' });
 });

@@ -1,3 +1,5 @@
+// WEB-ONLY EXECUTION — never import from native code paths. Native MCP runs in
+// Rust (crates/mcp-runtime); this module serves web chat + SvelteKit routes only.
 /** SSE (text/event-stream) response parsing for Streamable HTTP MCP servers.
  * Pure string parsing: the caller feeds the full response text (servers
  * answer POSTs with a bounded event sequence, then close).

@@ -5,8 +5,8 @@
  * when a redirect crosses origins. Non-GET-preserving redirects (301/302/303)
  * downgrade to GET per fetch semantics; 307/308 replay method and body.
  */
-import { assertSafeMcpUrl, type HostResolver } from '../../../lib/services/mcp/ssrf-guard.ts';
-import type { FetchImpl } from '../../../lib/services/mcp/http-client.ts';
+import { assertSafeMcpUrl, type HostResolver } from '../../../lib/services/web/mcp/ssrf-guard.ts';
+import type { FetchImpl } from '../../../lib/services/web/mcp/http-client.ts';
 
 const MAX_REDIRECTS = 3;
 

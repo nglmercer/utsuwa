@@ -9,7 +9,7 @@ import {
 	parseMcpServerConfigs,
 	type McpServerConfig
 } from '../../../../lib/services/mcp/types.ts';
-import { McpHttpClient } from '../../../../lib/services/mcp/http-client.ts';
+import { McpHttpClient } from '../../../../lib/services/web/mcp/http-client.ts';
 
 function singleServer(body: Record<string, unknown>): McpServerConfig {
 	const { servers, dropped } = parseMcpServerConfigs([body.server]);

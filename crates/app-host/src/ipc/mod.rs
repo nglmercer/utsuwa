@@ -9,6 +9,7 @@ pub mod agent;
 pub mod audio;
 pub mod desktop;
 pub mod dispatcher;
+pub mod mcp;
 pub mod permissions;
 pub mod plugins;
 pub mod providers;

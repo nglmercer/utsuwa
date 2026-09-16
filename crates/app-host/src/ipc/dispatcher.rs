@@ -192,19 +192,19 @@ impl Dispatcher {
         // without a reply means the handler wedged the calling thread).
         tracing::debug!(method = ?request.method, id = %request.id, "webview.ipc.request");
 
-        if request.method == IpcMethod::ProvidersFetchModels {
+        if runs_on_dedicated_worker(&request.method) {
             let dispatcher = self.clone();
             let reply_id = request.id.clone();
             let method = request.method.clone();
             // Run off the UI/IPC callback thread on a dedicated worker so a
-            // slow provider cannot freeze the app. The worker is a plain OS
-            // thread outside every Tokio runtime, so entering an executor
-            // here can never nest inside a Tokio worker.
+            // slow provider (or MCP server) cannot freeze the app. The worker
+            // is a plain OS thread outside every Tokio runtime, so entering
+            // an executor here can never nest inside a Tokio worker.
             std::thread::spawn(move || {
                 let started = std::time::Instant::now();
                 let owned = request;
                 let result = dispatcher.block_on_async(move |dispatcher| async move {
-                    dispatcher.fetch_provider_models(&owned).await
+                    dispatcher.dispatch_async(&owned).await
                 });
                 tracing::debug!(
                     method = ?method,
@@ -287,6 +287,9 @@ impl Dispatcher {
     pub async fn dispatch_async(&self, request: &IpcRequest) -> Result<Value, IpcErrorBody> {
         match request.method {
             IpcMethod::ProvidersFetchModels => self.fetch_provider_models(request).await,
+            IpcMethod::McpStatus => self.mcp_status().await,
+            IpcMethod::McpConnect => self.mcp_connect(request).await,
+            IpcMethod::McpSetServerToken => self.mcp_set_server_token(request).await,
             _ => self.dispatch(request),
         }
     }
@@ -356,6 +359,12 @@ impl Dispatcher {
                 code: ipc_core::ErrorCode::Internal,
                 message: "providers.fetch_models must be dispatched asynchronously".to_string(),
             }),
+            IpcMethod::McpStatus | IpcMethod::McpConnect | IpcMethod::McpSetServerToken => {
+                Err(IpcErrorBody {
+                    code: ipc_core::ErrorCode::Internal,
+                    message: "mcp.* methods must be dispatched asynchronously".to_string(),
+                })
+            }
             IpcMethod::AudioCaptureStart => self.audio_capture_start(request),
             IpcMethod::AudioCaptureStop => self.audio_capture_stop(),
             IpcMethod::AudioCaptureCancel => self.audio_capture_cancel(),
@@ -463,6 +472,19 @@ fn diagnostics_priority() -> bool {
 /// portal approvals) and therefore always dispatch on a worker thread,
 /// never on the UI/IPC callback thread. Everything else is in-memory or
 /// local-file fast and stays inline.
+/// Methods that await the agent worker or perform network I/O. They run
+/// on a dedicated OS thread (never the UI/IPC callback thread) and go
+/// through [`Dispatcher::dispatch_async`].
+fn runs_on_dedicated_worker(method: &IpcMethod) -> bool {
+    matches!(
+        method,
+        IpcMethod::ProvidersFetchModels
+            | IpcMethod::McpStatus
+            | IpcMethod::McpConnect
+            | IpcMethod::McpSetServerToken
+    )
+}
+
 fn runs_off_ui_thread(method: &IpcMethod) -> bool {
     matches!(
         method,
@@ -1307,6 +1329,96 @@ mod tests {
             .handle_message(r#"{"id":"72","method":"host.frontend_ready","params":{}}"#)
             .unwrap();
         assert!(script.contains("__resolve(\"72\", true"), "{script}");
+    }
+
+    fn mcp_test_dispatcher() -> Dispatcher {
+        let secrets: std::sync::Arc<dyn secret_core::SecretStore> =
+            std::sync::Arc::new(secret_core::MemoryStore::default());
+        Dispatcher::new("0.1.0")
+            .with_secret_store(secrets)
+            .with_agent(stub_runtime())
+    }
+
+    fn no_store_test_dispatcher() -> Dispatcher {
+        Dispatcher::new("0.1.0").with_agent(stub_runtime())
+    }
+
+    fn dispatch_async_blocking(
+        dispatcher: &Dispatcher,
+        raw: &str,
+    ) -> Result<serde_json::Value, String> {
+        let body = crate::ipc::dispatcher::raw_body(raw);
+        let request = ipc_core::IpcRequest::parse(&body).map_err(|e| e.to_string())?;
+        dispatcher
+            .block_on_async(
+                move |dispatcher| async move { dispatcher.dispatch_async(&request).await },
+            )
+            .map_err(|e| e.message)
+    }
+
+    #[test]
+    fn mcp_token_round_trip_and_status_flag() {
+        let dispatcher = mcp_test_dispatcher();
+
+        // Status with no servers is an empty array.
+        let status = dispatch_async_blocking(
+            &dispatcher,
+            r#"{"id":"80","method":"mcp.status","params":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(status, serde_json::json!([]));
+
+        // Store a token: write-only receipt, never the token.
+        let receipt = dispatch_async_blocking(
+            &dispatcher,
+            r#"{"id":"81","method":"mcp.set_server_token","params":{"id":"ha","token":"s3cr3t"}}"#,
+        )
+        .unwrap();
+        assert_eq!(receipt, serde_json::json!({"ok": true, "has_token": true}));
+
+        // Invalid ids and missing secrets are rejected, not stored.
+        let bad = dispatch_async_blocking(
+            &dispatcher,
+            r#"{"id":"82","method":"mcp.set_server_token","params":{"id":"bad id!","token":"x"}}"#,
+        )
+        .unwrap_err();
+        assert!(bad.contains("valid 'id'"), "{bad}");
+        let no_store = no_store_test_dispatcher();
+        let missing = dispatch_async_blocking(
+            &no_store,
+            r#"{"id":"83","method":"mcp.set_server_token","params":{"id":"ha","token":"x"}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            missing.contains("secret store is not attached"),
+            "{missing}"
+        );
+
+        // Empty token deletes.
+        let cleared = dispatch_async_blocking(
+            &dispatcher,
+            r#"{"id":"84","method":"mcp.set_server_token","params":{"id":"ha","token":""}}"#,
+        )
+        .unwrap();
+        assert_eq!(cleared, serde_json::json!({"ok": true, "has_token": false}));
+    }
+
+    #[test]
+    fn mcp_connect_validates_and_reports_unknown() {
+        let dispatcher = mcp_test_dispatcher();
+        let bad = dispatch_async_blocking(
+            &dispatcher,
+            r#"{"id":"85","method":"mcp.connect","params":{"id":""}}"#,
+        )
+        .unwrap_err();
+        assert!(bad.contains("valid 'id'"), "{bad}");
+
+        let unknown = dispatch_async_blocking(
+            &dispatcher,
+            r#"{"id":"86","method":"mcp.connect","params":{"id":"ghost"}}"#,
+        )
+        .unwrap_err();
+        assert!(unknown.contains("unknown MCP server"), "{unknown}");
     }
 
     #[test]

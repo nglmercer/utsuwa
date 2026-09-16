@@ -1,3 +1,5 @@
+// WEB-ONLY EXECUTION — never import from native code paths. Native MCP runs in
+// Rust (crates/mcp-runtime); this module serves web chat + SvelteKit routes only.
 /** Minimal JSON-RPC 2.0 framing for MCP. Pure: no I/O, no env access. */
 
 export interface JsonRpcRequest {

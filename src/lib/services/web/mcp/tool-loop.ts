@@ -1,3 +1,5 @@
+// WEB-ONLY EXECUTION — never import from native code paths. Native MCP runs in
+// Rust (crates/mcp-runtime); this module serves web chat + SvelteKit routes only.
 /** Provider-agnostic MCP tool loop for web chat turns.
  *
  * `runMcpToolLoop` drives up to `MCP_TOOL_LOOP_MAX_ROUNDS` model→tools→model

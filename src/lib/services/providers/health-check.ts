@@ -1,11 +1,6 @@
-import {
-	getChatBaseUrl,
-	getLMStudioApiBaseUrl,
-	getModelsBaseUrl,
-	getTTSBaseUrl,
-	isLocalLLMProvider
-} from './local-endpoints.ts';
-import { parseLMStudioModelCapabilities, type ModelInfo, type ToolCallingSupport } from './model-capabilities.ts';
+import { getChatBaseUrl, getTTSBaseUrl, isLocalLLMProvider } from './local-endpoints.ts';
+import type { ToolCallingSupport } from './model-capabilities.ts';
+import { fetchModelsDirect } from './client-models.ts';
 
 export type HealthStatus = 'unknown' | 'healthy' | 'unhealthy';
 
@@ -98,92 +93,32 @@ function safeProviderAddress(baseUrl: string): string {
 	}
 }
 
-function modelRecords(providerId: string, data: unknown): ModelInfo[] {
-	if (!data || typeof data !== 'object') return [];
-	const value = data as Record<string, unknown>;
-	const records = Array.isArray(value.models)
-		? value.models
-		: Array.isArray(value.data)
-			? value.data
-			: [];
-	return records
-		.filter((record): record is Record<string, unknown> => {
-			if (!record || typeof record !== 'object') return false;
-			if (providerId !== 'lmstudio') return true;
-			const type = (record as Record<string, unknown>).type;
-			return type === undefined || type === 'llm' || type === 'vlm';
-		})
-		.map((record) => {
-			const id =
-				typeof record.key === 'string'
-					? record.key
-					: typeof record.name === 'string'
-						? record.name
-						: typeof record.id === 'string'
-							? record.id
-							: '';
-			const capabilities =
-				providerId === 'lmstudio'
-					? parseLMStudioModelCapabilities(record)
-					: { toolCalling: true, toolCallingSupport: 'compatible' as const };
-			return {
-				id,
-				name:
-					typeof record.display_name === 'string'
-						? record.display_name
-						: typeof record.name === 'string'
-							? record.name
-							: id,
-				capabilities
-			};
-		})
-		.filter((model) => model.id.length > 0);
-}
-
-async function fetchLLMModelList(
+/**
+ * Model discovery for health checks, bounded by the health timeout. Discovery
+ * routes through the native host on desktop builds, so health checks never
+ * call provider APIs directly from the WebView.
+ */
+function fetchModelsDirectWithTimeout(
 	providerId: string,
 	apiKey: string | undefined,
-	baseUrl: string,
-	signal: AbortSignal
-): Promise<{ models: ModelInfo[]; endpointUrl: string }> {
-	const headers: Record<string, string> = {};
-	if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-	const cleanBase = providerId === 'ollama' || providerId === 'lmstudio'
-		? getModelsBaseUrl(providerId, baseUrl)
-		: getChatBaseUrl(providerId, baseUrl);
-	const urls =
-		providerId === 'lmstudio'
-			? [
-					`${getLMStudioApiBaseUrl(baseUrl)}/api/v1/models`,
-					`${getLMStudioApiBaseUrl(baseUrl)}/api/v0/models`,
-					`${cleanBase}/models`
-				]
-			: providerId === 'ollama'
-				? [`${cleanBase}/api/tags`]
-				: [`${cleanBase}/models`];
-
-	let lastResponse: Response | undefined;
-	for (const url of urls) {
-		const response = await fetch(url, { headers, signal });
-		lastResponse = response;
-		if (response.ok) {
-			try {
-				return { models: modelRecords(providerId, await response.json()), endpointUrl: url };
-			} catch {
-				throw new ProviderHealthCheckError('provider returned invalid model metadata', true, false, response.status);
+	baseUrl: string
+): Promise<Awaited<ReturnType<typeof fetchModelsDirect>>> {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(
+			() => reject(new Error('Connection test timed out.')),
+			HEALTH_CHECK_TIMEOUT_MS
+		);
+		fetchModelsDirect(providerId, apiKey, baseUrl).then(
+			(value) => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(reason) => {
+				clearTimeout(timer);
+				reject(reason);
 			}
-		}
-		if (providerId !== 'lmstudio' || response.status !== 404) break;
-	}
-	if (lastResponse?.status === 404) {
-		throw new ProviderHealthCheckError('model-list endpoint was not found', true, false, 404);
-	}
-	throw new ProviderHealthCheckError(
-		`provider returned HTTP ${lastResponse?.status ?? 'unknown'}`,
-		true,
-		false,
-		lastResponse?.status
-	);
+		);
+	});
 }
 
 export function getLLMProviderHealth(
@@ -217,14 +152,18 @@ export async function checkLLMProviderHealth(
 		return result;
 	}
 
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
 	let result: ProviderHealth;
 	try {
 		const configuredBase = baseUrl || (providerId === 'lmstudio' ? 'http://localhost:1234' : providerId === 'ollama' ? 'http://localhost:11434' : '');
 		if (!configuredBase) throw new Error('Enter a provider base URL first.');
-		const response = await fetchLLMModelList(providerId, apiKey, configuredBase, controller.signal);
-		const selected = response.models.find((item) => item.id === model);
+		const catalog = await fetchModelsDirectWithTimeout(providerId, apiKey, configuredBase);
+		if (catalog.error) {
+			// A status means the provider answered; without one the host was
+			// never reached, which keeps the "could not reach" wording below.
+			if (catalog.status === undefined) throw new Error(catalog.error);
+			throw new ProviderHealthCheckError(catalog.error, true, false, catalog.status);
+		}
+		const selected = catalog.models.find((item) => item.id === model);
 		result = {
 			reachable: true,
 			endpointValid: true,
@@ -261,8 +200,6 @@ export async function checkLLMProviderHealth(
 					? `Could not reach Ollama at ${address}. Make sure it is running with "ollama serve".`
 					: `Could not reach the provider at ${address}: ${message}`)
 		};
-	} finally {
-		clearTimeout(timeout);
 	}
 
 	llmHealthState.set(key, { result, checkedAt: Date.now() });

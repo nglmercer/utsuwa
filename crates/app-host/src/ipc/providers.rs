@@ -36,14 +36,16 @@ impl Dispatcher {
         let base_url = validate_provider_base_url(base_url)?;
 
         // A supplied key is an explicit per-request override. When omitted,
-        // use the native keychain value without ever sending it back to the
-        // WebView. An explicit blank key means anonymous access.
+        // only Kilo resolves the native keychain value (without ever sending
+        // it back to the WebView); every other provider stays anonymous so a
+        // stored key is never attached to the wrong endpoint. An explicit
+        // blank key means anonymous access.
         let api_key = if let Some(value) = request.params.get("api_key") {
             let value = value.as_str().ok_or_else(|| {
                 invalid_params("providers.fetch_models 'api_key' must be a string")
             })?;
             normalize_api_key(value)
-        } else {
+        } else if provider == "kilo" {
             // The secret store is synchronous OS IPC (on Linux it enters a
             // nested runtime), so it must never run on this async worker.
             // Read it on the blocking pool; a failed read falls back to an
@@ -63,6 +65,8 @@ impl Dispatcher {
                 }),
             };
             stored.and_then(|key| normalize_api_key(&key))
+        } else {
+            None
         };
 
         tracing::debug!(
@@ -73,13 +77,31 @@ impl Dispatcher {
         );
 
         let authenticated = api_key.is_some();
-        let catalog = OpenAICompatibleClient::new(base_url, api_key, "")
-            .fetch_models()
-            .await
-            .map_err(|error| IpcErrorBody {
-                code: ErrorCode::Internal,
-                message: error.to_string(),
-            })?;
+        let client = OpenAICompatibleClient::new(base_url, api_key, "");
+        // Provider-specific catalog endpoints mirror the frontend's direct
+        // fetch table (client-models.ts): same paths, same headers, same
+        // envelope expectations. The frontend keeps parsing/classifying.
+        let catalog = match provider {
+            "anthropic" => client.fetch_anthropic_models().await,
+            "ollama" => client.fetch_ollama_tags().await,
+            "lmstudio" => client.fetch_lmstudio_models().await,
+            "google" => client.fetch_google_models().await,
+            "elevenlabs" => client.fetch_elevenlabs_models().await,
+            "openai" | "deepseek" | "xai" | "kilo" | "openai-tts" => client.fetch_models().await,
+            "openai-compatible" if looks_like_ollama(client.base_url()) => {
+                client.fetch_ollama_tags().await
+            }
+            "openai-compatible" => client.fetch_models().await,
+            _ => {
+                return Err(invalid_params(format!(
+                    "providers.fetch_models unknown provider '{provider}'"
+                )))
+            }
+        }
+        .map_err(|error| IpcErrorBody {
+            code: ErrorCode::Internal,
+            message: error.to_string(),
+        })?;
 
         // Keep the key-use bit explicit because the frontend intentionally
         // does not hydrate keychain credentials into WebView memory. That
@@ -95,6 +117,17 @@ impl Dispatcher {
 fn normalize_api_key(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// A default local Ollama reached through the generic OpenAI-compatible
+/// provider: its model list lives at `/api/tags`. Mirrors the frontend's
+/// `looksLikeOllama` (local-endpoints.ts); keep the two in sync.
+fn looks_like_ollama(base_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(base_url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    (host == "localhost" || host == "127.0.0.1") && url.port() == Some(11434)
 }
 
 fn validate_provider_value(value: &str, name: &str) -> Result<(), IpcErrorBody> {

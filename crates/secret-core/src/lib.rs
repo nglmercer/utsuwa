@@ -72,7 +72,11 @@ where
         .spawn(op)
         .map_err(|error| SecretError::Backend(format!("keyring thread: {error}")))?
         .join()
-        .unwrap_or_else(|_| Err(SecretError::Backend("keyring operation panicked".to_string())))
+        .unwrap_or_else(|_| {
+            Err(SecretError::Backend(
+                "keyring operation panicked".to_string(),
+            ))
+        })
 }
 
 impl KeyringStore {

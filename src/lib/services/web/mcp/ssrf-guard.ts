@@ -1,3 +1,5 @@
+// WEB-ONLY EXECUTION — never import from native code paths. Native MCP runs in
+// Rust (crates/mcp-runtime); this module serves web chat + SvelteKit routes only.
 /** Server-side SSRF guard for the MCP proxy.
  *
  * Policy (narrower than the provider-URL guard on purpose): link-local,
@@ -11,7 +13,7 @@
  * tests and shared code stay portable. The node-backed resolver lives in
  * the server-only `src/routes/api/mcp/dns` module.
  */
-import { ipv4ToInt } from '../providers/url-guard.ts';
+import { ipv4ToInt } from '../../providers/url-guard.ts';
 
 /** Strip IPv6 brackets and any `%zone` suffix, lowercase. */
 function normalizeHost(hostname: string): string {

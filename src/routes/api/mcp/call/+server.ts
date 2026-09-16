@@ -10,7 +10,7 @@ import {
 	type McpServerConfig,
 	type McpToolResult
 } from '../../../../lib/services/mcp/types.ts';
-import { McpHttpClient } from '../../../../lib/services/mcp/http-client.ts';
+import { McpHttpClient } from '../../../../lib/services/web/mcp/http-client.ts';
 
 /** Cap on proxied tool arguments (JSON-encoded) per call. */
 const MAX_ARGUMENTS_BYTES = 64 * 1024;

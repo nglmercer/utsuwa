@@ -14,52 +14,14 @@ import {
 	fetchOpenAICompatibleModels,
 	hasApiKey
 } from '$lib/services/providers/openai-compatible';
+import {
+	applyChatModelFilter,
+	normalizeModelName
+} from '$lib/services/providers/model-parsers';
 
 interface FetchModelsResponse {
 	models: ModelInfo[];
 	error?: string;
-}
-
-// Model filter patterns - only keep chat-compatible models
-// Note: Google IDs have 'models/' prefix stripped before filtering
-const MODEL_FILTERS: Record<string, RegExp> = {
-	openai: /^(gpt-|o1-|o3-|chatgpt-4o-)/,
-	anthropic: /^claude-/,
-	deepseek: /^deepseek-(chat|reasoner)/,
-	xai: /^grok-/,
-	google: /^gemini-/
-};
-
-function filterModels(providerId: string, models: ModelInfo[]): ModelInfo[] {
-	const filter = MODEL_FILTERS[providerId];
-	if (!filter) return models; // No filter = keep all (Ollama, LM Studio, openai-compatible)
-	return models.filter((m) => filter.test(m.id));
-}
-
-function normalizeModelName(id: string, providerId: string): string {
-	let name = id;
-
-	// Remove 'models/' prefix from Google
-	if (providerId === 'google' && name.startsWith('models/')) {
-		name = name.replace('models/', '');
-	}
-
-	// Strip date suffixes from Anthropic models (e.g., -20251101)
-	if (providerId === 'anthropic') {
-		name = name.replace(/-\d{8}$/, '');
-		// Convert version like "opus-4-5" to "opus-4.5" (match version after model tier)
-		name = name.replace(/(opus|sonnet|haiku)-(\d+)-(\d+)$/, '$1-$2.$3');
-	}
-
-	// Capitalize and format common patterns
-	name = name
-		.replace(/-/g, ' ')
-		.replace(/\b\w/g, (c) => c.toUpperCase())
-		.replace(/Gpt/g, 'GPT')
-		.replace(/O1/g, 'o1')
-		.replace(/O3/g, 'o3');
-
-	return name;
 }
 
 async function fetchOpenAIModels(
@@ -314,7 +276,7 @@ export const POST: RequestHandler = async ({ request }) => {
 		}
 
 		// Filter to chat-compatible models
-		const filteredModels = filterModels(providerId, models);
+		const filteredModels = applyChatModelFilter(models, providerId);
 
 		return Response.json({ models: filteredModels } as FetchModelsResponse);
 	} catch (error) {

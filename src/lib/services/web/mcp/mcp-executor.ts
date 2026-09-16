@@ -1,14 +1,14 @@
-/** Executes MCP tools for the companion chat loop, either directly (desktop
- * builds talk to HTTP MCP servers from the webview) or through the same-origin
- * `/api/mcp` proxy (web builds).
- *
- * Responsibilities: per-server client/session caching, model-facing tool
- * naming (`<server>__<tool>`), the 8000-char result cap, and the
- * never-auto-execute confirm list. Transport and protocol errors surface per
- * server id so the Settings UI and the chat loop can report them precisely.
+// WEB-ONLY EXECUTION — never import from native code paths. Native MCP runs in
+// Rust (crates/mcp-runtime); this module serves web chat + SvelteKit routes only.
+/** Executes MCP tools for the companion chat loop through the same-origin
+ * `/api/mcp` proxy. All MCP transport lives server-side; the executor only
+ * owns per-server session caching, model-facing tool naming
+ * (`<server>__<tool>`), the 8000-char result cap, and the never-auto-execute
+ * confirm list. Transport and protocol errors surface per server id so the
+ * Settings UI and the chat loop can report them precisely.
  */
-import { McpHttpClient, type FetchImpl } from './http-client.ts';
-import { McpError, type McpServerConfig, type McpToolDef, type McpToolResult } from './types.ts';
+import type { FetchImpl } from './http-client.ts';
+import { McpError, type McpServerConfig, type McpToolDef, type McpToolResult } from '../../mcp/types.ts';
 
 export const MAX_TOOL_RESULT_CHARS = 8000;
 
@@ -58,17 +58,13 @@ export function capResultText(text: string, maxChars: number = MAX_TOOL_RESULT_C
 	return `${text.slice(0, maxChars)}…[truncated to ${maxChars} chars]`;
 }
 
-export type McpExecutorMode = 'direct' | 'proxy';
-
 export interface McpExecutorOptions {
-	mode: McpExecutorMode;
-	/** Used for proxy POSTs (and direct clients when provided, e.g. tests). */
+	/** Used for proxy POSTs (tests inject a stub). */
 	fetchImpl?: FetchImpl;
 	/** Same-origin prefix for proxy routes (default ''). */
 	proxyBase?: string;
 	/** Full (`server__tool`) or bare tool names that are never auto-executed. */
 	confirmTools?: string[];
-	toolTimeoutMs?: number;
 }
 
 interface ResolvedTool {
@@ -80,7 +76,6 @@ interface ResolvedTool {
 export class McpToolExecutor {
 	private readonly servers: McpServerConfig[];
 	private readonly options: McpExecutorOptions;
-	private readonly directClients = new Map<string, McpHttpClient>();
 	private readonly proxySessions = new Map<string, string>();
 	private readonly resolved = new Map<string, ResolvedTool>();
 	private readonly serverErrors = new Map<string, string>();
@@ -114,12 +109,8 @@ export class McpToolExecutor {
 		this.resolved.clear();
 		for (const server of this.servers) {
 			if (!server.enabled) continue;
-			if (server.transport === 'stdio' && this.options.mode === 'direct') {
-				this.noteError(server.id, 'stdio servers need the web proxy (unavailable in this build)');
-				continue;
-			}
 			try {
-				const tools = this.options.mode === 'direct' ? await this.listDirect(server) : await this.listViaProxy(server);
+				const tools = await this.listViaProxy(server);
 				this.clearError(server.id);
 				for (const tool of tools) {
 					const fullName = joinToolName(server.id, tool.name);
@@ -139,23 +130,6 @@ export class McpToolExecutor {
 			}
 		}
 		return definitions;
-	}
-
-	private directClient(serverId: string): McpHttpClient | undefined {
-		return this.directClients.get(serverId);
-	}
-
-	private async listDirect(server: McpServerConfig): Promise<McpToolDef[]> {
-		if (server.transport !== 'http') throw new McpError(server.id, 'unavailable', 'stdio is unavailable for direct calls');
-		let client = this.directClient(server.id);
-		if (!client) {
-			client = new McpHttpClient(server, {
-				...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {}),
-				...(this.options.toolTimeoutMs !== undefined ? { timeoutMs: this.options.toolTimeoutMs } : {})
-			});
-			this.directClients.set(server.id, client);
-		}
-		return client.listTools();
 	}
 
 	private async proxyPost<T>(path: string, payload: Record<string, unknown>): Promise<T> {
@@ -211,10 +185,7 @@ export class McpToolExecutor {
 		const server = this.servers.find((s) => s.id === resolved.serverId);
 		if (!server || !server.enabled) return `Tool '${fullName}' is no longer available.`;
 		try {
-			const result =
-				this.options.mode === 'direct'
-					? await this.callDirect(server, resolved.serverTool, args)
-					: await this.callViaProxy(server, resolved.serverTool, args);
+			const result = await this.callViaProxy(server, resolved.serverTool, args);
 			this.clearError(server.id);
 			return capResultText(toolResultToText(result));
 		} catch (error) {
@@ -222,25 +193,6 @@ export class McpToolExecutor {
 			const message = error instanceof Error ? error.message : String(error);
 			return `Tool '${fullName}' failed: ${message.slice(0, 500)}`;
 		}
-	}
-
-	private async callDirect(
-		server: McpServerConfig,
-		tool: string,
-		args: Record<string, unknown>
-	): Promise<McpToolResult> {
-		if (server.transport !== 'http') {
-			throw new McpError(server.id, 'unavailable', 'stdio is unavailable for direct calls');
-		}
-		let client = this.directClient(server.id);
-		if (!client) {
-			client = new McpHttpClient(server, {
-				...(this.options.fetchImpl ? { fetchImpl: this.options.fetchImpl } : {}),
-				...(this.options.toolTimeoutMs !== undefined ? { timeoutMs: this.options.toolTimeoutMs } : {})
-			});
-			this.directClients.set(server.id, client);
-		}
-		return client.callTool(tool, args);
 	}
 
 	private async callViaProxy(

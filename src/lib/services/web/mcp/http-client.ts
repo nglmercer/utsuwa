@@ -1,3 +1,5 @@
+// WEB-ONLY EXECUTION — never import from native code paths. Native MCP runs in
+// Rust (crates/mcp-runtime); this module serves web chat + SvelteKit routes only.
 /** Streamable HTTP MCP client (browser- and server-safe: no node builtins).
  *
  * Speaks JSON-RPC over POST with `Accept: application/json, text/event-stream`
@@ -8,7 +10,7 @@
  */
 import { rpcRequest, isRpcResponse, unwrapRpcResult, type JsonRpcResponse } from './jsonrpc.ts';
 import { parseSseJsonPayloads } from './sse.ts';
-import { McpError, type McpHttpServerConfig, type McpToolDef, type McpToolResult } from './types.ts';
+import { McpError, type McpHttpServerConfig, type McpToolDef, type McpToolResult } from '../../mcp/types.ts';
 
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
 const MCP_CLIENT_NAME = 'utsuwa-companion';
