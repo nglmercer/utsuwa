@@ -9,6 +9,8 @@
 	import { goto } from '$app/navigation';
 	import { localPath } from '$lib/config/links';
 	import { AVATAR_ACTIONS, AVATAR_ACTION_NAMES } from '$lib/engine/avatar-actions';
+	import { taskOrchestrator } from '$lib/tasks/browser';
+	import type { DurableTask } from '$lib/tasks/types';
 
 	// Material debug modes from @pixiv/three-vrm-materials-mtoon
 	const materialDebugModes = [
@@ -172,6 +174,56 @@
 
 	function resetAvatarRoot() {
 		vrmStore.requestAvatarAction({ kind: 'reset', action: 'reset' });
+	}
+
+	function runWalkSelfTest() {
+		vrmStore.requestAvatarRoutine(
+			(['left', 'right', 'forward', 'back'] as const).map((direction) => ({
+				kind: 'walk' as const,
+				action: 'walk',
+				direction,
+				durationMs: 1500
+			}))
+		);
+	}
+
+	let taskRows = $state<DurableTask[]>([]);
+	let tasksLoading = $state(false);
+
+	async function refreshTasks() {
+		tasksLoading = true;
+		try {
+			taskRows = await taskOrchestrator.list();
+		} finally {
+			tasksLoading = false;
+		}
+	}
+
+	async function submitWalkCheckTask() {
+		await taskOrchestrator.submit({
+			title: 'Dev walk check',
+			instruction: 'Walk left, right, forward, back to verify locomotion.',
+			priority: 80,
+			steps: [
+				{
+					type: 'avatar_routine',
+					input: {
+						steps: (['left', 'right', 'forward', 'back'] as const).map((direction) => ({
+							kind: 'walk' as const,
+							action: 'walk',
+							direction,
+							durationMs: 1500
+						}))
+					}
+				}
+			]
+		});
+		await refreshTasks();
+	}
+
+	async function cancelTask(id: string) {
+		await taskOrchestrator.cancel(id);
+		await refreshTasks();
 	}
 
 	function actionMeta(name: (typeof AVATAR_ACTION_NAMES)[number]): string {
@@ -419,6 +471,42 @@
 				<button class="event-btn" onclick={stopAvatarAction}>Stop</button>
 				<button class="event-btn" onclick={resetAvatarRoot}>Reset Position</button>
 			</div>
+			<p class="hint">Routine self-test: plays walk L/R/F/B in order with completion tracking.</p>
+			<div class="event-buttons">
+				<button class="event-btn" onclick={runWalkSelfTest}>Run Walk Self-Test</button>
+			</div>
+			{#if vrmStore.lastRoutineResult}
+				<p class="hint">
+					Last routine: {vrmStore.lastRoutineResult.status} ·
+					{vrmStore.lastRoutineResult.completed.join(', ') || 'no steps'} ·
+					{#if vrmStore.lastRoutineResult.endPosition}
+						ended at ({vrmStore.lastRoutineResult.endPosition.x.toFixed(2)},
+						{vrmStore.lastRoutineResult.endPosition.z.toFixed(2)})
+					{/if}
+				</p>
+			{/if}
+			{#if vrmStore.routineLedger.length > 0}
+				<p class="hint">Ledger: {vrmStore.routineLedger.slice(-6).map((e) => `${e.key}=${e.status}`).join(' · ')}</p>
+			{/if}
+		</section>
+
+		<!-- Durable Tasks -->
+		<section class="section">
+			<h3>Durable Tasks</h3>
+			<p class="hint">Orchestrator state (Dexie-backed, survives reload). {tasksLoading ? 'Loading…' : `${taskRows.length} task(s).`}</p>
+			<div class="event-buttons">
+				<button class="event-btn" onclick={refreshTasks}>Refresh</button>
+				<button class="event-btn" onclick={submitWalkCheckTask}>Submit Walk Check Task</button>
+			</div>
+			{#if taskRows.length > 0}
+				<div class="event-buttons">
+					{#each taskRows as task (task.id)}
+						<button class="event-btn" onclick={() => cancelTask(task.id)} title={`${task.instruction} (click to cancel)`}>
+							{task.title} · {task.status}
+						</button>
+					{/each}
+				</div>
+			{/if}
 		</section>
 
 		<!-- Material Debug -->
