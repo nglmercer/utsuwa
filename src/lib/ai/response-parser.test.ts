@@ -273,3 +273,76 @@ test('returns a null expressionCue when the model omits it', () => {
 	const { expressionCue } = parseResponse('Just chatting, no state block at all.');
 	assert.equal(expressionCue, null);
 });
+
+test('parses a gesture_cue emote alongside state updates', () => {
+	const raw = [
+		'Ta-da!',
+		'```json',
+		'{ "mood_change": { "emotion": "excited", "intensity_delta": 5 }, "gesture_cue": { "type": "emote", "id": "vrma_03" } }',
+		'```'
+	].join('\n');
+	const { dialogue, stateUpdates, gestureCue } = parseResponse(raw);
+	assert.equal(dialogue, 'Ta-da!');
+	assert.equal(stateUpdates?.moodChange?.emotion, 'excited');
+	assert.deepEqual(gestureCue, { type: 'emote', id: 'vrma_03' });
+});
+
+test('parses a gesture_cue reaction and normalizes case', () => {
+	const { gestureCue } = parseResponse('Hee!\n{ "gesture_cue": { "type": "Reaction", "zone": " Head " } }');
+	assert.deepEqual(gestureCue, { type: 'reaction', zone: 'head' });
+});
+
+test('drops unknown gesture_cue ids, zones, and shapes', () => {
+	const cases = [
+		'{ "gesture_cue": { "type": "emote", "id": "vrma_99" } }',
+		'{ "gesture_cue": { "type": "emote", "id": "/animations/evil.vrma" } }',
+		'{ "gesture_cue": { "type": "emote" } }',
+		'{ "gesture_cue": { "type": "reaction", "zone": "tail" } }',
+		'{ "gesture_cue": { "type": "reaction" } }',
+		'{ "gesture_cue": { "type": "dance", "id": "vrma_01" } }',
+		'{ "gesture_cue": "vrma_01" }',
+		'{ "gesture_cue": null }'
+	];
+	for (const block of cases) {
+		const { gestureCue, dialogue } = parseResponse(`Hey.\n${block}`);
+		assert.equal(gestureCue, null, block);
+		assert.ok(!dialogue.includes('gesture_cue'), `cue must be stripped from dialogue: ${block}`);
+	}
+});
+
+test('returns a null gestureCue when the model omits it', () => {
+	const { gestureCue } = parseResponse('Just chatting, no state block at all.');
+	assert.equal(gestureCue, null);
+});
+
+test('accepts a custom expression_cue preset from the loaded model', () => {
+	const available = ['happy', 'sad', 'Extra', 'Surprised', 'blink', 'blinkLeft'];
+	const { expressionCue } = parseResponse(
+		'Heh.\n```json\n{ "expression_cue": { "expression": "extra", "intensity": 0.6 } }\n```',
+		'Utsuwa',
+		available
+	);
+	assert.deepEqual(expressionCue, { expression: 'Extra', intensity: 0.6, durationMs: 2000 });
+});
+
+test('rejects protected and unknown expression_cue presets even when listed', () => {
+	const available = ['happy', 'Extra', 'blink', 'blinkLeft', 'jawOpen'];
+	for (const expression of ['blink', 'BlinkLeft', 'JAWOPEN', 'smirk']) {
+		const { expressionCue } = parseResponse(
+			`Hey.\n{ "expression_cue": { "expression": "${expression}" } }`,
+			'Utsuwa',
+			available
+		);
+		assert.equal(expressionCue, null, expression);
+	}
+	// Without the model's list, customs stay rejected but the emotional six pass.
+	assert.equal(
+		parseResponse('Hey.\n{ "expression_cue": { "expression": "Extra" } }').expressionCue,
+		null
+	);
+	assert.deepEqual(parseResponse('Hey.\n{ "expression_cue": { "expression": "Happy" } }', 'Utsuwa', []).expressionCue, {
+		expression: 'happy',
+		intensity: 0.8,
+		durationMs: 2000
+	});
+});

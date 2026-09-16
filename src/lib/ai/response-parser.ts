@@ -1,24 +1,33 @@
 import type { StateUpdates, Emotion } from '$lib/types/character';
+import type { TouchZone } from '../engine/photo-reactions.ts';
 import {
 	clamp01,
 	isEmotionalExpression,
-	type EmotionalExpression
+	isProtectedChannel
 } from '../engine/facial-expressions.ts';
 
 // A one-shot facial direction from the model ("smile while saying this").
 // Deliberately separate from StateUpdates: it never persists, it just stages
 // a temporary expression that melts back into the mood face.
 export interface ExpressionCue {
-	expression: EmotionalExpression;
+	// Usually one of the emotional six; a model-specific custom preset (e.g.
+	// 'Extra') when the loaded model provides it. Never a protected channel.
+	expression: string;
 	intensity: number;
 	durationMs: number;
 }
+
+// A one-shot body direction from the model ("wave while saying this").
+// Either a named emote clip or a tap-reaction-style body response to a zone.
+// Like ExpressionCue it is staged fire-and-forget and never persisted.
+export type GestureCue = { type: 'emote'; id: string } | { type: 'reaction'; zone: TouchZone };
 
 // Parsed response structure
 export interface ParsedResponse {
 	dialogue: string;
 	stateUpdates: Partial<StateUpdates> | null;
 	expressionCue: ExpressionCue | null;
+	gestureCue: GestureCue | null;
 	parseError?: string;
 }
 
@@ -40,6 +49,11 @@ interface LLMStateOutput {
 		expression?: string;
 		intensity?: number;
 		duration_ms?: number;
+	};
+	gesture_cue?: {
+		type?: string;
+		id?: string;
+		zone?: string;
 	};
 }
 
@@ -129,7 +143,7 @@ function cutHallucinatedTurn(text: string, companionName?: string): string {
 
 // JSON objects we care about carry at least one of these keys.
 const STATE_KEY_RE =
-	/"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|new_memory|expression_cue)"/;
+	/"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|new_memory|expression_cue|gesture_cue)"/;
 
 // Reasoning models (R1-style) emit a scratchpad before the answer. Strip it so
 // the trace never reaches the chat bubble or the JSON parser. Handles the
@@ -199,12 +213,19 @@ function tryParseJson(text: string): LLMStateOutput | null {
 	}
 }
 
-// Parse LLM response to extract dialogue and state updates
-export function parseResponse(rawResponse: string, companionName?: string): ParsedResponse {
+// Parse LLM response to extract dialogue and state updates. `available` is the
+// loaded model's expression preset list: when provided, an expression_cue may
+// also name one of its custom presets (protected channels still rejected).
+export function parseResponse(
+	rawResponse: string,
+	companionName?: string,
+	available?: readonly string[]
+): ParsedResponse {
 	const raw = stripReasoning(rawResponse);
 	let dialogue = raw.trim();
 	let stateUpdates: Partial<StateUpdates> | null = null;
 	let expressionCue: ExpressionCue | null = null;
+	let gestureCue: GestureCue | null = null;
 	let parseError: string | undefined;
 
 	// Prefer a fenced ```json block; otherwise grab the first bare JSON object
@@ -214,7 +235,8 @@ export function parseResponse(rawResponse: string, companionName?: string): Pars
 		const parsed = tryParseJson(fenced[1]);
 		if (parsed) {
 			stateUpdates = convertLLMOutput(parsed);
-			expressionCue = parseExpressionCue(parsed);
+			expressionCue = parseExpressionCue(parsed, available);
+			gestureCue = parseGestureCue(parsed);
 		} else {
 			parseError = 'Failed to parse JSON state block';
 			console.debug('Failed to parse LLM state updates:', fenced[1]);
@@ -226,14 +248,15 @@ export function parseResponse(rawResponse: string, companionName?: string): Pars
 			const parsed = tryParseJson(obj);
 			if (parsed) {
 				stateUpdates = convertLLMOutput(parsed);
-				expressionCue = parseExpressionCue(parsed);
+				expressionCue = parseExpressionCue(parsed, available);
+				gestureCue = parseGestureCue(parsed);
 				dialogue = raw.replace(obj, '').trim();
 			}
 		}
 	}
 
 	dialogue = cleanDialogue(dialogue, companionName);
-	return { dialogue, stateUpdates, expressionCue, parseError };
+	return { dialogue, stateUpdates, expressionCue, gestureCue, parseError };
 }
 
 // Convert LLM output format to our StateUpdates format
@@ -290,14 +313,23 @@ function clampDelta(value: number | undefined, min: number, max: number): number
 	return Math.max(min, Math.min(max, Math.round(value)));
 }
 
-// Validate an optional one-shot facial direction. Unknown expressions are
-// dropped (never persisted anywhere); intensity and duration are clamped to
-// sane stage ranges.
-function parseExpressionCue(output: LLMStateOutput): ExpressionCue | null {
+// Validate an optional one-shot facial direction. The emotional six always
+// pass; anything else must name a preset on the loaded model (matched
+// case-insensitively, returned in the model's casing for the exact writer)
+// and must never be a protected channel. Unknown expressions are dropped
+// (never persisted anywhere); intensity and duration are clamped to sane
+// stage ranges.
+function parseExpressionCue(output: LLMStateOutput, available?: readonly string[]): ExpressionCue | null {
 	const cue = output.expression_cue;
 	if (!cue || typeof cue !== 'object') return null;
-	const expression = typeof cue.expression === 'string' ? cue.expression.toLowerCase().trim() : '';
-	if (!isEmotionalExpression(expression)) return null;
+	const raw = typeof cue.expression === 'string' ? cue.expression.trim() : '';
+	if (!raw || isProtectedChannel(raw)) return null;
+	let expression = raw.toLowerCase();
+	if (!isEmotionalExpression(expression)) {
+		const match = available?.find((name) => typeof name === 'string' && name.toLowerCase() === expression);
+		if (!match || isProtectedChannel(match)) return null;
+		expression = match;
+	}
 	const durationMs =
 		typeof cue.duration_ms === 'number' && Number.isFinite(cue.duration_ms)
 			? Math.min(6000, Math.max(500, Math.round(cue.duration_ms)))
@@ -309,10 +341,37 @@ function parseExpressionCue(output: LLMStateOutput): ExpressionCue | null {
 	};
 }
 
+// Emote ids the model may address: the VRMA clips shipped in
+// static/animations/ (see vrmStore.availableAnimations). Pinned here instead
+// of imported from the store so this module stays runnable under node tests.
+const GESTURE_EMOTE_IDS = ['vrma_01', 'vrma_02', 'vrma_03', 'vrma_04', 'vrma_05', 'vrma_06', 'vrma_07'];
+
+const GESTURE_ZONES: TouchZone[] = ['head', 'face', 'shoulder', 'torso', 'hip'];
+
+// Validate an optional one-shot body direction. Unknown types, ids, and zones
+// are dropped (never staged anywhere): untrusted model output must not address
+// arbitrary animation files or reaction paths.
+function parseGestureCue(output: LLMStateOutput): GestureCue | null {
+	const cue = output.gesture_cue;
+	if (!cue || typeof cue !== 'object') return null;
+	const type = typeof cue.type === 'string' ? cue.type.toLowerCase().trim() : '';
+	if (type === 'emote') {
+		const id = typeof cue.id === 'string' ? cue.id.toLowerCase().trim() : '';
+		if (!GESTURE_EMOTE_IDS.includes(id)) return null;
+		return { type: 'emote', id };
+	}
+	if (type === 'reaction') {
+		const zone = typeof cue.zone === 'string' ? cue.zone.toLowerCase().trim() : '';
+		if (!(GESTURE_ZONES as readonly string[]).includes(zone)) return null;
+		return { type: 'reaction', zone: zone as TouchZone };
+	}
+	return null;
+}
+
 // Clean up dialogue text
 // State-block markers used to spot a truncated JSON block leaking into dialogue.
 const STATE_BLOCK_START =
-	/\{[^{}]*"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|energy_delta|new_memory|expression_cue)"/i;
+	/\{[^{}]*"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|energy_delta|new_memory|expression_cue|gesture_cue)"/i;
 
 // Cut a trailing state block that was never closed (unterminated ```json fence,
 // or a bare `{...` whose braces never balance) — the mark of a response truncated
@@ -356,7 +415,7 @@ function cleanDialogue(text: string, companionName?: string): string {
 	cleaned = stripTruncatedStateBlock(cleaned);
 
 	// Remove any leftover (closed) JSON-like content
-	cleaned = cleaned.replace(/\{[^}]*"(?:mood|delta|emotion|expression_cue)[^}]*\}/gi, '');
+	cleaned = cleaned.replace(/\{[^}]*"(?:mood|delta|emotion|expression_cue|gesture_cue)[^}]*\}/gi, '');
 
 	// Remove markdown formatting without mistaking the inner pair of a bold
 	// span for an action. The old single-asterisk expression matched the
