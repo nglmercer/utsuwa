@@ -106,6 +106,26 @@ test('busy avatar drops conversational cues but yields to explicit ones', () => 
 	});
 });
 
+test('explicit commands bypass cooldowns, duplicates, and rate limits', () => {
+	const state = createGestureGateState();
+	recordGestureExecution(state, wave, 0);
+	// Same gesture immediately: conversational is a duplicate, explicit passes.
+	assert.deepEqual(evaluateGestureGate(ctxAt(wave, 1000, state)).allowed, false);
+	assert.deepEqual(evaluateGestureGate(ctxAt(wave, 1000, state, { explicitRequest: true })), {
+		allowed: true
+	});
+	// Different gesture inside the global window: same split.
+	assert.deepEqual(evaluateGestureGate(ctxAt(nod, 1000, state)).allowed, false);
+	assert.deepEqual(evaluateGestureGate(ctxAt(nod, 1000, state, { explicitRequest: true })), {
+		allowed: true
+	});
+	// Photo mode still rejects explicit commands.
+	assert.deepEqual(
+		evaluateGestureGate(ctxAt(wave, 1000, state, { motion: 'photo_mode', explicitRequest: true })),
+		{ allowed: false, reason: 'photo-mode' }
+	);
+});
+
 test('rate limit caps automatic gestures per minute', () => {
 	const state = createGestureGateState();
 	// Four well-spaced distinct gestures fill the window.

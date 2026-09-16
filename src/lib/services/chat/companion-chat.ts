@@ -16,7 +16,11 @@ import { personaStore } from '$lib/stores/persona.svelte';
 import { vrmStore } from '$lib/stores/vrm.svelte';
 import { getLLMProvider, getTTSProvider } from '$lib/services/providers/registry';
 import { hasApiKey } from '$lib/services/providers/openai-compatible';
-import { processCompanionTurn, handleDirectAvatarCommand } from '$lib/services/chat/companion-turn';
+import { processCompanionTurn, planStepGestureKeys } from '$lib/services/chat/companion-turn';
+import { parseAvatarCommand, type AvatarCommandPlan } from '$lib/engine/avatar-commands';
+import { runAvatarRoutineAndWait } from '$lib/services/avatar/routine';
+import { photomodeStore } from '$lib/stores/photomode.svelte';
+import type { RoutineResult } from '$lib/stores/vrm.svelte';
 import { retrieveRelevantContext } from '$lib/engine/memory';
 import { buildSystemPrompt, truncateChatHistory, type PromptContext } from '$lib/ai/prompt-builder';
 import { keepImage, type PreparedImage } from '$lib/services/storage/keepsakes';
@@ -175,6 +179,58 @@ export interface SendCompanionMessageOptions {
 	systemEvent?: boolean;
 }
 
+function describeRoutineStep(key: string): string {
+	const [kind, action, direction] = key.split(':');
+	if (kind === 'walk') return `walked ${direction ?? 'forward'}`;
+	if (kind === 'jump') return 'jumped';
+	if (kind === 'emote') return { wave: 'waved', celebrate: 'celebrated', dance: 'danced' }[action] ?? action;
+	const verbs: Record<string, string> = {
+		nod: 'nodded',
+		shake_head: 'shook my head',
+		bow: 'bowed',
+		shrug: 'shrugged'
+	};
+	return verbs[action] ?? key.replaceAll(':', ' ');
+}
+
+// "Done" is generated from the runtime receipt, never predicted: completed
+// only when every expected step completed, partial/failed otherwise.
+function describeRoutineResult(result: RoutineResult): string {
+	if (result.status === 'completed') return 'Done.';
+	if (result.status === 'cancelled') return 'Stopped.';
+	const done = result.completed.map(describeRoutineStep).join(', ');
+	const failed = result.failures.map((f) => describeRoutineStep(f.key)).join(', ');
+	if (result.status === 'timed_out') return `That took too long — I managed ${done || 'nothing'}.`;
+	if (done && failed) return `I ${done}, but ${failed} failed.`;
+	if (failed) return `That didn't work — ${failed} failed.`;
+	return 'Done.';
+}
+
+// Pure physical requests skip the LLM turn: acknowledge, run the routine,
+// then report the authoritative outcome as the assistant reply.
+async function runPureAvatarTurn(
+	plan: AvatarCommandPlan,
+	hooks: CompanionChatHooks
+): Promise<void> {
+	hooks.setTyping(true);
+	chatStore.addMessage('assistant', 'Okay.');
+	if (photomodeStore.active) {
+		chatStore.updateLastMessage("Not while we're taking photos — pose first!");
+		hooks.setTyping(false);
+		return;
+	}
+	try {
+		const result = await runAvatarRoutineAndWait(plan.steps);
+		chatStore.updateLastMessage(`Okay. ${describeRoutineResult(result)}`);
+		hooks.setLatestResponse(describeRoutineResult(result));
+	} catch (e) {
+		console.debug('[AvatarCue] pure-plan routine failed:', e);
+		chatStore.updateLastMessage("Okay. That didn't work.");
+	} finally {
+		hooks.setTyping(false);
+	}
+}
+
 export async function sendCompanionMessage(
 	content: string,
 	images: PreparedImage[],
@@ -208,11 +264,25 @@ export async function sendCompanionMessage(
 	hooks.setPhase?.('remembering');
 	hooks.beforeStream?.();
 
-	// Direct avatar commands ("jump!", "walk left") execute immediately on the
-	// user's text instead of depending on the chat model emitting the right
-	// JSON. The conversational reply still streams normally afterwards.
-	if (!systemEvent) {
-		handleDirectAvatarCommand(content);
+	// Avatar command plans ("jump!", "walk left then right") execute as
+	// routines with authoritative completion. Pure physical requests bypass
+	// the LLM turn entirely; mixed requests run the routine concurrently
+	// while the conversation continues (model duplicates of the handled
+	// plan are correlated out, never re-staged).
+	const avatarPlan =
+		!systemEvent && images.length === 0 ? parseAvatarCommand(content) : null;
+	if (avatarPlan?.pureAvatarCommand) {
+		await runPureAvatarTurn(avatarPlan, hooks);
+		chatStore.setLoading(false);
+		hooks.setTyping(false);
+		return;
+	}
+	let handledAvatarKeys: readonly string[] = [];
+	if (avatarPlan && !photomodeStore.active) {
+		handledAvatarKeys = planStepGestureKeys(avatarPlan);
+		void runAvatarRoutineAndWait(avatarPlan.steps).catch((e) =>
+			console.debug('[AvatarCue] mixed-plan routine failed:', e)
+		);
 	}
 
 	// Only touch relationship-time state once the character has loaded, or an
@@ -356,6 +426,7 @@ export async function sendCompanionMessage(
 		const turn = await processCompanionTurn({
 			userMessage: content,
 			companionResponse: fullContent,
+			handledAvatarKeys,
 			llm: {
 				provider,
 				model: selectedModel,

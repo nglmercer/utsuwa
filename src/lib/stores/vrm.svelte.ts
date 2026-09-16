@@ -46,25 +46,49 @@ export interface RoutineStepInput {
 	url?: string;
 }
 
+export interface AvatarRoutinePolicy {
+	// Stop at the first failed step (default false = halt with partial/failed;
+	// true = run every step and report what survived). Dev diagnostics use true.
+	continueOnFailure?: boolean;
+}
+
 export interface AvatarRoutineRequest {
 	id: string;
 	steps: RoutineStepInput[];
+	policy: AvatarRoutinePolicy;
 	seq: number;
 }
 
+export type RoutineStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+
 export interface RoutineStepResult {
 	routineId: string;
+	stepIndex: number;
 	key: string;
-	status: 'done' | 'dropped' | 'cancelled';
+	status: RoutineStepStatus;
 	reason?: string;
+	startedAt?: number;
+	finishedAt?: number;
 	at: number;
 }
 
+// Routine truth table (decided by the renderer, never predicted):
+// completed = every expected step completed, zero failures.
+// partial    = halted or finished with some steps completed and some failed.
+// failed     = nothing completed, at least one failure (and not cancelled).
+// cancelled  = interrupted by photo/swap/stop/new routine (never a success).
+// timed_out  = halted because a step exceeded its watchdog deadline.
+export type RoutineStatus = 'completed' | 'partial' | 'failed' | 'cancelled' | 'timed_out';
+
 export interface RoutineResult {
 	routineId: string;
-	status: 'done' | 'cancelled';
+	status: RoutineStatus;
+	expected: string[];
 	completed: string[];
-	endPosition?: { x: number; z: number };
+	failures: Array<{ stepIndex: number; key: string; reason: string }>;
+	startedAt: number;
+	finishedAt: number;
+	endPosition?: { x: number; y: number; z: number };
 	at: number;
 	seq: number;
 }
@@ -211,9 +235,9 @@ function createVrmStore() {
 	// reload, but every step lands in the ledger before it is forgotten.
 	let routineRequest = $state<AvatarRoutineRequest | null>(null);
 	let routineSeq = 0;
-	function requestAvatarRoutine(steps: RoutineStepInput[]): string {
+	function requestAvatarRoutine(steps: RoutineStepInput[], policy?: AvatarRoutinePolicy): string {
 		const id = crypto.randomUUID();
-		routineRequest = { id, steps, seq: ++routineSeq };
+		routineRequest = { id, steps, policy: policy ?? {}, seq: ++routineSeq };
 		return id;
 	}
 	let routineLedger = $state<RoutineStepResult[]>([]);
@@ -228,13 +252,27 @@ function createVrmStore() {
 		};
 	}
 	function recordRoutineStep(entry: Omit<RoutineStepResult, 'at'>) {
-		routineLedger = [...routineLedger.slice(-19), { ...entry, at: Date.now() }];
+		// Upsert by (routineId, stepIndex): a step transitions
+		// pending -> running -> completed|failed|cancelled in place.
+		const next = { ...entry, at: Date.now() };
+		const index = routineLedger.findIndex(
+			(e) => e.routineId === next.routineId && e.stepIndex === next.stepIndex
+		);
+		if (index >= 0) {
+			routineLedger = [...routineLedger.slice(0, index), next, ...routineLedger.slice(index + 1)];
+		} else {
+			routineLedger = [...routineLedger.slice(-39), next];
+		}
 	}
 	function recordRoutineResult(input: {
 		routineId: string;
-		status: 'done' | 'cancelled';
+		status: RoutineStatus;
+		expected: string[];
 		completed: string[];
-		endPosition?: { x: number; z: number };
+		failures: Array<{ stepIndex: number; key: string; reason: string }>;
+		startedAt: number;
+		finishedAt: number;
+		endPosition?: { x: number; y: number; z: number };
 	}) {
 		const result: RoutineResult = { ...input, at: Date.now(), seq: ++routineResultSeq };
 		lastRoutineResult = result;

@@ -4,6 +4,17 @@
 // it without drift. The model NEVER addresses animation files directly.
 import type { TouchZone } from './photo-reactions.ts';
 
+// One step of an avatar routine: a procedural bone program, a root-motion
+// jump, a bounded walk, or a VRMA emote clip. Shared by the command parser,
+// the VRM store, and the renderer so all three agree on the shape.
+export interface AvatarRoutineStep {
+	kind: 'procedural' | 'jump' | 'walk' | 'emote';
+	action: string;
+	direction?: LocomotionDirection;
+	durationMs?: number;
+	url?: string;
+}
+
 // A one-shot body direction from the model ("wave while saying this").
 // Semantic actions first; legacy numbered emotes stay parseable for backward
 // compatibility but are never advertised to the model.

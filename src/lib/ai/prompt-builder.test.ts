@@ -412,6 +412,7 @@ test('both modes document gesture_cue in the JSON block', () => {
 		assert.ok(prompt.includes('"type": "reaction"'), appMode);
 		assert.ok(prompt.includes('BODY GESTURE RULES'), appMode);
 		assert.ok(prompt.includes('gesture_cue MUST be null'), appMode);
+		assert.ok(prompt.includes('COMPLETION HONESTY'), appMode);
 		assert.ok(!prompt.includes('vrma_'), `${appMode} must not advertise numbered emotes`);
 	}
 });

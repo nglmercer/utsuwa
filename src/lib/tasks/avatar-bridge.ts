@@ -3,7 +3,7 @@
 // ledger), and the notifier records firings for UI/callbacks. Browser-only:
 // imports the Svelte store, so no node test — covered by typecheck and the
 // dev-tools self-test instead.
-import { vrmStore } from '$lib/stores/vrm.svelte';
+import { runAvatarRoutineAndWait } from '$lib/services/avatar/routine';
 import { routineTimeoutMs } from './executor.ts';
 import { makeEvent, type TaskEventBus } from './events.ts';
 import type { AvatarRoutineRunner, NotificationSink } from './executor.ts';
@@ -12,33 +12,26 @@ import type { AvatarRoutineStepInput, DurableTask, NotificationStepInput } from 
 export function createBrowserAvatarRunner(bus: TaskEventBus): AvatarRoutineRunner {
 	return {
 		run: async (input: AvatarRoutineStepInput) => {
-			const routineId = vrmStore.requestAvatarRoutine(input.steps);
 			// The executor's own timeout fires first on a stuck routine; this
-			// longer bound only guarantees the listener is eventually freed.
-			const bound = routineTimeoutMs(input) + 5000;
-			return new Promise<{ completed: string[]; detail?: unknown }>((resolve, reject) => {
-				const timer = setTimeout(() => {
-					off();
-					reject(new Error(`routine ${routineId} produced no result within ${bound}ms`));
-				}, bound);
-				const off = vrmStore.onRoutineResult((result) => {
-					if (result.routineId !== routineId) return;
-					clearTimeout(timer);
-					off();
-					bus.emit(
-						makeEvent('avatar.completed', Date.now(), {
-							sourceId: routineId,
-							correlationId: routineId,
-							payload: { status: result.status, completed: result.completed }
-						})
-					);
-					if (result.status === 'done') {
-						resolve({ completed: result.completed, detail: { endPosition: result.endPosition } });
-					} else {
-						reject(new Error(`routine ${routineId} was cancelled`));
-					}
-				});
+			// longer bound only guarantees the wait is eventually freed.
+			const result = await runAvatarRoutineAndWait(input.steps, {
+				policy: input.policy,
+				timeoutMs: routineTimeoutMs(input) + 5000
 			});
+			bus.emit(
+				makeEvent('avatar.completed', Date.now(), {
+					sourceId: result.routineId,
+					correlationId: result.routineId,
+					payload: { status: result.status, completed: result.completed }
+				})
+			);
+			if (result.status === 'completed') {
+				return { completed: result.completed, detail: { endPosition: result.endPosition } };
+			}
+			const failures = result.failures.map((f) => `${f.key} (${f.reason})`).join(', ');
+			throw new Error(
+				`routine ${result.routineId} ended ${result.status}: ${failures || 'no steps completed'}`
+			);
 		}
 	};
 }

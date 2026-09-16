@@ -13,7 +13,7 @@ import {
 	gestureKey,
 	recordGestureExecution
 } from '$lib/engine/avatar-action-gate';
-import { detectExplicitAvatarCommand } from '$lib/engine/avatar-commands';
+import type { AvatarCommandPlan } from '$lib/engine/avatar-commands';
 import { calculateBaselineUpdates, analyzeMessage } from '$lib/engine/heuristics';
 import { mergeUpdates, checkAndApplyStageTransition } from '$lib/engine/state-updates';
 import {
@@ -50,6 +50,9 @@ export interface CompanionTurnInput {
 	systemEvent?: boolean;
 	// DEV-only console logging of the raw/parsed model output.
 	debug?: boolean;
+	// Gesture-cue keys already executed locally as an avatar plan this turn.
+	// Model cues matching these are ignored by correlation, not cooldowns.
+	handledAvatarKeys?: readonly string[];
 }
 
 export interface CompanionTurnResult {
@@ -91,8 +94,15 @@ const gestureGateState = createGestureGateState();
 // Stage a one-shot body direction through the runtime gesture gate. The gate
 // (not the model's obedience) enforces cooldowns, duplicates, rate limits,
 // busy/photo guards, and the explicit-request rule for large gestures.
-function fireGestureCue(cue: GestureCue | null, explicitRequest: boolean) {
+// Model cues are always conversational here: direct user commands travel as
+// avatar plans and are correlated out via handledKeys instead of cooldowns.
+function fireGestureCue(cue: GestureCue | null, handledKeys: readonly string[] = []) {
 	if (!cue) return;
+	const key = gestureKey(cue);
+	if (handledKeys.includes(key)) {
+		console.debug('[AvatarCue] skipped: handled-locally', key);
+		return;
+	}
 	try {
 		const gate = evaluateGestureGate({
 			cue,
@@ -100,15 +110,15 @@ function fireGestureCue(cue: GestureCue | null, explicitRequest: boolean) {
 			state: gestureGateState,
 			motion: photomodeStore.active ? 'photo_mode' : 'idle',
 			busy: vrmStore.actionBusy || vrmStore.currentAnimation !== null,
-			explicitRequest
+			explicitRequest: false
 		});
 		if (!gate.allowed) {
-			console.debug(`[AvatarCue] rejected: ${gate.reason}`, gestureKey(cue));
+			console.debug(`[AvatarCue] rejected: ${gate.reason}`, key);
 			return;
 		}
 		stageGestureCue(cue);
 		recordGestureExecution(gestureGateState, cue, Date.now());
-		console.debug('[AvatarCue] accepted', gestureKey(cue));
+		console.debug('[AvatarCue] accepted', key);
 	} catch (e) {
 		console.debug('[AvatarCue] failed to stage cue:', e);
 	}
@@ -150,27 +160,15 @@ function stageGestureCue(cue: GestureCue) {
 	}
 }
 
-// A model cue counts as explicit only when the user actually asked for that
-// same action this turn ("jump" + wave cue stays an ordinary gated cue).
-function cueMatchesExplicitCommand(cue: GestureCue, userMessage: string): boolean {
-	const direct = detectExplicitAvatarCommand(userMessage);
-	if (!direct) return false;
-	if (direct.type !== cue.type) return false;
-	if (direct.type === 'animation' && cue.type === 'animation') return direct.action === cue.action;
-	if (direct.type === 'locomotion' && cue.type === 'locomotion') {
-		return direct.action === cue.action && direct.direction === cue.direction;
-	}
-	return false;
-}
-
-// Handle a direct avatar command in the user's message ("jump!", "walk
-// left") immediately, without depending on the chat model emitting the right
-// JSON. Returns true when a command was detected (staged or gate-rejected).
-export function handleDirectAvatarCommand(userMessage: string): boolean {
-	const cue = detectExplicitAvatarCommand(userMessage);
-	if (!cue) return false;
-	fireGestureCue(cue, true);
-	return true;
+// Translate a locally executed avatar plan into gesture-cue keys so a late
+// model cue for the same requested action is ignored by correlation (not by
+// elapsed-time cooldowns, which cannot span a slow model round-trip).
+export function planStepGestureKeys(plan: AvatarCommandPlan): string[] {
+	return plan.steps.map((step) => {
+		if (step.kind === 'walk') return `locomotion:walk:${step.direction ?? 'forward'}`;
+		if (step.kind === 'jump') return 'animation:jump';
+		return `animation:${step.action}`;
+	});
 }
 
 export async function processCompanionTurn(input: CompanionTurnInput): Promise<CompanionTurnResult> {
@@ -200,10 +198,7 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 	const dialogue = parsed.dialogue;
 	let llmUpdates = parsed.stateUpdates;
 	fireExpressionCue(parsed.expressionCue);
-	fireGestureCue(
-		parsed.gestureCue,
-		parsed.gestureCue ? cueMatchesExplicitCommand(parsed.gestureCue, userMessage) : false
-	);
+	fireGestureCue(parsed.gestureCue, input.handledAvatarKeys);
 
 	if (debug) {
 		console.log('%c[LLM raw response]', 'color:#00b2ff;font-weight:bold', companionResponse);
@@ -234,10 +229,7 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 			const fallback = parseResponse(extracted, state.name, vrmStore.availableExpressions);
 			llmUpdates = fallback.stateUpdates;
 			fireExpressionCue(fallback.expressionCue);
-			fireGestureCue(
-				fallback.gestureCue,
-				fallback.gestureCue ? cueMatchesExplicitCommand(fallback.gestureCue, userMessage) : false
-			);
+			fireGestureCue(fallback.gestureCue, input.handledAvatarKeys);
 			if (debug) {
 				console.log('%c[extraction fallback]', 'color:#f59e0b;font-weight:bold', extracted, '->', llmUpdates);
 			}

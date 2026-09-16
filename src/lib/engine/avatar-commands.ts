@@ -1,57 +1,121 @@
-// Direct avatar commands: recognize explicit user requests ("jump!", "walk
-// left") locally so physical responsiveness never depends on whether the chat
-// model remembered to emit the right gesture_cue. Pure and dependency-free.
+// Avatar command plans: parse explicit user requests ("walk left 3s then
+// right 3s") into ordered routine steps. Multi-segment aware — every action
+// segment becomes a step, never just the first match. Pure and node-safe.
 // English plus compact Japanese; word-boundaried to avoid "jumper"/"dancer".
-import type { GestureCue } from './avatar-actions.ts';
+import {
+	AVATAR_ACTIONS,
+	type AvatarActionName,
+	type AvatarRoutineStep,
+	type LocomotionDirection
+} from './avatar-actions.ts';
 
-interface CommandPattern {
-	re: RegExp;
-	cue: () => GestureCue;
+export interface AvatarCommandPlan {
+	steps: AvatarRoutineStep[];
+	// True when the whole message is avatar direction (no conversation left).
+	pureAvatarCommand: boolean;
+	// Non-avatar remainder for mixed requests ("walk left and tell me a joke").
+	remainingText?: string;
 }
 
-const WALK_DURATION_MS = 1200;
+export const WALK_DURATION_MIN_MS = 300;
+export const WALK_DURATION_MAX_MS = 3000;
+export const WALK_DURATION_DEFAULT_MS = 1200;
+const MAX_PLAN_STEPS = 8;
 
-const PATTERNS: CommandPattern[] = [
-	// Walk variants first: "walk left" must win before any bare verb below.
-	{
-		re: /walk\b[^.!?]*\bleft\b|left[^.!?]*\bwalk\b|左\s*(に|へ)\s*(歩|すすむ|進む)|左に来て/,
-		cue: () => ({ type: 'locomotion', action: 'walk', direction: 'left', durationMs: WALK_DURATION_MS })
-	},
-	{
-		re: /walk\b[^.!?]*\bright\b|right[^.!?]*\bwalk\b|右\s*(に|へ)\s*(歩|すすむ|進む)|右に来て/,
-		cue: () => ({ type: 'locomotion', action: 'walk', direction: 'right', durationMs: WALK_DURATION_MS })
-	},
-	{
-		re: /walk\b[^.!?]*\b(forward|forwards|ahead)\b|(come|step)\s+(here|closer|forward)|前に?(進め|歩いて|来て)/,
-		cue: () => ({ type: 'locomotion', action: 'walk', direction: 'forward', durationMs: WALK_DURATION_MS })
-	},
-	{
-		re: /walk\b[^.!?]*\bback(wards?)?\b|step\s+back|後ろ\s*(に|へ)?\s*(下がって|歩いて)/,
-		cue: () => ({ type: 'locomotion', action: 'walk', direction: 'back', durationMs: WALK_DURATION_MS })
-	},
-	{ re: /\bjump(ing|ed)?\b|跳んで|ジャンプ/, cue: () => ({ type: 'animation', action: 'jump' }) },
-	{ re: /\bwav(e|ing)\b|手を振/, cue: () => ({ type: 'animation', action: 'wave' }) },
-	{ re: /\bnod(ing|ded)?\b|うなず|頷/, cue: () => ({ type: 'animation', action: 'nod' }) },
-	{
-		re: /shake\s+your\s+head|首を(横に)?振/,
-		cue: () => ({ type: 'animation', action: 'shake_head' })
-	},
-	{ re: /\bbow(ing|ed)?\b|お辞儀/, cue: () => ({ type: 'animation', action: 'bow' }) },
-	{ re: /\bdance[sd]?\b|\bdancing\b|踊/, cue: () => ({ type: 'animation', action: 'dance' }) },
-	{ re: /\bcelebrate[sd]?\b|お祝い/, cue: () => ({ type: 'animation', action: 'celebrate' }) },
-	{ re: /\bshrug(ged|s)?\b|肩をすくめ/, cue: () => ({ type: 'animation', action: 'shrug' }) },
-	// Bare "walk" with no direction reads as a step forward.
-	{ re: /\bwalk\b|歩いて/, cue: () => ({ type: 'locomotion', action: 'walk', direction: 'forward', durationMs: WALK_DURATION_MS }) }
+// Split sequential commands: "walk left then right", "jump, wave", "nod. bow".
+const SEGMENT_SPLIT_RE = /\b(?:and then|then|after that|and)\b|[;,.\n、。！？]|!|\?/i;
+// Polite filler that does not make a segment conversational.
+const FILLER_RE = /\b(?:please|thanks|thank you|can you|could you|would you)\b|おねがい|ください/gi;
+// Durations: "3 seconds", "3s", "3秒". Applies to walk steps.
+const DURATION_RE = /(\d+)\s*(seconds?|secs?|s|秒)\b/i;
+
+function actionStep(action: AvatarActionName): AvatarRoutineStep {
+	const def = AVATAR_ACTIONS[action];
+	if (def.source.kind === 'vrma') {
+		return { kind: 'emote', action, url: def.source.url };
+	}
+	if (action === 'jump') return { kind: 'jump', action };
+	return { kind: 'procedural', action };
+}
+
+function walkStep(direction: LocomotionDirection): (durationMs?: number) => AvatarRoutineStep {
+	return (durationMs?: number) => ({
+		kind: 'walk',
+		action: 'walk',
+		direction,
+		durationMs: clampWalkDuration(durationMs ?? WALK_DURATION_DEFAULT_MS)
+	});
+}
+
+export function clampWalkDuration(durationMs: number): number {
+	if (!Number.isFinite(durationMs)) return WALK_DURATION_DEFAULT_MS;
+	return Math.min(WALK_DURATION_MAX_MS, Math.max(WALK_DURATION_MIN_MS, Math.round(durationMs)));
+}
+
+const WALK_DIRS: Array<{ re: RegExp; direction: LocomotionDirection }> = [
+	{ re: /\bleft\b|左/, direction: 'left' },
+	{ re: /\bright\b|右/, direction: 'right' },
+	{ re: /\b(forward|forwards|forth|ahead)\b|前/, direction: 'forward' },
+	{ re: /\bback(wards?)?\b|後ろ|バック/, direction: 'back' }
 ];
 
-// A direct command if any pattern matches. Returns the cue to stage (the
-// caller treats it as an explicit request); null when the message carries no
-// avatar command.
-export function detectExplicitAvatarCommand(message: string): GestureCue | null {
-	if (typeof message !== 'string' || message.length === 0) return null;
-	const text = message.toLowerCase();
-	for (const pattern of PATTERNS) {
-		if (pattern.re.test(text)) return pattern.cue();
+const VERBS: Array<{ re: RegExp; action: AvatarActionName }> = [
+	{ re: /\bjump(ing|ed)?\b|跳んで|ジャンプ/, action: 'jump' },
+	{ re: /\bwav(e|ing)\b|手を振/, action: 'wave' },
+	{ re: /\bnod(ing|ded)?\b|うなず|頷/, action: 'nod' },
+	{ re: /shake\s+(your\s+)?head|首を(横に)?振/, action: 'shake_head' },
+	{ re: /\bbow(ing|ed)?\b|お辞儀/, action: 'bow' },
+	{ re: /\bdance[sd]?\b|\bdancing\b|踊/, action: 'dance' },
+	{ re: /\bcelebrate[sd]?\b|お祝い/, action: 'celebrate' },
+	{ re: /\bshrug(ged|s)?\b|肩をすくめ/, action: 'shrug' }
+];
+
+function parseDurationMs(segment: string): number | undefined {
+	const match = DURATION_RE.exec(segment);
+	if (!match) return undefined;
+	return clampWalkDuration(Number(match[1]) * 1000);
+}
+
+function parseSegment(segment: string, inheritWalk: boolean): AvatarRoutineStep | null {
+	const text = segment.toLowerCase();
+	if (/\bwalk\b|歩/.test(text)) {
+		for (const { re, direction } of WALK_DIRS) {
+			if (re.test(text)) return walkStep(direction)(parseDurationMs(text));
+		}
+		return walkStep('forward')(parseDurationMs(text));
+	}
+	for (const { re, action } of VERBS) {
+		if (re.test(text)) return actionStep(action);
+	}
+	// "walk left then right": a bare direction continues the previous walk.
+	if (inheritWalk) {
+		for (const { re, direction } of WALK_DIRS) {
+			if (re.test(text)) return walkStep(direction)(parseDurationMs(text));
+		}
 	}
 	return null;
+}
+
+// Parse a user message into an ordered avatar plan, or null when it carries
+// no avatar command. Segments that are empty after filler-stripping are
+// ignored; segments with other content make the plan mixed, never pure.
+export function parseAvatarCommand(message: string): AvatarCommandPlan | null {
+	if (typeof message !== 'string' || message.length === 0) return null;
+	const steps: AvatarRoutineStep[] = [];
+	const leftovers: string[] = [];
+	for (const raw of message.split(SEGMENT_SPLIT_RE)) {
+		const cleaned = raw.replace(FILLER_RE, ' ').replace(/\s+/g, ' ').trim();
+		if (!cleaned) continue;
+		const inheritWalk = steps.length > 0 && steps[steps.length - 1].action === 'walk';
+		const step = parseSegment(cleaned, inheritWalk);
+		if (step) {
+			if (steps.length < MAX_PLAN_STEPS) steps.push(step);
+		} else {
+			leftovers.push(raw.trim());
+		}
+	}
+	if (steps.length === 0) return null;
+	const plan: AvatarCommandPlan = { steps, pureAvatarCommand: leftovers.length === 0 };
+	if (leftovers.length > 0) plan.remainingText = leftovers.join(' ').trim();
+	return plan;
 }

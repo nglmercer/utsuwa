@@ -34,6 +34,8 @@ export interface AvatarRoutineStepInput {
 	}>;
 	// Hard cap for the whole routine; the step fails retryably past it.
 	timeoutMs?: number;
+	// Failure policy; default stops at the first failed step.
+	policy?: { continueOnFailure?: boolean };
 }
 
 export interface NotificationStepInput {

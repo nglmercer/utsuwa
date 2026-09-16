@@ -777,11 +777,22 @@
 	}
 
 	// === Avatar routines: ordered step sequences with completion ===
+	// Every step transitions pending -> running -> completed|failed|cancelled
+	// in the ledger, and the routine resolves to completed ONLY when every
+	// expected step completed with zero failures. A per-step watchdog (driven
+	// by render time, so a hidden tab pauses deadlines together with motion)
+	// fails stuck steps instead of hanging the routine forever.
 	interface ActiveRoutine {
 		id: string;
 		steps: Array<{ kind: string; action: string; direction?: string; durationMs?: number; url?: string }>;
 		index: number;
 		completed: string[];
+		failures: Array<{ stepIndex: number; key: string; reason: string }>;
+		continueOnFailure: boolean;
+		startedAt: number;
+		stepStartedAt: number;
+		stepElapsed: number;
+		stepDeadlineMs: number;
 	}
 	let routine: ActiveRoutine | null = null;
 	let routineSeqSeen = 0;
@@ -791,72 +802,129 @@
 		return `${step.kind}:${step.action}${step.direction ? `:${step.direction}` : ''}`;
 	}
 
-	function cancelRoutine(reason: string) {
-		cancelAvatarActions();
+	function finishRoutine(status: 'completed' | 'partial' | 'failed' | 'cancelled' | 'timed_out') {
 		if (!routine) return;
 		vrmStore.recordRoutineResult({
 			routineId: routine.id,
-			status: 'cancelled',
+			status,
+			expected: routine.steps.map(routineStepKey),
 			completed: routine.completed,
-			endPosition: { x: avatarRoot.position.x, z: avatarRoot.position.z }
+			failures: routine.failures,
+			startedAt: routine.startedAt,
+			finishedAt: Date.now(),
+			endPosition: { x: avatarRoot.position.x, y: avatarRoot.position.y, z: avatarRoot.position.z }
 		});
-		console.debug('[AvatarCue] routine cancelled', `${routine.id} (${reason})`);
+		console.debug('[AvatarCue] routine finished', `${routine.id} (${status})`);
 		routine = null;
 		routineAwaitingEmote = null;
 		syncActionBusy();
 	}
 
+	function cancelRoutine(reason: string) {
+		if (routine) {
+			const step = routine.steps[routine.index];
+			if (step) {
+				vrmStore.recordRoutineStep({
+					routineId: routine.id,
+					stepIndex: routine.index,
+					key: routineStepKey(step),
+					status: 'cancelled',
+					reason,
+					startedAt: routine.stepStartedAt,
+					finishedAt: Date.now()
+				});
+			}
+			// Drop a routine-owned emote selection so a pending load cannot
+			// play after the cancel; a manual selection is left untouched.
+			if (routineAwaitingEmote && vrmStore.currentAnimation === routineAwaitingEmote) {
+				vrmStore.setCurrentAnimation(null);
+			}
+			console.debug('[AvatarCue] routine cancelled', `${routine.id} (${reason})`);
+		}
+		cancelAvatarActions();
+		if (!routine) return;
+		finishRoutine('cancelled');
+	}
+
 	function advanceRoutine() {
 		if (!routine) return;
 		if (routine.index >= routine.steps.length) {
-			vrmStore.recordRoutineResult({
-				routineId: routine.id,
-				status: 'done',
-				completed: routine.completed,
-				endPosition: { x: avatarRoot.position.x, z: avatarRoot.position.z }
-			});
-			console.debug('[AvatarCue] routine finished', routine.id);
-			routine = null;
-			routineAwaitingEmote = null;
-			syncActionBusy();
+			if (routine.failures.length === 0) finishRoutine('completed');
+			else if (routine.completed.length > 0) finishRoutine('partial');
+			else finishRoutine('failed');
 			return;
 		}
 		const step = routine.steps[routine.index];
 		const key = routineStepKey(step);
+		routine.stepStartedAt = Date.now();
+		routine.stepElapsed = 0;
 		let started = false;
+		let deadline = 5000;
 		if (step.kind === 'procedural') {
 			started = startProceduralAction(step.action);
+			deadline = (PROCEDURAL_DURATIONS[step.action] ?? 1) * 1000 + 1500;
 		} else if (step.kind === 'jump') {
 			startJumpAction();
 			started = true;
+			deadline = JUMP_DURATION * 1000 + 1500;
 		} else if (step.kind === 'walk') {
 			startWalkAction(step.direction ?? 'forward', step.durationMs);
 			started = true;
+			deadline = Math.min(3000, Math.max(300, Math.round(step.durationMs ?? 1200))) + 1500;
 		} else if (step.kind === 'emote' && step.url) {
 			routineAwaitingEmote = step.url;
 			vrmStore.setCurrentAnimation(step.url);
 			started = true;
+			deadline = 15000;
 		}
+		routine.stepDeadlineMs = deadline;
 		if (!started) {
-			vrmStore.recordRoutineStep({ routineId: routine.id, key, status: 'dropped', reason: 'unknown step' });
-			routine.index++;
-			advanceRoutine();
+			failCurrentStep('unknown step');
 			return;
 		}
+		vrmStore.recordRoutineStep({
+			routineId: routine.id,
+			stepIndex: routine.index,
+			key,
+			status: 'running',
+			startedAt: routine.stepStartedAt
+		});
 		syncActionBusy();
 	}
 
-	function dropRoutineStep(reason: string) {
+	function failCurrentStep(reason: string, timedOut = false) {
 		if (!routine) return;
 		const step = routine.steps[routine.index];
 		if (!step) return;
+		const key = routineStepKey(step);
+		routine.failures.push({ stepIndex: routine.index, key, reason });
 		vrmStore.recordRoutineStep({
 			routineId: routine.id,
-			key: routineStepKey(step),
-			status: 'dropped',
-			reason
+			stepIndex: routine.index,
+			key,
+			status: 'failed',
+			reason,
+			startedAt: routine.stepStartedAt,
+			finishedAt: Date.now()
 		});
+		// Stop the half-played motion.
+		if (step.kind === 'walk') locomotion = null;
+		if (step.kind === 'jump') {
+			jumpState = null;
+			avatarRoot.position.y = 0;
+		}
+		if (step.kind === 'procedural') procedural = null;
+		if (step.kind === 'emote') {
+			routineAwaitingEmote = null;
+			if (step.url && vrmStore.currentAnimation === step.url) vrmStore.setCurrentAnimation(null);
+		}
 		routine.index++;
+		if (!routine.continueOnFailure) {
+			if (timedOut) finishRoutine('timed_out');
+			else if (routine.completed.length > 0) finishRoutine('partial');
+			else finishRoutine('failed');
+			return;
+		}
 		advanceRoutine();
 	}
 
@@ -866,15 +934,37 @@
 		if (!step) return;
 		const key = routineStepKey(step);
 		routine.completed.push(key);
-		vrmStore.recordRoutineStep({ routineId: routine.id, key, status: 'done' });
+		vrmStore.recordRoutineStep({
+			routineId: routine.id,
+			stepIndex: routine.index,
+			key,
+			status: 'completed',
+			startedAt: routine.stepStartedAt,
+			finishedAt: Date.now()
+		});
 		routine.index++;
 		advanceRoutine();
 	}
 
-	function startRoutine(request: { id: string; steps: ActiveRoutine['steps'] }) {
+	function startRoutine(request: {
+		id: string;
+		steps: ActiveRoutine['steps'];
+		policy?: { continueOnFailure?: boolean };
+	}) {
 		// Replacement policy: at most one routine; a new one cancels the old.
 		cancelRoutine('superseded');
-		routine = { id: request.id, steps: request.steps, index: 0, completed: [] };
+		routine = {
+			id: request.id,
+			steps: request.steps,
+			index: 0,
+			completed: [],
+			failures: [],
+			continueOnFailure: request.policy?.continueOnFailure ?? false,
+			startedAt: Date.now(),
+			stepStartedAt: 0,
+			stepElapsed: 0,
+			stepDeadlineMs: 0
+		};
 		console.debug('[AvatarCue] routine started', `${request.id} (${request.steps.length} steps)`);
 		advanceRoutine();
 	}
@@ -983,6 +1073,9 @@
 			.then((vrmAnimation) => {
 				untrack(() => {
 					if (!vrm || !mixer) return;
+					// Stale load (selection moved on while fetching): discard
+					// instead of playing a clip nobody asked for anymore.
+					if (vrmStore.currentAnimation !== animId) return;
 
 					// Fade out idle animation
 					const currentIdle = idleAction;
@@ -1002,6 +1095,13 @@
 					action.reset().fadeIn(0.2).play();
 					emoteAction = action;
 					isEmotePlaying = true;
+					// Routine emote steps get a clip-derived watchdog budget
+					// from the moment the clip actually starts playing.
+					if (routine && routineAwaitingEmote === animationData.url) {
+						routine.stepDeadlineMs =
+							(action.getClip().duration / action.timeScale) * 1000 + 3000;
+						routine.stepElapsed = 0;
+					}
 					syncActionBusy();
 					console.debug('[AvatarCue] action started', `emote:${animationData.id}`);
 					// A manually triggered emote supersedes any routine; the
@@ -1057,7 +1157,7 @@
 				vrmStore.setCurrentAnimation(null);
 				if (routine && routineAwaitingEmote) {
 					routineAwaitingEmote = null;
-					dropRoutineStep('emote load failed');
+					failCurrentStep('emote load failed');
 				}
 			});
 	});
@@ -1352,6 +1452,15 @@
 				syncActionBusy();
 			} else {
 				applyProceduralAction(procedural.name, progress);
+			}
+		}
+		// Routine watchdog: a step that never reports completion fails instead
+		// of hanging the routine (and its promise) forever.
+		if (routine) {
+			routine.stepElapsed += delta;
+			if (routine.stepElapsed * 1000 > routine.stepDeadlineMs) {
+				console.debug('[AvatarCue] step watchdog fired', routine.id);
+				failCurrentStep('step exceeded its deadline', true);
 			}
 		}
 

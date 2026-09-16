@@ -9,8 +9,8 @@
 	import { goto } from '$app/navigation';
 	import { localPath } from '$lib/config/links';
 	import { AVATAR_ACTIONS, AVATAR_ACTION_NAMES } from '$lib/engine/avatar-actions';
-	import { taskOrchestrator } from '$lib/tasks/browser';
-	import type { DurableTask } from '$lib/tasks/types';
+	import { resolveTaskAuthority, taskOrchestrator, type TaskAuthority } from '$lib/tasks/browser';
+	import { hostTasks, parseCapabilityReview } from '$lib/tasks/host';
 
 	// Material debug modes from @pixiv/three-vrm-materials-mtoon
 	const materialDebugModes = [
@@ -177,53 +177,113 @@
 	}
 
 	function runWalkSelfTest() {
+		// Diagnostics run every step even if one fails, to gather full evidence.
 		vrmStore.requestAvatarRoutine(
 			(['left', 'right', 'forward', 'back'] as const).map((direction) => ({
 				kind: 'walk' as const,
 				action: 'walk',
 				direction,
 				durationMs: 1500
-			}))
+			})),
+			{ continueOnFailure: true }
 		);
 	}
 
-	let taskRows = $state<DurableTask[]>([]);
+	interface TaskRow {
+		id: string;
+		title: string;
+		status: string;
+		instruction: string;
+		reviewReason?: string;
+	}
+
+	let taskRows = $state<TaskRow[]>([]);
 	let tasksLoading = $state(false);
+	let taskAuthority = $state<TaskAuthority>('browser');
+
+	function toRow(task: {
+		id: string;
+		title: string;
+		status: string;
+		instruction: string;
+		last_error?: { message: string };
+		lastError?: { message: string };
+	}): TaskRow {
+		return {
+			id: task.id,
+			title: task.title,
+			status: task.status,
+			instruction: task.instruction,
+			reviewReason: task.last_error?.message ?? task.lastError?.message
+		};
+	}
 
 	async function refreshTasks() {
 		tasksLoading = true;
 		try {
-			taskRows = await taskOrchestrator.list();
+			taskAuthority = resolveTaskAuthority();
+			if (taskAuthority === 'host') {
+				taskRows = (await hostTasks().list()).map(toRow);
+			} else {
+				taskRows = (await taskOrchestrator.list()).map(toRow);
+			}
 		} finally {
 			tasksLoading = false;
 		}
 	}
 
+	function walkCheckSteps() {
+		return (['left', 'right', 'forward', 'back'] as const).map((direction) => ({
+			kind: 'walk' as const,
+			action: 'walk',
+			direction,
+			durationMs: 1500
+		}));
+	}
+
 	async function submitWalkCheckTask() {
-		await taskOrchestrator.submit({
-			title: 'Dev walk check',
-			instruction: 'Walk left, right, forward, back to verify locomotion.',
-			priority: 80,
-			steps: [
-				{
+		if (resolveTaskAuthority() === 'host') {
+			await hostTasks().create({
+				title: 'Dev walk check',
+				instruction: 'Walk left, right, forward, back to verify locomotion.',
+				priority: 80,
+				verification: {
 					type: 'avatar_routine',
-					input: {
-						steps: (['left', 'right', 'forward', 'back'] as const).map((direction) => ({
-							kind: 'walk' as const,
-							action: 'walk',
-							direction,
-							durationMs: 1500
-						}))
-					}
-				}
-			]
-		});
+					// Renderer receipt keys are `kind:action:direction` (see routineStepKey).
+					expected_steps: ['walk:walk:left', 'walk:walk:right', 'walk:walk:forward', 'walk:walk:back']
+				},
+				steps: [{ step_type: 'avatar_routine', input: { steps: walkCheckSteps() } }]
+			});
+		} else {
+			await taskOrchestrator.submit({
+				title: 'Dev walk check',
+				instruction: 'Walk left, right, forward, back to verify locomotion.',
+				priority: 80,
+				steps: [{ type: 'avatar_routine', input: { steps: walkCheckSteps() } }]
+			});
+		}
 		await refreshTasks();
 	}
 
 	async function cancelTask(id: string) {
-		await taskOrchestrator.cancel(id);
+		if (taskAuthority === 'host') {
+			await hostTasks().cancel(id, 'cancelled from dev tools');
+		} else {
+			await taskOrchestrator.cancel(id);
+		}
 		await refreshTasks();
+	}
+
+	async function reviewTask(id: string, approved: boolean) {
+		await hostTasks().review(id, approved, approved ? 'approved from dev tools' : 'rejected from dev tools');
+		await refreshTasks();
+	}
+
+	function reviewLabel(row: TaskRow): string | null {
+		if (row.status !== 'needs_review' || !row.reviewReason) return null;
+		const capability = parseCapabilityReview(row.reviewReason);
+		if (capability) return `${capability.tool} needs ${capability.capability}`;
+		return row.reviewReason;
 	}
 
 	function actionMeta(name: (typeof AVATAR_ACTION_NAMES)[number]): string {
@@ -493,7 +553,7 @@
 		<!-- Durable Tasks -->
 		<section class="section">
 			<h3>Durable Tasks</h3>
-			<p class="hint">Orchestrator state (Dexie-backed, survives reload). {tasksLoading ? 'Loading…' : `${taskRows.length} task(s).`}</p>
+			<p class="hint">Authority: {taskAuthority === 'host' ? 'native host (SQLite)' : 'browser (Dexie fallback)'}. {tasksLoading ? 'Loading…' : `${taskRows.length} task(s).`}</p>
 			<div class="event-buttons">
 				<button class="event-btn" onclick={refreshTasks}>Refresh</button>
 				<button class="event-btn" onclick={submitWalkCheckTask}>Submit Walk Check Task</button>
@@ -504,6 +564,15 @@
 						<button class="event-btn" onclick={() => cancelTask(task.id)} title={`${task.instruction} (click to cancel)`}>
 							{task.title} · {task.status}
 						</button>
+						{#if taskAuthority === 'host' && task.status === 'needs_review'}
+							{@const label = reviewLabel(task)}
+							<button class="event-btn" onclick={() => reviewTask(task.id, true)} title={label ?? 'Approve'}>
+								Approve{label ? ` (${label})` : ''}
+							</button>
+							<button class="event-btn" onclick={() => reviewTask(task.id, false)}>
+								Reject
+							</button>
+						{/if}
 					{/each}
 				</div>
 			{/if}

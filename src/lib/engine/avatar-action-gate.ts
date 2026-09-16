@@ -90,8 +90,11 @@ export function evaluateGestureGate(ctx: GestureGateContext): GestureGateResult 
 	// Photo mode owns the body unconditionally, even for explicit commands.
 	if (motion === 'photo_mode') return { allowed: false, reason: 'photo-mode' };
 	if (requiresExplicit(cue) && !explicitRequest) return { allowed: false, reason: 'not-explicit' };
-	// Explicit commands may interrupt; conversational cues drop when busy.
-	if (busy && !explicitRequest) return { allowed: false, reason: 'busy' };
+	// Explicit user commands bypass the autonomous anti-spam policy
+	// (cooldowns, duplicates, rate limit, busy): only hard safety states
+	// reject them. The gate stays strict for model-generated gestures.
+	if (explicitRequest) return { allowed: true };
+	if (busy) return { allowed: false, reason: 'busy' };
 	const key = gestureKey(cue);
 	if (state.lastKey === key && now - state.lastAt < duplicateWindowMs(cue)) {
 		return { allowed: false, reason: 'duplicate' };
@@ -99,11 +102,9 @@ export function evaluateGestureGate(ctx: GestureGateContext): GestureGateResult 
 	if (state.lastKey !== null && state.lastKey !== key && now - state.lastAt < GLOBAL_GESTURE_COOLDOWN_MS) {
 		return { allowed: false, reason: 'cooldown' };
 	}
-	if (!explicitRequest) {
-		const recent = state.recentAt.filter((t) => now - t < RATE_WINDOW_MS);
-		if (recent.length >= MAX_AUTOMATIC_GESTURES_PER_MINUTE) {
-			return { allowed: false, reason: 'rate-limit' };
-		}
+	const recent = state.recentAt.filter((t) => now - t < RATE_WINDOW_MS);
+	if (recent.length >= MAX_AUTOMATIC_GESTURES_PER_MINUTE) {
+		return { allowed: false, reason: 'rate-limit' };
 	}
 	return { allowed: true };
 }
