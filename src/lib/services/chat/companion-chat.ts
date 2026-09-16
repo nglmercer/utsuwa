@@ -20,7 +20,14 @@ import { processCompanionTurn, planStepGestureKeys } from '$lib/services/chat/co
 import { parseAvatarCommand, type AvatarCommandPlan } from '$lib/engine/avatar-commands';
 import { runAvatarRoutineAndWait } from '$lib/services/avatar/routine';
 import { photomodeStore } from '$lib/stores/photomode.svelte';
-import type { RoutineResult } from '$lib/stores/vrm.svelte';
+import {
+	executeAvatarPlan,
+	launchAvatarPlan,
+	type AvatarTaskDeps,
+	type RoutineSummary
+} from './avatar-task';
+import { resolveTaskAuthority } from '$lib/tasks/browser';
+import { hostTasks } from '$lib/tasks/host';
 import { retrieveRelevantContext } from '$lib/engine/memory';
 import { buildSystemPrompt, truncateChatHistory, type PromptContext } from '$lib/ai/prompt-builder';
 import { keepImage, type PreparedImage } from '$lib/services/storage/keepsakes';
@@ -193,9 +200,22 @@ function describeRoutineStep(key: string): string {
 	return verbs[action] ?? key.replaceAll(':', ' ');
 }
 
-// "Done" is generated from the runtime receipt, never predicted: completed
+// Chat-side routine deps: durable host task when bridged, local renderer
+// queue otherwise (or when host submission itself fails).
+function chatRoutineDeps(): AvatarTaskDeps {
+	return {
+		useHost: () => resolveTaskAuthority() === 'host',
+		createTask: (input) => hostTasks().create(input),
+		getTask: (id) => hostTasks().get(id),
+		cancelTask: (id, reason) => hostTasks().cancel(id, reason),
+		runLocal: (steps) => runAvatarRoutineAndWait(steps),
+		log: (message) => console.debug(`[AvatarCue] ${message}`)
+	};
+}
+
+// "Done" is generated from the routine receipt, never predicted: completed
 // only when every expected step completed, partial/failed otherwise.
-function describeRoutineResult(result: RoutineResult): string {
+function describeRoutineResult(result: RoutineSummary): string {
 	if (result.status === 'completed') return 'Done.';
 	if (result.status === 'cancelled') return 'Stopped.';
 	const done = result.completed.map(describeRoutineStep).join(', ');
@@ -220,7 +240,7 @@ async function runPureAvatarTurn(
 		return;
 	}
 	try {
-		const result = await runAvatarRoutineAndWait(plan.steps);
+		const result = await executeAvatarPlan(chatRoutineDeps(), { steps: plan.steps });
 		chatStore.updateLastMessage(`Okay. ${describeRoutineResult(result)}`);
 		hooks.setLatestResponse(describeRoutineResult(result));
 	} catch (e) {
@@ -280,9 +300,7 @@ export async function sendCompanionMessage(
 	let handledAvatarKeys: readonly string[] = [];
 	if (avatarPlan && !photomodeStore.active) {
 		handledAvatarKeys = planStepGestureKeys(avatarPlan);
-		void runAvatarRoutineAndWait(avatarPlan.steps).catch((e) =>
-			console.debug('[AvatarCue] mixed-plan routine failed:', e)
-		);
+		launchAvatarPlan(chatRoutineDeps(), { steps: avatarPlan.steps });
 	}
 
 	// Only touch relationship-time state once the character has loaded, or an

@@ -39,6 +39,7 @@
 		type CameraAngles
 	} from '$lib/engine/camera-impulse';
 	import { lipSyncAnalyzer } from '$lib/services/lipsync/analyzer';
+	import { routineStepKey } from '$lib/tasks/host-avatar';
 	import { untrack } from 'svelte';
 	import * as THREE from 'three';
 
@@ -798,9 +799,7 @@
 	let routineSeqSeen = 0;
 	let routineAwaitingEmote: string | null = null;
 
-	function routineStepKey(step: { kind: string; action: string; direction?: string }): string {
-		return `${step.kind}:${step.action}${step.direction ? `:${step.direction}` : ''}`;
-	}
+	// Canonical step key (receipts + verification) lives in tasks/host-avatar.ts.
 
 	function finishRoutine(status: 'completed' | 'partial' | 'failed' | 'cancelled' | 'timed_out') {
 		if (!routine) return;

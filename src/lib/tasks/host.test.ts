@@ -14,6 +14,7 @@ import {
 	handleRoutineRequest,
 	parseRoutineRequest,
 	routineResultToReceipt,
+	routineStepKey,
 	runTimeoutFor,
 	startHostAvatarListener,
 	type HostRoutineRequest
@@ -128,6 +129,12 @@ function routineResult(overrides: Partial<RoutineResult> = {}): RoutineResult {
 }
 
 describe('host avatar listener', () => {
+	it('locks the canonical step key format', () => {
+		assert.equal(routineStepKey({ kind: 'walk', action: 'walk', direction: 'left' }), 'walk:walk:left');
+		assert.equal(routineStepKey({ kind: 'emote', action: 'wave' }), 'emote:wave');
+		assert.equal(routineStepKey({ kind: 'jump', action: 'jump' }), 'jump:jump');
+	});
+
 	it('maps only completed to success receipts', () => {
 		assert.equal(routineResultToReceipt(routineResult()).status, 'success');
 		for (const status of ['partial', 'failed', 'cancelled', 'timed_out'] as const) {

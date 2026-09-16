@@ -30,6 +30,19 @@ export interface AvatarReceipt {
 	routine_id: string;
 }
 
+/**
+ * Canonical routine step key shared by the renderer (receipts) and task
+ * creators (verification specs). Keep in sync: changing this format breaks
+ * in-flight `avatar_routine` verification expectations.
+ */
+export function routineStepKey(step: {
+	kind: string;
+	action: string;
+	direction?: string;
+}): string {
+	return `${step.kind}:${step.action}${step.direction ? `:${step.direction}` : ''}`;
+}
+
 const DEFAULT_RUN_TIMEOUT_MS = 55_000;
 const RECEIPT_MARGIN_MS = 2_000;
 const MIN_RUN_TIMEOUT_MS = 5_000;
