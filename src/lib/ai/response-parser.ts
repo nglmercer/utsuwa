@@ -5,6 +5,15 @@ import {
 	isEmotionalExpression,
 	isProtectedChannel
 } from '../engine/facial-expressions.ts';
+import {
+	isAvatarActionName,
+	isLocomotionDirection,
+	resolveLegacyEmote,
+	type GestureCue as EngineGestureCue
+} from '../engine/avatar-actions.ts';
+
+// Re-exported so turn staging keeps one import site.
+export type GestureCue = EngineGestureCue;
 
 // A one-shot facial direction from the model ("smile while saying this").
 // Deliberately separate from StateUpdates: it never persists, it just stages
@@ -16,11 +25,6 @@ export interface ExpressionCue {
 	intensity: number;
 	durationMs: number;
 }
-
-// A one-shot body direction from the model ("wave while saying this").
-// Either a named emote clip or a tap-reaction-style body response to a zone.
-// Like ExpressionCue it is staged fire-and-forget and never persisted.
-export type GestureCue = { type: 'emote'; id: string } | { type: 'reaction'; zone: TouchZone };
 
 // Parsed response structure
 export interface ParsedResponse {
@@ -52,8 +56,11 @@ interface LLMStateOutput {
 	};
 	gesture_cue?: {
 		type?: string;
+		action?: string;
 		id?: string;
 		zone?: string;
+		direction?: string;
+		duration_ms?: number;
 	};
 }
 
@@ -341,29 +348,47 @@ function parseExpressionCue(output: LLMStateOutput, available?: readonly string[
 	};
 }
 
-// Emote ids the model may address: the VRMA clips shipped in
-// static/animations/ (see vrmStore.availableAnimations). Pinned here instead
-// of imported from the store so this module stays runnable under node tests.
-const GESTURE_EMOTE_IDS = ['vrma_01', 'vrma_02', 'vrma_03', 'vrma_04', 'vrma_05', 'vrma_06', 'vrma_07'];
-
 const GESTURE_ZONES: TouchZone[] = ['head', 'face', 'shoulder', 'torso', 'hip'];
 
-// Validate an optional one-shot body direction. Unknown types, ids, and zones
-// are dropped (never staged anywhere): untrusted model output must not address
-// arbitrary animation files or reaction paths.
+// AI walking is bounded: brisk enough to read, short enough to stay framed.
+const WALK_DURATION_MIN_MS = 300;
+const WALK_DURATION_MAX_MS = 3000;
+const WALK_DURATION_DEFAULT_MS = 1200;
+
+// Validate an optional one-shot body direction. Semantic actions resolve
+// against the avatar-action registry; legacy numbered emotes stay parseable
+// but are never advertised. Unknown types, actions, ids, zones, and
+// directions are dropped (never staged anywhere): untrusted model output must
+// not address arbitrary animation files or reaction paths.
 function parseGestureCue(output: LLMStateOutput): GestureCue | null {
 	const cue = output.gesture_cue;
 	if (!cue || typeof cue !== 'object') return null;
 	const type = typeof cue.type === 'string' ? cue.type.toLowerCase().trim() : '';
-	if (type === 'emote') {
-		const id = typeof cue.id === 'string' ? cue.id.toLowerCase().trim() : '';
-		if (!GESTURE_EMOTE_IDS.includes(id)) return null;
-		return { type: 'emote', id };
+	if (type === 'animation') {
+		const action = typeof cue.action === 'string' ? cue.action.toLowerCase().trim() : '';
+		if (!isAvatarActionName(action) || action === 'walk') return null;
+		return { type: 'animation', action };
+	}
+	if (type === 'locomotion') {
+		const action = typeof cue.action === 'string' ? cue.action.toLowerCase().trim() : '';
+		const direction =
+			typeof cue.direction === 'string' ? cue.direction.toLowerCase().trim() : '';
+		if (action !== 'walk' || !isLocomotionDirection(direction)) return null;
+		const durationMs =
+			typeof cue.duration_ms === 'number' && Number.isFinite(cue.duration_ms)
+				? Math.min(WALK_DURATION_MAX_MS, Math.max(WALK_DURATION_MIN_MS, Math.round(cue.duration_ms)))
+				: WALK_DURATION_DEFAULT_MS;
+		return { type: 'locomotion', action: 'walk', direction, durationMs };
 	}
 	if (type === 'reaction') {
 		const zone = typeof cue.zone === 'string' ? cue.zone.toLowerCase().trim() : '';
 		if (!(GESTURE_ZONES as readonly string[]).includes(zone)) return null;
 		return { type: 'reaction', zone: zone as TouchZone };
+	}
+	if (type === 'emote') {
+		const id = typeof cue.id === 'string' ? cue.id.toLowerCase().trim() : '';
+		if (!resolveLegacyEmote(id)) return null;
+		return { type: 'emote', id };
 	}
 	return null;
 }

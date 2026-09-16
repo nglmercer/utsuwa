@@ -315,6 +315,53 @@ test('returns a null gestureCue when the model omits it', () => {
 	assert.equal(gestureCue, null);
 });
 
+test('parses semantic animation cues', () => {
+	const { gestureCue } = parseResponse('Hi!\n```json\n{ "gesture_cue": { "type": "Animation", "action": " Wave " } }\n```');
+	assert.deepEqual(gestureCue, { type: 'animation', action: 'wave' });
+	const jump = parseResponse('Boing.\n{ "gesture_cue": { "type": "animation", "action": "jump" } }');
+	assert.deepEqual(jump.gestureCue, { type: 'animation', action: 'jump' });
+});
+
+test('parses locomotion cues and clamps duration', () => {
+	const { gestureCue } = parseResponse(
+		'Coming.\n{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "left", "duration_ms": 1500 } }'
+	);
+	assert.deepEqual(gestureCue, { type: 'locomotion', action: 'walk', direction: 'left', durationMs: 1500 });
+	const def = parseResponse('Coming.\n{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "back" } }');
+	assert.deepEqual(def.gestureCue, {
+		type: 'locomotion',
+		action: 'walk',
+		direction: 'back',
+		durationMs: 1200
+	});
+	const hi = parseResponse(
+		'Coming.\n{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "right", "duration_ms": 99999 } }'
+	);
+	assert.equal(hi.gestureCue?.type === 'locomotion' ? hi.gestureCue.durationMs : -1, 3000);
+	const lo = parseResponse(
+		'Coming.\n{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "right", "duration_ms": 5 } }'
+	);
+	assert.equal(lo.gestureCue?.type === 'locomotion' ? lo.gestureCue.durationMs : -1, 300);
+});
+
+test('drops unknown actions, directions, and shape mismatches', () => {
+	const cases = [
+		'{ "gesture_cue": { "type": "animation", "action": "moonwalk" } }',
+		'{ "gesture_cue": { "type": "animation", "action": "walk" } }',
+		'{ "gesture_cue": { "type": "animation", "action": "/animations/evil.vrma" } }',
+		'{ "gesture_cue": { "type": "animation" } }',
+		'{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "up" } }',
+		'{ "gesture_cue": { "type": "locomotion", "action": "run", "direction": "left" } }',
+		'{ "gesture_cue": { "type": "locomotion", "action": "walk" } }',
+		'{ "gesture_cue": { "type": "dance", "action": "dance" } }'
+	];
+	for (const block of cases) {
+		const { gestureCue, dialogue } = parseResponse(`Hey.\n${block}`);
+		assert.equal(gestureCue, null, block);
+		assert.ok(!dialogue.includes('gesture_cue'), `cue must be stripped from dialogue: ${block}`);
+	}
+});
+
 test('accepts a custom expression_cue preset from the loaded model', () => {
 	const available = ['happy', 'sad', 'Extra', 'Surprised', 'blink', 'blinkLeft'];
 	const { expressionCue } = parseResponse(
