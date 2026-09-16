@@ -31,6 +31,9 @@ const SEGMENT_SPLIT_RE = /\b(?:and then|then|after that|and)\b|[;,.\n、。！�
 const FILLER_RE = /\b(?:please|thanks|thank you|can you|could you|would you)\b|おねがい|ください/gi;
 // Durations: "3 seconds", "3s", "3秒". Applies to walk/run steps.
 const DURATION_RE = /(\d+)\s*(seconds?|secs?|s|秒)\b/i;
+// Locomotion verbs. "Step" is deliberately absent: "next step" and "step by
+// step" are instructional chat, not movement, and would false-positive.
+const LOCOMOTION_VERB_RE = /\bwalk\b|\brun\b|\bmove\b|\bgo\b|歩|走/;
 
 function actionStep(action: AvatarActionName): AvatarRoutineStep {
 	const def = AVATAR_ACTIONS[action];
@@ -61,11 +64,26 @@ export function clampWalkDuration(durationMs: number): number {
 	return Math.min(WALK_DURATION_MAX_MS, Math.max(WALK_DURATION_MIN_MS, Math.round(durationMs)));
 }
 
-const WALK_DIRS: Array<{ re: RegExp; direction: LocomotionDirection }> = [
+const WALK_DIRS: Array<{ re: RegExp; direction: LocomotionDirection; notIf?: RegExp }> = [
 	{ re: /\bleft\b|左/, direction: 'left' },
 	{ re: /\bright\b|右/, direction: 'right' },
-	{ re: /\b(forward|forwards|forth|ahead)\b|前/, direction: 'forward' },
-	{ re: /\bback(wards?)?\b|後ろ|バック/, direction: 'back' }
+	{ re: /\b(forward|forwards|forth|ahead|front|closer|nearer)\b|前/, direction: 'forward' },
+	{ re: /\bback(wards?)?\b|\b(backside|behind|farther|further)\b|後ろ|バック/, direction: 'back' },
+	// Screen-relative: in the orbit view world-away reads as up-screen and
+	// world-toward as down-screen. "Up" never matches approach phrasing ("up
+	// to X" has its own branch below); the notIf guards keep idioms ("give
+	// up", "calm down") from steering her.
+	{
+		re: /\bup\b(?!\s+to\b)/,
+		direction: 'back',
+		notIf:
+			/\b(what'?s|what is|give|grow|grew|wake|woke|get|got|look|pick|scroll|bring|brought|hold|hang|step)\s+up\b/
+	},
+	{
+		re: /\bdown\b/,
+		direction: 'forward',
+		notIf: /\b(lie|lies|lay|lying|calm|calming|sit|sitting|sat|kneel|sleep|settle|bend|break|broke|broken|slow)\b/
+	}
 ];
 
 const TURN_DIRS: Array<{ re: RegExp; direction: TurnDirection }> = [
@@ -75,7 +93,8 @@ const TURN_DIRS: Array<{ re: RegExp; direction: TurnDirection }> = [
 ];
 
 function findWalkDirection(text: string): LocomotionDirection | null {
-	for (const { re, direction } of WALK_DIRS) {
+	for (const { re, direction, notIf } of WALK_DIRS) {
+		if (notIf?.test(text)) continue;
 		if (re.test(text)) return direction;
 	}
 	return null;
@@ -138,7 +157,29 @@ function parseSegment(
 		if (anchor) return { kind: 'goto', action: 'goto', anchorId: anchor.id };
 		// "Go to the left" walks left; "go to mars" is not a walk at all.
 		const bare = label.replace(/^(the|a)\s+/, '').trim();
-		if (!/^(left|right|forward|forwards|forth|ahead|back|backwards?|左|右|前|後ろ|バック)$/.test(bare)) {
+		if (
+			!/^(left|right|forward|forwards|forth|ahead|front|closer|nearer|back|backwards?|backside|behind|farther|further|up|down|左|右|前|後ろ|バック)$/.test(
+				bare
+			)
+		) {
+			return null;
+		}
+	}
+
+	// Approach phrasing ("walk up to the chair", "go up to me"): a named
+	// anchor becomes a goto, the viewer becomes a forward walk, and an
+	// unknown target stays conversational — stepping somewhere random would
+	// be the wrong motion. Requires a locomotion verb so "it's up to me"
+	// never moves her.
+	if (LOCOMOTION_VERB_RE.test(text)) {
+		const upTo = /\bup\s+to\b/.exec(text);
+		if (upTo && upTo.index !== undefined) {
+			const label = text.slice(upTo.index + upTo[0].length).trim();
+			if (/\b(me|you|here|camera)\b/.test(label)) {
+				return locomotionStep('forward')(parseDurationMs(text));
+			}
+			const anchor = label ? resolveSceneAnchor(label) : null;
+			if (anchor) return { kind: 'goto', action: 'goto', anchorId: anchor.id };
 			return null;
 		}
 	}
@@ -217,4 +258,23 @@ export function parseAvatarCommand(message: string): AvatarCommandPlan | null {
 	const plan: AvatarCommandPlan = { steps, pureAvatarCommand: leftovers.length === 0 };
 	if (leftovers.length > 0) plan.remainingText = leftovers.join(' ').trim();
 	return plan;
+}
+
+// True when the message explicitly asks the avatar to move: a locomotion
+// verb plus a direction word (or approach phrasing) in the same segment.
+// The turn uses it to let a matching model locomotion cue through the
+// gesture gate — without it every model walk is rejected as not-explicit
+// while the model's own text claims it moved.
+export function isExplicitLocomotionAsk(message: string): boolean {
+	if (typeof message !== 'string' || message.length === 0) return false;
+	for (const raw of message.split(SEGMENT_SPLIT_RE)) {
+		const text = raw.toLowerCase();
+		if (!LOCOMOTION_VERB_RE.test(text)) continue;
+		// Bare "walk"/"run" steps forward (parser default), so it counts
+		// without a direction; "move"/"go" stay direction-gated ("go on").
+		if (/\bwalk\b|\brun\b|歩|走/.test(text)) return true;
+		if (findWalkDirection(text)) return true;
+		if (/\bup\s+to\b/.test(text)) return true;
+	}
+	return false;
 }

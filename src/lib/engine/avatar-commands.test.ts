@@ -6,6 +6,7 @@ import {
 	WALK_DURATION_MAX_MS,
 	WALK_DURATION_MIN_MS,
 	clampWalkDuration,
+	isExplicitLocomotionAsk,
 	parseAvatarCommand
 } from './avatar-commands.ts';
 
@@ -156,6 +157,73 @@ test('parses goto and sit-on-anchor sequences', () => {
 	assert.deepEqual(parseAvatarCommand('stand up')?.steps, [
 		{ kind: 'procedural', action: 'stand' }
 	]);
+});
+
+test('parses front/back/up/down direction synonyms', () => {
+	const forward = ['move front', 'walk to the front', 'go to the front', 'move closer', 'go down'];
+	for (const text of forward) {
+		assert.deepEqual(parseAvatarCommand(text)?.steps, [
+			{ kind: 'walk', action: 'walk', direction: 'forward', durationMs: 1200 }
+		], text);
+	}
+	const back = ['move to backside', 'walk behind', 'go behind', 'go up', 'move up', 'go farther'];
+	for (const text of back) {
+		assert.deepEqual(parseAvatarCommand(text)?.steps, [
+			{ kind: 'walk', action: 'walk', direction: 'back', durationMs: 1200 }
+		], text);
+	}
+});
+
+test('parses approach phrasing and rejects unknown targets', () => {
+	assert.deepEqual(parseAvatarCommand('walk up to me')?.steps, [
+		{ kind: 'walk', action: 'walk', direction: 'forward', durationMs: 1200 }
+	]);
+	assert.deepEqual(parseAvatarCommand('go up to the chair')?.steps, [
+		{ kind: 'goto', action: 'goto', anchorId: 'chair' }
+	]);
+	assert.equal(parseAvatarCommand('walk up to the window'), null);
+	assert.equal(parseAvatarCommand("it's up to me"), null);
+});
+
+test('up/down idioms never steer her', () => {
+	for (const text of ['give up', 'wake up', 'look up the word', 'calm down', 'lie down']) {
+		assert.equal(parseAvatarCommand(text), null, text);
+	}
+	// Idiom after a real walk: the walk stands, the idiom stays conversational.
+	const plan = parseAvatarCommand('walk left then calm down');
+	assert.equal(plan?.steps.length, 1);
+	assert.equal(plan?.pureAvatarCommand, false);
+	const whatsUp = parseAvatarCommand("walk, what's up");
+	assert.equal(whatsUp?.steps.length, 1);
+	assert.equal(whatsUp?.steps[0].direction, 'forward');
+});
+
+test('isExplicitLocomotionAsk gates model walks on user asks', () => {
+	for (const text of [
+		'walk left',
+		'walk',
+		'move to backside',
+		'go up',
+		'walk to the front',
+		'walk up to the window',
+		'walk left and tell me a joke'
+	]) {
+		assert.equal(isExplicitLocomotionAsk(text), true, text);
+	}
+	for (const text of [
+		'how are you?',
+		'',
+		'go on, tell me more',
+		'move along with the story',
+		"it's up to me",
+		'give up',
+		'calm down',
+		'turn up the volume',
+		'explain step by step',
+		null as unknown as string
+	]) {
+		assert.equal(isExplicitLocomotionAsk(text), false, String(text));
+	}
 });
 
 test('clampWalkDuration locks renderer-safe bounds', () => {

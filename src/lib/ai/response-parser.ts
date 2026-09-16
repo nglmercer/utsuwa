@@ -11,7 +11,8 @@ import {
 	isLocomotionDirection,
 	isTurnDirection,
 	resolveLegacyEmote,
-	type GestureCue as EngineGestureCue
+	type GestureCue as EngineGestureCue,
+	type LocomotionDirection
 } from '../engine/avatar-actions.ts';
 import { resolveSceneAnchor } from '../engine/scene-anchors.ts';
 import { CAMERA_LIMITS } from '../stores/display-types.ts';
@@ -376,6 +377,31 @@ function parseExpressionCue(output: LLMStateOutput, available?: readonly string[
 
 const GESTURE_ZONES: TouchZone[] = ['head', 'face', 'shoulder', 'torso', 'hip'];
 
+// Direction words the model may echo from the user ("move to the front",
+// "go up"), normalized to the canonical four. Anything else still drops
+// the cue: untrusted output must not invent motion.
+const LOCOMOTION_DIRECTION_ALIASES: Record<string, LocomotionDirection> = {
+	front: 'forward',
+	ahead: 'forward',
+	forth: 'forward',
+	closer: 'forward',
+	nearer: 'forward',
+	down: 'forward',
+	backside: 'back',
+	behind: 'back',
+	backwards: 'back',
+	farther: 'back',
+	further: 'back',
+	up: 'back'
+};
+
+function normalizeLocomotionDirection(raw: unknown): LocomotionDirection | null {
+	if (typeof raw !== 'string') return null;
+	const word = raw.toLowerCase().trim();
+	if (isLocomotionDirection(word)) return word;
+	return LOCOMOTION_DIRECTION_ALIASES[word] ?? null;
+}
+
 // AI walking is bounded: brisk enough to read, short enough to stay framed.
 const WALK_DURATION_MIN_MS = 300;
 const WALK_DURATION_MAX_MS = 3000;
@@ -415,9 +441,8 @@ function parseGestureCue(output: LLMStateOutput): GestureCue | null {
 	}
 	if (type === 'locomotion') {
 		const action = typeof cue.action === 'string' ? cue.action.toLowerCase().trim() : '';
-		const direction =
-			typeof cue.direction === 'string' ? cue.direction.toLowerCase().trim() : '';
-		if (!isLocomotionActionName(action) || !isLocomotionDirection(direction)) return null;
+		const direction = normalizeLocomotionDirection(cue.direction);
+		if (!isLocomotionActionName(action) || !direction) return null;
 		const durationMs =
 			typeof cue.duration_ms === 'number' && Number.isFinite(cue.duration_ms)
 				? Math.min(WALK_DURATION_MAX_MS, Math.max(WALK_DURATION_MIN_MS, Math.round(cue.duration_ms)))

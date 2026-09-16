@@ -315,6 +315,32 @@ test('returns a null gestureCue when the model omits it', () => {
 	assert.equal(gestureCue, null);
 });
 
+test('normalizes locomotion direction words the model echoes', () => {
+	const cases: Array<[string, string]> = [
+		['front', 'forward'],
+		['ahead', 'forward'],
+		['closer', 'forward'],
+		['down', 'forward'],
+		['backside', 'back'],
+		['behind', 'back'],
+		['backwards', 'back'],
+		['farther', 'back'],
+		['up', 'back']
+	];
+	for (const [word, direction] of cases) {
+		const { gestureCue } = parseResponse(`On it.\n{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "${word}" } }`);
+		assert.deepEqual(
+			gestureCue,
+			{ type: 'locomotion', action: 'walk', direction, durationMs: 1200 },
+			word
+		);
+	}
+	const { gestureCue } = parseResponse(
+		'{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "sideways" } }'
+	);
+	assert.equal(gestureCue, null);
+});
+
 test('parses a camera_cue with only the keys the model set', () => {
 	const { cameraCue, dialogue } = parseResponse(
 		'Zooming in!\n{ "camera_cue": { "zoom": 1.8, "reframe": true } }'
@@ -408,7 +434,7 @@ test('drops unknown actions, directions, and shape mismatches', () => {
 		'{ "gesture_cue": { "type": "animation", "action": "turn", "direction": "forward" } }',
 		'{ "gesture_cue": { "type": "animation", "action": "goto" } }',
 		'{ "gesture_cue": { "type": "animation", "action": "goto", "anchor_id": "mars" } }',
-		'{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "up" } }',
+		'{ "gesture_cue": { "type": "locomotion", "action": "walk", "direction": "sideways" } }',
 		'{ "gesture_cue": { "type": "locomotion", "action": "jump", "direction": "left" } }',
 		'{ "gesture_cue": { "type": "locomotion", "action": "walk" } }',
 		'{ "gesture_cue": { "type": "dance", "action": "dance" } }'

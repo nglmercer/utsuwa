@@ -14,7 +14,7 @@ import {
 	gestureKey,
 	recordGestureExecution
 } from '$lib/engine/avatar-action-gate';
-import type { AvatarCommandPlan } from '$lib/engine/avatar-commands';
+import { isExplicitLocomotionAsk, type AvatarCommandPlan } from '$lib/engine/avatar-commands';
 import { calculateBaselineUpdates, analyzeMessage } from '$lib/engine/heuristics';
 import { mergeUpdates, checkAndApplyStageTransition } from '$lib/engine/state-updates';
 import {
@@ -96,9 +96,12 @@ const gestureGateState = createGestureGateState();
 // Stage a one-shot body direction through the runtime gesture gate. The gate
 // (not the model's obedience) enforces cooldowns, duplicates, rate limits,
 // busy/photo guards, and the explicit-request rule for large gestures.
-// Model cues are always conversational here: direct user commands travel as
+// Model cues are conversational by default: direct user commands travel as
 // avatar plans and are correlated out via handledKeys instead of cooldowns.
-function fireGestureCue(cue: GestureCue | null, handledKeys: readonly string[] = []) {
+// Exception: a locomotion cue answering an explicit move ask in the user
+// message counts as explicit — otherwise every model walk is rejected as
+// not-explicit while the model's own text claims it moved.
+function fireGestureCue(cue: GestureCue | null, handledKeys: readonly string[] = [], userMessage = '') {
 	if (!cue) return;
 	const key = gestureKey(cue);
 	if (handledKeys.includes(key)) {
@@ -112,7 +115,7 @@ function fireGestureCue(cue: GestureCue | null, handledKeys: readonly string[] =
 			state: gestureGateState,
 			motion: photomodeStore.active ? 'photo_mode' : 'idle',
 			busy: vrmStore.actionBusy || vrmStore.currentAnimation !== null,
-			explicitRequest: false
+			explicitRequest: cue.type === 'locomotion' && isExplicitLocomotionAsk(userMessage)
 		});
 		if (!gate.allowed) {
 			console.debug(`[AvatarCue] rejected: ${gate.reason}`, key);
@@ -237,7 +240,7 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 	const dialogue = parsed.dialogue;
 	let llmUpdates = parsed.stateUpdates;
 	fireExpressionCue(parsed.expressionCue);
-	fireGestureCue(parsed.gestureCue, input.handledAvatarKeys);
+	fireGestureCue(parsed.gestureCue, input.handledAvatarKeys, userMessage);
 	fireCameraCue(parsed.cameraCue);
 
 	if (debug) {
@@ -269,7 +272,7 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 			const fallback = parseResponse(extracted, state.name, vrmStore.availableExpressions);
 			llmUpdates = fallback.stateUpdates;
 			fireExpressionCue(fallback.expressionCue);
-			fireGestureCue(fallback.gestureCue, input.handledAvatarKeys);
+			fireGestureCue(fallback.gestureCue, input.handledAvatarKeys, userMessage);
 			fireCameraCue(fallback.cameraCue);
 			if (debug) {
 				console.log('%c[extraction fallback]', 'color:#f59e0b;font-weight:bold', extracted, '->', llmUpdates);
