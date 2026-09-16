@@ -401,3 +401,47 @@ test('truncateChatHistory handles image content placeholders', () => {
 	assert.ok(result.length > 0);
 	assert.equal(result[result.length - 1].content, 'newest message');
 });
+
+test('both modes document gesture_cue in the JSON block', () => {
+	for (const appMode of ['dating_sim', 'companion'] as const) {
+		const prompt = buildSystemPrompt(makeContext({ state: makeState({ appMode }) }));
+		assert.ok(prompt.includes('"gesture_cue"'), appMode);
+		assert.ok(prompt.includes('"type": "emote"'), appMode);
+		assert.ok(prompt.includes('vrma_01'), appMode);
+		assert.ok(prompt.includes('"type": "reaction"'), appMode);
+	}
+});
+
+test('avatar catalog lists model presets minus protected channels', () => {
+	const availableExpressions = [
+		'happy',
+		'Extra',
+		'Surprised',
+		'blink',
+		'blinkLeft',
+		'aa',
+		'jawOpen'
+	];
+	const prompt = buildSystemPrompt(makeContext({ availableExpressions }));
+	assert.ok(prompt.includes('<avatar>'));
+	assert.ok(prompt.includes('Extra'), 'custom presets must be addressable');
+	assert.ok(prompt.includes('Surprised'));
+	assert.ok(!prompt.includes('blinkLeft'), 'protected channels must not be offered');
+	assert.ok(!prompt.includes('jawOpen'));
+	assert.ok(prompt.includes('vrma_01') && prompt.includes('vrma_07'));
+	assert.ok(prompt.includes('head, face, shoulder, torso, hip'));
+});
+
+test('avatar catalog falls back to the emotional six with no model loaded', () => {
+	const prompt = buildSystemPrompt(makeContext());
+	assert.ok(prompt.includes('<avatar>'));
+	for (const name of ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'neutral']) {
+		assert.ok(prompt.includes(name), name);
+	}
+});
+
+test('extraction prompt requests both stage-direction cues', () => {
+	const prompt = buildExtractionSystemPrompt();
+	assert.ok(prompt.includes('"expression_cue"'));
+	assert.ok(prompt.includes('"gesture_cue"'));
+});

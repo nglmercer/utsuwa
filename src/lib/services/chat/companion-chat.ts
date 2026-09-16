@@ -71,7 +71,8 @@ async function buildCompanionPrompt(
 		pendingReminders: reminderStore.upcoming.map((r) => ({ triggerAt: r.triggerAt, content: r.content })),
 		sessionStartedAt: workingMemory.sessionStartedAt,
 		systemEvent,
-		nativeRuntime
+		nativeRuntime,
+		availableExpressions: vrmStore.availableExpressions
 	};
 	return buildSystemPrompt(context);
 }

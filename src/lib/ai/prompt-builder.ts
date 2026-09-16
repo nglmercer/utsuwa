@@ -2,8 +2,9 @@ import type { CharacterState } from '$lib/types/character';
 import type { Fact, SessionSummary, RelevantContext, MemoryBudget } from '../types/memory.ts';
 import { getMemoryBudget } from '../types/memory.ts';
 import type { PersonaCard } from '$lib/stores/persona.svelte';
-// Relative import keeps this module runnable under the node test runner
+// Relative imports keep this module runnable under the node test runner
 import { STAGE_BEHAVIORS, STAGE_INSTRUCTIONS } from '../engine/stages.ts';
+import { isProtectedChannel } from '../engine/facial-expressions.ts';
 
 // Prompt context for building
 export interface PromptContext {
@@ -28,6 +29,9 @@ export interface PromptContext {
 	systemEvent?: string;
 	// True only when this prompt is sent through the native Rust agent runtime.
 	nativeRuntime?: boolean;
+	// Expression presets on the loaded 3D model. Shown to the model (minus
+	// protected channels) so cues can address model-specific customs.
+	availableExpressions?: string[];
 }
 
 function getContextMemoryBudget(contextSize?: number): MemoryBudget | undefined {
@@ -72,6 +76,23 @@ function buildEventLayer(ctx: PromptContext): string | null {
 	return `<event>\n${ctx.systemEvent}\n</event>`;
 }
 
+// Avatar capability catalog: the face and body moves the model can stage via
+// expression_cue / gesture_cue. Face presets come from the loaded model minus
+// protected channels (blink, visemes, jaw move on their own); emotes and
+// reaction zones are fixed capabilities. Falls back to the emotional six
+// before a model has loaded.
+function buildAvatarCatalogLayer(ctx: PromptContext): string {
+	const faces =
+		ctx.availableExpressions && ctx.availableExpressions.length > 0
+			? [...new Set(ctx.availableExpressions)].filter((name) => !isProtectedChannel(name))
+			: ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'neutral'];
+	return `<avatar>
+Your 3D avatar's face can show: ${faces.join(', ')}.
+Your 3D avatar's body can play one-shot emotes (vrma_01, vrma_02, vrma_03, vrma_04, vrma_05, vrma_06, vrma_07) or react physically, startling or leaning as if touched at: head, face, shoulder, torso, hip.
+Direct the face with expression_cue and the body with gesture_cue in your JSON block. Blinking, lip-sync, and jaw motion happen on their own — never name those presets.
+</avatar>`;
+}
+
 // Build the complete system prompt
 export function buildSystemPrompt(context: PromptContext): string {
 	// Companion Mode - simplified prompt without relationship mechanics
@@ -86,6 +107,7 @@ export function buildSystemPrompt(context: PromptContext): string {
 		...(context.hasImages ? [buildBeingShownLayer()] : []),
 		buildEventLayer(context),
 		...(context.nativeRuntime ? [buildNativeAgentLayer()] : []),
+		buildAvatarCatalogLayer(context),
 		buildInstructionLayer(context)
 	].filter((layer): layer is string => layer !== null);
 
@@ -154,6 +176,7 @@ Energy: ${energyDesc} (${ctx.state.energy}/100)
 	const eventLayer = buildEventLayer(ctx);
 	if (eventLayer) parts.push(eventLayer);
 	if (ctx.nativeRuntime) parts.push(buildNativeAgentLayer());
+	parts.push(buildAvatarCatalogLayer(ctx));
 
 	// Simple instructions (no relationship mechanics)
 	parts.push(`<instructions>
@@ -167,11 +190,14 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "mood_change": { "emotion": "emotion_name", "intensity_delta": number },
   "energy_delta": number,
   "new_memory": null | "something specific worth remembering about them",
-  "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 }
+  "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
+  "gesture_cue": null | { "type": "emote", "id": "vrma_01|vrma_02|vrma_03|vrma_04|vrma_05|vrma_06|vrma_07" } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 \`\`\`
 
 expression_cue is optional stage direction for your avatar's face: a brief flash of expression while your reply lands, which then melts back into your mood. Omit it (null) when your mood's resting face already fits.
+
+gesture_cue is optional stage direction for your avatar's body: a one-shot emote performance, or a physical startle or lean as if touched at that zone. Use it rarely, only when the reply clearly calls for a visible gesture — most replies need none. Omit it (null) otherwise.
 
 Use new_memory whenever they reveal something about themselves: a preference, a plan, a feeling, someone in their life, or a moment you shared (like a photo they show you). Write it in third person about them (they/them, never assume gender), one short factual sentence stating only what they actually said. Never invent details. Use null only when nothing meaningful came up.
 
@@ -359,10 +385,14 @@ Shape:
   "trust_delta": -10 to 10,
   "intimacy_delta": -10 to 10,
   "comfort_delta": -10 to 10,
-  "new_memory": null | "a fact about the user"
+  "new_memory": null | "a fact about the user",
+  "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
+  "gesture_cue": null | { "type": "emote", "id": "vrma_01|vrma_02|vrma_03|vrma_04|vrma_05|vrma_06|vrma_07" } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 
 The four *_delta values are small numbers for how this exchange moved the relationship: positive when they open up, share, or warm to the companion; near 0 for neutral chat; negative if it went badly. Usually between -3 and 5.
+
+expression_cue and gesture_cue are optional stage direction for the avatar's face and body while the reply lands; use null for both unless the reply clearly calls for a visible reaction.
 
 new_memory — when to write one:
 - Capture it whenever they reveal something real about themselves or their life: a fact, a preference, a plan, a feeling, their job, or someone in their life (family, friends, pets).${imageLine} When in doubt, capture it.
@@ -414,11 +444,14 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "comfort_delta": number,
   "new_memory": null | "something specific worth remembering about them",
   "triggered_event": null | "event_id",
-  "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 }
+  "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
+  "gesture_cue": null | { "type": "emote", "id": "vrma_01|vrma_02|vrma_03|vrma_04|vrma_05|vrma_06|vrma_07" } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
 }
 \`\`\`
 
 expression_cue is optional stage direction for your avatar's face: a brief flash of expression while your reply lands (a smile, a gasp, a softening), which then melts back into your mood. Omit it (null) when your mood's resting face already fits.
+
+gesture_cue is optional stage direction for your avatar's body: a one-shot emote performance, or a physical startle or lean as if touched at that zone. Use it rarely, only when the reply clearly calls for a visible gesture — most replies need none. Omit it (null) otherwise.
 
 Keep deltas small (-10 to +10 for most interactions). Use new_memory whenever they reveal something about themselves: a preference, a plan, a feeling, someone in their life, or a moment you shared (like a photo they show you). Write it in third person about them (they/them, never assume gender), one short factual sentence stating only what they actually said. Never invent details. Use null only when nothing meaningful came up.
 
