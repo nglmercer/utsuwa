@@ -42,6 +42,7 @@ members = [
     "crates/file-target",
     "crates/tool-filesystem-host",
     "crates/utsuwa-sdk",
+    "crates/task-core",
 ]
 
 [workspace.package]
@@ -110,6 +111,7 @@ tool-filesystem-host = { path = "crates/tool-filesystem-host" }
 tool-process = { path = "crates/tool-process" }
 tool-sdk = { path = "crates/tool-sdk" }
 utsuwa-sdk = { path = "crates/utsuwa-sdk" }
+task-core = { path = "crates/task-core" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-appender = "0.2"
