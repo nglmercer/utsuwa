@@ -8,6 +8,7 @@
 	import { debugEventsStore, testEvents } from '$lib/stores/debugEvents.svelte';
 	import { goto } from '$app/navigation';
 	import { localPath } from '$lib/config/links';
+	import { AVATAR_ACTIONS, AVATAR_ACTION_NAMES } from '$lib/engine/avatar-actions';
 
 	// Material debug modes from @pixiv/three-vrm-materials-mtoon
 	const materialDebugModes = [
@@ -144,6 +145,40 @@
 			}
 			vrm.expressionManager.update();
 		}
+	}
+
+	// Avatar action controls: manual playback for every registry action,
+	// bypassing the AI gate so visuals can be confirmed independently.
+	function playAvatarAction(name: (typeof AVATAR_ACTION_NAMES)[number]) {
+		const def = AVATAR_ACTIONS[name];
+		if (def.source.kind === 'vrma') {
+			vrmStore.setCurrentAnimation(def.source.url);
+		} else if (name === 'walk') {
+			vrmStore.requestAvatarAction({ kind: 'walk', action: 'walk', direction: 'forward', durationMs: 1200 });
+		} else if (name === 'jump') {
+			vrmStore.requestAvatarAction({ kind: 'jump', action: 'jump' });
+		} else {
+			vrmStore.requestAvatarAction({ kind: 'procedural', action: name });
+		}
+	}
+
+	function walkAvatar(direction: 'left' | 'right' | 'forward' | 'back') {
+		vrmStore.requestAvatarAction({ kind: 'walk', action: 'walk', direction, durationMs: 1500 });
+	}
+
+	function stopAvatarAction() {
+		vrmStore.requestAvatarAction({ kind: 'stop', action: 'stop' });
+	}
+
+	function resetAvatarRoot() {
+		vrmStore.requestAvatarAction({ kind: 'reset', action: 'reset' });
+	}
+
+	function actionMeta(name: (typeof AVATAR_ACTION_NAMES)[number]): string {
+		const def = AVATAR_ACTIONS[name];
+		const src =
+			def.source.kind === 'vrma' ? def.source.url.split('/').pop() : def.source.kind;
+		return `${src} · ${def.mode} · cd ${(def.cooldownMs / 1000).toFixed(0)}s · AI ${def.aiAllowed ? 'yes' : 'no'}${def.explicitRequestOnly ? ' · explicit-only' : ''}`;
 	}
 
 	// Test blink
@@ -360,6 +395,29 @@
 						<option value={anim.url}>{anim.name}</option>
 					{/each}
 				</select>
+			</div>
+		</section>
+
+		<!-- Avatar Actions -->
+		<section class="section">
+			<h3>Avatar Actions</h3>
+			<p class="hint">Play registry actions directly (bypasses the AI gate). Busy: {vrmStore.actionBusy ? 'yes' : 'no'}.</p>
+			<div class="event-buttons">
+				{#each AVATAR_ACTION_NAMES as name (name)}
+					<button class="event-btn" onclick={() => playAvatarAction(name)} title={actionMeta(name)}>
+						<Icon name="play" size={14} />
+						{AVATAR_ACTIONS[name].label}
+					</button>
+				{/each}
+			</div>
+			<p class="hint">Walk directions, stop, and root reset.</p>
+			<div class="event-buttons">
+				<button class="event-btn" onclick={() => walkAvatar('left')}>Walk Left</button>
+				<button class="event-btn" onclick={() => walkAvatar('right')}>Walk Right</button>
+				<button class="event-btn" onclick={() => walkAvatar('forward')}>Walk Forward</button>
+				<button class="event-btn" onclick={() => walkAvatar('back')}>Walk Back</button>
+				<button class="event-btn" onclick={stopAvatarAction}>Stop</button>
+				<button class="event-btn" onclick={resetAvatarRoot}>Reset Position</button>
 			</div>
 		</section>
 
