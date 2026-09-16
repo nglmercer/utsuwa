@@ -361,6 +361,16 @@ impl<S: TaskStore> Executor<S> {
             Err(err) => {
                 let message = format!("verification failed: {err}");
                 if task.attempts < task.max_attempts {
+                    // Retry the step that produced the bad receipt — not the
+                    // whole task, and never by re-verifying the same result.
+                    let retry_index = verification_retry_index(&task);
+                    if let Some(step) = task.steps.get_mut(retry_index) {
+                        step.status = TaskStepStatus::Pending;
+                        step.result = None;
+                        step.error = Some(message.clone());
+                        step.finished_at = None;
+                    }
+                    task.current_step_index = retry_index;
                     task.status = TaskStatus::Ready;
                     task.lease_until = None;
                     task.next_attempt_at = Some(now + backoff_ms(task.attempts));
@@ -415,6 +425,28 @@ impl<S: TaskStore> Executor<S> {
             })
             .await
     }
+}
+
+/// Index of the step a verification retry should re-run: the most recent
+/// step with an explicit failure receipt (`status` present and not
+/// `"success"` — a failed routine/tool receipt names its producer).
+/// Results without a `status` field (wait steps, plain completions) are
+/// neutral and never selected. Falls back to the last step when every
+/// receipt claims success but verification still failed (misconfigured
+/// expectation or an overclaiming producer — bounded by max_attempts, and
+/// the reason verification specs must be exact).
+fn verification_retry_index(task: &Task) -> usize {
+    let last = task.steps.len().saturating_sub(1);
+    task.steps
+        .iter()
+        .rposition(|step| {
+            step.result
+                .as_ref()
+                .and_then(|result| result.get("status"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|status| status != "success")
+        })
+        .unwrap_or(last)
 }
 
 fn aggregate_results(task: &Task) -> serde_json::Value {
@@ -657,6 +689,61 @@ mod tests {
         let waiting = executor.execute_task(&task.id).await.expect("execute");
         assert_eq!(waiting.status, TaskStatus::Waiting);
         assert!(waiting.wait_for.is_some());
+    }
+
+    #[tokio::test]
+    async fn verification_failure_retries_the_failed_step_only() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let (store, clock, _) = setup();
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_clone = calls.clone();
+        let runners = Runners {
+            avatar_routine: Arc::new(FnRunner::new(move |_, _, _| {
+                let call = calls_clone.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    StepOutcome::Completed(serde_json::json!({
+                        "status": "failed",
+                        "completed_steps": [],
+                    }))
+                } else {
+                    StepOutcome::Completed(serde_json::json!({
+                        "status": "success",
+                        "completed_steps": ["wave"],
+                    }))
+                }
+            })),
+            ..test_runners()
+        };
+        let executor = Executor::new(
+            store.clone(),
+            clock.clone() as Arc<dyn Clock>,
+            runners,
+            60_000,
+        );
+        let mut input = notify_task();
+        input.verification = Some(crate::model::VerificationSpec::AvatarRoutine {
+            expected_steps: vec!["wave".to_string()],
+        });
+        input.steps = vec![NewTaskStep {
+            step_type: TaskStepType::AvatarRoutine,
+            input: serde_json::json!({}),
+            max_attempts: None,
+        }];
+        let mut task = store.create(input, 1_000).await.expect("create");
+        task.status = TaskStatus::Ready;
+        store.update(&task, 1_000).await.expect("ready");
+
+        // First run: bad receipt → verification fails → step reset, requeued.
+        let requeued = executor.execute_task(&task.id).await.expect("run1");
+        assert_eq!(requeued.status, TaskStatus::Ready);
+        assert_eq!(requeued.steps[0].status, TaskStepStatus::Pending);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Second run: good receipt → verified → completed.
+        clock.set(100_000);
+        let done = executor.execute_task(&task.id).await.expect("run2");
+        assert_eq!(done.status, TaskStatus::Completed);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
