@@ -4,7 +4,8 @@ import {
 	validateStateUpdates,
 	extractPotentialFacts,
 	type ExpressionCue,
-	type GestureCue
+	type GestureCue,
+	type CameraCue
 } from '$lib/ai/response-parser';
 import { AVATAR_ACTIONS, resolveLegacyEmote } from '$lib/engine/avatar-actions';
 import {
@@ -28,6 +29,7 @@ import { extractReminderTags } from '$lib/utils/reminders';
 import { reminderStore } from '$lib/stores/reminders.svelte';
 import { vrmStore } from '$lib/stores/vrm.svelte';
 import { photomodeStore } from '$lib/stores/photomode.svelte';
+import { displayStore } from '$lib/stores/display.svelte';
 import { ensureSession } from '$lib/engine/memory';
 import type { LLMProvider } from '$lib/types';
 import type { EventDefinition } from '$lib/types/events';
@@ -169,6 +171,27 @@ function stageGestureCue(cue: GestureCue) {
 	}
 }
 
+// Apply a one-shot camera direction. Only the keys the model set are
+// applied, against the main profile; framing is low-risk and user-undoable
+// via the camera panel, so no gate — the prompt restricts cues to explicit
+// camera requests, and photo mode keeps owning its own framing.
+function fireCameraCue(cue: CameraCue | null) {
+	if (!cue) return;
+	try {
+		if (photomodeStore.active) return;
+		if (cue.follow !== undefined) displayStore.setFollowAvatar(cue.follow);
+		const framing: { zoom?: number; height?: number; fov?: number } = {};
+		if (cue.zoom !== undefined) framing.zoom = cue.zoom;
+		if (cue.height !== undefined) framing.height = cue.height;
+		if (cue.fov !== undefined) framing.fov = cue.fov;
+		if (Object.keys(framing).length > 0) displayStore.setCamera(framing, 'main');
+		if (cue.reframe) displayStore.requestReframe();
+		console.debug('[CameraCue] applied', cue);
+	} catch (e) {
+		console.debug('[CameraCue] failed to stage cue:', e);
+	}
+}
+
 // Translate a locally executed avatar plan into gesture-cue keys so a late
 // model cue for the same requested action is ignored by correlation (not by
 // elapsed-time cooldowns, which cannot span a slow model round-trip).
@@ -215,6 +238,7 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 	let llmUpdates = parsed.stateUpdates;
 	fireExpressionCue(parsed.expressionCue);
 	fireGestureCue(parsed.gestureCue, input.handledAvatarKeys);
+	fireCameraCue(parsed.cameraCue);
 
 	if (debug) {
 		console.log('%c[LLM raw response]', 'color:#00b2ff;font-weight:bold', companionResponse);
@@ -246,6 +270,7 @@ export async function processCompanionTurn(input: CompanionTurnInput): Promise<C
 			llmUpdates = fallback.stateUpdates;
 			fireExpressionCue(fallback.expressionCue);
 			fireGestureCue(fallback.gestureCue, input.handledAvatarKeys);
+			fireCameraCue(fallback.cameraCue);
 			if (debug) {
 				console.log('%c[extraction fallback]', 'color:#f59e0b;font-weight:bold', extracted, '->', llmUpdates);
 			}

@@ -315,6 +315,35 @@ test('returns a null gestureCue when the model omits it', () => {
 	assert.equal(gestureCue, null);
 });
 
+test('parses a camera_cue with only the keys the model set', () => {
+	const { cameraCue, dialogue } = parseResponse(
+		'Zooming in!\n{ "camera_cue": { "zoom": 1.8, "reframe": true } }'
+	);
+	assert.deepEqual(cameraCue, { zoom: 1.8, reframe: true });
+	assert.ok(!dialogue.includes('camera_cue'));
+});
+
+test('clamps camera_cue numbers to the slider limits', () => {
+	const { cameraCue } = parseResponse(
+		'{ "camera_cue": { "zoom": 99, "height": -99, "fov": 10, "follow": true } }'
+	);
+	assert.deepEqual(cameraCue, { zoom: 2.5, height: -0.5, fov: 20, follow: true });
+});
+
+test('drops camera_cue noise instead of touching the camera', () => {
+	const cases = [
+		'{ "camera_cue": { "follow": "yes", "zoom": "close" } }',
+		'{ "camera_cue": { "orbit": "left", "target": "chair" } }',
+		'{ "camera_cue": {} }',
+		'{ "camera_cue": null }'
+	];
+	for (const block of cases) {
+		const { cameraCue, dialogue } = parseResponse(`Hey.\n${block}`);
+		assert.equal(cameraCue, null, block);
+		assert.ok(!dialogue.includes('camera_cue'), `cue must be stripped from dialogue: ${block}`);
+	}
+});
+
 test('parses semantic animation cues', () => {
 	const { gestureCue } = parseResponse('Hi!\n```json\n{ "gesture_cue": { "type": "Animation", "action": " Wave " } }\n```');
 	assert.deepEqual(gestureCue, { type: 'animation', action: 'wave' });

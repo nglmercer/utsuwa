@@ -14,6 +14,7 @@ import {
 	type GestureCue as EngineGestureCue
 } from '../engine/avatar-actions.ts';
 import { resolveSceneAnchor } from '../engine/scene-anchors.ts';
+import { CAMERA_LIMITS } from '../stores/display-types.ts';
 
 // Re-exported so turn staging keeps one import site.
 export type GestureCue = EngineGestureCue;
@@ -35,6 +36,7 @@ export interface ParsedResponse {
 	stateUpdates: Partial<StateUpdates> | null;
 	expressionCue: ExpressionCue | null;
 	gestureCue: GestureCue | null;
+	cameraCue: CameraCue | null;
 	parseError?: string;
 }
 
@@ -66,6 +68,23 @@ interface LLMStateOutput {
 		anchor_id?: string;
 		duration_ms?: number;
 	};
+	camera_cue?: {
+		follow?: boolean;
+		zoom?: number;
+		height?: number;
+		fov?: number;
+		reframe?: boolean;
+	};
+}
+
+// A one-shot camera direction from the model ("zoom in on my new hair").
+// All fields optional: the turn applies only the keys the model set.
+export interface CameraCue {
+	follow?: boolean;
+	zoom?: number;
+	height?: number;
+	fov?: number;
+	reframe?: boolean;
 }
 
 // Valid emotions for validation
@@ -154,7 +173,7 @@ function cutHallucinatedTurn(text: string, companionName?: string): string {
 
 // JSON objects we care about carry at least one of these keys.
 const STATE_KEY_RE =
-	/"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|new_memory|expression_cue|gesture_cue)"/;
+	/"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|new_memory|expression_cue|gesture_cue|camera_cue)"/;
 
 // Reasoning models (R1-style) emit a scratchpad before the answer. Strip it so
 // the trace never reaches the chat bubble or the JSON parser. Handles the
@@ -237,6 +256,7 @@ export function parseResponse(
 	let stateUpdates: Partial<StateUpdates> | null = null;
 	let expressionCue: ExpressionCue | null = null;
 	let gestureCue: GestureCue | null = null;
+	let cameraCue: CameraCue | null = null;
 	let parseError: string | undefined;
 
 	// Prefer a fenced ```json block; otherwise grab the first bare JSON object
@@ -248,6 +268,7 @@ export function parseResponse(
 			stateUpdates = convertLLMOutput(parsed);
 			expressionCue = parseExpressionCue(parsed, available);
 			gestureCue = parseGestureCue(parsed);
+			cameraCue = parseCameraCue(parsed);
 		} else {
 			parseError = 'Failed to parse JSON state block';
 			console.debug('Failed to parse LLM state updates:', fenced[1]);
@@ -261,13 +282,14 @@ export function parseResponse(
 				stateUpdates = convertLLMOutput(parsed);
 				expressionCue = parseExpressionCue(parsed, available);
 				gestureCue = parseGestureCue(parsed);
+				cameraCue = parseCameraCue(parsed);
 				dialogue = raw.replace(obj, '').trim();
 			}
 		}
 	}
 
 	dialogue = cleanDialogue(dialogue, companionName);
-	return { dialogue, stateUpdates, expressionCue, gestureCue, parseError };
+	return { dialogue, stateUpdates, expressionCue, gestureCue, cameraCue, parseError };
 }
 
 // Convert LLM output format to our StateUpdates format
@@ -415,10 +437,33 @@ function parseGestureCue(output: LLMStateOutput): GestureCue | null {
 	return null;
 }
 
+// Validate an optional one-shot camera direction. Strict booleans, finite
+// numbers clamped to the UI slider limits; unknown keys ignored. A cue with
+// no usable key is null, so the turn never touches the camera on noise.
+function parseCameraCue(output: LLMStateOutput): CameraCue | null {
+	const cue = output.camera_cue;
+	if (!cue || typeof cue !== 'object') return null;
+	const parsed: CameraCue = {};
+	if (typeof cue.follow === 'boolean') parsed.follow = cue.follow;
+	if (typeof cue.reframe === 'boolean') parsed.reframe = cue.reframe;
+	const zoom = clampCueNumber(cue.zoom, CAMERA_LIMITS.zoom.min, CAMERA_LIMITS.zoom.max);
+	if (zoom !== undefined) parsed.zoom = zoom;
+	const height = clampCueNumber(cue.height, CAMERA_LIMITS.height.min, CAMERA_LIMITS.height.max);
+	if (height !== undefined) parsed.height = height;
+	const fov = clampCueNumber(cue.fov, CAMERA_LIMITS.fov.min, CAMERA_LIMITS.fov.max);
+	if (fov !== undefined) parsed.fov = fov;
+	return Object.keys(parsed).length > 0 ? parsed : null;
+}
+
+function clampCueNumber(value: unknown, min: number, max: number): number | undefined {
+	if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+	return Math.min(max, Math.max(min, value));
+}
+
 // Clean up dialogue text
 // State-block markers used to spot a truncated JSON block leaking into dialogue.
 const STATE_BLOCK_START =
-	/\{[^{}]*"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|energy_delta|new_memory|expression_cue|gesture_cue)"/i;
+	/\{[^{}]*"(?:mood_change|affection_delta|trust_delta|intimacy_delta|comfort_delta|respect_delta|energy_delta|new_memory|expression_cue|gesture_cue|camera_cue)"/i;
 
 // Cut a trailing state block that was never closed (unterminated ```json fence,
 // or a bare `{...` whose braces never balance) — the mark of a response truncated
@@ -462,7 +507,7 @@ function cleanDialogue(text: string, companionName?: string): string {
 	cleaned = stripTruncatedStateBlock(cleaned);
 
 	// Remove any leftover (closed) JSON-like content
-	cleaned = cleaned.replace(/\{[^}]*"(?:mood|delta|emotion|expression_cue|gesture_cue)[^}]*\}/gi, '');
+	cleaned = cleaned.replace(/\{[^}]*"(?:mood|delta|emotion|expression_cue|gesture_cue|camera_cue)[^}]*\}/gi, '');
 
 	// Remove markdown formatting without mistaking the inner pair of a bold
 	// span for an action. The old single-asterisk expression matched the

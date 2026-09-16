@@ -417,6 +417,16 @@ test('both modes document gesture_cue in the JSON block', () => {
 	}
 });
 
+test('both modes document camera_cue in the JSON block', () => {
+	for (const appMode of ['dating_sim', 'companion'] as const) {
+		const prompt = buildSystemPrompt(makeContext({ state: makeState({ appMode }) }));
+		assert.ok(prompt.includes('"camera_cue"'), appMode);
+		assert.ok(prompt.includes('"follow": true|false'), appMode);
+		assert.ok(prompt.includes('CAMERA RULES'), appMode);
+		assert.ok(prompt.includes('default to camera_cue null'), appMode);
+	}
+});
+
 test('avatar catalog lists model presets minus protected channels', () => {
 	const availableExpressions = [
 		'happy',

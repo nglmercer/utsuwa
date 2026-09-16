@@ -84,9 +84,31 @@
 		/>
 	</label>
 
-	<button class="reset-btn" onclick={() => displayStore.resetCamera(profile)} disabled={isDefault}>
-		Reset camera
+	<button
+		class="switch-row"
+		role="switch"
+		aria-checked={displayStore.followAvatar}
+		aria-label="Follow avatar with camera"
+		onclick={() => displayStore.setFollowAvatar(!displayStore.followAvatar)}
+	>
+		<span class="switch-label">Follow avatar</span>
+		<span class="switch" class:on={displayStore.followAvatar} aria-hidden="true">
+			<span class="switch-knob"></span>
+		</span>
 	</button>
+
+	<div class="btn-row">
+		<button class="reset-btn grow" onclick={() => displayStore.requestReframe()}>
+			Center on avatar
+		</button>
+		<button
+			class="reset-btn grow"
+			onclick={() => displayStore.resetCamera(profile)}
+			disabled={isDefault}
+		>
+			Reset camera
+		</button>
+	</div>
 
 	{#if profile === 'main'}
 		<div class="section-divider">
@@ -268,6 +290,60 @@
 	.reset-btn:disabled {
 		opacity: 0.45;
 		cursor: default;
+	}
+
+	.btn-row {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	.reset-btn.grow {
+		flex: 1;
+		margin-top: 0;
+	}
+
+	.switch-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 0.125rem 0;
+		border: none;
+		background: transparent;
+		cursor: pointer;
+	}
+
+	.switch-label {
+		font-size: 0.75rem;
+		font-weight: 500;
+		color: var(--text-secondary);
+	}
+
+	.switch {
+		position: relative;
+		width: 32px;
+		height: 18px;
+		border-radius: var(--radius-full);
+		background: var(--bg-tertiary);
+		transition: background 0.15s ease;
+	}
+
+	.switch.on {
+		background: var(--accent);
+	}
+
+	.switch-knob {
+		position: absolute;
+		top: 2px;
+		left: 2px;
+		width: 14px;
+		height: 14px;
+		border-radius: 50%;
+		background: var(--bg-primary);
+		transition: transform 0.15s ease;
+	}
+
+	.switch.on .switch-knob {
+		transform: translateX(14px);
 	}
 
 	.section-divider {

@@ -67,9 +67,13 @@ function createDisplayStore() {
 	// Session-only counter; the chat window clears its saved rect when it changes
 	let chatWindowResetToken = $state(0);
 	// Camera follow: the orbit target tracks the avatar as she walks so she
-	// stays framed instead of stranding at the edge. Photo mode always opts
-	// out (the user owns that framing).
-	let followAvatar = $state(true);
+	// stays framed instead of stranding at the edge. Off by default so walks
+	// read as motion in the viewport; reframe or the follow toggle recovers
+	// the framing. Photo mode always opts out (the user owns that framing).
+	let followAvatar = $state(false);
+	// Session-only counter; each bump re-centers the fitted framing on her
+	// current position (the camera panel's reframe button, or a model cue).
+	let reframeCounter = $state(0);
 
 	if (browser) {
 		const saved = localStorage.getItem(STORAGE_KEY);
@@ -195,6 +199,10 @@ function createDisplayStore() {
 		save();
 	}
 
+	function requestReframe() {
+		reframeCounter += 1;
+	}
+
 	return {
 		get camera() {
 			return camera;
@@ -232,6 +240,9 @@ function createDisplayStore() {
 		get followAvatar() {
 			return followAvatar;
 		},
+		get reframeCounter() {
+			return reframeCounter;
+		},
 		setCamera,
 		resetCamera,
 		setPhysicsIntensity,
@@ -244,6 +255,7 @@ function createDisplayStore() {
 		setTextRevealSpeed,
 		setChatBarAlignment,
 		setFollowAvatar,
+		requestReframe,
 		requestChatWindowReset
 	};
 }

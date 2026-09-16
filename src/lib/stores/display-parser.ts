@@ -97,7 +97,7 @@ export function parseDisplaySettings(raw: unknown): ParsedDisplaySettings {
 			typingIndicatorDelayMs: DEFAULT_TYPING_INDICATOR_DELAY_MS,
 			textRevealSpeed: DEFAULT_TEXT_REVEAL_SPEED,
 			chatBarAlignment: DEFAULT_CHAT_BAR_ALIGNMENT,
-			followAvatar: true
+			followAvatar: false
 		};
 	}
 
@@ -155,7 +155,7 @@ export function parseDisplaySettings(raw: unknown): ParsedDisplaySettings {
 		? parsed.chatBarAlignment
 		: DEFAULT_CHAT_BAR_ALIGNMENT;
 
-	const followAvatar = typeof parsed.followAvatar === 'boolean' ? parsed.followAvatar : true;
+	const followAvatar = typeof parsed.followAvatar === 'boolean' ? parsed.followAvatar : false;
 
 	return { camera, overlayCamera, physicsIntensity, sceneBackground, chatDisplayMode, sidebarPosition, waitToneEnabled, typingIndicatorDelayMs, textRevealSpeed, chatBarAlignment, followAvatar };
 }

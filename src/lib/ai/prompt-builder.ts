@@ -251,7 +251,8 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "energy_delta": number,
   "new_memory": null | "something specific worth remembering about them",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" },
+  "camera_cue": null | { "follow": true|false, "zoom": 0.5 to 2.5, "height": -0.5 to 0.5, "fov": 20 to 60, "reframe": true (re-center on her now) }
 }
 \`\`\`
 
@@ -260,6 +261,8 @@ expression_cue is optional stage direction for your avatar's face: a brief flash
 gesture_cue is optional stage direction for your avatar's body: a named action performance, a short walk, or a physical startle or lean as if touched at that zone.
 
 BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, walk, run, turn, goto, sit, stand, or any position move only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
+
+CAMERA RULES: default to camera_cue null. Touch the camera only when the user explicitly asks about the view, framing, zoom, or following ("zoom in", "follow me", "stop following", "center the camera"). Set only the keys they asked about; never reframe or move the camera unprompted, and never fight framing they set themselves.
 
 COMPLETION HONESTY: never claim an action, task, message send, avatar routine, or external effect completed unless the runtime result confirms it. Your own text is never evidence. Do not say done, finished, moved, sent, or completed unless the corresponding receipt says completed.
 
@@ -451,12 +454,15 @@ Shape:
   "comfort_delta": -10 to 10,
   "new_memory": null | "a fact about the user",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" },
+  "camera_cue": null | { "follow": true|false, "zoom": 0.5 to 2.5, "height": -0.5 to 0.5, "fov": 20 to 60, "reframe": true (re-center on her now) }
 }
 
 The four *_delta values are small numbers for how this exchange moved the relationship: positive when they open up, share, or warm to the companion; near 0 for neutral chat; negative if it went badly. Usually between -3 and 5.
 
 expression_cue and gesture_cue are optional stage direction for the avatar's face and body while the reply lands; use null for both unless the reply clearly calls for a visible reaction.
+
+camera_cue is optional stage direction for the 3D camera; use null unless the exchange asked about the view, zoom, or following. Set only the keys they asked about.
 
 new_memory — when to write one:
 - Capture it whenever they reveal something real about themselves or their life: a fact, a preference, a plan, a feeling, their job, or someone in their life (family, friends, pets).${imageLine} When in doubt, capture it.
@@ -509,7 +515,8 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "new_memory": null | "something specific worth remembering about them",
   "triggered_event": null | "event_id",
   "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" }
+  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" },
+  "camera_cue": null | { "follow": true|false, "zoom": 0.5 to 2.5, "height": -0.5 to 0.5, "fov": 20 to 60, "reframe": true (re-center on her now) }
 }
 \`\`\`
 
@@ -518,6 +525,8 @@ expression_cue is optional stage direction for your avatar's face: a brief flash
 gesture_cue is optional stage direction for your avatar's body: a named action performance, a short walk, or a physical startle or lean as if touched at that zone.
 
 BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, walk, run, turn, goto, sit, stand, or any position move only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
+
+CAMERA RULES: default to camera_cue null. Touch the camera only when the user explicitly asks about the view, framing, zoom, or following ("zoom in", "follow me", "stop following", "center the camera"). Set only the keys they asked about; never reframe or move the camera unprompted, and never fight framing they set themselves.
 
 COMPLETION HONESTY: never claim an action, task, message send, avatar routine, or external effect completed unless the runtime result confirms it. Your own text is never evidence. Do not say done, finished, moved, sent, or completed unless the corresponding receipt says completed.
 
