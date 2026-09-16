@@ -18,9 +18,14 @@
 		emptyWeights,
 		moodToExpressionWeights,
 		reactionEnvelope,
-		resolveExpressionName,
 		resolveTargets
 	} from '$lib/engine/facial-expressions';
+	import {
+		actionForAnimationUrl,
+		clampWalkOffset,
+		expressionForAnimationUrl,
+		jumpArcHeight
+	} from '$lib/engine/avatar-actions';
 	import {
 		computeSpringJointParams,
 		clampFrameDelta,
@@ -83,7 +88,11 @@
 
 	let { url }: Props = $props();
 	let vrm = $state<VRM | null>(null);
-	let group = $state<THREE.Group | null>(null);
+	// AvatarRoot owns application-level world motion (walk translation, jump
+	// arc, facing); the VRM scene parented inside it owns the skeleton pose.
+	// The mixer never moves the root, so world motion and bone animation stay
+	// separate systems that cannot fight.
+	const avatarRoot = new THREE.Group();
 
 	// === Spring-bone physics ===
 	// Authored per-joint values captured at load. The intensity setting always
@@ -426,6 +435,7 @@
 				return;
 			}
 			if (active && !wasPhotoActive) {
+				cancelAvatarActions();
 				if (talkingAction) talkingAction.fadeOut(0.2);
 				if (idleAction) {
 					// Ensure the idle actually holds weight (entering mid-talk left it
@@ -505,7 +515,7 @@
 		direction: number;
 	}
 	let activePulses: ReactionPulse[] = [];
-	let appliedNudges: Array<{ bone: THREE.Object3D; z: number; x: number }> = [];
+	let appliedNudges: Array<{ bone: THREE.Object3D; z: number; x: number; y?: number }> = [];
 	// In-flight transient face (tap flash, emote grin, AI cue): staged from
 	// vrmStore.expressionRequest and arbitrated against the mood face below.
 	let transientFace: { name: string; weight: number; t: number; duration: number; seq: number } | null =
@@ -594,6 +604,176 @@
 		});
 	});
 
+	// === Intentional avatar actions (procedural / jump / walk) ===
+	// At most one runs at a time; staging a new one cancels the current.
+	// Bone offsets reuse appliedNudges (auto-undone next frame); root motion
+	// is set absolutely every frame, so interrupts can never strand a pose.
+	const PROCEDURAL_DURATIONS: Record<string, number> = {
+		nod: 0.9,
+		shake_head: 0.9,
+		bow: 1.3,
+		shrug: 0.8
+	};
+	const WALK_SPEED = 0.45; // m/s: gentle, stays framed
+	const WALK_STEP_HZ = 1.7;
+	const WALK_MAX_RADIUS = 2.0; // m from origin; walks clamp onto this rim
+	const JUMP_DURATION = 0.65; // s
+	const JUMP_HEIGHT = 0.28; // m at the apex
+	interface LocomotionState {
+		dirX: number;
+		dirZ: number;
+		remainingMs: number;
+		phase: number;
+	}
+	let locomotion: LocomotionState | null = null;
+	let jumpState: { t: number } | null = null;
+	let procedural: { name: string; t: number; duration: number } | null = null;
+	let actionSeqSeen = 0;
+
+	function syncActionBusy() {
+		vrmStore.setActionBusy(
+			isEmotePlaying || locomotion !== null || jumpState !== null || procedural !== null
+		);
+	}
+
+	function cancelAvatarActions() {
+		locomotion = null;
+		procedural = null;
+		if (jumpState) {
+			jumpState = null;
+			avatarRoot.position.y = 0;
+		}
+		syncActionBusy();
+	}
+
+	function smoothstep(edge0: number, edge1: number, x: number): number {
+		const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+		return t * t * (3 - 2 * t);
+	}
+
+	function shortAngle(delta: number): number {
+		while (delta > Math.PI) delta -= Math.PI * 2;
+		while (delta < -Math.PI) delta += Math.PI * 2;
+		return delta;
+	}
+
+	function nudge(bone: THREE.Object3D | null, x: number, z: number, y = 0) {
+		if (!bone) return;
+		bone.rotation.x += x;
+		bone.rotation.z += z;
+		if (y) bone.rotation.y += y;
+		appliedNudges.push({ bone, z, x, y });
+	}
+
+	// One procedural frame at progress p (0..1). Small additive programs that
+	// read correctly without mocap; all offsets unwind via appliedNudges.
+	function applyProceduralAction(name: string, p: number) {
+		const targetVrm = vrm;
+		if (!targetVrm) return;
+		const humanoid = targetVrm.humanoid;
+		if (name === 'nod') {
+			const a = Math.sin(p * Math.PI * 2);
+			nudge(humanoid.getNormalizedBoneNode('head'), -0.3 * a, 0);
+			nudge(humanoid.getNormalizedBoneNode('neck'), -0.12 * a, 0);
+		} else if (name === 'shake_head') {
+			nudge(humanoid.getNormalizedBoneNode('head'), 0, 0, 0.45 * Math.sin(p * Math.PI * 2));
+		} else if (name === 'bow') {
+			const k = smoothstep(0, 0.35, p) * (1 - smoothstep(0.65, 1, p));
+			nudge(humanoid.getNormalizedBoneNode('spine'), 0.38 * k, 0);
+			nudge(humanoid.getNormalizedBoneNode('chest'), 0.12 * k, 0);
+			nudge(humanoid.getNormalizedBoneNode('head'), 0.24 * k, 0);
+		} else if (name === 'shrug') {
+			const k = Math.sin(p * Math.PI);
+			for (const side of ['leftUpperArm', 'rightUpperArm'] as const) {
+				const bone = humanoid.getNormalizedBoneNode(side);
+				// Outward follows the rig's own rest sign, so v0 and v1 agree.
+				if (bone) nudge(bone, 0, (Math.sign(bone.rotation.z) || 1) * 0.28 * k);
+			}
+			nudge(humanoid.getNormalizedBoneNode('head'), -0.06 * k, 0.1 * k);
+		}
+	}
+
+	const scratchWalkDir = new THREE.Vector3();
+	const scratchWalkToAvatar = new THREE.Vector3();
+
+	// Walk directions are viewer-relative: "left" means screen-left from the
+	// current camera, "forward" means toward the viewer.
+	function walkDirectionVector(direction: string): { x: number; z: number } {
+		if (camera.current) {
+			camera.current.getWorldPosition(scratchWalkDir);
+			scratchWalkToAvatar.subVectors(avatarRoot.position, scratchWalkDir);
+			scratchWalkToAvatar.y = 0;
+			if (scratchWalkToAvatar.lengthSq() > 1e-6) {
+				scratchWalkToAvatar.normalize();
+				// Screen-right = view direction × up = (-vz, 0, vx).
+				const rx = -scratchWalkToAvatar.z;
+				const rz = scratchWalkToAvatar.x;
+				if (direction === 'left') return { x: -rx, z: -rz };
+				if (direction === 'right') return { x: rx, z: rz };
+				if (direction === 'back') return { x: scratchWalkToAvatar.x, z: scratchWalkToAvatar.z };
+				return { x: -scratchWalkToAvatar.x, z: -scratchWalkToAvatar.z };
+			}
+		}
+		if (direction === 'left') return { x: -1, z: 0 };
+		if (direction === 'right') return { x: 1, z: 0 };
+		if (direction === 'back') return { x: 0, z: -1 };
+		return { x: 0, z: 1 };
+	}
+
+	function handleAvatarActionRequest(req: {
+		kind: string;
+		action: string;
+		direction?: string;
+		durationMs?: number;
+	}) {
+		if (req.kind === 'stop') {
+			cancelAvatarActions();
+			vrmStore.setCurrentAnimation(null);
+			return;
+		}
+		if (req.kind === 'reset') {
+			cancelAvatarActions();
+			avatarRoot.position.set(0, 0, 0);
+			avatarRoot.rotation.set(0, 0, 0);
+			return;
+		}
+		// A new action interrupts the current one; every program below is
+		// absolute per-frame, so interruption strands nothing.
+		cancelAvatarActions();
+		if (req.kind === 'procedural') {
+			const duration = PROCEDURAL_DURATIONS[req.action];
+			if (!duration) return;
+			procedural = { name: req.action, t: 0, duration };
+			console.debug('[AvatarCue] action started', `procedural:${req.action}`);
+		} else if (req.kind === 'jump') {
+			jumpState = { t: 0 };
+			console.debug('[AvatarCue] action started', 'jump');
+		} else if (req.kind === 'walk') {
+			const dir = walkDirectionVector(req.direction ?? 'forward');
+			locomotion = {
+				dirX: dir.x,
+				dirZ: dir.z,
+				remainingMs: Math.min(3000, Math.max(300, Math.round(req.durationMs ?? 1200))),
+				phase: 0
+			};
+			console.debug('[AvatarCue] action started', `walk:${req.direction ?? 'forward'}`);
+		} else {
+			return;
+		}
+		syncActionBusy();
+	}
+
+	$effect(() => {
+		const request = vrmStore.actionRequest;
+		if (!request) return;
+		untrack(() => {
+			if (!vrm || !mixer) return;
+			if (request.seq === actionSeqSeen) return;
+			actionSeqSeen = request.seq;
+			handleAvatarActionRequest(request);
+		});
+	});
+
 	// Update lip-sync analyser when TTS state changes
 	$effect(() => {
 		lipSyncAnalyzer.setAnalyser(ttsStore.currentAnalyser);
@@ -660,6 +840,7 @@
 		if (!animId) {
 			isEmotePlaying = false;
 			emoteAction = null;
+			syncActionBusy();
 			if (currentIdleAction && !currentIdleAction.isRunning()) {
 				currentIdleAction.reset().fadeIn(0.3).play();
 			}
@@ -682,22 +863,31 @@
 						currentIdle.fadeOut(0.2);
 					}
 
-					// Create and play emote
+					// Create and play emote; loop mode comes from the action
+					// registry (all VRMA entries are one-shots today).
 					const clip = createVRMAnimationClip(vrmAnimation, vrm);
 					const action = mixer.clipAction(clip);
-					action.setLoop(THREE.LoopOnce, 1);
+					const loopForever = actionForAnimationUrl(animationData.url)?.mode === 'loop';
+					if (loopForever) action.setLoop(THREE.LoopRepeat, Infinity);
+					else action.setLoop(THREE.LoopOnce, 1);
 					action.clampWhenFinished = true;
 					action.timeScale = 1.5;
 					action.reset().fadeIn(0.2).play();
 					emoteAction = action;
 					isEmotePlaying = true;
+					syncActionBusy();
+					console.debug('[AvatarCue] action started', `emote:${animationData.id}`);
 
-					// Grin for the emote's duration through the shared arbitration;
-					// the envelope ends with the clip, so no manual cleanup is needed.
-					const happyExpr = resolveExpressionName('happy', vrmStore.availableExpressions);
-					if (happyExpr) {
+					// Face comes from the action's metadata, not a generic
+					// grin: unmapped clips leave the mood face alone.
+					const face = expressionForAnimationUrl(animationData.url);
+					if (face) {
 						const clipMs = Math.round((action.getClip().duration / action.timeScale) * 1000);
-						vrmStore.requestExpression({ expression: happyExpr, intensity: 0.7, durationMs: clipMs });
+						vrmStore.requestExpression({
+							expression: face.expression,
+							intensity: face.intensity,
+							durationMs: clipMs
+						});
 					}
 
 					// When emote finishes, return to idle
@@ -708,8 +898,10 @@
 							capturedMixer.removeEventListener('finished', onFinished);
 							isEmotePlaying = false;
 							emoteAction = null;
+							syncActionBusy();
+							console.debug('[AvatarCue] action finished', `emote:${animationData.id}`);
 
-							// The emote grin fades out with its own envelope; nothing to clear.
+							// The action face fades out with its own envelope; nothing to clear.
 
 							// Resume idle animation
 							if (capturedIdleAction) {
@@ -724,6 +916,9 @@
 			})
 			.catch((error) => {
 				console.error('Error loading emote animation:', error);
+				// Clear the stale selection so the gesture gate's busy flag
+				// (currentAnimation !== null) can't stick forever.
+				vrmStore.setCurrentAnimation(null);
 			});
 	});
 
@@ -783,7 +978,9 @@
 				snapshotSpringBase(loadedVrm);
 
 				vrm = loadedVrm;
-				group = loadedVrm.scene;
+				avatarRoot.position.set(0, 0, 0);
+				avatarRoot.rotation.set(0, 0, 0);
+				avatarRoot.add(loadedVrm.scene);
 				const newMixer = new THREE.AnimationMixer(loadedVrm.scene);
 				mixer = newMixer;
 				vrmStore.setVrm(loadedVrm);
@@ -875,11 +1072,14 @@
 				vrmStore.setCurrentAnimation(null);
 			}
 			if (vrm) {
+				avatarRoot.remove(vrm.scene);
+				avatarRoot.position.set(0, 0, 0);
+				avatarRoot.rotation.set(0, 0, 0);
+				cancelAvatarActions();
 				// Frees geometries, materials, and textures (manual traverse missed textures)
 				VRMUtils.deepDispose(vrm.scene);
 				vrmStore.setVrm(null);
 				vrm = null;
-				group = null;
 				springBase = [];
 				poseAction = null;
 				poseClipCache.clear();
@@ -925,6 +1125,7 @@
 		for (const applied of appliedNudges) {
 			applied.bone.rotation.z -= applied.z;
 			applied.bone.rotation.x -= applied.x;
+			if (applied.y) applied.bone.rotation.y -= applied.y;
 		}
 		appliedNudges.length = 0;
 
@@ -954,6 +1155,61 @@
 				remaining.push(pulse);
 			}
 			activePulses = remaining;
+		}
+
+		// Intentional world-motion actions: walk translation with a procedural
+		// step swing, and the jump parabola. Root motion is absolute per-frame;
+		// bone offsets ride appliedNudges and unwind automatically.
+		if (locomotion) {
+			const step = Math.min(delta, 0.1);
+			const dist = WALK_SPEED * step;
+			const clamped = clampWalkOffset(
+				avatarRoot.position.x + locomotion.dirX * dist,
+				avatarRoot.position.z + locomotion.dirZ * dist,
+				WALK_MAX_RADIUS
+			);
+			avatarRoot.position.x = clamped.x;
+			avatarRoot.position.z = clamped.z;
+			const targetYaw = Math.atan2(locomotion.dirX, locomotion.dirZ);
+			avatarRoot.rotation.y += shortAngle(targetYaw - avatarRoot.rotation.y) * Math.min(1, delta * 6);
+			locomotion.phase += delta * Math.PI * 2 * WALK_STEP_HZ;
+			const swing = Math.sin(locomotion.phase);
+			const humanoid = vrm.humanoid;
+			nudge(humanoid.getNormalizedBoneNode('leftUpperLeg'), -0.38 * swing, 0);
+			nudge(humanoid.getNormalizedBoneNode('rightUpperLeg'), 0.38 * swing, 0);
+			nudge(humanoid.getNormalizedBoneNode('leftLowerLeg'), 0.45 * Math.max(0, -swing), 0);
+			nudge(humanoid.getNormalizedBoneNode('rightLowerLeg'), 0.45 * Math.max(0, swing), 0);
+			nudge(humanoid.getNormalizedBoneNode('leftUpperArm'), 0.2 * swing, 0);
+			nudge(humanoid.getNormalizedBoneNode('rightUpperArm'), -0.2 * swing, 0);
+			locomotion.remainingMs -= delta * 1000;
+			if (locomotion.remainingMs <= 0) {
+				locomotion = null;
+				syncActionBusy();
+				console.debug('[AvatarCue] action finished', 'locomotion:walk');
+			}
+		}
+		if (jumpState) {
+			jumpState.t += delta;
+			const progress = jumpState.t / JUMP_DURATION;
+			if (progress >= 1) {
+				avatarRoot.position.y = 0;
+				jumpState = null;
+				syncActionBusy();
+				console.debug('[AvatarCue] action finished', 'jump');
+			} else {
+				avatarRoot.position.y = jumpArcHeight(progress, JUMP_HEIGHT);
+			}
+		}
+		if (procedural) {
+			procedural.t += delta;
+			const progress = procedural.t / procedural.duration;
+			if (progress >= 1) {
+				console.debug('[AvatarCue] action finished', `procedural:${procedural.name}`);
+				procedural = null;
+				syncActionBusy();
+			} else {
+				applyProceduralAction(procedural.name, progress);
+			}
 		}
 
 		// Camera-driven jiggle: measure orbit velocity and advance the damped
@@ -1211,6 +1467,4 @@
 	});
 </script>
 
-{#if group}
-	<T is={group} />
-{/if}
+<T is={avatarRoot} />
