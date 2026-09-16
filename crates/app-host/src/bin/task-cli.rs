@@ -2,7 +2,7 @@
 //! and headlessly executes tasks against the same `tasks.db` the app
 //! uses — verification only, never a second product surface.
 //!
-//! Two execution modes:
+//! Three execution modes:
 //!
 //! - App mode (default): the running app owns execution; the CLI only
 //!   talks to the same `tasks.db` (`list`, `get`, `watch`, `timings`,
@@ -12,6 +12,10 @@
 //!   kilo-auto/free by default) to check whether a model can complete
 //!   a task. Close the app first — two tick loops racing can
 //!   double-execute steps.
+//! - Headless daemon: `daemon` runs the full tick loop plus worker pool
+//!   against the shared `tasks.db` until Ctrl-C, so scheduled and
+//!   waiting tasks progress with the app closed. Same rule: exactly one
+//!   driver at a time — never the daemon and the app together.
 //!
 //! Full verify loop for an interval task:
 //!
@@ -56,14 +60,21 @@ fn usage() -> &'static str {
      \x20 run <task-id> [--provider ID] [--model ID] [--base-url URL]\n\
      \x20 \x20 \x20 [--api-key KEY] [--yes] [--timeout-secs N] [--interval-ms MS]\n\
      \x20 \x20 \x20 [--timings]\n\
+     \x20 daemon [--provider ID] [--model ID] [--base-url URL]\n\
+     \x20 \x20 \x20 [--api-key KEY] [--yes] [--tick-ms MS]\n\
+     \x20 \x20 \x20 execute ALL ready tasks headlessly until Ctrl-C (closed-app\n\
+     \x20 \x20 \x20 mode): the same tick loop plus worker pool the app runs.\n\
+     \x20 \x20 \x20 Without --yes, review tasks park and are listed;\n\
+     \x20 \x20 \x20 with --yes they are approved as they arrive.\n\
      \n\
      list/get/watch/timings assume the app is running (it executes tasks\n\
-     from the shared tasks.db). interval and run execute headlessly\n\
-     instead: close the app first. Both default to --provider kilo\n\
-     --model kilo-auto/free (no API key); other providers need --base-url\n\
-     plus --api-key or $UTSUWA_MODEL_API_KEY. Both need --yes to\n\
-     auto-approve reviews. --timings prints the per-step timing table\n\
-     after the run.\n\
+     from the shared tasks.db). interval, run, and daemon execute\n\
+     headlessly instead: close the app first. All three default to\n\
+     --provider kilo --model kilo-auto/free (no API key); other providers\n\
+     need --base-url plus --api-key or $UTSUWA_MODEL_API_KEY. run needs\n\
+     --yes to auto-approve reviews; daemon without --yes leaves review\n\
+     tasks parked. --timings prints the per-step timing table after the\n\
+     run.\n\
      DB: <state-dir>/utsuwa/tasks.db (same path the host uses)."
 }
 
@@ -720,10 +731,19 @@ fn cmd_run_pre(args: &[String]) -> Result<RunArgs, String> {
     Ok(opts)
 }
 
-async fn cmd_run_exec(opts: RunArgs) -> Result<ExitCode, String> {
-    // Isolated provider settings (model-cli approach): temp state.db holds
-    // only the provider/model/base-url; the real tasks.db still carries
-    // the task itself.
+/// Headless task authority: the same focused registry, agent backend,
+/// and shared tasks.db the app wires, but with isolated temp provider
+/// settings (model-cli approach) and log-only event emission.
+/// Returns the host plus its temp state dir (the caller removes it).
+/// Shared by `run` (one task) and `daemon` (all tasks).
+fn build_headless_host(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<(task_host::TaskHost, PathBuf), String> {
+    // Isolated provider settings: temp state.db holds only the
+    // provider/model/base-url; the real tasks.db carries the tasks.
     let state_dir = std::env::temp_dir().join(format!("utsuwa-task-cli-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&state_dir);
     std::fs::create_dir_all(&state_dir)
@@ -737,9 +757,9 @@ async fn cmd_run_exec(opts: RunArgs) -> Result<ExitCode, String> {
             .lock()
             .map_err(|_| "temp storage lock failed".to_string())?;
         for (key, value) in [
-            (app_host::runtime::SETTING_PROVIDER, opts.provider.as_str()),
-            (app_host::runtime::SETTING_BASE_URL, opts.base_url.as_str()),
-            (app_host::runtime::SETTING_MODEL_NAME, opts.model.as_str()),
+            (app_host::runtime::SETTING_PROVIDER, provider),
+            (app_host::runtime::SETTING_BASE_URL, base_url),
+            (app_host::runtime::SETTING_MODEL_NAME, model),
         ] {
             store
                 .set_setting(key, &serde_json::json!(value))
@@ -747,7 +767,7 @@ async fn cmd_run_exec(opts: RunArgs) -> Result<ExitCode, String> {
         }
     }
     let secrets: Arc<dyn secret_core::SecretStore> = Arc::new(secret_core::MemoryStore::default());
-    if let Some(key) = &opts.api_key {
+    if let Some(key) = api_key {
         secrets
             .set(secret_core::ACCOUNT_MODEL_API_KEY, key)
             .map_err(|err| format!("cannot stage API key: {err}"))?;
@@ -775,6 +795,21 @@ async fn cmd_run_exec(opts: RunArgs) -> Result<ExitCode, String> {
                 "task-cli: avatar routine requested — needs the app renderer; run the app instead"
             );
         }
+        if event.event == task_host::TASK_TERMINAL_EVENT {
+            println!(
+                "task {} finished: {}",
+                event
+                    .data
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+                event
+                    .data
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?"),
+            );
+        }
     });
     let backend = Arc::new(app_host::runtime::task_agent::TaskAgentBackend::new(
         providers,
@@ -786,6 +821,16 @@ async fn cmd_run_exec(opts: RunArgs) -> Result<ExitCode, String> {
     let host =
         task_host::TaskHost::open_with_services(&tasks_db_path(), services, emit, Some(backend))
             .map_err(|err| format!("cannot open tasks.db: {err}"))?;
+    Ok((host, state_dir))
+}
+
+async fn cmd_run_exec(opts: RunArgs) -> Result<ExitCode, String> {
+    let (host, state_dir) = build_headless_host(
+        &opts.provider,
+        &opts.model,
+        &opts.base_url,
+        opts.api_key.as_deref(),
+    )?;
     println!(
         "driving {} with {}:{} (close the app first to avoid dual tick loops)",
         opts.task_id, opts.provider, opts.model
@@ -816,11 +861,132 @@ async fn cmd_run_exec(opts: RunArgs) -> Result<ExitCode, String> {
     })
 }
 
+/// Closed-app execution cadence: same 2s scheduling pass the app's
+/// background tick loop runs.
+const DEFAULT_DAEMON_TICK_MS: usize = 2_000;
+/// How often the daemon reports parked reviews (stdout is the only UI).
+const DAEMON_REVIEW_POLL_SECS: u64 = 30;
+
+#[derive(Debug, PartialEq, Eq)]
+struct DaemonArgs {
+    provider: String,
+    model: String,
+    base_url: String,
+    api_key: Option<String>,
+    auto_approve: bool,
+    tick: Duration,
+}
+
+fn parse_daemon_args(args: &[String]) -> Result<DaemonArgs, String> {
+    let auto_approve = args.iter().any(|arg| arg == "--yes");
+    let provider = parse_provider_args(args, auto_approve, DEFAULT_RUN_TIMEOUT_SECS as usize)?;
+    let tick_ms = parse_usize_arg(args, "--tick-ms", DEFAULT_DAEMON_TICK_MS)?;
+    Ok(DaemonArgs {
+        provider: provider.provider,
+        model: provider.model,
+        base_url: provider.base_url,
+        api_key: provider.api_key,
+        auto_approve,
+        tick: Duration::from_millis(tick_ms.max(250) as u64),
+    })
+}
+
+/// Synchronous `daemon` prelude: same nested-runtime rationale as the
+/// `run`/`interval` preludes.
+fn cmd_daemon_pre(args: &[String]) -> Result<DaemonArgs, String> {
+    let opts = parse_daemon_args(args)?;
+    app_host::runtime::providers::print_resolved_capabilities(
+        &opts.provider,
+        &opts.model,
+        &opts.base_url,
+        opts.api_key.as_deref(),
+        None,
+    );
+    println!("---");
+    Ok(opts)
+}
+
+async fn cmd_daemon_exec(opts: DaemonArgs) -> Result<ExitCode, String> {
+    let (host, state_dir) = build_headless_host(
+        &opts.provider,
+        &opts.model,
+        &opts.base_url,
+        opts.api_key.as_deref(),
+    )?;
+    let host = Arc::new(host);
+    println!(
+        "task daemon: executing all ready tasks with {}:{} (close the app first; Ctrl-C to stop)",
+        opts.provider, opts.model
+    );
+    if !opts.auto_approve {
+        println!("task daemon: without --yes, tasks needing review park until approved in the app");
+    }
+    tokio::spawn(task_host::run_tick_loop(Arc::clone(&host), opts.tick));
+    tokio::spawn(task_host::run_worker_pool(
+        Arc::clone(&host),
+        task_host::WorkerConfig::default(),
+    ));
+    let mut review_poll = tokio::time::interval(Duration::from_secs(DAEMON_REVIEW_POLL_SECS));
+    review_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("task daemon: stopping");
+                break;
+            }
+            _ = review_poll.tick() => {
+                report_parked_reviews(&host, opts.auto_approve).await;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&state_dir);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Surface parked reviews on stdout (the daemon has no other UI).
+/// With `--yes` they are approved as they arrive; otherwise they wait
+/// for the app — the daemon never auto-approves by surprise.
+async fn report_parked_reviews(host: &task_host::TaskHost, auto_approve: bool) {
+    let parked = match host.list(Some(TaskStatus::NeedsReview), 50).await {
+        Ok(tasks) => tasks,
+        Err(err) => {
+            eprintln!("task daemon: cannot list reviews: {err}");
+            return;
+        }
+    };
+    for task in parked {
+        let reason = task
+            .last_error
+            .as_ref()
+            .map(|err| err.message.as_str())
+            .unwrap_or("review required");
+        let short: String = reason.chars().take(160).collect();
+        if auto_approve {
+            match host
+                .review(
+                    &task.id,
+                    true,
+                    Some("approved by task-cli daemon --yes".to_string()),
+                )
+                .await
+            {
+                Ok(_) => println!("task daemon: approved {} ({})", task.id, task.title),
+                Err(err) => eprintln!("task daemon: cannot approve {}: {err}", task.id),
+            }
+        } else {
+            println!(
+                "task daemon: {} ({}) needs review: {short}",
+                task.id, task.title
+            );
+        }
+    }
+}
+
 fn run(argv: Vec<String>) -> ExitCode {
     let command = argv.first().map(String::as_str).unwrap_or("");
     let rest = argv.get(1..).unwrap_or(&[]).to_vec();
-    // `run`/`interval` preludes execute before the async runtime
-    // exists (capability discovery builds its own runtime).
+    // `run`/`interval`/`daemon` preludes execute before the async
+    // runtime exists (capability discovery builds its own runtime).
     let run_opts = if command == "run" {
         match cmd_run_pre(&rest) {
             Ok(opts) => Some(opts),
@@ -834,6 +1000,17 @@ fn run(argv: Vec<String>) -> ExitCode {
     };
     let interval_opts = if command == "interval" {
         match cmd_interval_pre(&rest) {
+            Ok(opts) => Some(opts),
+            Err(err) => {
+                eprintln!("task-cli: {err}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let daemon_opts = if command == "daemon" {
+        match cmd_daemon_pre(&rest) {
             Ok(opts) => Some(opts),
             Err(err) => {
                 eprintln!("task-cli: {err}");
@@ -864,6 +1041,9 @@ fn run(argv: Vec<String>) -> ExitCode {
                 "watch" => cmd_watch(&rest).await,
                 "timings" => cmd_timings(&rest).await,
                 "run" => cmd_run_exec(run_opts.expect("run prelude must have parsed")).await,
+                "daemon" => {
+                    cmd_daemon_exec(daemon_opts.expect("daemon prelude must have parsed")).await
+                }
                 "-h" | "--help" | "help" | "" => {
                     println!("{}", usage());
                     Ok(ExitCode::SUCCESS)
@@ -1106,6 +1286,36 @@ mod tests {
             ..completed
         };
         assert_eq!(summarize_step(&wait), "wait:completed");
+    }
+
+    #[test]
+    fn daemon_args_default_to_kilo_free_and_two_second_ticks() {
+        let args = parse_daemon_args(&argv(&[])).unwrap();
+        assert_eq!(args.provider, "kilo");
+        assert_eq!(args.model, "kilo-auto/free");
+        assert_eq!(args.base_url, KILO_BASE_URL);
+        assert!(!args.auto_approve);
+        assert_eq!(args.tick, Duration::from_millis(2_000));
+        let args = parse_daemon_args(&argv(&[
+            "--provider",
+            "ollama",
+            "--model",
+            "m",
+            "--base-url",
+            "http://x/v1",
+            "--yes",
+            "--tick-ms",
+            "500",
+        ]))
+        .unwrap();
+        assert_eq!(args.model, "m");
+        assert!(args.auto_approve);
+        assert_eq!(args.tick, Duration::from_millis(500));
+        // Non-kilo providers still need explicit model + base URL.
+        assert!(parse_daemon_args(&argv(&["--provider", "ollama"])).is_err());
+        // Absurdly tight ticks clamp instead of spinning.
+        let args = parse_daemon_args(&argv(&["--tick-ms", "1"])).unwrap();
+        assert_eq!(args.tick, Duration::from_millis(250));
     }
 
     #[test]

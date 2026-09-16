@@ -200,6 +200,11 @@ fn tasks_db_path() -> PathBuf {
 /// turn cannot schedule a quota-burning tight loop.
 const INTERVAL_TOOL_MAX_TIMES: usize = 30;
 const INTERVAL_TOOL_MIN_GAP_MS: i64 = 1_000;
+/// Limits for generic model-driven task creation: enough for real
+/// multi-step work, bounded so a confused turn cannot queue an
+/// unbounded plan.
+const CREATE_TOOL_MAX_STEPS: usize = 30;
+const CREATE_TOOL_MAX_ATTEMPTS: i32 = 10;
 
 // Small task-tool helpers. Deliberately functions, not a framework: every
 // model-facing task tool funnels its errors, store access, and id checks
@@ -429,6 +434,210 @@ impl TypedTool for CreateIntervalTaskTool {
 }
 
 #[derive(Deserialize)]
+struct CreateTaskArgs {
+    title: String,
+    instruction: String,
+    steps: Vec<task_core::NewTaskStep>,
+    scheduled_at: Option<i64>,
+    priority: Option<i32>,
+    max_attempts: Option<i32>,
+    verification: Option<task_core::VerificationSpec>,
+}
+
+/// Create any durable task from an explicit step list: one-shot work,
+/// custom multi-step plans, and scheduled runs that are not plain
+/// repetitions (for N-times-with-gaps, prefer `tasks.create_interval`).
+/// Step inputs are validated up front so a malformed plan fails here
+/// with a clear code instead of failing mid-run. No capability
+/// requirement: like the other task tools this only writes the host's
+/// own state dir, and every side-effecting step still authorizes at
+/// execution time.
+struct CreateTaskTool {
+    source: TaskToolSource,
+}
+
+#[async_trait::async_trait]
+impl TypedTool for CreateTaskTool {
+    type Args = CreateTaskArgs;
+    type Output = serde_json::Value;
+
+    fn id(&self) -> &'static str {
+        "tasks.create"
+    }
+
+    fn description(&self) -> &'static str {
+        "Create a durable task from an explicit step list: one-shot work, custom multi-step plans, or a run scheduled for later. Each step names its type (agent, tool, wait, notification, approval, avatar_routine) plus its input. Returns the task id — report it instead of waiting for the task to finish."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "instruction", "steps"],
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Short task title.",
+                },
+                "instruction": {
+                    "type": "string",
+                    "description": "What the task accomplishes overall.",
+                },
+                "steps": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": CREATE_TOOL_MAX_STEPS,
+                    "description": "Ordered step list: [{step_type, input, max_attempts?}]. Agent steps need input.prompt; tool steps need input.tool plus input.args.",
+                    "items": {
+                        "type": "object",
+                        "required": ["step_type", "input"],
+                        "properties": {
+                            "step_type": {
+                                "type": "string",
+                                "enum": ["avatar_routine", "notification", "wait", "agent", "tool", "approval"],
+                            },
+                            "input": { "type": "object" },
+                            "max_attempts": { "type": "integer", "minimum": 1 },
+                        },
+                    },
+                },
+                "scheduled_at": {
+                    "type": "integer",
+                    "description": "First run no earlier than this (epoch milliseconds). Omit to start now.",
+                },
+                "priority": {
+                    "type": "integer",
+                    "description": "Higher runs first when several tasks are ready (10 background, 50 normal, 80 user-requested, 100 urgent).",
+                },
+                "max_attempts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CREATE_TOOL_MAX_ATTEMPTS,
+                    "description": "Whole-task retry budget.",
+                },
+                "verification": {
+                    "type": "object",
+                    "description": "Completion check: {type: none|result_present} or {type: tool_receipt, tool_name} or {type: avatar_routine, expected_steps} or {type: file_exists, file_ref}.",
+                },
+            },
+        })
+    }
+
+    fn effects(&self) -> Vec<tool_core::ToolEffect> {
+        vec![]
+    }
+
+    async fn call(
+        &self,
+        _ctx: tool_core::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, tool_core::ToolError> {
+        let tool = "tasks.create";
+        let title = args.title.trim().to_string();
+        require_non_empty(&title, "title", tool, "invalid_title")?;
+        let instruction = args.instruction.trim().to_string();
+        require_non_empty(&instruction, "instruction", tool, "invalid_instruction")?;
+        if args.steps.is_empty() || args.steps.len() > CREATE_TOOL_MAX_STEPS {
+            return Err(task_tool_error(
+                tool,
+                "invalid_steps",
+                format!("steps must contain 1..={CREATE_TOOL_MAX_STEPS} steps"),
+            ));
+        }
+        validate_create_steps(tool, &args.steps)?;
+        if args.scheduled_at.is_some_and(|at| at < 0) {
+            return Err(task_tool_error(
+                tool,
+                "invalid_scheduled_at",
+                "scheduled_at must be epoch milliseconds >= 0",
+            ));
+        }
+        if args
+            .max_attempts
+            .is_some_and(|n| !(1..=CREATE_TOOL_MAX_ATTEMPTS).contains(&n))
+        {
+            return Err(task_tool_error(
+                tool,
+                "invalid_max_attempts",
+                format!("max_attempts must be 1..={CREATE_TOOL_MAX_ATTEMPTS}"),
+            ));
+        }
+        let store = self.source.open(tool)?;
+        let created = store
+            .create(
+                task_core::NewTask {
+                    title,
+                    instruction,
+                    scheduled_at: args.scheduled_at,
+                    priority: args.priority,
+                    max_attempts: args.max_attempts,
+                    verification: args.verification,
+                    parent_task_id: None,
+                    steps: args.steps,
+                },
+                now_ms(),
+            )
+            .await
+            .map_err(|err| {
+                task_tool_error(tool, "create_failed", format!("cannot create task: {err}"))
+            })?;
+        Ok(serde_json::json!({
+            "task_id": created.id,
+            "title": created.title,
+            "status": created.status.as_str(),
+            "steps": created.steps.len(),
+            "execute_with": "leave the app running",
+        }))
+    }
+}
+
+/// Fail a malformed plan at creation time with the same requirements
+/// the runners enforce at execution time (agent prompt, tool name):
+/// a clear `invalid_steps` here beats a mid-run step failure.
+fn validate_create_steps(
+    tool: &'static str,
+    steps: &[task_core::NewTaskStep],
+) -> Result<(), tool_core::ToolError> {
+    use task_core::TaskStepType;
+    for (index, step) in steps.iter().enumerate() {
+        let here = |detail: &str| {
+            task_tool_error(
+                tool,
+                "invalid_steps",
+                format!("step {index} ({}): {detail}", step.step_type.as_str()),
+            )
+        };
+        match step.step_type {
+            TaskStepType::Agent => {
+                let prompt = step
+                    .input
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if prompt.trim().is_empty() {
+                    return Err(here("agent steps need a non-empty string input.prompt"));
+                }
+            }
+            TaskStepType::Tool => {
+                let name = step
+                    .input
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if name.trim().is_empty() {
+                    return Err(here("tool steps need a non-empty string input.tool"));
+                }
+            }
+            _ => {}
+        }
+        if step.max_attempts.is_some_and(|n| n < 1) {
+            return Err(here("max_attempts must be >= 1"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
 struct ListTasksArgs {
     status: Option<String>,
     limit: Option<i64>,
@@ -555,7 +764,7 @@ impl TypedTool for GetTaskTool {
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Task id from tasks.create_interval or tasks.list.",
+                    "description": "Task id from tasks.create, tasks.create_interval or tasks.list.",
                 },
             },
         })
@@ -620,7 +829,7 @@ impl TypedTool for CancelTaskTool {
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Task id from tasks.create_interval or tasks.list.",
+                    "description": "Task id from tasks.create, tasks.create_interval or tasks.list.",
                 },
                 "reason": {
                     "type": "string",
@@ -706,7 +915,7 @@ impl TypedTool for EditTaskTool {
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Task id from tasks.create_interval or tasks.list.",
+                    "description": "Task id from tasks.create, tasks.create_interval or tasks.list.",
                 },
                 "title": { "type": "string", "description": "New title." },
                 "instruction": { "type": "string", "description": "New instruction." },
@@ -876,6 +1085,9 @@ impl ToolPack for TasksToolPack {
             TypedToolAdapter::arc(CreateIntervalTaskTool {
                 source: self.source.clone(),
             }),
+            TypedToolAdapter::arc(CreateTaskTool {
+                source: self.source.clone(),
+            }),
             TypedToolAdapter::arc(ListTasksTool {
                 source: self.source.clone(),
             }),
@@ -936,6 +1148,7 @@ mod tests {
             ids,
             vec![
                 "tasks.create_interval".to_string(),
+                "tasks.create".to_string(),
                 "tasks.list".to_string(),
                 "tasks.get".to_string(),
                 "tasks.cancel".to_string(),
@@ -1038,6 +1251,132 @@ mod tests {
         let mut bad = args("x");
         bad.scheduled_at = Some(-1);
         assert!(tool.call(ctx(), bad).await.is_err());
+    }
+
+    fn create_tool_at(tasks_db: PathBuf) -> CreateTaskTool {
+        CreateTaskTool {
+            source: TaskToolSource::Path(tasks_db),
+        }
+    }
+
+    fn create_args(title: &str, steps: Vec<task_core::NewTaskStep>) -> CreateTaskArgs {
+        CreateTaskArgs {
+            title: title.to_string(),
+            instruction: "do the thing".to_string(),
+            steps,
+            scheduled_at: None,
+            priority: None,
+            max_attempts: None,
+            verification: None,
+        }
+    }
+
+    fn wait_step() -> task_core::NewTaskStep {
+        task_core::NewTaskStep {
+            step_type: task_core::TaskStepType::Wait,
+            input: serde_json::json!({ "duration_ms": 10 }),
+            max_attempts: None,
+        }
+    }
+
+    fn agent_step(prompt: &str) -> task_core::NewTaskStep {
+        task_core::NewTaskStep {
+            step_type: task_core::TaskStepType::Agent,
+            input: serde_json::json!({ "prompt": prompt }),
+            max_attempts: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_writes_generic_task() {
+        let db = scratch_db("create");
+        let tool = create_tool_at(db.clone());
+        let out = tool
+            .call(
+                ctx(),
+                create_args("mixed plan", vec![wait_step(), agent_step("say hi")]),
+            )
+            .await
+            .expect("call");
+        let id = out
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task_id")
+            .to_string();
+        assert_eq!(
+            out.get("steps").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        let store = task_core::SqliteTaskStore::open(&db).expect("open");
+        let task = store.get(&id).await.expect("get").expect("task");
+        assert_eq!(task.title, "mixed plan");
+        assert_eq!(task.steps.len(), 2);
+        assert_eq!(task.steps[0].step_type, task_core::TaskStepType::Wait);
+        assert_eq!(task.steps[1].step_type, task_core::TaskStepType::Agent);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_malformed_plans() {
+        // Validation runs before any store access, so this path never
+        // touches the database.
+        let tool = create_tool_at(PathBuf::from("/nonexistent-tasks.db"));
+        assert!(tool
+            .call(ctx(), create_args("  ", vec![wait_step()]))
+            .await
+            .is_err());
+        assert!(tool.call(ctx(), create_args("t", vec![])).await.is_err());
+        let too_many = (0..CREATE_TOOL_MAX_STEPS + 1)
+            .map(|_| wait_step())
+            .collect();
+        assert!(tool.call(ctx(), create_args("t", too_many)).await.is_err());
+        // Agent step without a prompt fails here, not mid-run.
+        assert!(tool
+            .call(ctx(), create_args("t", vec![agent_step("  ")]))
+            .await
+            .is_err());
+        let tool_step = task_core::NewTaskStep {
+            step_type: task_core::TaskStepType::Tool,
+            input: serde_json::json!({ "args": {} }),
+            max_attempts: None,
+        };
+        assert!(tool
+            .call(ctx(), create_args("t", vec![tool_step]))
+            .await
+            .is_err());
+        let mut bad = create_args("t", vec![wait_step()]);
+        bad.scheduled_at = Some(-1);
+        assert!(tool.call(ctx(), bad).await.is_err());
+        let mut bad = create_args("t", vec![wait_step()]);
+        bad.max_attempts = Some(11);
+        assert!(tool.call(ctx(), bad).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_carries_schedule_priority_and_verification() {
+        let db = scratch_db("create-opts");
+        let tool = create_tool_at(db.clone());
+        let mut args = create_args("later", vec![wait_step()]);
+        args.scheduled_at = Some(9_999_999_999_999);
+        args.priority = Some(task_core::model::priority::URGENT);
+        args.max_attempts = Some(5);
+        args.verification = Some(task_core::VerificationSpec::ResultPresent);
+        let out = tool.call(ctx(), args).await.expect("call");
+        let id = out
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task_id");
+        let store = task_core::SqliteTaskStore::open(&db).expect("open");
+        let task = store.get(id).await.expect("get").expect("task");
+        assert_eq!(task.scheduled_at, Some(9_999_999_999_999));
+        assert_eq!(task.status, task_core::TaskStatus::Scheduled);
+        assert_eq!(task.priority, task_core::model::priority::URGENT);
+        assert_eq!(task.max_attempts, 5);
+        assert!(matches!(
+            task.verification,
+            Some(task_core::VerificationSpec::ResultPresent)
+        ));
+        let _ = std::fs::remove_file(&db);
     }
 
     #[tokio::test]
@@ -1498,6 +1837,6 @@ mod tests {
         );
         // And the pack-level constructor wires the same context through.
         let pack = TasksToolPack::with_context(TaskToolContext::new(store));
-        assert_eq!(pack.tools(&ToolLoadContext::default()).len(), 5);
+        assert_eq!(pack.tools(&ToolLoadContext::default()).len(), 6);
     }
 }

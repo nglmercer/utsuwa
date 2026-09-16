@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Procedural pose convention for VRM0/VRM1**: all body programs (sit/stand, walk/run swing, bow, nod, shrug) now pose through a `HumanoidMotionBasis` with semantic operations (`thighForward`, `kneeFlex`, `footPitch`, ...) instead of raw Euler signs. Previously the fixed signs were anatomically reversed on VRM0 models — which includes all three shipped models — producing backward knees when sitting. Sit is now a real pose (thighs ~77°, knee interior ~97°, leveled feet, upright spine), and shrug is symmetric (it previously lifted one arm inward).
+- **Sit/stand posture transitions**: idempotent sit/stand (no re-measure lift, no fake crouch), baseline-interpolated root/weight so mid-transition reversals glide, cancel/stopKind restore the origin posture (no more sinking into the floor), and seated walk/run/goto/jump play the stand transition first instead of teleporting upright.
+- **VRM0 facing normalization** uses the official `VRMUtils.rotateVRM0()` helper (behavior-identical to the previous manual scene rotation, unknown versions keep the VRM0-facing default).
+
 ### Added
+- **Persisted execution receipts with idempotent replay**: every tool-step attempt records an `ExecutionReceipt` in `tasks.db` (schema v2, v1 databases migrate on open). A retry whose earlier attempt already succeeded replays the stored output instead of re-invoking the tool, so a crash between "effect fired" and "step completed" no longer double-fires side effects; timeouts record `unknown_outcome`, failures stay audit-only.
+- **Crash/restart fault suites**: `task-core` and `task-host` integration tests drop file-backed stores mid-state and assert recovery after reopen (stale leases requeue, waits resume and expire, receipts survive, one tool effect fires exactly once across a simulated crash).
+- **Generic model-facing `tasks.create`**: the default agent can now create any durable task from an explicit step list (one-shot, multi-step, scheduled), with up-front plan validation; `tasks.create_interval` stays the path for plain repetitions.
+- **Task Center (Settings → Tasks)**: lifecycle filters, per-step progress, attempts, errors, and approve/reject/cancel actions over the same `task.*` IPC the daemon and model tools use.
+- **`task-cli daemon` for closed-app execution**: runs the tick loop plus worker pool headlessly against the shared `tasks.db` until Ctrl-C, printing terminal results and reporting (or, with `--yes`, approving) parked reviews. Exactly one driver at a time — never alongside the app.
+- **Model-gate aging and fairness metrics**: background turns are admitted despite queued interactive turns after 8 consecutive interactive admissions or 30s of waiting, and `snapshot()` exposes per-kind admissions plus total/max queueing waits.
+- **CI `durable-tasks` job**: explicit per-PR signal for the task suites plus a no-network `task-cli` smoke test (submit, list, timings, daemon startup).
 - **Agent tool-profile selector in Settings**: the native agent's tool surface (`minimal` … `full`) is now user-configurable from the desktop Settings panel and persists via `settings.set`. Smaller profiles answer simple requests noticeably faster (a trivial Kilo request dropped from ~17 s wall-clock on 131 tools to ~10 s on 64 tools in local testing); the default stays `full` for cloud / `simple` for local providers.
 - **Per-request timing diagnostics**: `--debug` turn logs now report time-to-first-content and total stream time per model request plus per-iteration timings, so the next slow turn shows exactly where wall-clock time went.
 

@@ -9,6 +9,7 @@ import {
 	type MotionRoot
 } from './motion-controller.ts';
 import type { PoseHumanoid, PoseNudge } from './procedural-pose-controller.ts';
+import { VRM0_MOTION_BASIS } from './humanoid-motion-basis.ts';
 
 interface Bone {
 	rotation: { x: number; y: number; z: number };
@@ -58,7 +59,8 @@ function makeEnv(overrides: Partial<MotionEnvironment> = {}): MotionEnvironment 
 			out.z = 2;
 			return true;
 		},
-		measureHipsY: () => 0.9,
+		// Hips world height tracks the root like the live bone measurement.
+		measureHipsY: () => 0.9 + root.position.y,
 		log: () => {},
 		...overrides
 	};
@@ -183,14 +185,162 @@ test('procedural actions run, sit persists until stand', () => {
 	assert.equal(env.root.position.y, 0);
 });
 
-test('locomotion auto-stands before moving', () => {
+test('locomotion stands first, then moves — never teleports upright', () => {
 	const env = makeEnv();
 	const motion = new MotionController(env);
 	assert.ok(motion.startProcedural('sit'));
 	for (let i = 0; i < 100 && motion.isBusy(false); i++) motion.update(0.05);
 	assert.equal(motion.sitting, true);
+	const seatY = env.root.position.y;
+	assert.ok(seatY < 0);
+
 	motion.startWalk('forward', 300);
+	// Still seated the moment the walk is requested: the stand plays first.
+	assert.equal(motion.sitting, true);
+	assert.equal(env.root.position.y, seatY);
+	assert.equal(env.root.position.z, 0);
+
+	let stoodFrame = -1;
+	let movedFrame = -1;
+	const seen: string[] = [];
+	for (let i = 0; i < 300 && motion.isBusy(false); i++) {
+		for (const c of motion.update(0.05)) seen.push(c.type);
+		if (stoodFrame < 0 && !motion.sitting) stoodFrame = i;
+		if (movedFrame < 0 && env.root.position.z > 0) movedFrame = i;
+	}
+	assert.ok(stoodFrame >= 0, 'stood up during the sequence');
+	assert.ok(movedFrame >= 0, 'walked after standing');
+	assert.ok(movedFrame >= stoodFrame, 'no translation before the stand finished');
+	assert.deepEqual(seen, ['procedural', 'locomotion']);
+	assert.equal(env.root.position.y, 0);
+});
+
+test('sit twice is idempotent; stand while standing is a no-op', () => {
+	const env = makeEnv();
+	const motion = new MotionController(env);
+	assert.ok(motion.startProcedural('sit'));
+	for (let i = 0; i < 100 && motion.isBusy(false); i++) motion.update(0.05);
+	const seatY = env.root.position.y;
+
+	// Second sit completes at once without re-measuring or lifting.
+	assert.ok(motion.startProcedural('sit'));
+	assert.deepEqual(motion.update(0.05), [{ type: 'procedural', routine: true }]);
+	assert.equal(motion.sitting, true);
+	assert.equal(env.root.position.y, seatY);
+
+	assert.ok(motion.startProcedural('stand'));
+	for (let i = 0; i < 100 && motion.isBusy(false); i++) motion.update(0.05);
+	assert.equal(env.root.position.y, 0);
+
+	// Standing while standing completes at once with no crouch dip.
+	assert.ok(motion.startProcedural('stand'));
+	assert.deepEqual(motion.update(0.05), [{ type: 'procedural', routine: true }]);
+	assert.equal(env.root.position.y, 0);
+	assert.deepEqual(motion.update(0.5), []);
+	assert.equal(env.root.position.y, 0);
+});
+
+test('cancel mid-sit restores standing; cancel mid-stand restores seated', () => {
+	const env = makeEnv();
+	const motion = new MotionController(env);
+	assert.ok(motion.startProcedural('sit'));
+	motion.update(0.5);
+	assert.ok(env.root.position.y < 0, 'sit transition lowered the root');
+	motion.cancel();
+	assert.equal(env.root.position.y, 0);
 	assert.equal(motion.sitting, false);
+	assert.equal(motion.isBusy(false), false);
+	assert.deepEqual(motion.update(0.5), []);
+	assert.equal(env.root.position.y, 0, 'no partial posture survives cancel');
+
+	// stopKind('procedural') restores the same way.
+	assert.ok(motion.startProcedural('sit'));
+	motion.update(0.5);
+	assert.ok(env.root.position.y < 0);
+	motion.stopKind('procedural');
+	assert.equal(env.root.position.y, 0);
+	assert.equal(motion.sitting, false);
+
+	// A cancelled stand reverts to the seated baseline.
+	assert.ok(motion.startProcedural('sit'));
+	for (let i = 0; i < 100 && motion.isBusy(false); i++) motion.update(0.05);
+	const seatY = env.root.position.y;
+	assert.ok(motion.startProcedural('stand'));
+	motion.update(0.4);
+	assert.ok(env.root.position.y > seatY, 'stand transition raised the root');
+	motion.cancel();
+	assert.equal(env.root.position.y, seatY);
+	assert.equal(motion.sitting, true);
+	// Held posture keeps the seat afterward.
+	motion.update(0.05);
+	assert.equal(env.root.position.y, seatY);
+});
+
+test('sit/stand reversals glide from mid-pose without snapping', () => {
+	const env = makeEnv();
+	const motion = new MotionController(env);
+	assert.ok(motion.startProcedural('sit'));
+	motion.update(0.5);
+	const midY = env.root.position.y;
+	assert.ok(midY < 0 && midY > -0.45, `mid-transition root ${midY}`);
+
+	// Reverse into stand: root rises continuously from midY, never snaps.
+	assert.ok(motion.startProcedural('stand'));
+	let prev = midY;
+	let maxStep = 0;
+	for (let i = 0; i < 100 && motion.isBusy(false); i++) {
+		motion.update(0.05);
+		maxStep = Math.max(maxStep, Math.abs(env.root.position.y - prev));
+		prev = env.root.position.y;
+	}
+	assert.equal(motion.sitting, false);
+	assert.equal(env.root.position.y, 0);
+	assert.ok(maxStep < 0.1, `reversal glides (max step ${maxStep})`);
+
+	// And back the other way: stand halfway, re-sit to full depth.
+	assert.ok(motion.startProcedural('sit'));
+	for (let i = 0; i < 100 && motion.isBusy(false); i++) motion.update(0.05);
+	const seatY = env.root.position.y;
+	assert.ok(motion.startProcedural('stand'));
+	motion.update(0.4);
+	assert.ok(motion.startProcedural('sit'));
+	for (let i = 0; i < 100 && motion.isBusy(false); i++) motion.update(0.05);
+	assert.equal(motion.sitting, true);
+	assert.ok(
+		Math.abs(env.root.position.y - seatY) < 1e-9,
+		're-sit after reversal reaches full seat depth'
+	);
+});
+
+test('jump while seated stands first, then arcs', () => {
+	const env = makeEnv();
+	const motion = new MotionController(env);
+	assert.ok(motion.startProcedural('sit'));
+	for (let i = 0; i < 100 && motion.isBusy(false); i++) motion.update(0.05);
+	motion.startJump();
+	assert.equal(motion.sitting, true, 'still seated when the jump is requested');
+	const seen: string[] = [];
+	let apex = 0;
+	for (let i = 0; i < 300 && motion.isBusy(false); i++) {
+		for (const c of motion.update(1 / 60)) seen.push(c.type);
+		apex = Math.max(apex, env.root.position.y);
+	}
+	assert.deepEqual(seen, ['procedural', 'jump']);
+	assert.ok(apex > 0.2, `jump arced after standing (apex ${apex})`);
+	assert.equal(env.root.position.y, 0);
+});
+
+test('controller poses through its motion basis', () => {
+	const env = makeEnv();
+	const motion = new MotionController(env);
+	motion.setMotionBasis(VRM0_MOTION_BASIS);
+	assert.ok(motion.startProcedural('sit'));
+	motion.update(0.6);
+	const thigh = env.humanoidImpl.bones.get('leftUpperLeg');
+	assert.ok(thigh, 'sit nudged the thigh');
+	// VRM0 scene space mirrors pitch: the thigh angle is positive where
+	// VRM1 would be negative for the identical anatomical swing.
+	assert.ok(thigh.rotation.x > 0, `vrm0 thigh mirrors (x=${thigh.rotation.x})`);
 });
 
 test('cancel halts motion and stopKind halts one kind', () => {

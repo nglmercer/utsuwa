@@ -27,6 +27,7 @@
 	} from '$lib/avatar/routine-controller';
 	import { PROCEDURAL_DURATIONS } from '$lib/avatar/procedural-pose-controller';
 	import type { PoseHumanoid } from '$lib/avatar/procedural-pose-controller';
+	import { motionBasisFor } from '$lib/avatar/humanoid-motion-basis';
 	import { AnimationController } from '$lib/avatar/animation-controller';
 	import {
 		ExpressionController,
@@ -49,11 +50,13 @@
 	import * as THREE from 'three';
 
 	// Pose configurations for different VRM versions
-	// VRM 0.x and 1.0 have different bone orientations and coordinate systems
+	// VRM 0.x and 1.0 have different bone orientations and coordinate systems.
+	// Scene facing is handled by VRMUtils.rotateVRM0 in normalizeModel (the
+	// official VRM0/1 compatibility helper); only the idle arm rest pose
+	// still needs per-version authored values.
 	const VRM_POSE_CONFIG = {
 		// VRM 0.x (older models like AvatarSample_A/B)
 		'0': {
-			sceneRotationY: Math.PI, // Rotate 180° to face camera
 			leftUpperArm: { x: Math.PI * 0.05, y: 0, z: Math.PI * 0.4 },
 			rightUpperArm: { x: Math.PI * 0.05, y: 0, z: -Math.PI * 0.4 },
 			leftLowerArm: { x: 0, y: -Math.PI * 0.1, z: 0 },
@@ -61,7 +64,6 @@
 		},
 		// VRM 1.0 (VRoid Studio models like Utsuwa)
 		'1': {
-			sceneRotationY: 0, // Already facing camera
 			leftUpperArm: { x: Math.PI * 0.05, y: 0, z: -Math.PI * 0.4 },
 			rightUpperArm: { x: Math.PI * 0.05, y: 0, z: Math.PI * 0.4 },
 			leftLowerArm: { x: 0, y: -Math.PI * 0.1, z: 0 }, // Same Y values as 0.x
@@ -169,11 +171,14 @@
 	// Normalize model orientation and position
 	function normalizeModel(loadedVrm: VRM) {
 		const scene = loadedVrm.scene;
-		const version = loadedVrm.meta?.metaVersion === '1' ? '1' : '0';
-		const config = VRM_POSE_CONFIG[version];
 
-		// Apply version-specific scene rotation
-		scene.rotation.y = config.sceneRotationY;
+		// Official VRM0/1 facing normalization: Y-flips VRM0 (faces Z-) to
+		// face the camera like VRM1, and leaves VRM1 untouched. Unknown
+		// versions keep the legacy VRM0-facing default.
+		scene.rotation.y = 0;
+		VRMUtils.rotateVRM0(loadedVrm);
+		const metaVersion = loadedVrm.meta?.metaVersion;
+		if (metaVersion !== '0' && metaVersion !== '1') scene.rotation.y = Math.PI;
 
 		// Calculate bounding box
 		const box = new THREE.Box3().setFromObject(scene);
@@ -651,6 +656,10 @@
 
 				vrm = loadedVrm;
 				motion.resetPose();
+				// Procedural pose convention for this rig: VRM0 and VRM1 face
+				// opposite directions, so semantic bone rotations mirror per
+				// version (see humanoid-motion-basis).
+				motion.setMotionBasis(motionBasisFor(loadedVrm.meta?.metaVersion));
 				avatarRoot.add(loadedVrm.scene);
 				animation.attach(loadedVrm, new THREE.AnimationMixer(loadedVrm.scene));
 				vrmStore.setVrm(loadedVrm);

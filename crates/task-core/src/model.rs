@@ -257,17 +257,55 @@ pub enum ReceiptStatus {
     UnknownOutcome,
 }
 
+impl ReceiptStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReceiptStatus::Success => "success",
+            ReceiptStatus::Failed => "failed",
+            ReceiptStatus::UnknownOutcome => "unknown_outcome",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "success" => Some(ReceiptStatus::Success),
+            "failed" => Some(ReceiptStatus::Failed),
+            "unknown_outcome" => Some(ReceiptStatus::UnknownOutcome),
+            _ => None,
+        }
+    }
+}
+
+/// Durable proof that one step attempt executed an external operation.
+///
+/// Receipts are append-only audit: one row per attempt, keyed by a
+/// deterministic idempotency key. A crash between "effect happened" and
+/// "step completed" is indistinguishable from "never ran", so runners
+/// check for a prior `success` receipt before re-invoking a side effect
+/// and skip the call when one exists (at-least-once execution with
+/// at-most-once effects for tools that went through).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionReceipt {
     pub execution_id: String,
     pub task_id: String,
     pub step_id: String,
+    pub idempotency_key: String,
     pub operation: String,
     pub status: ReceiptStatus,
     pub started_at: Ms,
-    pub finished_at: Ms,
+    pub finished_at: Option<Ms>,
     pub external_id: Option<String>,
     pub output: serde_json::Value,
+}
+
+/// Deterministic idempotency key for one step attempt's operation.
+///
+/// The attempt number is part of the key, so every attempt records its
+/// own receipt and retries never overwrite history. Replay checks look
+/// for ANY prior `success` receipt for the (task, step, operation)
+/// triple, not for this exact key.
+pub fn idempotency_key(task_id: &str, step_id: &str, operation: &str, attempt: i32) -> String {
+    format!("{task_id}:{step_id}:{operation}:attempt-{attempt}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +368,26 @@ mod tests {
         assert!(TaskStatus::Waiting.can_transition_to(TaskStatus::Failed));
         assert!(TaskStatus::NeedsReview.can_transition_to(TaskStatus::Failed));
         assert!(!TaskStatus::Ready.can_transition_to(TaskStatus::Failed));
+    }
+
+    #[test]
+    fn receipt_status_round_trips_through_storage_strings() {
+        for status in [
+            ReceiptStatus::Success,
+            ReceiptStatus::Failed,
+            ReceiptStatus::UnknownOutcome,
+        ] {
+            assert_eq!(ReceiptStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(ReceiptStatus::parse("bogus"), None);
+    }
+
+    #[test]
+    fn idempotency_keys_are_stable_per_attempt() {
+        let first = idempotency_key("task", "step", "test.echo", 1);
+        assert_eq!(first, idempotency_key("task", "step", "test.echo", 1));
+        assert_ne!(first, idempotency_key("task", "step", "test.echo", 2));
+        assert_ne!(first, idempotency_key("task", "step", "other.tool", 1));
     }
 
     #[test]

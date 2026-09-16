@@ -20,8 +20,8 @@ pub use executor::{
     StepOutcome, StepRunner, WaitRunner,
 };
 pub use model::{
-    ExecutionReceipt, Ms, NewTask, NewTaskStep, ReceiptStatus, Task, TaskError, TaskEvent,
-    TaskStatus, TaskStep, TaskStepStatus, TaskStepType, TaskWait, VerificationSpec,
+    idempotency_key, ExecutionReceipt, Ms, NewTask, NewTaskStep, ReceiptStatus, Task, TaskError,
+    TaskEvent, TaskStatus, TaskStep, TaskStepStatus, TaskStepType, TaskWait, VerificationSpec,
 };
 pub use recovery::{expire_waits, recover_stale, DEFAULT_LEASE_MS};
 pub use scheduler::{cancel_task, Scheduler, TickReport, DEFAULT_BATCH_LIMIT};

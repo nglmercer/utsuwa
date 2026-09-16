@@ -13,6 +13,7 @@
 		{ href: localPath('app', '/settings/stt'), label: 'STT', icon: 'mic' },
 		{ href: localPath('app', '/settings/data'), label: 'Data', icon: 'database' },
 		{ href: localPath('app', '/settings/activity'), label: 'Activity', icon: 'file-text' },
+		{ href: localPath('app', '/settings/tasks'), label: 'Tasks', icon: 'list' },
 		{ href: localPath('app', '/settings/plugins'), label: 'Plugins', icon: 'circle-dot' },
 		{ href: localPath('app', '/settings/mcp'), label: 'MCP Tools', icon: 'link' },
 		{ href: localPath('app', '/settings/access'), label: 'Access', icon: 'lock' },

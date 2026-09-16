@@ -89,6 +89,66 @@ jobs:
       - name: Rust tests
         run: cargo test --workspace --locked
 
+  # Durable-task reliability layer: receipts, crash/restart fault suites,
+  # model-facing task tools, the model gate, and the headless daemon get
+  # their own explicit signal (plus a no-network task-cli smoke test), so
+  # a regression here is visible even when the broad workspace suite is
+  # narrowed or reinterpreted.
+  durable-tasks:
+    env:
+      UTSUWA_SKIP_WEB_BUILD: "1"
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Task core + host tests (receipts, crash/restart faults)
+        run: cargo test -p task-core -p task-host --locked
+
+      - name: Model-facing task tool tests (tasks.create et al)
+        run: cargo test -p app-host --lib --locked tooling
+
+      - name: Model gate tests (priority, aging, metrics)
+        run: cargo test -p app-host --lib --locked model_gate
+
+      - name: task-cli tests (run/interval/daemon arg parsing)
+        run: cargo test -p app-host --bin task-cli --locked
+
+      - name: task-cli smoke test (no network, temp tasks.db)
+        run: |
+          cargo build -p app-host --bin task-cli --locked
+          export UTSUWA_TASKS_DB="$(mktemp /tmp/utsuwa-ci-tasks-XXXXXX.db)"
+          ./target/debug/task-cli list | grep -q "no tasks"
+          ./target/debug/task-cli interval --instruction "use system.time to get the date" --submit-only
+          ./target/debug/task-cli list | grep -q "Interval task"
+          # timings on a non-terminal task prints the table and exits 2.
+          task_id="$(./target/debug/task-cli list | head -n 1 | awk '{print $1}')"
+          if ./target/debug/task-cli timings "$task_id"; then
+            echo "expected timings to exit non-zero for a pending task"
+            exit 1
+          fi
+          rm -f "$UTSUWA_TASKS_DB"*
+          # daemon starts the tick loop + workers on an empty db (no model
+          # calls without tasks) and idles until killed.
+          export UTSUWA_TASKS_DB="$(mktemp /tmp/utsuwa-ci-daemon-XXXXXX.db)"
+          timeout 8s ./target/debug/task-cli daemon > daemon.log 2>&1 || code=$?
+          grep -q "task daemon: executing all ready tasks" daemon.log
+          rm -f "$UTSUWA_TASKS_DB"*
+
   # Production desktop path: build the host WITHOUT skipping the bundled
   # frontend so build.rs exercises `pnpm build:native`, then run the host
   # tests (asset server, handshake, protocol) against real artifacts.

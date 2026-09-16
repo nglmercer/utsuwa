@@ -38,6 +38,7 @@ import {
 	type PoseHumanoid,
 	type PoseNudge
 } from './procedural-pose-controller.ts';
+import { VRM1_MOTION_BASIS, type HumanoidMotionBasis } from './humanoid-motion-basis.ts';
 
 export const JUMP_DURATION = 0.65; // s
 export const JUMP_HEIGHT = 0.28; // m at the apex
@@ -89,6 +90,16 @@ interface TurnState {
 	routineStep: boolean;
 }
 
+// Captured when a sit/stand transition starts so root Y and seated weight
+// interpolate between measured endpoints. Never assume a transition begins
+// from standing (Y=0, weight=0): reversals begin mid-pose.
+interface PostureBaseline {
+	fromRootY: number;
+	targetRootY: number;
+	fromWeight: number;
+	targetWeight: number;
+}
+
 export function resolveGotoTarget(req: {
 	anchorId?: string;
 	x?: number;
@@ -115,10 +126,29 @@ export class MotionController {
 	private sittingFlag = false;
 	private sitOffsetY = 0;
 	private sitTargetY = 0;
+	// Continuous seated blend (0 standing .. 1 fully seated), tracked every
+	// frame a posture transition runs so reversals and cancels resume from
+	// the true current pose instead of an assumed endpoint.
+	private seatedWeight = 0;
+	private postureBaseline: PostureBaseline | null = null;
+	// Movement deferred behind a stand transition (seated walk/run/goto/jump
+	// stands first, then moves — never teleports upright).
+	private pendingAfterStand: (() => void) | null = null;
+	// Completions for idempotent no-ops (sit while seated, ...): the caller
+	// was promised a routine completion, so one is emitted next update.
+	private instantCompletions: MotionCompletion[] = [];
+	private basis: HumanoidMotionBasis = VRM1_MOTION_BASIS;
 	private readonly scratchCam = { x: 0, y: 0, z: 0 };
 
 	constructor(env: MotionEnvironment) {
 		this.env = env;
+	}
+
+	// Anatomical rotation convention for the loaded rig. The renderer sets
+	// this from the VRM meta version at load; programs using it pose VRM0
+	// and VRM1 identically despite opposite forward conventions.
+	setMotionBasis(basis: HumanoidMotionBasis): void {
+		this.basis = basis;
 	}
 
 	private log(message: string, detail?: string): void {
@@ -152,30 +182,64 @@ export class MotionController {
 		this.locomotion = null;
 		this.gotoState = null;
 		this.turnState = null;
+		this.restorePostureAfterHalt();
 		this.procedural = null;
+		this.pendingAfterStand = null;
 		if (this.jumpState) {
 			this.jumpState = null;
 			this.env.root.position.y = this.sittingFlag ? this.sitOffsetY : 0;
 		}
 	}
 
-	// Standing up is implicit in every translation and jump: she stands,
-	// then moves. Only an explicit sit step (or a reset/model swap) changes
-	// the seated baseline otherwise.
-	private autoStand(): void {
-		if (!this.sittingFlag) return;
+	// A halted posture transition reverts to its origin posture: a sit that
+	// never completed was never seated (standing Y=0), a stand that never
+	// completed is still seated (seated baseline). No intermediate posture
+	// survives cancellation.
+	private restorePostureAfterHalt(): void {
+		if (this.procedural?.name === 'sit') {
+			this.env.root.position.y = 0;
+			this.seatedWeight = 0;
+			this.sitTargetY = 0;
+		} else if (this.procedural?.name === 'stand') {
+			this.env.root.position.y = this.sitOffsetY;
+			this.seatedWeight = 1;
+		}
+		this.postureBaseline = null;
+	}
+
+	// Standing up is implicit in every translation and jump, but sequenced:
+	// she plays the stand transition first, then moves. Only an explicit
+	// sit step (or a reset/model swap) changes the seated baseline
+	// otherwise. A sit/stand already in flight reverses smoothly from the
+	// captured baseline instead of snapping.
+	private standThen(action: () => void): void {
+		this.pendingAfterStand = action;
+		if (this.sittingFlag || this.procedural?.name === 'sit') {
+			if (this.procedural?.name !== 'stand') this.startProcedural('stand');
+			return;
+		}
+		if (this.procedural?.name === 'stand') return;
+		this.pendingAfterStand = null;
+		action();
+	}
+
+	// Instantly clear the seated state. Only for resets: every movement
+	// path sequences through standThen so posture transitions stay visible.
+	private clearSeated(): void {
 		this.sittingFlag = false;
 		this.sitOffsetY = 0;
 		this.sitTargetY = 0;
+		this.seatedWeight = 0;
+		this.postureBaseline = null;
 		this.env.root.position.y = 0;
 	}
 
 	// Root transform + posture baseline for resets and model swaps.
 	resetPose(): void {
 		this.cancel();
-		this.sittingFlag = false;
-		this.sitOffsetY = 0;
-		this.sitTargetY = 0;
+		this.clearSeated();
+		this.pendingAfterStand = null;
+		this.instantCompletions = [];
 		this.env.root.position.x = 0;
 		this.env.root.position.y = 0;
 		this.env.root.position.z = 0;
@@ -211,12 +275,42 @@ export class MotionController {
 	startProcedural(name: string, anchorId?: string): boolean {
 		const duration = PROCEDURAL_DURATIONS[name];
 		if (!duration) return false;
+		// Idempotent posture: re-sitting while seated (or standing while
+		// standing) completes at once instead of re-measuring or crouching.
+		// A stand/sit already reversing the other way is NOT a no-op — it
+		// re-captures the baseline and reverses smoothly from mid-pose.
+		if (name === 'sit' && this.sittingFlag && this.procedural?.name !== 'stand') {
+			this.instantCompletions.push({ type: 'procedural', routine: true });
+			this.log('[AvatarCue] action finished', 'procedural:sit (already seated)');
+			return true;
+		}
+		if (name === 'stand' && !this.sittingFlag && this.procedural?.name !== 'sit') {
+			this.instantCompletions.push({ type: 'procedural', routine: true });
+			this.log('[AvatarCue] action finished', 'procedural:stand (already standing)');
+			return true;
+		}
 		if (name === 'sit') {
 			// Seat height comes from the anchor when the plan traveled to one
 			// ("sit on the chair"); otherwise the default chair height.
 			const seatHeight =
 				(anchorId && resolveSceneAnchor(anchorId)?.seatHeight) || DEFAULT_SEAT_HEIGHT;
-			this.sitTargetY = computeSitOffsetY(this.env.measureHipsY(), seatHeight);
+			// Hips measured live include any current root drop; subtract it
+			// so reversals target full seat depth instead of a shallower one.
+			const hipsRestY = this.env.measureHipsY() - this.env.root.position.y;
+			this.sitTargetY = computeSitOffsetY(hipsRestY, seatHeight);
+			this.postureBaseline = {
+				fromRootY: this.env.root.position.y,
+				targetRootY: this.sitTargetY,
+				fromWeight: this.seatedWeight,
+				targetWeight: 1
+			};
+		} else if (name === 'stand') {
+			this.postureBaseline = {
+				fromRootY: this.env.root.position.y,
+				targetRootY: 0,
+				fromWeight: this.seatedWeight,
+				targetWeight: 0
+			};
 		}
 		this.procedural = { name, t: 0, duration };
 		this.log('[AvatarCue] action started', `procedural:${name}`);
@@ -224,24 +318,26 @@ export class MotionController {
 	}
 
 	startJump(): void {
-		this.autoStand();
-		this.jumpState = { t: 0 };
-		this.log('[AvatarCue] action started', 'jump');
+		this.standThen(() => {
+			this.jumpState = { t: 0 };
+			this.log('[AvatarCue] action started', 'jump');
+		});
 	}
 
 	private startLocomotion(direction: string, durationMs: number | undefined, action: string): void {
-		this.autoStand();
-		const dir = this.walkDirectionVector(direction);
-		const running = action === 'run';
-		this.locomotion = {
-			dirX: dir.x,
-			dirZ: dir.z,
-			remainingMs: clampWalkDuration(durationMs ?? WALK_DURATION_DEFAULT_MS),
-			phase: 0,
-			speed: running ? RUN_SPEED_MPS : WALK_SPEED_MPS,
-			stepHz: running ? RUN_STEP_HZ : WALK_STEP_HZ
-		};
-		this.log('[AvatarCue] action started', `${running ? 'run' : 'walk'}:${direction}`);
+		this.standThen(() => {
+			const dir = this.walkDirectionVector(direction);
+			const running = action === 'run';
+			this.locomotion = {
+				dirX: dir.x,
+				dirZ: dir.z,
+				remainingMs: clampWalkDuration(durationMs ?? WALK_DURATION_DEFAULT_MS),
+				phase: 0,
+				speed: running ? RUN_SPEED_MPS : WALK_SPEED_MPS,
+				stepHz: running ? RUN_STEP_HZ : WALK_STEP_HZ
+			};
+			this.log('[AvatarCue] action started', `${running ? 'run' : 'walk'}:${direction}`);
+		});
 	}
 
 	startWalk(direction: string, durationMs?: number): void {
@@ -253,10 +349,11 @@ export class MotionController {
 	}
 
 	startGoto(targetX: number, targetZ: number, label: string): void {
-		this.autoStand();
-		const clamped = clampWalkOffset(targetX, targetZ, WALK_MAX_RADIUS);
-		this.gotoState = { targetX: clamped.x, targetZ: clamped.z, phase: 0 };
-		this.log('[AvatarCue] action started', label);
+		this.standThen(() => {
+			const clamped = clampWalkOffset(targetX, targetZ, WALK_MAX_RADIUS);
+			this.gotoState = { targetX: clamped.x, targetZ: clamped.z, phase: 0 };
+			this.log('[AvatarCue] action started', label);
+		});
 	}
 
 	startReturnHome(): void {
@@ -292,16 +389,29 @@ export class MotionController {
 	}
 
 	// Halt one half-played motion kind (routine step failure). Ambient
-	// turns are never routine-owned, so a turn stop always clears.
+	// turns are never routine-owned, so a turn stop always clears. Halting
+	// a movement kind also drops its deferred start: a failed step must not
+	// begin moving after its stand transition finishes.
 	stopKind(kind: string): void {
-		if (kind === 'walk') this.locomotion = null;
-		if (kind === 'return_home' || kind === 'goto') this.gotoState = null;
+		if (kind === 'walk') {
+			this.locomotion = null;
+			this.pendingAfterStand = null;
+		}
+		if (kind === 'return_home' || kind === 'goto') {
+			this.gotoState = null;
+			this.pendingAfterStand = null;
+		}
 		if (kind === 'turn' || kind === 'face_camera') this.turnState = null;
 		if (kind === 'jump') {
 			this.jumpState = null;
+			this.pendingAfterStand = null;
 			this.env.root.position.y = this.sittingFlag ? this.sitOffsetY : 0;
 		}
-		if (kind === 'procedural') this.procedural = null;
+		if (kind === 'procedural') {
+			this.restorePostureAfterHalt();
+			this.procedural = null;
+			this.pendingAfterStand = null;
+		}
 	}
 
 	// Advance every motion by `delta` seconds. Returns completions in
@@ -309,6 +419,10 @@ export class MotionController {
 	// ones), ambient re-facing (locomotion/goto arrivals), and busy sync.
 	update(delta: number): MotionCompletion[] {
 		const completions: MotionCompletion[] = [];
+		if (this.instantCompletions.length > 0) {
+			completions.push(...this.instantCompletions);
+			this.instantCompletions = [];
+		}
 		const root = this.env.root;
 		const humanoid = this.env.humanoid();
 		const nudge = this.env.nudge;
@@ -326,7 +440,7 @@ export class MotionController {
 			const targetYaw = Math.atan2(this.locomotion.dirX, this.locomotion.dirZ);
 			root.yaw += shortAngleDelta(targetYaw - root.yaw) * Math.min(1, delta * 6);
 			this.locomotion.phase += delta * Math.PI * 2 * this.locomotion.stepHz;
-			applyWalkSwing(humanoid, nudge, Math.sin(this.locomotion.phase));
+			applyWalkSwing(humanoid, nudge, this.basis, Math.sin(this.locomotion.phase));
 			this.locomotion.remainingMs -= delta * 1000;
 			if (this.locomotion.remainingMs <= 0) {
 				this.locomotion = null;
@@ -355,7 +469,7 @@ export class MotionController {
 				const targetYaw = Math.atan2(dx, dz);
 				root.yaw += shortAngleDelta(targetYaw - root.yaw) * Math.min(1, delta * 6);
 				this.gotoState.phase += delta * Math.PI * 2 * WALK_STEP_HZ;
-				applyWalkSwing(humanoid, nudge, Math.sin(this.gotoState.phase));
+				applyWalkSwing(humanoid, nudge, this.basis, Math.sin(this.gotoState.phase));
 			}
 		}
 		if (this.turnState) {
@@ -394,27 +508,56 @@ export class MotionController {
 				if (this.procedural.name === 'sit') {
 					this.sittingFlag = true;
 					this.sitOffsetY = this.sitTargetY;
+					this.seatedWeight = 1;
 					root.position.y = this.sitOffsetY;
 				} else if (this.procedural.name === 'stand') {
 					this.sittingFlag = false;
 					this.sitOffsetY = 0;
 					this.sitTargetY = 0;
+					this.seatedWeight = 0;
 					root.position.y = 0;
 				}
+				this.postureBaseline = null;
 				this.log('[AvatarCue] action finished', `procedural:${this.procedural.name}`);
 				this.procedural = null;
 				completions.push({ type: 'procedural', routine: true });
-			} else {
-				if (this.procedural.name === 'sit') {
-					root.position.y = this.sitTargetY * smoothstep(0, 0.8, progress);
-				} else if (this.procedural.name === 'stand') {
-					root.position.y = this.sitOffsetY * (1 - smoothstep(0, 0.8, progress));
+				// A movement deferred behind this stand starts now, on the
+				// same frame the posture settles — no teleport, no gap. If a
+				// replacement program stole the transition (still seated), the
+				// movement re-queues behind a fresh stand instead of walking
+				// out of the chair.
+				const pending = this.pendingAfterStand;
+				this.pendingAfterStand = null;
+				if (pending) {
+					if (this.sittingFlag) this.standThen(pending);
+					else pending();
 				}
-				applyProceduralAction(humanoid, nudge, this.procedural.name, progress);
+			} else if (this.procedural.name === 'sit' || this.procedural.name === 'stand') {
+				// Posture transitions interpolate from the captured baseline,
+				// so mid-transition reversals glide instead of snapping.
+				const w = smoothstep(0, 0.8, progress);
+				const baseline = this.postureBaseline;
+				if (baseline) {
+					root.position.y = baseline.fromRootY + (baseline.targetRootY - baseline.fromRootY) * w;
+					this.seatedWeight =
+						baseline.fromWeight + (baseline.targetWeight - baseline.fromWeight) * w;
+				} else {
+					this.seatedWeight = this.procedural.name === 'sit' ? w : 1 - w;
+				}
+				applyProceduralAction(
+					humanoid,
+					nudge,
+					this.basis,
+					this.procedural.name,
+					progress,
+					this.seatedWeight
+				);
+			} else {
+				applyProceduralAction(humanoid, nudge, this.basis, this.procedural.name, progress);
 			}
 		}
 		// Held sitting posture: re-applied every frame once the sit transition
-		// hands off, until stand or any locomotion (which auto-stands first).
+		// hands off, until stand or any locomotion (which stands first).
 		if (
 			this.sittingFlag &&
 			!this.procedural &&
@@ -423,7 +566,7 @@ export class MotionController {
 			!this.jumpState
 		) {
 			root.position.y = this.sitOffsetY;
-			applySittingPose(humanoid, nudge, 1);
+			applySittingPose(humanoid, nudge, this.basis, 1);
 		}
 		return completions;
 	}

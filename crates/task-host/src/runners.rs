@@ -9,7 +9,10 @@ use crate::{EmitFn, HostServices};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
-use task_core::{Ms, StepContext, StepOutcome, StepRunner, Task, TaskStep, TaskStore, TaskWait};
+use task_core::{
+    Clock, ExecutionReceipt, Ms, ReceiptStatus, StepContext, StepOutcome, StepRunner, Task,
+    TaskStep, TaskStore, TaskWait,
+};
 use tool_core::{ToolContext, ToolError};
 
 pub const AVATAR_ROUTINE_REQUESTED_EVENT: &str = ipc_core::events::AVATAR_ROUTINE_REQUESTED;
@@ -58,14 +61,56 @@ impl CapabilityReviewRequest {
     }
 }
 
+/// Durable receipt recording for tool invocations. When wired, every
+/// attempt records an [`ExecutionReceipt`] and a retry whose earlier
+/// attempt already succeeded replays the stored output instead of
+/// re-invoking the tool — so a crash between "effect happened" and
+/// "step completed" does not double-fire the side effect.
+#[derive(Clone)]
+pub struct ReceiptRecorder {
+    store: Arc<task_core::SqliteTaskStore>,
+    clock: Arc<dyn Clock>,
+}
+
+/// One attempt's receipt fields, bundled so the recorder stays readable.
+struct AttemptRecord<'a> {
+    ctx: &'a StepContext,
+    step: &'a TaskStep,
+    tool_name: &'a str,
+    status: ReceiptStatus,
+    started_at: Ms,
+    external_id: Option<String>,
+    output: serde_json::Value,
+}
+
 /// Runs any registered tool by name. Input: `{ "tool": "...", "args": {...} }`.
 pub struct ToolRunner {
     services: Arc<HostServices>,
+    receipts: Option<ReceiptRecorder>,
 }
 
 impl ToolRunner {
     pub fn new(services: Arc<HostServices>) -> Self {
-        Self { services }
+        Self {
+            services,
+            receipts: None,
+        }
+    }
+
+    /// Record an execution receipt per attempt and replay prior successes.
+    /// Unwired runners keep the old behavior (hosts without receipt needs,
+    /// and unit tests that construct runners directly).
+    pub fn with_receipts(
+        mut self,
+        store: Arc<task_core::SqliteTaskStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        self.set_receipts(store, clock);
+        self
+    }
+
+    pub fn set_receipts(&mut self, store: Arc<task_core::SqliteTaskStore>, clock: Arc<dyn Clock>) {
+        self.receipts = Some(ReceiptRecorder { store, clock });
     }
 
     /// Execute one tool call; shared by the `tool` step type and the
@@ -86,6 +131,11 @@ impl ToolRunner {
                 };
             }
         };
+        // Idempotent replay: an earlier attempt's success receipt means the
+        // effect already went through — reuse it, never re-invoke.
+        if let Some(replayed) = self.replay_if_succeeded(ctx, step, tool_name).await {
+            return StepOutcome::Completed(replayed);
+        }
         let mut tool_ctx = ToolContext::new(self.services.task_principal());
         // Single-use approval ticket, minted by TaskHost::review after the
         // user approved exactly this step. Consumed here, never reused.
@@ -96,15 +146,142 @@ impl ToolRunner {
             tool_ctx.invocation_id = stashed.invocation_id;
             tool_ctx = tool_ctx.with_ticket(stashed.ticket);
         }
+        let started_at = self.now_ms(ctx);
         match tool.invoke(tool_ctx, args.clone()).await {
-            Ok(output) => StepOutcome::Completed(serde_json::json!({
-                "tool": tool_name,
-                "status": "success",
-                "output": output.content,
-                "truncated": output.truncated,
-            })),
-            Err(err) => self.map_tool_error(tool_name, &args, err),
+            Ok(output) => {
+                let value = serde_json::json!({
+                    "tool": tool_name,
+                    "status": "success",
+                    "output": output.content,
+                    "truncated": output.truncated,
+                });
+                self.record_attempt(AttemptRecord {
+                    ctx,
+                    step,
+                    tool_name,
+                    status: ReceiptStatus::Success,
+                    started_at,
+                    external_id: None,
+                    output: value.clone(),
+                })
+                .await;
+                StepOutcome::Completed(value)
+            }
+            Err(err) => {
+                // Timeouts are the honest unknown: the effect may or may
+                // not have happened. Everything else failed deterministically.
+                let timed_out = matches!(err, ToolError::Timeout(_));
+                let outcome = self.map_tool_error(tool_name, &args, err);
+                self.record_failure_receipt(ctx, step, tool_name, started_at, timed_out, &outcome)
+                    .await;
+                outcome
+            }
         }
+    }
+
+    async fn replay_if_succeeded(
+        &self,
+        ctx: &StepContext,
+        step: &TaskStep,
+        tool_name: &str,
+    ) -> Option<serde_json::Value> {
+        let receipts = self.receipts.as_ref()?;
+        receipts
+            .store
+            .find_success_receipt(&ctx.task_id, &step.id, tool_name)
+            .await
+            .ok()
+            .flatten()
+            .map(|receipt| {
+                tracing::info!(
+                    task_id = %ctx.task_id,
+                    step_id = %step.id,
+                    operation = %tool_name,
+                    execution_id = %receipt.execution_id,
+                    "replaying prior success receipt instead of re-invoking tool"
+                );
+                receipt.output
+            })
+    }
+
+    fn now_ms(&self, ctx: &StepContext) -> Ms {
+        self.receipts
+            .as_ref()
+            .map(|recorder| recorder.clock.now_ms())
+            .unwrap_or(ctx.now_ms)
+    }
+
+    async fn record_attempt(&self, attempt: AttemptRecord<'_>) {
+        let Some(receipts) = self.receipts.as_ref() else {
+            return;
+        };
+        let AttemptRecord {
+            ctx,
+            step,
+            tool_name,
+            status,
+            started_at,
+            external_id,
+            output,
+        } = attempt;
+        let receipt = ExecutionReceipt {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            task_id: ctx.task_id.clone(),
+            step_id: step.id.clone(),
+            idempotency_key: task_core::idempotency_key(
+                &ctx.task_id,
+                &step.id,
+                tool_name,
+                ctx.attempt,
+            ),
+            operation: tool_name.to_string(),
+            status,
+            started_at,
+            finished_at: Some(receipts.clock.now_ms()),
+            external_id,
+            output,
+        };
+        if let Err(err) = receipts.store.record_receipt(&receipt).await {
+            // Receipt loss must never fail the step: the step result is the
+            // source of truth; the receipt is audit plus replay optimization.
+            tracing::warn!(
+                task_id = %ctx.task_id,
+                step_id = %step.id,
+                %err,
+                "failed to record execution receipt"
+            );
+        }
+    }
+
+    /// Failure receipts are audit: timeouts record `unknown_outcome` (the
+    /// effect may or may not have happened), everything else `failed`.
+    /// Neither blocks a later retry — only `success` replays.
+    async fn record_failure_receipt(
+        &self,
+        ctx: &StepContext,
+        step: &TaskStep,
+        tool_name: &str,
+        started_at: Ms,
+        timed_out: bool,
+        outcome: &StepOutcome,
+    ) {
+        let StepOutcome::Failed { message, .. } = outcome else {
+            return;
+        };
+        self.record_attempt(AttemptRecord {
+            ctx,
+            step,
+            tool_name,
+            status: if timed_out {
+                ReceiptStatus::UnknownOutcome
+            } else {
+                ReceiptStatus::Failed
+            },
+            started_at,
+            external_id: None,
+            output: serde_json::json!({ "tool": tool_name, "error": message }),
+        })
+        .await;
     }
 
     fn map_tool_error(
@@ -207,6 +384,15 @@ impl NotificationRunner {
         Self {
             inner: ToolRunner::new(services),
         }
+    }
+
+    pub fn with_receipts(
+        mut self,
+        store: Arc<task_core::SqliteTaskStore>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        self.inner.set_receipts(store, clock);
+        self
     }
 }
 
@@ -692,6 +878,129 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, AVATAR_ROUTINE_REQUESTED_EVENT);
         assert_eq!(events[0].data["task_id"], "task-1");
+    }
+
+    #[tokio::test]
+    async fn success_receipt_replays_without_reinvoking() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use task_core::ManualClock;
+
+        struct CountingTool {
+            calls: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl Tool for CountingTool {
+            fn metadata(&self) -> ToolMetadata {
+                ToolMetadata {
+                    id: capability_core::ToolId::new("test.counting"),
+                    description: "counting".to_string(),
+                    input_schema: serde_json::json!({}),
+                    effects: vec![ToolEffect::ExternalSideEffect],
+                }
+            }
+
+            async fn invoke(
+                &self,
+                _ctx: ToolContext,
+                _args: serde_json::Value,
+            ) -> Result<tool_core::ToolOutput, ToolError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(tool_core::ToolOutput::json(serde_json::json!({ "n": 1 })))
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut registry = tool_core::ToolRegistry::new();
+        registry
+            .register(Arc::new(CountingTool {
+                calls: calls.clone(),
+            }))
+            .unwrap();
+        let services = Arc::new(HostServices::new(Arc::new(registry)));
+        let store = Arc::new(task_core::SqliteTaskStore::open_in_memory().expect("store"));
+        let clock = ManualClock::new(1_000);
+        let runner =
+            ToolRunner::new(services).with_receipts(store.clone(), clock.clone() as Arc<dyn Clock>);
+        let input = serde_json::json!({ "tool": "test.counting", "args": {} });
+
+        let first = runner.run(&ctx(), &task(), &step(input.clone())).await;
+        assert!(matches!(first, StepOutcome::Completed(_)), "{first:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let receipts = store.list_receipts("task-1", 10).await.expect("receipts");
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].status, ReceiptStatus::Success);
+        assert_eq!(receipts[0].operation, "test.counting");
+
+        // Second attempt (e.g. the completion was lost to a crash): the
+        // stored success replays, the tool is NOT invoked again, and no
+        // second receipt is written.
+        let retry_ctx = StepContext {
+            attempt: 2,
+            ..ctx()
+        };
+        let second = runner.run(&retry_ctx, &task(), &step(input)).await;
+        match (first, second) {
+            (StepOutcome::Completed(a), StepOutcome::Completed(b)) => assert_eq!(a, b),
+            other => panic!("unexpected outcomes: {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let receipts = store.list_receipts("task-1", 10).await.expect("receipts");
+        assert_eq!(receipts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_attempt_does_not_replay() {
+        use task_core::ManualClock;
+
+        let store = Arc::new(task_core::SqliteTaskStore::open_in_memory().expect("store"));
+        let clock = ManualClock::new(1_000);
+        let runner = ToolRunner::new(services())
+            .with_receipts(store.clone(), clock.clone() as Arc<dyn Clock>);
+        // Deterministic failure (unknown tool): recorded, never replayed.
+        let outcome = runner
+            .run(
+                &ctx(),
+                &task(),
+                &step(serde_json::json!({ "tool": "nope.missing", "args": {} })),
+            )
+            .await;
+        assert!(matches!(outcome, StepOutcome::Failed { .. }));
+        // Unknown tools fail before any invocation, so no receipt exists...
+        assert!(store
+            .find_success_receipt("task-1", "step-1", "nope.missing")
+            .await
+            .expect("find")
+            .is_none());
+        // ...while a failed receipt for a real tool does not replay either.
+        let failed = ExecutionReceipt {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            task_id: "task-1".to_string(),
+            step_id: "step-1".to_string(),
+            idempotency_key: task_core::idempotency_key("task-1", "step-1", "system.echo", 1),
+            operation: "system.echo".to_string(),
+            status: ReceiptStatus::Failed,
+            started_at: 1_000,
+            finished_at: Some(1_100),
+            external_id: None,
+            output: serde_json::json!({}),
+        };
+        assert!(store.record_receipt(&failed).await.expect("record"));
+        let retry = runner
+            .run(
+                &StepContext {
+                    attempt: 2,
+                    ..ctx()
+                },
+                &task(),
+                &step(serde_json::json!({ "tool": "system.echo", "args": {} })),
+            )
+            .await;
+        assert!(matches!(retry, StepOutcome::Completed(_)), "{retry:?}");
+        assert_eq!(
+            store.list_receipts("task-1", 10).await.expect("list").len(),
+            2
+        );
     }
 
     #[tokio::test]

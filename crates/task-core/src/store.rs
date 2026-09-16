@@ -1,14 +1,14 @@
 use crate::error::{TaskCoreError, TaskCoreResult};
 use crate::model::{
-    Ms, NewTask, Task, TaskEvent, TaskStatus, TaskStep, TaskStepStatus, TaskStepType,
-    VerificationSpec,
+    ExecutionReceipt, Ms, NewTask, ReceiptStatus, Task, TaskEvent, TaskStatus, TaskStep,
+    TaskStepStatus, TaskStepType, VerificationSpec,
 };
 use async_trait::async_trait;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Durable task storage. All scheduling and execution state lives here so a
 /// restart can recover running work instead of losing it.
@@ -31,6 +31,25 @@ pub trait TaskStore: Send + Sync {
         correlation_id: Option<&str>,
         now: Ms,
     ) -> TaskCoreResult<Option<Task>>;
+    /// Append one attempt's execution receipt. Returns `false` (leaving
+    /// the stored row untouched) when the idempotency key already exists:
+    /// first writer wins, retries record under their own attempt's key.
+    async fn record_receipt(&self, receipt: &ExecutionReceipt) -> TaskCoreResult<bool>;
+    async fn get_receipt_by_key(&self, key: &str) -> TaskCoreResult<Option<ExecutionReceipt>>;
+    /// Replay check: the most recent `success` receipt for one step's
+    /// operation, across all attempts. `Some` means the effect already
+    /// went through — skip the call and reuse the stored output.
+    async fn find_success_receipt(
+        &self,
+        task_id: &str,
+        step_id: &str,
+        operation: &str,
+    ) -> TaskCoreResult<Option<ExecutionReceipt>>;
+    async fn list_receipts(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> TaskCoreResult<Vec<ExecutionReceipt>>;
 }
 
 #[derive(Debug)]
@@ -318,11 +337,24 @@ impl SqliteTaskStore {
                     payload TEXT NOT NULL DEFAULT '{}',
                     created_at INTEGER NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS execution_receipts (
+                    execution_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    step_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    operation TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    finished_at INTEGER,
+                    external_id TEXT,
+                    output TEXT NOT NULL DEFAULT '{}'
+                );
                 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_ready ON tasks(status, next_attempt_at, scheduled_at, priority DESC);
                 CREATE INDEX IF NOT EXISTS idx_tasks_wait ON tasks(status, wait_for);
                 CREATE INDEX IF NOT EXISTS idx_task_steps_task ON task_steps(task_id, step_index);
-                CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);",
+                CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_receipts_task_step ON execution_receipts(task_id, step_id);",
             )?;
             let version: i32 = conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -370,6 +402,35 @@ impl SqliteTaskStore {
             )
             .optional()?;
         stored.map(|stored| materialize(conn, stored)).transpose()
+    }
+
+    fn read_receipt(row: &rusqlite::Row) -> rusqlite::Result<ExecutionReceipt> {
+        let status_raw: String = row.get(5)?;
+        let output_raw: String = row.get(9)?;
+        Ok(ExecutionReceipt {
+            execution_id: row.get(0)?,
+            task_id: row.get(1)?,
+            step_id: row.get(2)?,
+            idempotency_key: row.get(3)?,
+            operation: row.get(4)?,
+            status: ReceiptStatus::parse(&status_raw).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    format!("unknown receipt_status: {status_raw}").into(),
+                )
+            })?,
+            started_at: row.get(6)?,
+            finished_at: row.get(7)?,
+            external_id: row.get(8)?,
+            output: serde_json::from_str(&output_raw).map_err(|err| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    9,
+                    rusqlite::types::Type::Text,
+                    Box::new(err),
+                )
+            })?,
+        })
     }
 
     fn read_tasks(
@@ -749,12 +810,88 @@ impl TaskStore for SqliteTaskStore {
             })
         }))
     }
+
+    async fn record_receipt(&self, receipt: &ExecutionReceipt) -> TaskCoreResult<bool> {
+        let output = serde_json::to_string(&receipt.output)
+            .map_err(|err| TaskCoreError::Serialization(err.to_string()))?;
+        let receipt = receipt.clone();
+        self.with_conn(|conn| {
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO execution_receipts
+                     (execution_id, task_id, step_id, idempotency_key, operation,
+                      status, started_at, finished_at, external_id, output)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    receipt.execution_id,
+                    receipt.task_id,
+                    receipt.step_id,
+                    receipt.idempotency_key,
+                    receipt.operation,
+                    receipt.status.as_str(),
+                    receipt.started_at,
+                    receipt.finished_at,
+                    receipt.external_id,
+                    output,
+                ],
+            )?;
+            Ok(inserted == 1)
+        })
+    }
+
+    async fn get_receipt_by_key(&self, key: &str) -> TaskCoreResult<Option<ExecutionReceipt>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT execution_id, task_id, step_id, idempotency_key, operation,
+                        status, started_at, finished_at, external_id, output
+                 FROM execution_receipts WHERE idempotency_key = ?1",
+                params![key],
+                Self::read_receipt,
+            )
+            .optional()
+        })
+    }
+
+    async fn find_success_receipt(
+        &self,
+        task_id: &str,
+        step_id: &str,
+        operation: &str,
+    ) -> TaskCoreResult<Option<ExecutionReceipt>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT execution_id, task_id, step_id, idempotency_key, operation,
+                        status, started_at, finished_at, external_id, output
+                 FROM execution_receipts
+                 WHERE task_id = ?1 AND step_id = ?2 AND operation = ?3 AND status = 'success'
+                 ORDER BY started_at DESC LIMIT 1",
+                params![task_id, step_id, operation],
+                Self::read_receipt,
+            )
+            .optional()
+        })
+    }
+
+    async fn list_receipts(
+        &self,
+        task_id: &str,
+        limit: i64,
+    ) -> TaskCoreResult<Vec<ExecutionReceipt>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT execution_id, task_id, step_id, idempotency_key, operation,
+                        status, started_at, finished_at, external_id, output
+                 FROM execution_receipts WHERE task_id = ?1 ORDER BY started_at ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![task_id, limit], Self::read_receipt)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{NewTaskStep, TaskStepType};
+    use crate::model::{idempotency_key, NewTaskStep, TaskStepType};
 
     fn sample_task() -> NewTask {
         NewTask {
@@ -817,5 +954,78 @@ mod tests {
         let stale = store.stale_running(200, 10).await.expect("stale");
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].id, task.id);
+    }
+
+    fn sample_receipt(task_id: &str, attempt: i32, status: ReceiptStatus) -> ExecutionReceipt {
+        ExecutionReceipt {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            task_id: task_id.to_string(),
+            step_id: "step-1".to_string(),
+            idempotency_key: idempotency_key(task_id, "step-1", "test.echo", attempt),
+            operation: "test.echo".to_string(),
+            status,
+            started_at: 100 + attempt as i64,
+            finished_at: Some(150),
+            external_id: None,
+            output: serde_json::json!({ "ok": true }),
+        }
+    }
+
+    #[tokio::test]
+    async fn receipts_round_trip_and_replay_finds_success() {
+        let store = SqliteTaskStore::open_in_memory().expect("in-memory store");
+        let task = store.create(sample_task(), 100).await.expect("create");
+        assert!(store
+            .list_receipts(&task.id, 10)
+            .await
+            .expect("list")
+            .is_empty());
+
+        let failed = sample_receipt(&task.id, 1, ReceiptStatus::Failed);
+        assert!(store.record_receipt(&failed).await.expect("record"));
+        // A failed attempt is not a replay: no success receipt yet.
+        assert!(store
+            .find_success_receipt(&task.id, "step-1", "test.echo")
+            .await
+            .expect("find")
+            .is_none());
+
+        let ok = sample_receipt(&task.id, 2, ReceiptStatus::Success);
+        assert!(store.record_receipt(&ok).await.expect("record"));
+        let replay = store
+            .find_success_receipt(&task.id, "step-1", "test.echo")
+            .await
+            .expect("find")
+            .expect("success receipt");
+        assert_eq!(replay.execution_id, ok.execution_id);
+        assert_eq!(replay.output, serde_json::json!({ "ok": true }));
+
+        let by_key = store
+            .get_receipt_by_key(&ok.idempotency_key)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(by_key.status, ReceiptStatus::Success);
+        let listed = store.list_receipts(&task.id, 10).await.expect("list");
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn duplicate_idempotency_key_keeps_first_writer() {
+        let store = SqliteTaskStore::open_in_memory().expect("in-memory store");
+        let task = store.create(sample_task(), 100).await.expect("create");
+        let first = sample_receipt(&task.id, 1, ReceiptStatus::Success);
+        assert!(store.record_receipt(&first).await.expect("record"));
+        let mut second = sample_receipt(&task.id, 1, ReceiptStatus::Failed);
+        second.execution_id = uuid::Uuid::new_v4().to_string();
+        second.idempotency_key = first.idempotency_key.clone();
+        assert!(!store.record_receipt(&second).await.expect("record"));
+        let stored = store
+            .get_receipt_by_key(&first.idempotency_key)
+            .await
+            .expect("get")
+            .expect("row");
+        assert_eq!(stored.execution_id, first.execution_id);
+        assert_eq!(stored.status, ReceiptStatus::Success);
     }
 }

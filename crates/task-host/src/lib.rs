@@ -253,7 +253,10 @@ impl TaskHost {
         let runners = Runners {
             wait: Arc::new(task_core::WaitRunner),
             notification: Arc::new(LimitedRunner::new(
-                Arc::new(NotificationRunner::new(services.clone())),
+                Arc::new(
+                    NotificationRunner::new(services.clone())
+                        .with_receipts(store.clone(), clock.clone() as Arc<dyn Clock>),
+                ),
                 NOTIFICATION_STEP_CONCURRENCY,
                 "notification",
             )),
@@ -263,7 +266,10 @@ impl TaskHost {
                 "avatar",
             )),
             tool: Arc::new(LimitedRunner::new(
-                Arc::new(ToolRunner::new(services.clone())),
+                Arc::new(
+                    ToolRunner::new(services.clone())
+                        .with_receipts(store.clone(), clock.clone() as Arc<dyn Clock>),
+                ),
                 TOOL_STEP_CONCURRENCY,
                 "tool",
             )),
