@@ -51,6 +51,7 @@
 	import type { NativeToolStep } from '$lib/services/native/agent';
 	import { createReminderFiredHandler } from '$lib/services/chat/reminder-chat';
 	import { reminderStore } from '$lib/stores/reminders.svelte';
+	import { taskOrchestrator } from '$lib/tasks/browser';
 	import { type PreparedImage } from '$lib/services/storage/keepsakes';
 	import { browser } from '$app/environment';
 	import type { StateUpdates } from '$lib/types/character';
@@ -226,8 +227,12 @@
 			createReminderFiredHandler((content, options) => handleSend(content, [], options))
 		);
 		reminderStore.startPolling();
+		// Durable task orchestrator: recovers scheduled/running/waiting tasks
+		// (including work orphaned by a previous close) and dispatches them.
+		taskOrchestrator.start();
 		return () => {
 			reminderStore.stopPolling();
+			taskOrchestrator.stop();
 			unsubscribeReminder();
 		};
 	});

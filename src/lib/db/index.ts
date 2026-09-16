@@ -28,6 +28,19 @@ export interface DBReminder extends Omit<Reminder, 'id'> {
 	id?: number;
 }
 
+export interface DBTask {
+	id: string;
+	status: string;
+	priority: number;
+	createdAt: number;
+	updatedAt: number;
+	scheduledAt?: number;
+	leaseUntil?: number;
+	title: string;
+	instruction: string;
+	data: string;
+}
+
 // Legacy persona storage keys (for migration)
 const LEGACY_PERSONA_CARDS_KEY = 'utsuwa-persona-cards';
 const LEGACY_PERSONA_ACTIVE_KEY = 'utsuwa-persona-active-id';
@@ -39,6 +52,7 @@ class UtsuwaDatabase extends Dexie {
 	conversationTurns!: EntityTable<DBConversationTurn, 'id'>;
 	completedEvents!: EntityTable<DBCompletedEvent, 'id'>;
 	reminders!: EntityTable<DBReminder, 'id'>;
+	tasks!: EntityTable<DBTask, 'id'>;
 
 	constructor() {
 		super('utsuwa-db');
@@ -155,6 +169,19 @@ class UtsuwaDatabase extends Dexie {
 			conversationTurns: '++id, sessionId, createdAt',
 			completedEvents: '++id, eventId, completedAt',
 			reminders: '++id, sessionId, triggerAt, executed, dismissed, [executed+triggerAt]'
+		});
+
+		// Version 7: Durable task orchestrator table. The full task row lives
+		// in `data` (JSON); indexed columns serve the scheduler's hot queries
+		// (due, ready-by-priority, lease recovery) without full scans.
+		this.version(7).stores({
+			characterStates: '++id, updatedAt',
+			facts: '++id, category, importance, createdAt',
+			sessions: '++id, startedAt',
+			conversationTurns: '++id, sessionId, createdAt',
+			completedEvents: '++id, eventId, completedAt',
+			reminders: '++id, sessionId, triggerAt, executed, dismissed, [executed+triggerAt]',
+			tasks: 'id, status, scheduledAt, leaseUntil, [status+scheduledAt]'
 		});
 	}
 }
