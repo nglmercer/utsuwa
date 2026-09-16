@@ -903,6 +903,24 @@ mod tests {
     }
 
     #[test]
+    fn agent_notify_without_grant_requires_approval() {
+        // Provenance for interval tasks: a background agent step calling
+        // notification.show parks in needs_review unless a standing grant
+        // (autonomous mode) or a task-review ticket covers it.
+        let principal = Principal::Agent(AgentId::new("task-agent"));
+        let request = CapabilityRequest {
+            principal: principal.clone(),
+            capability: Capability::NotificationSend,
+            resource: Resource::NotificationService,
+        };
+        let d = authorize(&principal, &request, &ctx());
+        assert!(matches!(
+            d,
+            AuthorizationDecision::RequireUserApproval { .. }
+        ));
+    }
+
+    #[test]
     fn agent_read_with_matching_grant_is_allowed() {
         let r = read_req();
         let granting = AuthorizationContext {

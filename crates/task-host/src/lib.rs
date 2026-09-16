@@ -21,7 +21,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use task_core::{
     Clock, Executor, Ms, NewTask, Runners, Scheduler, SqliteTaskStore, SystemClock, Task,
-    TaskStatus, TaskStore, TickReport,
+    TaskStatus, TaskStepStatus, TaskStepType, TaskStore, TickReport,
 };
 use thiserror::Error;
 
@@ -162,10 +162,20 @@ impl Default for WorkerConfig {
     }
 }
 
+/// Emitted to the WebView when a worker finishes an agent step with text.
+/// Payload: `{ task_id, step_id, title, text }`. This is how background
+/// results (interval readings, …) reach the user's eyes; without it step
+/// output sits in SQLite, visible only to drivers that poll.
+pub const TASK_STEP_COMPLETED_EVENT: &str = "task.step_completed";
+/// Emitted when a worker leaves a task terminal. Payload: `{ task_id,
+/// title, status, text }` with `text` joining every agent step's text.
+pub const TASK_TERMINAL_EVENT: &str = "task.terminal";
+
 pub struct TaskHost {
     store: Arc<SqliteTaskStore>,
     scheduler: Scheduler<SqliteTaskStore>,
     services: Arc<HostServices>,
+    emit: EmitFn,
     clock: Arc<SystemClock>,
     /// Wake signal for the single background tick loop. Mutating IPC calls
     /// notify instead of ticking inline, so responses return immediately.
@@ -248,7 +258,7 @@ impl TaskHost {
                 "notification",
             )),
             avatar_routine: Arc::new(LimitedRunner::new(
-                Arc::new(AvatarRoutineRunner::new(emit)),
+                Arc::new(AvatarRoutineRunner::new(Arc::clone(&emit))),
                 AVATAR_STEP_CONCURRENCY,
                 "avatar",
             )),
@@ -281,6 +291,7 @@ impl TaskHost {
             store,
             scheduler,
             services,
+            emit,
             clock,
             wake: Arc::new(tokio::sync::Notify::new()),
             dispatch_tx,
@@ -310,6 +321,11 @@ impl TaskHost {
     /// One scheduling pass. With workers running this is dispatch-only:
     /// bookkeeping plus enqueue, returning before any step executes. Without
     /// workers (tests, task-cli) it executes inline, as before.
+    ///
+    /// Note: the inline batch path does not surface `task.*` progress
+    /// events (only [`TaskHost::execute_task`] and [`TaskHost::tick_one`]
+    /// do). Degraded/batch callers read results back from the store, and in
+    /// degraded mode agent steps can't produce text anyway (no backend).
     pub async fn tick(&self) -> TaskResult<TickReport> {
         if !self.dispatch_active.load(Ordering::SeqCst) {
             return Ok(self.scheduler.tick().await?);
@@ -339,11 +355,17 @@ impl TaskHost {
 
     /// Execute one task outside the tick loop (worker path). Clears the
     /// in-flight mark on every exit so a later tick can redispatch retries.
+    /// Surfaces finished agent-step text plus terminal status to the WebView
+    /// so background results are visible without polling.
     pub async fn execute_task(&self, task_id: &str) -> TaskResult<Task> {
         let started_at = self.now_ms();
         tracing::info!(task_id = %task_id, started_at, "task dispatched to worker");
+        let before = self.store.get(task_id).await.ok().flatten();
         let outcome = self.scheduler.execute_task(task_id).await;
         self.unmark_in_flight(task_id);
+        if let Ok(task) = &outcome {
+            self.emit_task_progress(before.as_ref(), task);
+        }
         let finished_at = self.now_ms();
         match &outcome {
             Ok(task) => tracing::info!(
@@ -381,7 +403,75 @@ impl TaskHost {
     /// `Scheduler::tick_one`). Single-task headless drivers use this so
     /// a stranger's slow model turn can never delay wait expiry.
     pub async fn tick_one(&self, task_id: &str) -> TaskResult<TickReport> {
-        Ok(self.scheduler.tick_one(task_id).await?)
+        let before = self.store.get(task_id).await.ok().flatten();
+        let report = self.scheduler.tick_one(task_id).await?;
+        if report.executed.iter().any(|id| id == task_id) {
+            if let Ok(Some(task)) = self.store.get(task_id).await {
+                self.emit_task_progress(before.as_ref(), &task);
+            }
+        }
+        Ok(report)
+    }
+
+    /// Surface this execution's new agent-step text plus any terminal
+    /// status as HostEvents. Agent steps only: tool results are JSON blobs
+    /// for drivers, and notification steps already notify natively. Steps
+    /// without text are skipped quietly (a tool-only agent turn).
+    fn emit_task_progress(&self, before: Option<&Task>, after: &Task) {
+        for (index, step) in after.steps.iter().enumerate() {
+            if step.step_type != TaskStepType::Agent || step.status != TaskStepStatus::Completed {
+                continue;
+            }
+            let was_completed = before
+                .and_then(|task| task.steps.get(index))
+                .is_some_and(|prev| prev.status == TaskStepStatus::Completed);
+            if was_completed {
+                continue;
+            }
+            let Some(text) = step
+                .result
+                .as_ref()
+                .and_then(|result| result.get("text"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            (self.emit)(ipc_core::HostEvent {
+                event: TASK_STEP_COMPLETED_EVENT.to_string(),
+                data: serde_json::json!({
+                    "task_id": after.id,
+                    "step_id": step.id,
+                    "title": after.title,
+                    "text": text,
+                }),
+            });
+        }
+        if after.status.is_terminal() {
+            let text = after
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.step_type == TaskStepType::Agent
+                        && step.status == TaskStepStatus::Completed
+                })
+                .filter_map(|step| {
+                    step.result
+                        .as_ref()
+                        .and_then(|result| result.get("text"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (self.emit)(ipc_core::HostEvent {
+                event: TASK_TERMINAL_EVENT.to_string(),
+                data: serde_json::json!({
+                    "task_id": after.id,
+                    "title": after.title,
+                    "status": after.status.as_str(),
+                    "text": text,
+                }),
+            });
+        }
     }
 
     pub async fn create(&self, task: NewTask) -> TaskResult<Task> {
@@ -870,5 +960,192 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// Capability-free echo tool: stands in for read-only tools such as
+    /// `system.time` (no ticket needed, returns instantly).
+    struct InstantEchoTool;
+
+    #[async_trait]
+    impl tool_core::Tool for InstantEchoTool {
+        fn metadata(&self) -> tool_core::ToolMetadata {
+            tool_core::ToolMetadata {
+                id: capability_core::ToolId::new("test.echo"),
+                description: "echo".to_string(),
+                input_schema: serde_json::json!({}),
+                effects: vec![],
+            }
+        }
+
+        async fn invoke(
+            &self,
+            _ctx: tool_core::ToolContext,
+            args: serde_json::Value,
+        ) -> Result<tool_core::ToolOutput, tool_core::ToolError> {
+            Ok(tool_core::ToolOutput::json(args))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_step_interval_runs_at_wait_speed() {
+        // Option C timing probe: tool steps add no model latency, so an
+        // interval of instant tools + 40ms waits finishes in well under a
+        // second. (An agent-step interval pays a full model turn — tens of
+        // seconds — per repetition instead.)
+        let mut registry = tool_core::ToolRegistry::new();
+        registry.register(Arc::new(InstantEchoTool)).unwrap();
+        let host = TaskHost::open_in_memory(Arc::new(registry), silent_emit(), None).expect("host");
+        let mut task = gated_task();
+        task.steps = vec![
+            NewTaskStep {
+                step_type: TaskStepType::Tool,
+                input: serde_json::json!({ "tool": "test.echo", "args": { "n": 1 } }),
+                max_attempts: Some(1),
+            },
+            NewTaskStep {
+                step_type: TaskStepType::Wait,
+                input: serde_json::json!({ "duration_ms": 40 }),
+                max_attempts: Some(1),
+            },
+            NewTaskStep {
+                step_type: TaskStepType::Tool,
+                input: serde_json::json!({ "tool": "test.echo", "args": { "n": 2 } }),
+                max_attempts: Some(1),
+            },
+            NewTaskStep {
+                step_type: TaskStepType::Wait,
+                input: serde_json::json!({ "duration_ms": 40 }),
+                max_attempts: Some(1),
+            },
+            NewTaskStep {
+                step_type: TaskStepType::Tool,
+                input: serde_json::json!({ "tool": "test.echo", "args": { "n": 3 } }),
+                max_attempts: Some(1),
+            },
+        ];
+        task.max_attempts = Some(1);
+        let created = host.create(task).await.expect("create");
+        let start = Instant::now();
+        let mut terminal = None;
+        for _ in 0..20 {
+            host.tick().await.expect("tick");
+            let current = host.get(&created.id).await.expect("get").expect("task");
+            if current.status.is_terminal() {
+                terminal = Some(current);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let done = terminal.expect("tool interval should finish");
+        assert_eq!(done.status, TaskStatus::Completed, "{done:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "tool steps must not pay model latency: {:?}",
+            start.elapsed()
+        );
+        // Static args in, echoed args out: each tool step sees only its own
+        // input — there is no chaining of prior results (the C caveat).
+        let outputs: Vec<i64> = done
+            .steps
+            .iter()
+            .filter(|step| step.step_type == TaskStepType::Tool)
+            .filter_map(|step| step.result.as_ref()?.get("output")?.get("n")?.as_i64())
+            .collect();
+        assert_eq!(outputs, vec![1, 2, 3]);
+    }
+
+    struct TextAgentBackend;
+
+    #[async_trait]
+    impl AgentStepBackend for TextAgentBackend {
+        async fn run_agent_step(
+            &self,
+            _ctx: &task_core::StepContext,
+            _task: &Task,
+            step: &task_core::TaskStep,
+        ) -> task_core::StepOutcome {
+            let prompt = step
+                .input
+                .get("prompt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            task_core::StepOutcome::Completed(serde_json::json!({
+                "status": "success",
+                "text": format!("reading for: {prompt}"),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_surfaces_agent_text_as_host_events() {
+        let events: Arc<Mutex<Vec<ipc_core::HostEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let host = Arc::new(
+            TaskHost::open_in_memory(
+                registry(),
+                Arc::new(move |event| sink.lock().unwrap().push(event)),
+                Some(Arc::new(TextAgentBackend)),
+            )
+            .expect("host"),
+        );
+        let created = host
+            .create(crate::interval::interval_task(
+                &crate::interval::IntervalOptions {
+                    title: "readings".to_string(),
+                    instruction: "read".to_string(),
+                    prompts: vec!["one".to_string(), "two".to_string()],
+                    gap_ms: 30,
+                    max_iterations: 1,
+                    scheduled_at: None,
+                },
+            ))
+            .await
+            .expect("create");
+        tokio::spawn(run_worker_pool(
+            Arc::clone(&host),
+            WorkerConfig { task_workers: 1 },
+        ));
+        let start = Instant::now();
+        while !host.has_workers() {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "worker pool did not activate"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Drive the production path (dispatch ticks + worker execution)
+        // until the interval finishes: 2 agent steps, 1 wait between.
+        let start = Instant::now();
+        loop {
+            host.tick().await.expect("tick");
+            let current = host.get(&created.id).await.expect("get").expect("task");
+            if current.status == TaskStatus::Completed {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "interval did not finish: {current:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let events = events.lock().unwrap();
+        let steps: Vec<&ipc_core::HostEvent> = events
+            .iter()
+            .filter(|e| e.event == TASK_STEP_COMPLETED_EVENT)
+            .collect();
+        assert_eq!(steps.len(), 2, "one event per reading: {events:?}");
+        assert_eq!(steps[0].data["task_id"], created.id);
+        assert_eq!(steps[0].data["text"], "reading for: one");
+        assert_eq!(steps[1].data["text"], "reading for: two");
+        let terminal: Vec<&ipc_core::HostEvent> = events
+            .iter()
+            .filter(|e| e.event == TASK_TERMINAL_EVENT)
+            .collect();
+        assert_eq!(terminal.len(), 1, "{events:?}");
+        assert_eq!(terminal[0].data["status"], "completed");
+        assert_eq!(
+            terminal[0].data["text"],
+            "reading for: one\nreading for: two"
+        );
     }
 }

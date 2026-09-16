@@ -6,6 +6,7 @@
 	import { sttStore } from '$lib/stores/stt.svelte';
 	import { displayStore } from '$lib/stores/display.svelte';
 	import { chatHintStore } from '$lib/stores/chat-hint.svelte';
+	import { attachTaskEventsListener } from '$lib/services/native/task-events.svelte';
 	import { queueFiles } from './attach-files';
 	import { chatDraftStore } from '$lib/stores/chat-draft.svelte';
 	import { type PreparedImage } from '$lib/services/storage/keepsakes';
@@ -34,6 +35,10 @@
 		overlay = false,
 		barHidden = false
 	}: Props = $props();
+
+	// Background-task results land here as toasts; this bar is always
+	// mounted, so it owns the listener. No-op without a native bridge.
+	attachTaskEventsListener();
 
 	// Companion mood + stats, merged into the command bar.
 	const moodInfo = $derived(characterStore.moodInfo);
