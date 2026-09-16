@@ -100,6 +100,7 @@ impl MediaRegistry {
             } else {
                 "text/plain"
             },
+            media_allow_origin(&request),
         )
     }
 }
@@ -132,20 +133,57 @@ fn purge_expired(entries: &mut HashMap<String, MediaEntry>) {
     entries.retain(|_, entry| now.duration_since(entry.inserted_at) < MEDIA_TTL);
 }
 
+/// Origin reflected in media `Access-Control-Allow-Origin`. The bundled app
+/// origin always qualifies; http(s) loopback qualifies so the `vite dev`
+/// page (`http://localhost:…`) can fetch handles during development.
+/// Anything else — including a missing or opaque origin — gets `null`:
+/// media must never be readable from a foreign origin.
+fn media_allow_origin(request: &Request<Vec<u8>>) -> String {
+    let origin = request
+        .headers()
+        .get("Origin")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if origin == crate::protocol::APP_ORIGIN || is_loopback_origin(origin) {
+        return origin.to_string();
+    }
+    "null".to_string()
+}
+
+/// `http(s)://<loopback>[:port]` and nothing else: no userinfo, no path.
+fn is_loopback_origin(origin: &str) -> bool {
+    let rest = match origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    {
+        Some(rest) => rest,
+        None => return false,
+    };
+    if rest.contains(['@', '/', '?', '#']) {
+        return false;
+    }
+    let host = match rest.strip_prefix('[') {
+        // Bracketed IPv6 literal: `::1` only.
+        Some(inner) => inner.split(']').next().unwrap_or(""),
+        None => rest.split(':').next().unwrap_or(""),
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
 fn response(
     status: StatusCode,
     body: Cow<'static, [u8]>,
     content_type: &'static str,
+    allow_origin: String,
 ) -> Response<Cow<'static, [u8]>> {
     Response::builder()
         .status(status)
         .header("Content-Type", content_type)
         .header("Cache-Control", "no-store")
-        // The dev WebView page is http://localhost while media is still served
-        // from the same companion://app origin in bundled builds; a wildcard
-        // keeps the dev page able to fetch the handle and is safe here because
-        // the registry is local-only, short-lived, and contains no credentials.
-        .header("Access-Control-Allow-Origin", "*")
+        .header("Access-Control-Allow-Origin", allow_origin)
         .body(body)
         .unwrap_or_else(|_| Response::new(Cow::Borrowed(&[])))
 }
@@ -404,6 +442,58 @@ mod tests {
                 registry.handle(request).status(),
                 StatusCode::FORBIDDEN,
                 "{uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn media_cors_reflects_only_app_and_loopback_origins() {
+        let registry = MediaRegistry::new();
+        registry
+            .insert("capture-1".to_string(), vec![1, 2, 3, 4])
+            .unwrap();
+        for origin in [
+            crate::protocol::APP_ORIGIN,
+            "http://localhost:5173",
+            "http://127.0.0.1:8080",
+            "https://localhost:5173",
+            "http://[::1]:5173",
+        ] {
+            let request = Request::builder()
+                .uri("companion://app/__media/capture-1")
+                .header("Origin", origin)
+                .body(Vec::new())
+                .unwrap();
+            assert_eq!(
+                registry.handle(request).headers()["Access-Control-Allow-Origin"],
+                origin,
+                "{origin}"
+            );
+        }
+        // Missing, opaque, and foreign origins — including lookalikes — get `null`.
+        let mut cases: Vec<Option<&str>> = vec![None];
+        cases.extend(
+            [
+                "null",
+                "https://example.com",
+                "http://localhost.evil.com",
+                "http://localhost@evil.com",
+                "http://evil.com#@localhost",
+                "companion://evil",
+            ]
+            .into_iter()
+            .map(Some),
+        );
+        for origin in cases {
+            let mut builder = Request::builder().uri("companion://app/__media/capture-1");
+            if let Some(origin) = origin {
+                builder = builder.header("Origin", origin);
+            }
+            let request = builder.body(Vec::new()).unwrap();
+            assert_eq!(
+                registry.handle(request).headers()["Access-Control-Allow-Origin"],
+                "null",
+                "{origin:?}"
             );
         }
     }

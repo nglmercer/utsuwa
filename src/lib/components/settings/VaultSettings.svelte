@@ -119,6 +119,12 @@
 			The vault is locked — providers and MCP tools are unavailable until you unlock.
 			There is no recovery: forgetting the passphrase means re-entering your keys.
 		</p>
+		{#if settingsStore.vaultPendingEdits}
+			<p class="provider-note provider-warning">
+				<Icon name="alert-circle" size={14} />
+				Settings changed while the vault was locked. Unlock to merge and save them.
+			</p>
+		{/if}
 		<div class="vault-rows">
 			<input
 				type="password"

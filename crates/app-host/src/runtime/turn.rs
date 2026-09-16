@@ -94,6 +94,14 @@ impl AgentRuntime {
     ) -> Result<(), RuntimeError> {
         let this = Arc::clone(self);
         let executor_handle = this.executor.handle().clone();
+        // Hold the state lock across spawn + store: a fast-failing worker
+        // can otherwise emit its terminal event (clearing `running`)
+        // before the store below lands, leaving a stale finished handle
+        // behind. `spawn` only schedules — it never blocks — so the worker
+        // simply waits on the lock until the store is done. No deadlock:
+        // nothing under this lock waits on the worker, and neither caller
+        // (`send_request`, `notify_decided`) holds the lock when calling in.
+        let mut state = self.lock_state()?;
         let handle = executor_handle.spawn(async move {
             this.run_turn(
                 transcript,
@@ -106,7 +114,11 @@ impl AgentRuntime {
             )
             .await;
         });
-        self.lock_state()?.running = Some(handle);
+        // Only the current generation owns `running`: a superseding request
+        // may have bumped the generation while this spawn was starting.
+        if state.generation == generation {
+            state.running = Some(handle);
+        }
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]

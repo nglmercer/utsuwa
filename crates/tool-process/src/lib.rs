@@ -456,11 +456,31 @@ fn is_secret_name(name: &str) -> bool {
     FRAGMENTS.iter().any(|frag| upper.contains(frag))
 }
 
-/// Injection vectors with no legitimate per-child use.
+/// Loader-hijack and runtime code-execution variables. Neither explicit
+/// caller deltas nor the inherited environment may carry these: a value like
+/// `NODE_OPTIONS=--require …` or `LD_PRELOAD=…` turns an innocent-looking
+/// approval into arbitrary code execution inside the child.
+///
+/// Interpreter *module search* paths (`PYTHONPATH`, `RUBYLIB`, `PERL5LIB`,
+/// …) are deliberately NOT listed: they need attacker-planted files to
+/// exploit, they have routine legitimate uses (`PYTHONPATH=src pytest`),
+/// and the approval dialog shows env-var names so they cannot hide.
 fn is_injection_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "LD_PRELOAD" | "DYLD_INSERT_LIBRARIES"
+        "LD_PRELOAD"
+            | "LD_AUDIT"
+            | "LD_LIBRARY_PATH"
+            | "DYLD_INSERT_LIBRARIES"
+            | "DYLD_LIBRARY_PATH"
+            | "DYLD_FALLBACK_LIBRARY_PATH"
+            | "DYLD_FRAMEWORK_PATH"
+            | "NODE_OPTIONS"
+            | "JAVA_TOOL_OPTIONS"
+            | "_JAVA_OPTIONS"
+            | "JDK_JAVA_OPTIONS"
+            | "RUBYOPT"
+            | "PERL5OPT"
     )
 }
 

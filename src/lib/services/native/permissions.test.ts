@@ -114,6 +114,41 @@ test('home toggle stays off without a matching grant', () => {
 	);
 });
 
+test('process summary names env vars and quotes spaced args', () => {
+	const req = parsePermissionRequest({
+		id: 'perm-2',
+		principal: { Agent: 'a1' },
+		capability: 'ProcessSpawn',
+		resource: {
+			Process: {
+				executable: '/usr/bin/node',
+				args: ['server.js', 'two words'],
+				cwd: '/work',
+				env: [
+					['NODE_OPTIONS', '--require /tmp/evil.js'],
+					['PATH', '/usr/bin']
+				]
+			}
+		}
+	});
+	assert.equal(req?.resource.kind, 'process');
+	assert.equal(
+		req?.resource.label,
+		'/usr/bin/node server.js "two words" (cwd /work, env NODE_OPTIONS, PATH)'
+	);
+});
+
+test('process summary caps long env lists without hiding the count', () => {
+	const env = Array.from({ length: 9 }, (_, i) => [`VAR_${i}`, 'x']);
+	const req = parsePermissionRequest({
+		id: 'perm-3',
+		principal: { Agent: 'a1' },
+		capability: 'ProcessSpawn',
+		resource: { Process: { executable: 'x', args: [], cwd: '/', env } }
+	});
+	assert.match(req?.resource.label ?? '', /VAR_0.*\(\+3 more\)/);
+});
+
 test('autonomous mode reads and writes the native setting', async () => {
 	const calls: Array<[string, Record<string, unknown> | undefined]> = [];
 	const invoke = async (method: string, params?: Record<string, unknown>) => {

@@ -73,6 +73,28 @@ function summarizePrincipal(principal: unknown): string {
 	return kind;
 }
 
+/** Max env-var names shown in a process label; the rest fold into "+N more". */
+const MAX_ENV_NAMES_SHOWN = 6;
+
+/** Quote one argv element for display so `two words` can't pass as two args. */
+function quoteArg(arg: string): string {
+	if (arg !== '' && !/[\s"'\\$`!*?#~()[\]{};|&<>]/.test(arg)) return arg;
+	return `"${arg.replace(/(["\\$`])/g, '\\$1')}"`;
+}
+
+/** Env-var names from a Process resource. Rust sends pairs; values stay hidden. */
+function envVarNames(env: unknown): string[] {
+	if (Array.isArray(env)) {
+		const names: string[] = [];
+		for (const entry of env) {
+			if (Array.isArray(entry) && typeof entry[0] === 'string') names.push(entry[0]);
+		}
+		return names;
+	}
+	if (env !== null && typeof env === 'object') return Object.keys(env);
+	return [];
+}
+
 function summarizeResource(resource: unknown): ResourceSummary {
 	if (typeof resource === 'string') return { kind: 'unknown', label: resource };
 	if (typeof resource !== 'object' || resource === null) {
@@ -88,11 +110,15 @@ function summarizeResource(resource: unknown): ResourceSummary {
 			? process.args.filter((arg): arg is string => typeof arg === 'string')
 			: [];
 		const cwd = typeof process.cwd === 'string' ? process.cwd : 'unknown cwd';
-		const env = process.env && typeof process.env === 'object' ? process.env : [];
-		const envCount = Array.isArray(env) ? env.length : Object.keys(env).length;
+		const names = envVarNames(process.env);
+		const shown = names.slice(0, MAX_ENV_NAMES_SHOWN);
+		const hidden = names.length - shown.length;
+		const envSuffix = names.length
+			? `, env ${shown.join(', ')}${hidden > 0 ? ` (+${hidden} more)` : ''}`
+			: '';
 		return {
 			kind: 'process',
-			label: `${executable}${args.length ? ` ${args.join(' ')}` : ''} (cwd ${cwd}${envCount ? `, ${envCount} env change${envCount === 1 ? '' : 's'}` : ''})`
+			label: `${executable}${args.length ? ` ${args.map(quoteArg).join(' ')}` : ''} (cwd ${cwd}${envSuffix})`
 		};
 	}
 	if (typeof r.Application === 'string') return { kind: 'application', label: r.Application };

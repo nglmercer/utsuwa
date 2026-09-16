@@ -400,6 +400,42 @@ async fn loader_injection_environment_is_rejected_even_when_explicit() {
 }
 
 #[tokio::test]
+async fn runtime_code_execution_environment_is_rejected() {
+    let echo = tool_process::resolve_executable("echo").unwrap();
+    for name in [
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "NODE_OPTIONS",
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "RUBYOPT",
+        "PERL5OPT",
+    ] {
+        let spawn = SpawnTool {
+            manager: manager(),
+            limits: ProcessLimits::default(),
+        };
+        let mut env = serde_json::Map::new();
+        env.insert(name.to_string(), serde_json::Value::String("x".into()));
+        let params = serde_json::json!({ "executable": "echo", "env": env });
+        // The ticket covers the env on purpose: only the parser may refuse it.
+        let err = spawn
+            .invoke(ticketed_ctx_for(&echo, &params), params)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not allowed for process isolation"),
+            "{name}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn unknown_handles_and_bad_args_fail_closed() {
     let manager = manager();
     let echo = tool_process::resolve_executable("echo").unwrap();

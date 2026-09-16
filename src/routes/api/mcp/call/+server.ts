@@ -1,6 +1,6 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { env } from '$env/dynamic/private';
-import { isMcpProxyEnabled, mcpErrorResponse } from '../shared.ts';
+import { assertHttpHostAllowed, isMcpProxyEnabled, mcpErrorResponse } from '../shared.ts';
 import { nodeHostResolver } from '../../dns.ts';
 import { createGuardedFetch } from '../guarded-fetch.ts';
 import { parseAllowedCommands, pinnedStdioServer, runStdioMethod } from '../stdio.ts';
@@ -63,6 +63,7 @@ export const POST: RequestHandler = async ({ request }) => {
 			);
 			return json({ result, sessionId: null });
 		}
+		assertHttpHostAllowed(server, env.MCP_HTTP_ALLOWED_HOSTS);
 		const client = new McpHttpClient(server, { fetchImpl: createGuardedFetch(nodeHostResolver) });
 		if (typeof body.sessionId === 'string' && body.sessionId) client.adoptSession(body.sessionId);
 		const result = await client.callTool(tool, args);

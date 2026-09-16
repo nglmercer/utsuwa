@@ -3648,6 +3648,48 @@ mod tests {
         assert!(harness.runtime.lock_state().unwrap().running.is_none());
     }
 
+    #[test]
+    fn superseded_spawn_does_not_claim_running() {
+        // A spawn superseded before its store lands must not claim
+        // `running`: the handle belongs to a dead generation.
+        let approvals = Arc::new(Mutex::new(ApprovalQueue::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let runtime = AgentRuntime::start_with_factory(
+            approvals,
+            None,
+            None,
+            Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }),
+            sync_factory(|| -> Result<Arc<dyn ModelProvider>, RuntimeError> {
+                panic!("boom in provider factory")
+            }),
+        )
+        .unwrap();
+        // Bump past generation 0 without ever running a turn.
+        runtime.cancel();
+        runtime
+            .spawn_turn(
+                Vec::new(),
+                0,
+                "task".to_string(),
+                "turn".to_string(),
+                None,
+                Arc::new(agent_core::ToolReplayCache::new()),
+                None,
+            )
+            .unwrap();
+        assert!(runtime.lock_state().unwrap().running.is_none());
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.event.starts_with("agent.turn_")),
+            "stale worker emitted a turn event: {events:?}"
+        );
+    }
+
     struct PanicProvider;
 
     #[async_trait::async_trait]

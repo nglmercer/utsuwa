@@ -25,6 +25,21 @@ function clientIp(event: RequestEvent): string {
 	}
 }
 
+/** Reject browser-driven cross-site mutations. Requests without an `Origin`
+ * header (curl, server-to-server, same-origin navigations that omit it) are
+ * allowed — only a present-but-foreign origin is forged. Exported for tests. */
+export function isSameOriginRequest(request: Request, url: URL): boolean {
+	const origin = request.headers.get('origin');
+	if (origin === null || origin.trim() === '') return true;
+	let parsed: URL;
+	try {
+		parsed = new URL(origin);
+	} catch {
+		return false;
+	}
+	return parsed.origin === url.origin;
+}
+
 export const handle: Handle = async ({ event, resolve }) => {
 	const pathname = event.url.pathname;
 	if (event.request.method !== 'GET' && pathname.startsWith('/api/')) {
@@ -37,6 +52,12 @@ export const handle: Handle = async ({ event, resolve }) => {
 					headers: { 'Content-Type': 'application/json' }
 				});
 			}
+		}
+		if (!isSameOriginRequest(event.request, event.url)) {
+			return new Response(JSON.stringify({ error: 'Cross-origin request forbidden' }), {
+				status: 403,
+				headers: { 'Content-Type': 'application/json' }
+			});
 		}
 		const verdict = checkRateLimit(pathname, clientIp(event));
 		if (!verdict.allowed) {

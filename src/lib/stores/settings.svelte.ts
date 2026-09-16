@@ -21,6 +21,7 @@ import {
 	type VaultEnvelope,
 	type VaultSession
 } from '$lib/services/security/vault';
+import { mergePendingSecrets } from './settings-merge';
 
 export type ProviderCategory = 'llm' | 'tts' | 'stt';
 
@@ -58,6 +59,9 @@ function createSettingsStore() {
 	// in-memory secrets are empty and consumers see "not configured".
 	let vaultSet = $state(false);
 	let vaultLocked = $state(false);
+	// True when in-memory secrets changed while locked and are waiting for
+	// an unlock to merge them into the vault (a locked save can't persist).
+	let vaultPendingEdits = $state(false);
 	let vaultSession: VaultSession | null = null;
 	let saveChain: Promise<void> = Promise.resolve();
 
@@ -174,11 +178,16 @@ function createSettingsStore() {
 				'utsuwa-settings',
 				JSON.stringify({ ...nonSecrets, providerConfigs: {}, mcpServers: [], vault: envelope })
 			);
+			vaultPendingEdits = false;
 			return;
 		}
 		if (vaultLocked) {
 			// Locked: persist non-secrets only and preserve the stored envelope
 			// byte-for-byte (in-memory secrets are empty and must not wipe it).
+			// If a programmatic writer did change secrets while locked, flag
+			// them for the unlock merge instead of silently dropping them.
+			vaultPendingEdits =
+				Object.keys(providerConfigs).length > 0 || mcpServers.length > 0;
 			let vault: unknown;
 			try {
 				vault = (JSON.parse(localStorage.getItem('utsuwa-settings') ?? '{}') as Record<string, unknown>)
@@ -202,6 +211,7 @@ function createSettingsStore() {
 			'utsuwa-settings',
 			JSON.stringify({ ...nonSecrets, providerConfigs: persistedProviderConfigs(), mcpServers })
 		);
+		vaultPendingEdits = false;
 	}
 
 	function readStoredEnvelope(): VaultEnvelope | null {
@@ -234,10 +244,22 @@ function createSettingsStore() {
 		if (!envelope) return false;
 		try {
 			const session = await deriveSessionKey(passphrase, envelope);
+			// Snapshot locked-time edits before the decrypted envelope
+			// overwrites them: they are newer, so they overlay the vault.
+			const pending = vaultPendingEdits
+				? { providerConfigs: { ...providerConfigs }, mcpServers: [...mcpServers] }
+				: null;
 			applyDecryptedSecrets(await decryptSecretsWithKey(envelope, session.key));
+			if (pending) {
+				const merged = mergePendingSecrets({ providerConfigs, mcpServers }, pending);
+				providerConfigs = merged.providerConfigs;
+				mcpServers = merged.mcpServers;
+			}
 			vaultSession = session;
 			vaultLocked = false;
 			vaultSet = true;
+			vaultPendingEdits = false;
+			if (pending) save();
 			return true;
 		} catch (e) {
 			if (e instanceof VaultError) return false;
@@ -295,6 +317,7 @@ function createSettingsStore() {
 		providerConfigs = {};
 		mcpServers = [];
 		vaultLocked = true;
+		vaultPendingEdits = false;
 	}
 
 	async function hydrateNativeModelSettings() {
@@ -669,6 +692,9 @@ function createSettingsStore() {
 		},
 		get vaultLocked() {
 			return vaultLocked;
+		},
+		get vaultPendingEdits() {
+			return vaultPendingEdits;
 		},
 		unlockVault,
 		setVaultPassphrase,
