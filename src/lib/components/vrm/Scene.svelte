@@ -29,6 +29,7 @@
 		drawPhotoStickers
 	} from '$lib/services/photo-capture';
 	import { drawSceneBackground } from '$lib/services/scene-backgrounds';
+	import { followPushDelta } from '$lib/engine/camera-follow';
 	import { PHOTO_FILTERS } from '$lib/stores/photomode.svelte';
 	import { onMount } from 'svelte';
 
@@ -356,6 +357,14 @@
 		if (photomodeStore.active) applyCamera();
 	});
 
+	// The camera panel's reframe button (or a model camera cue) asks for the
+	// fitted framing back on her current position. applyCamera is idempotent,
+	// so the mount run is a harmless duplicate of the settings effect above.
+	$effect(() => {
+		void displayStore.reframeCounter;
+		applyCamera();
+	});
+
 	// Photo-mode camera profile: damping for deliberate motion, a wider zoom
 	// range for close portraits and full-body shots, and a polar clamp that
 	// keeps the camera above the floor. Exiting restores the chat profile and
@@ -422,8 +431,10 @@
 		cam.getWorldPosition(followCamPos);
 		vrmStore.setCameraPose({ x: followCamPos.x, y: followCamPos.y, z: followCamPos.z });
 		// Camera follow: pan target AND camera together toward her plane
-		// position, preserving the orbit offset. Photo mode and XR own their
-		// framing, so they opt out.
+		// position, preserving the orbit offset — but only past a deadzone, so
+		// walks read as motion in the viewport (across AND closer/farther)
+		// instead of the camera gluing her to the frame center. Photo mode and
+		// XR own their framing, so they opt out.
 		if (
 			!displayStore.followAvatar ||
 			!controls?.enabled ||
@@ -432,14 +443,16 @@
 		) {
 			return;
 		}
-		const dx = vrmStore.avatarPose.x - controls.target.x;
-		const dz = vrmStore.avatarPose.z - controls.target.z;
-		if (Math.hypot(dx, dz) < 0.005) return;
-		const k = Math.min(1, delta * 3);
-		controls.target.x += dx * k;
-		controls.target.z += dz * k;
-		cam.position.x += dx * k;
-		cam.position.z += dz * k;
+		const push = followPushDelta(
+			vrmStore.avatarPose.x - controls.target.x,
+			vrmStore.avatarPose.z - controls.target.z,
+			delta
+		);
+		if (push.x === 0 && push.z === 0) return;
+		controls.target.x += push.x;
+		controls.target.z += push.z;
+		cam.position.x += push.x;
+		cam.position.z += push.z;
 	});
 </script>
 
