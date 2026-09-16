@@ -233,40 +233,50 @@ impl<S: TaskStore> Scheduler<S> {
     /// Cancel a task from any non-terminal state.
     pub async fn cancel(&self, task_id: &str, reason: String) -> TaskCoreResult<Task> {
         let now = self.clock.now_ms();
-        let mut task = self
-            .store
-            .get(task_id)
-            .await?
-            .ok_or_else(|| TaskCoreError::NotFound(task_id.to_string()))?;
-        if task.status.is_terminal() {
-            return Err(TaskCoreError::Step(format!(
-                "task {task_id} is already {}",
-                task.status.as_str()
-            )));
-        }
-        task.status = TaskStatus::Cancelled;
-        task.finished_at = Some(now);
-        task.lease_until = None;
-        task.wait_for = None;
-        task.last_error = Some(crate::model::TaskError {
-            message: reason,
-            retryable: false,
-            timestamp: now,
-        });
-        self.store.update(&task, now).await?;
-        self.store
-            .record_event(TaskEvent {
-                id: uuid::Uuid::new_v4().to_string(),
-                event_type: event_type::CANCELLED.to_string(),
-                task_id: Some(task.id.clone()),
-                step_id: None,
-                correlation_id: None,
-                payload: serde_json::json!({}),
-                created_at: now,
-            })
-            .await?;
-        Ok(task)
+        cancel_task(self.store.as_ref(), task_id, reason, now).await
     }
+}
+
+/// Cancel a task from any non-terminal state. Shared by the scheduler
+/// and the agent-facing cancel tool: one implementation, no drift.
+pub async fn cancel_task<S: TaskStore>(
+    store: &S,
+    task_id: &str,
+    reason: String,
+    now: Ms,
+) -> TaskCoreResult<Task> {
+    let mut task = store
+        .get(task_id)
+        .await?
+        .ok_or_else(|| TaskCoreError::NotFound(task_id.to_string()))?;
+    if task.status.is_terminal() {
+        return Err(TaskCoreError::Step(format!(
+            "task {task_id} is already {}",
+            task.status.as_str()
+        )));
+    }
+    task.status = TaskStatus::Cancelled;
+    task.finished_at = Some(now);
+    task.lease_until = None;
+    task.wait_for = None;
+    task.last_error = Some(crate::model::TaskError {
+        message: reason,
+        retryable: false,
+        timestamp: now,
+    });
+    store.update(&task, now).await?;
+    store
+        .record_event(TaskEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            event_type: event_type::CANCELLED.to_string(),
+            task_id: Some(task.id.clone()),
+            step_id: None,
+            correlation_id: None,
+            payload: serde_json::json!({}),
+            created_at: now,
+        })
+        .await?;
+    Ok(task)
 }
 
 #[cfg(test)]

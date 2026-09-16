@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use task_core::{TaskStatus, TaskStep, TaskStore};
-use task_host::interval::{IntervalOptions, DEFAULT_GAP_MS};
+use task_host::interval::{numbered_prompts, IntervalOptions, DEFAULT_GAP_MS};
 use tool_sdk::ToolPack as _;
 
 const DEFAULT_WATCH_INTERVAL_MS: u64 = 500;
@@ -204,7 +204,7 @@ async fn cmd_interval(opts: IntervalArgs) -> Result<ExitCode, String> {
     let options = IntervalOptions {
         title: opts.title.clone(),
         instruction: opts.instruction.clone(),
-        prompts: vec![opts.instruction.clone(); opts.times],
+        prompts: numbered_prompts(&opts.instruction, opts.times),
         gap_ms: opts.gap_ms,
         max_iterations: 4,
         scheduled_at: None,

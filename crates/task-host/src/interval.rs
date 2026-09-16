@@ -24,6 +24,22 @@ pub struct IntervalOptions {
     pub scheduled_at: Option<i64>,
 }
 
+/// Expand one instruction into per-repetition prompts, each told its
+/// own number. Identical prompts make the model guess which repetition
+/// it is (observed live: wrong numbers on every turn), so the number
+/// comes from the builder, never from the model.
+pub fn numbered_prompts(instruction: &str, times: usize) -> Vec<String> {
+    (0..times.max(1))
+        .map(|index| {
+            format!(
+                "{instruction}\n(This is repetition {} of {}.)",
+                index + 1,
+                times.max(1)
+            )
+        })
+        .collect()
+}
+
 /// Build the interval task: agent steps (one per prompt) separated by
 /// waits. Pure constructor.
 pub fn interval_task(options: &IntervalOptions) -> NewTask {
@@ -104,6 +120,19 @@ mod tests {
                 .and_then(serde_json::Value::as_i64),
             Some(3_000)
         );
+    }
+
+    #[test]
+    fn numbered_prompts_tell_each_repetition_its_number() {
+        let prompts = numbered_prompts("get the date", 3);
+        assert_eq!(prompts.len(), 3);
+        for (index, prompt) in prompts.iter().enumerate() {
+            assert!(prompt.starts_with("get the date"), "{prompt}");
+            assert!(
+                prompt.contains(&format!("repetition {} of 3", index + 1)),
+                "{prompt}"
+            );
+        }
     }
 
     #[test]

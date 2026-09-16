@@ -24,6 +24,6 @@ pub use model::{
     TaskStatus, TaskStep, TaskStepStatus, TaskStepType, TaskWait, VerificationSpec,
 };
 pub use recovery::{expire_waits, recover_stale, DEFAULT_LEASE_MS};
-pub use scheduler::{Scheduler, TickReport, DEFAULT_BATCH_LIMIT};
+pub use scheduler::{cancel_task, Scheduler, TickReport, DEFAULT_BATCH_LIMIT};
 pub use store::{SqliteTaskStore, TaskStore, SCHEMA_VERSION};
 pub use verify::verify_task;

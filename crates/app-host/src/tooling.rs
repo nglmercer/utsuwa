@@ -22,7 +22,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use task_core::{Clock as _, TaskStore as _};
-use task_host::interval::{interval_task, IntervalOptions};
+use task_host::interval::{interval_task, numbered_prompts, IntervalOptions};
 use tool_sdk::{ToolLoadContext, ToolPack, TypedTool, TypedToolAdapter};
 
 /// Empty argument object shared by the system-fact tools. Deserializing
@@ -315,7 +315,7 @@ impl TypedTool for CreateIntervalTaskTool {
         let task = interval_task(&IntervalOptions {
             title,
             instruction: instruction.clone(),
-            prompts: vec![instruction; times],
+            prompts: numbered_prompts(&instruction, times),
             gap_ms,
             max_iterations: 4,
             scheduled_at: args.scheduled_at,
@@ -334,6 +334,437 @@ impl TypedTool for CreateIntervalTaskTool {
             "steps": created.steps.len(),
             "repetitions": times,
             "gap_ms": gap_ms,
+            "execute_with": format!(
+                "leave the app running, or headless: task-cli run {} --yes --timings",
+                created.id
+            ),
+        }))
+    }
+}
+
+#[derive(Deserialize)]
+struct ListTasksArgs {
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+/// List durable tasks with status and progress. Summaries only —
+/// `tasks.get` has the full detail. Same local-state rationale as
+/// creation: no capability requirement.
+struct ListTasksTool {
+    tasks_db: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TypedTool for ListTasksTool {
+    type Args = ListTasksArgs;
+    type Output = serde_json::Value;
+
+    fn id(&self) -> &'static str {
+        "tasks.list"
+    }
+
+    fn description(&self) -> &'static str {
+        "List durable tasks with their status and step progress. Use this to check what is scheduled, running, or finished before asking for details with tasks.get."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "description": "Only tasks in this status.",
+                    "enum": ["pending", "scheduled", "ready", "running", "waiting", "needs_review", "completed", "failed", "cancelled"],
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 20,
+                    "description": "Maximum tasks to return.",
+                },
+            },
+        })
+    }
+
+    fn effects(&self) -> Vec<tool_core::ToolEffect> {
+        vec![]
+    }
+
+    async fn call(
+        &self,
+        _ctx: tool_core::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, tool_core::ToolError> {
+        let invalid = |code: &str, message: String| {
+            tool_core::ToolError::structured("tasks.list", code, message)
+        };
+        let status = args
+            .status
+            .map(|raw| {
+                task_core::TaskStatus::parse(&raw).ok_or_else(|| {
+                    invalid(
+                        "invalid_status",
+                        format!(
+                            "unknown status '{raw}': pending, scheduled, ready, running, waiting, needs_review, completed, failed, cancelled"
+                        ),
+                    )
+                })
+            })
+            .transpose()?;
+        let limit = args.limit.unwrap_or(20).clamp(1, 200);
+        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
+            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
+        let tasks = store
+            .list(status, limit)
+            .await
+            .map_err(|err| invalid("list_failed", format!("cannot list tasks: {err}")))?;
+        let summaries: Vec<serde_json::Value> = tasks
+            .iter()
+            .map(|task| {
+                serde_json::json!({
+                    "id": task.id,
+                    "title": task.title,
+                    "status": task.status.as_str(),
+                    "step": task.current_step_index.min(task.steps.len()),
+                    "steps": task.steps.len(),
+                    "attempts": task.attempts,
+                    "scheduled_at": task.scheduled_at,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "tasks": summaries, "count": tasks.len() }))
+    }
+}
+
+#[derive(Deserialize)]
+struct GetTaskArgs {
+    task_id: String,
+}
+
+/// Full task detail: status, per-step progress, step results, errors.
+/// This is how the agent checks whether a scheduled task ran and what
+/// each repetition produced.
+struct GetTaskTool {
+    tasks_db: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TypedTool for GetTaskTool {
+    type Args = GetTaskArgs;
+    type Output = serde_json::Value;
+
+    fn id(&self) -> &'static str {
+        "tasks.get"
+    }
+
+    fn description(&self) -> &'static str {
+        "Get one durable task in full: status, per-step progress, step results, and errors. Use this to check whether a scheduled task ran and what each repetition produced."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["task_id"],
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Task id from tasks.create_interval or tasks.list.",
+                },
+            },
+        })
+    }
+
+    fn effects(&self) -> Vec<tool_core::ToolEffect> {
+        vec![]
+    }
+
+    async fn call(
+        &self,
+        _ctx: tool_core::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, tool_core::ToolError> {
+        let invalid = |code: &str, message: String| {
+            tool_core::ToolError::structured("tasks.get", code, message)
+        };
+        if args.task_id.trim().is_empty() {
+            return Err(invalid(
+                "invalid_task_id",
+                "task_id must be a non-empty string".to_string(),
+            ));
+        }
+        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
+            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
+        let task = store
+            .get(&args.task_id)
+            .await
+            .map_err(|err| invalid("get_failed", format!("cannot read task: {err}")))?
+            .ok_or_else(|| invalid("unknown_task", format!("unknown task '{}'", args.task_id)))?;
+        serde_json::to_value(&task)
+            .map_err(|err| invalid("serialization", format!("cannot encode task: {err}")))
+    }
+}
+
+#[derive(Deserialize)]
+struct CancelTaskArgs {
+    task_id: String,
+    reason: Option<String>,
+}
+
+/// Stop a task that has not finished. Same `cancel_task` the
+/// scheduler uses — one implementation, no drift. The cancelled task
+/// stays in history (durable by design); there is no hard delete.
+struct CancelTaskTool {
+    tasks_db: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TypedTool for CancelTaskTool {
+    type Args = CancelTaskArgs;
+    type Output = serde_json::Value;
+
+    fn id(&self) -> &'static str {
+        "tasks.cancel"
+    }
+
+    fn description(&self) -> &'static str {
+        "Stop a task that has not finished (pending, scheduled, running, waiting, or needs_review). The task is marked cancelled and kept as history. Cancellation is final; create a new task instead of resuming."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["task_id"],
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Task id from tasks.create_interval or tasks.list.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the task is cancelled (recorded).",
+                },
+            },
+        })
+    }
+
+    fn effects(&self) -> Vec<tool_core::ToolEffect> {
+        vec![]
+    }
+
+    async fn call(
+        &self,
+        _ctx: tool_core::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, tool_core::ToolError> {
+        let invalid = |code: &str, message: String| {
+            tool_core::ToolError::structured("tasks.cancel", code, message)
+        };
+        if args.task_id.trim().is_empty() {
+            return Err(invalid(
+                "invalid_task_id",
+                "task_id must be a non-empty string".to_string(),
+            ));
+        }
+        let reason = args
+            .reason
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or_else(|| "cancelled by agent".to_string());
+        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
+            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
+        let now = task_core::SystemClock.now_ms();
+        match task_core::cancel_task(&store, &args.task_id, reason, now).await {
+            Ok(task) => Ok(serde_json::json!({
+                "task_id": task.id,
+                "status": task.status.as_str(),
+            })),
+            Err(task_core::TaskCoreError::NotFound(_)) => Err(invalid(
+                "unknown_task",
+                format!("unknown task '{}'", args.task_id),
+            )),
+            Err(task_core::TaskCoreError::Step(message)) => {
+                Err(invalid("already_terminal", message))
+            }
+            Err(err) => Err(invalid(
+                "cancel_failed",
+                format!("cannot cancel task: {err}"),
+            )),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct EditTaskArgs {
+    task_id: String,
+    title: Option<String>,
+    instruction: Option<String>,
+    steps: Option<Vec<task_core::NewTaskStep>>,
+    scheduled_at: Option<i64>,
+}
+
+/// Change a task that never started (pending/scheduled, 0 attempts).
+/// Anything already running must be cancelled and recreated instead —
+/// rewriting a live task's steps would corrupt the run the manager is
+/// executing.
+struct EditTaskTool {
+    tasks_db: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TypedTool for EditTaskTool {
+    type Args = EditTaskArgs;
+    type Output = serde_json::Value;
+
+    fn id(&self) -> &'static str {
+        "tasks.edit"
+    }
+
+    fn description(&self) -> &'static str {
+        "Change a task that never started: title, instruction, steps, or scheduled start. Only pending/scheduled tasks with 0 attempts can be edited; cancel and recreate anything already running. Pass a past scheduled_at to run as soon as possible."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["task_id"],
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Task id from tasks.create_interval or tasks.list.",
+                },
+                "title": { "type": "string", "description": "New title." },
+                "instruction": { "type": "string", "description": "New instruction." },
+                "steps": {
+                    "type": "array",
+                    "description": "Full replacement step list: [{step_type, input, max_attempts?}].",
+                    "items": {
+                        "type": "object",
+                        "required": ["step_type", "input"],
+                        "properties": {
+                            "step_type": {
+                                "type": "string",
+                                "enum": ["avatar_routine", "notification", "wait", "agent", "tool", "approval"],
+                            },
+                            "input": { "type": "object" },
+                            "max_attempts": { "type": "integer", "minimum": 1 },
+                        },
+                    },
+                },
+                "scheduled_at": {
+                    "type": "integer",
+                    "description": "First run no earlier than this (epoch milliseconds). A past value runs as soon as possible.",
+                },
+            },
+        })
+    }
+
+    fn effects(&self) -> Vec<tool_core::ToolEffect> {
+        vec![]
+    }
+
+    async fn call(
+        &self,
+        _ctx: tool_core::ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, tool_core::ToolError> {
+        let invalid = |code: &str, message: String| {
+            tool_core::ToolError::structured("tasks.edit", code, message)
+        };
+        if args.task_id.trim().is_empty() {
+            return Err(invalid(
+                "invalid_task_id",
+                "task_id must be a non-empty string".to_string(),
+            ));
+        }
+        if let Some(scheduled_at) = args.scheduled_at {
+            if scheduled_at < 0 {
+                return Err(invalid(
+                    "invalid_scheduled_at",
+                    "scheduled_at must be epoch milliseconds >= 0".to_string(),
+                ));
+            }
+        }
+        if let Some(steps) = &args.steps {
+            if steps.is_empty() {
+                return Err(invalid(
+                    "invalid_steps",
+                    "steps must contain at least one step".to_string(),
+                ));
+            }
+        }
+        if let Some(title) = &args.title {
+            if title.trim().is_empty() {
+                return Err(invalid(
+                    "invalid_title",
+                    "title must not be empty".to_string(),
+                ));
+            }
+        }
+        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
+            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
+        let mut task = store
+            .get(&args.task_id)
+            .await
+            .map_err(|err| invalid("get_failed", format!("cannot read task: {err}")))?
+            .ok_or_else(|| invalid("unknown_task", format!("unknown task '{}'", args.task_id)))?;
+        let editable = matches!(
+            task.status,
+            task_core::TaskStatus::Pending | task_core::TaskStatus::Scheduled
+        ) && task.attempts == 0
+            && task.current_step_index == 0;
+        if !editable {
+            return Err(invalid(
+                "already_started",
+                "only tasks that never started (pending/scheduled, 0 attempts) can be edited; cancel it and create a new one instead"
+                    .to_string(),
+            ));
+        }
+        let now = task_core::SystemClock.now_ms();
+        if let Some(title) = args.title {
+            task.title = title;
+        }
+        if let Some(instruction) = args.instruction {
+            task.instruction = instruction;
+        }
+        if let Some(steps) = args.steps {
+            task.steps = steps
+                .into_iter()
+                .map(|step| task_core::TaskStep {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    step_type: step.step_type,
+                    status: task_core::TaskStepStatus::Pending,
+                    input: step.input,
+                    result: None,
+                    attempts: 0,
+                    max_attempts: step.max_attempts.unwrap_or(1).max(1),
+                    started_at: None,
+                    finished_at: None,
+                    error: None,
+                })
+                .collect();
+            task.current_step_index = 0;
+        }
+        // Status never changes here: the schedule takes effect through
+        // the field alone (the ready batch gates pending tasks on
+        // scheduled_at too), and Pending -> Scheduled is not a legal
+        // transition — Scheduled only arises at creation.
+        if let Some(scheduled_at) = args.scheduled_at {
+            task.scheduled_at = Some(scheduled_at);
+        }
+        store
+            .update(&task, now)
+            .await
+            .map_err(|err| invalid("edit_failed", format!("cannot update task: {err}")))?;
+        Ok(serde_json::json!({
+            "task_id": task.id,
+            "title": task.title,
+            "status": task.status.as_str(),
+            "steps": task.steps.len(),
         }))
     }
 }
@@ -369,9 +800,23 @@ impl ToolPack for TasksToolPack {
     }
 
     fn tools(&self, _ctx: &ToolLoadContext) -> Vec<Arc<dyn tool_core::Tool>> {
-        vec![TypedToolAdapter::arc(CreateIntervalTaskTool {
-            tasks_db: self.tasks_db.clone(),
-        })]
+        vec![
+            TypedToolAdapter::arc(CreateIntervalTaskTool {
+                tasks_db: self.tasks_db.clone(),
+            }),
+            TypedToolAdapter::arc(ListTasksTool {
+                tasks_db: self.tasks_db.clone(),
+            }),
+            TypedToolAdapter::arc(GetTaskTool {
+                tasks_db: self.tasks_db.clone(),
+            }),
+            TypedToolAdapter::arc(CancelTaskTool {
+                tasks_db: self.tasks_db.clone(),
+            }),
+            TypedToolAdapter::arc(EditTaskTool {
+                tasks_db: self.tasks_db.clone(),
+            }),
+        ]
     }
 }
 
@@ -406,14 +851,23 @@ mod tests {
     }
 
     #[test]
-    fn pack_exposes_create_interval() {
+    fn pack_exposes_task_management_tools() {
         let pack = TasksToolPack::with_tasks_db(PathBuf::from("/nonexistent-tasks.db"));
         let ids: Vec<String> = pack
             .tools(&ToolLoadContext::default())
             .iter()
             .map(|tool| tool.metadata().id.0.clone())
             .collect();
-        assert_eq!(ids, vec!["tasks.create_interval".to_string()]);
+        assert_eq!(
+            ids,
+            vec![
+                "tasks.create_interval".to_string(),
+                "tasks.list".to_string(),
+                "tasks.get".to_string(),
+                "tasks.cancel".to_string(),
+                "tasks.edit".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -443,9 +897,18 @@ mod tests {
         for (index, step) in task.steps.iter().enumerate() {
             if index % 2 == 0 {
                 assert_eq!(step.step_type, task_core::TaskStepType::Agent);
-                assert_eq!(
-                    step.input.get("prompt").and_then(serde_json::Value::as_str),
-                    Some("use system.time to get the date")
+                let prompt = step
+                    .input
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                assert!(
+                    prompt.starts_with("use system.time to get the date"),
+                    "{prompt}"
+                );
+                assert!(
+                    prompt.contains(&format!("repetition {} of 3", index / 2 + 1)),
+                    "{prompt}"
                 );
             } else {
                 assert_eq!(step.step_type, task_core::TaskStepType::Wait);
@@ -501,6 +964,297 @@ mod tests {
         let task = store.get(id).await.expect("get").expect("task");
         assert_eq!(task.scheduled_at, Some(9_999_999_999_999));
         assert_eq!(task.steps.len(), 1);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    async fn create_task(db: &std::path::Path, instruction: &str) -> String {
+        let out = tool_at(db.to_path_buf())
+            .call(ctx(), args(instruction))
+            .await
+            .expect("create");
+        out.get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task_id")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn list_returns_summaries_and_filters() {
+        let db = scratch_db("list");
+        let first = create_task(&db, "first").await;
+        let _second = create_task(&db, "second").await;
+        let tool = ListTasksTool {
+            tasks_db: db.clone(),
+        };
+        let out = tool
+            .call(
+                ctx(),
+                ListTasksArgs {
+                    status: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect("list");
+        assert_eq!(
+            out.get("count").and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        let out = tool
+            .call(
+                ctx(),
+                ListTasksArgs {
+                    status: Some("completed".to_string()),
+                    limit: None,
+                },
+            )
+            .await
+            .expect("filtered");
+        assert_eq!(
+            out.get("count").and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        let out = tool
+            .call(
+                ctx(),
+                ListTasksArgs {
+                    status: Some("bogus".to_string()),
+                    limit: None,
+                },
+            )
+            .await;
+        assert!(out.is_err());
+        // Summary carries progress without full step detail.
+        let store = task_core::SqliteTaskStore::open(&db).expect("open");
+        let task = store.get(&first).await.expect("get").expect("task");
+        assert_eq!(task.steps.len(), 5);
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn get_returns_full_task_or_unknown() {
+        let db = scratch_db("get");
+        let id = create_task(&db, "fetch me").await;
+        let tool = GetTaskTool {
+            tasks_db: db.clone(),
+        };
+        let out = tool
+            .call(
+                ctx(),
+                GetTaskArgs {
+                    task_id: id.clone(),
+                },
+            )
+            .await
+            .expect("get");
+        assert_eq!(
+            out.get("id").and_then(serde_json::Value::as_str),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            out.get("steps")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(5)
+        );
+        let missing = tool
+            .call(
+                ctx(),
+                GetTaskArgs {
+                    task_id: "nope".to_string(),
+                },
+            )
+            .await;
+        assert!(missing.is_err());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn cancel_marks_cancelled_and_refuses_terminal() {
+        let db = scratch_db("cancel");
+        let id = create_task(&db, "stop me").await;
+        let tool = CancelTaskTool {
+            tasks_db: db.clone(),
+        };
+        let out = tool
+            .call(
+                ctx(),
+                CancelTaskArgs {
+                    task_id: id.clone(),
+                    reason: Some("no longer needed".to_string()),
+                },
+            )
+            .await
+            .expect("cancel");
+        assert_eq!(
+            out.get("status").and_then(serde_json::Value::as_str),
+            Some("cancelled")
+        );
+        // Second cancel fails: already terminal.
+        let again = tool
+            .call(
+                ctx(),
+                CancelTaskArgs {
+                    task_id: id.clone(),
+                    reason: None,
+                },
+            )
+            .await;
+        assert!(again.is_err());
+        let missing = tool
+            .call(
+                ctx(),
+                CancelTaskArgs {
+                    task_id: "nope".to_string(),
+                    reason: None,
+                },
+            )
+            .await;
+        assert!(missing.is_err());
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn edit_updates_unstarted_task() {
+        let db = scratch_db("edit");
+        let id = create_task(&db, "fix me").await;
+        let tool = EditTaskTool {
+            tasks_db: db.clone(),
+        };
+        let out = tool
+            .call(
+                ctx(),
+                EditTaskArgs {
+                    task_id: id.clone(),
+                    title: Some("fixed title".to_string()),
+                    instruction: Some("fixed instruction".to_string()),
+                    steps: None,
+                    scheduled_at: Some(9_999_999_999_999),
+                },
+            )
+            .await
+            .expect("edit");
+        // Status never changes on edit (Pending -> Scheduled is not a
+        // legal transition); the schedule takes effect through the field.
+        assert_eq!(
+            out.get("status").and_then(serde_json::Value::as_str),
+            Some("pending")
+        );
+        assert_eq!(
+            out.get("title").and_then(serde_json::Value::as_str),
+            Some("fixed title")
+        );
+        let store = task_core::SqliteTaskStore::open(&db).expect("open");
+        let edited = store.get(&id).await.expect("get").expect("task");
+        assert_eq!(edited.scheduled_at, Some(9_999_999_999_999));
+        assert_eq!(edited.instruction, "fixed instruction");
+        // Step replacement rebuilds fresh pending steps.
+        let out = tool
+            .call(
+                ctx(),
+                EditTaskArgs {
+                    task_id: id.clone(),
+                    title: None,
+                    instruction: None,
+                    steps: Some(vec![task_core::NewTaskStep {
+                        step_type: task_core::TaskStepType::Wait,
+                        input: serde_json::json!({ "duration_ms": 500 }),
+                        max_attempts: Some(1),
+                    }]),
+                    scheduled_at: None,
+                },
+            )
+            .await
+            .expect("edit steps");
+        assert_eq!(
+            out.get("steps").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        // Validation: empty title, empty steps, bad schedule.
+        for bad in [
+            EditTaskArgs {
+                task_id: id.clone(),
+                title: Some("  ".to_string()),
+                instruction: None,
+                steps: None,
+                scheduled_at: None,
+            },
+            EditTaskArgs {
+                task_id: id.clone(),
+                title: None,
+                instruction: None,
+                steps: Some(vec![]),
+                scheduled_at: None,
+            },
+            EditTaskArgs {
+                task_id: id.clone(),
+                title: None,
+                instruction: None,
+                steps: None,
+                scheduled_at: Some(-5),
+            },
+        ] {
+            assert!(tool.call(ctx(), bad).await.is_err());
+        }
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_started_or_finished_tasks() {
+        let db = scratch_db("edit-started");
+        let id = create_task(&db, "running").await;
+        let store = task_core::SqliteTaskStore::open(&db).expect("open");
+        let mut task = store.get(&id).await.expect("get").expect("task");
+        // Leave the unstarted set through a legal transition: a Ready
+        // task is claimable, so editing must refuse it too.
+        task.status = task_core::TaskStatus::Ready;
+        store
+            .update(&task, task_core::SystemClock.now_ms())
+            .await
+            .expect("mark ready");
+        let tool = EditTaskTool {
+            tasks_db: db.clone(),
+        };
+        let refused = tool
+            .call(
+                ctx(),
+                EditTaskArgs {
+                    task_id: id.clone(),
+                    title: Some("too late".to_string()),
+                    instruction: None,
+                    steps: None,
+                    scheduled_at: None,
+                },
+            )
+            .await;
+        assert!(refused.is_err());
+        // Terminal tasks refuse as well.
+        let finished = create_task(&db, "done").await;
+        CancelTaskTool {
+            tasks_db: db.clone(),
+        }
+        .call(
+            ctx(),
+            CancelTaskArgs {
+                task_id: finished.clone(),
+                reason: None,
+            },
+        )
+        .await
+        .expect("cancel");
+        let refused = tool
+            .call(
+                ctx(),
+                EditTaskArgs {
+                    task_id: finished,
+                    title: Some("too late".to_string()),
+                    instruction: None,
+                    steps: None,
+                    scheduled_at: None,
+                },
+            )
+            .await;
+        assert!(refused.is_err());
         let _ = std::fs::remove_file(&db);
     }
 }
