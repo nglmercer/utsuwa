@@ -1,11 +1,15 @@
 import type { StateUpdates, Emotion } from '$lib/types/character';
-import type { TouchZone } from '../engine/photo-reactions.ts';
+import { TOUCH_ZONES, type TouchZone } from '../engine/photo-reactions.ts';
 import {
+	EXPRESSION_CUE_DEFAULT_DURATION_MS,
+	EXPRESSION_CUE_DURATION_MAX_MS,
+	EXPRESSION_CUE_DURATION_MIN_MS,
 	clamp01,
 	isEmotionalExpression,
 	isProtectedChannel
 } from '../engine/facial-expressions.ts';
 import {
+	clampWalkDuration,
 	isAvatarActionName,
 	isLocomotionActionName,
 	isLocomotionDirection,
@@ -366,8 +370,11 @@ function parseExpressionCue(output: LLMStateOutput, available?: readonly string[
 	}
 	const durationMs =
 		typeof cue.duration_ms === 'number' && Number.isFinite(cue.duration_ms)
-			? Math.min(6000, Math.max(500, Math.round(cue.duration_ms)))
-			: 2000;
+			? Math.min(
+					EXPRESSION_CUE_DURATION_MAX_MS,
+					Math.max(EXPRESSION_CUE_DURATION_MIN_MS, Math.round(cue.duration_ms))
+				)
+			: EXPRESSION_CUE_DEFAULT_DURATION_MS;
 	return {
 		expression,
 		intensity: typeof cue.intensity === 'number' ? clamp01(cue.intensity) : 0.8,
@@ -375,7 +382,9 @@ function parseExpressionCue(output: LLMStateOutput, available?: readonly string[
 	};
 }
 
-const GESTURE_ZONES: TouchZone[] = ['head', 'face', 'shoulder', 'torso', 'hip'];
+// Reaction zones alias the shared touch-zone registry: untrusted model
+// output must not invent zones.
+const GESTURE_ZONES: readonly TouchZone[] = TOUCH_ZONES;
 
 // Direction words the model may echo from the user ("move to the front",
 // "go up"), normalized to the canonical four. Anything else still drops
@@ -401,11 +410,6 @@ function normalizeLocomotionDirection(raw: unknown): LocomotionDirection | null 
 	if (isLocomotionDirection(word)) return word;
 	return LOCOMOTION_DIRECTION_ALIASES[word] ?? null;
 }
-
-// AI walking is bounded: brisk enough to read, short enough to stay framed.
-const WALK_DURATION_MIN_MS = 300;
-const WALK_DURATION_MAX_MS = 3000;
-const WALK_DURATION_DEFAULT_MS = 1200;
 
 // Validate an optional one-shot body direction. Semantic actions resolve
 // against the avatar-action registry; legacy numbered emotes stay parseable
@@ -443,10 +447,10 @@ function parseGestureCue(output: LLMStateOutput): GestureCue | null {
 		const action = typeof cue.action === 'string' ? cue.action.toLowerCase().trim() : '';
 		const direction = normalizeLocomotionDirection(cue.direction);
 		if (!isLocomotionActionName(action) || !direction) return null;
-		const durationMs =
-			typeof cue.duration_ms === 'number' && Number.isFinite(cue.duration_ms)
-				? Math.min(WALK_DURATION_MAX_MS, Math.max(WALK_DURATION_MIN_MS, Math.round(cue.duration_ms)))
-				: WALK_DURATION_DEFAULT_MS;
+		// clampWalkDuration maps NaN/Infinity/missing to the safe default.
+		const durationMs = clampWalkDuration(
+			typeof cue.duration_ms === 'number' ? cue.duration_ms : NaN
+		);
 		return { type: 'locomotion', action, direction, durationMs };
 	}
 	if (type === 'reaction') {

@@ -1,5 +1,6 @@
 import { browser } from '$app/environment';
-import { getBridge, HOST_EVENT, isHostEvent } from './bridge';
+import { getBridge } from './bridge';
+import { HOST_EVENTS, subscribeHostEvents } from './host-events';
 import {
 	EMPTY_SENSOR_ACTIVITY,
 	parseSensorActivity,
@@ -10,24 +11,22 @@ let camera = $state<SensorActivityState>({ ...EMPTY_SENSOR_ACTIVITY });
 let microphone = $state<SensorActivityState>({ ...EMPTY_SENSOR_ACTIVITY });
 let attached = false;
 
-function updateSensor(event: string, data: unknown) {
-	const next = parseSensorActivity(data);
-	if (!next) return;
-	if (event === 'camera.activity.changed') camera = next;
-	if (event === 'microphone.activity.changed') microphone = next;
-}
-
-function onHostEvent(event: Event) {
-	if (!isHostEvent(event)) return;
-	const detail = (event as CustomEvent).detail;
-	if (!detail) return;
-	updateSensor(detail.event, detail.data);
-}
-
 export function attachSensorActivityListener() {
 	if (!browser || attached) return;
 	attached = true;
-	window.addEventListener(HOST_EVENT, onHostEvent);
+	subscribeHostEvents(
+		(event, data) => {
+			if (event !== HOST_EVENTS.CAMERA_ACTIVITY_CHANGED && event !== HOST_EVENTS.MICROPHONE_ACTIVITY_CHANGED) {
+				return null;
+			}
+			const next = parseSensorActivity(data);
+			return next ? { event, next } : null;
+		},
+		({ event, next }) => {
+			if (event === HOST_EVENTS.CAMERA_ACTIVITY_CHANGED) camera = next;
+			if (event === HOST_EVENTS.MICROPHONE_ACTIVITY_CHANGED) microphone = next;
+		}
+	);
 	void refreshSensorActivity();
 }
 

@@ -166,10 +166,10 @@ impl Default for WorkerConfig {
 /// Payload: `{ task_id, step_id, title, text }`. This is how background
 /// results (interval readings, …) reach the user's eyes; without it step
 /// output sits in SQLite, visible only to drivers that poll.
-pub const TASK_STEP_COMPLETED_EVENT: &str = "task.step_completed";
+pub const TASK_STEP_COMPLETED_EVENT: &str = ipc_core::events::TASK_STEP_COMPLETED;
 /// Emitted when a worker leaves a task terminal. Payload: `{ task_id,
 /// title, status, text }` with `text` joining every agent step's text.
-pub const TASK_TERMINAL_EVENT: &str = "task.terminal";
+pub const TASK_TERMINAL_EVENT: &str = ipc_core::events::TASK_TERMINAL;
 
 pub struct TaskHost {
     store: Arc<SqliteTaskStore>,
@@ -299,6 +299,12 @@ impl TaskHost {
             dispatch_active: AtomicBool::new(false),
             in_flight: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Borrow the one SQLite authority so model-facing task tools can
+    /// share it instead of reopening tasks.db on every call.
+    pub fn store(&self) -> &Arc<SqliteTaskStore> {
+        &self.store
     }
 
     pub fn now_ms(&self) -> Ms {

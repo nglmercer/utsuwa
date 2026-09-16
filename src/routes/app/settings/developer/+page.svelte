@@ -9,6 +9,10 @@
 	import { goto } from '$app/navigation';
 	import { localPath } from '$lib/config/links';
 	import { AVATAR_ACTIONS, AVATAR_ACTION_NAMES } from '$lib/engine/avatar-actions';
+	import {
+		actionToRoutineStep,
+		routineStepToAvatarRequest
+	} from '$lib/engine/avatar-action-runtime';
 	import { resolveTaskAuthority, taskOrchestrator, type TaskAuthority } from '$lib/tasks/browser';
 	import { hostTasks, parseCapabilityReview } from '$lib/tasks/host';
 
@@ -151,25 +155,21 @@
 
 	// Avatar action controls: manual playback for every registry action,
 	// bypassing the AI gate so visuals can be confirmed independently.
+	// Parameterized actions use fixed dev defaults (forward walk, left turn,
+	// chair goto) through the same conversion the AI path uses.
 	function playAvatarAction(name: (typeof AVATAR_ACTION_NAMES)[number]) {
-		const def = AVATAR_ACTIONS[name];
-		if (def.source.kind === 'vrma') {
-			vrmStore.setCurrentAnimation(def.source.url);
-		} else if (name === 'walk' || name === 'run') {
-			vrmStore.requestAvatarAction({ kind: 'walk', action: name, direction: 'forward', durationMs: 1200 });
-		} else if (name === 'jump') {
-			vrmStore.requestAvatarAction({ kind: 'jump', action: 'jump' });
-		} else if (name === 'return_home') {
-			vrmStore.requestAvatarAction({ kind: 'return_home', action: name });
-		} else if (name === 'face_camera') {
-			vrmStore.requestAvatarAction({ kind: 'face_camera', action: name });
-		} else if (name === 'turn') {
-			vrmStore.requestAvatarAction({ kind: 'turn', action: name, direction: 'left' });
-		} else if (name === 'goto') {
-			vrmStore.requestAvatarAction({ kind: 'goto', action: name, anchorId: 'chair' });
-		} else {
-			vrmStore.requestAvatarAction({ kind: 'procedural', action: name });
+		const step = actionToRoutineStep(name, {
+			direction: name === 'turn' ? 'left' : 'forward',
+			durationMs: 1200,
+			anchorId: name === 'goto' ? 'chair' : undefined
+		});
+		if (!step) return;
+		if (step.kind === 'emote') {
+			if (step.url) vrmStore.setCurrentAnimation(step.url);
+			return;
 		}
+		const request = routineStepToAvatarRequest(step);
+		if (request) vrmStore.requestAvatarAction(request);
 	}
 
 	function walkAvatar(direction: 'left' | 'right' | 'forward' | 'back') {
@@ -325,7 +325,7 @@
 	function actionMeta(name: (typeof AVATAR_ACTION_NAMES)[number]): string {
 		const def = AVATAR_ACTIONS[name];
 		const src =
-			def.source.kind === 'vrma' ? def.source.url.split('/').pop() : def.source.kind;
+			def.execution.kind === 'vrma' ? def.execution.url.split('/').pop() : def.execution.kind;
 		return `${src} · ${def.mode} · cd ${(def.cooldownMs / 1000).toFixed(0)}s · AI ${def.aiAllowed ? 'yes' : 'no'}${def.explicitRequestOnly ? ' · explicit-only' : ''}`;
 	}
 

@@ -1,5 +1,6 @@
 import { browser } from '$app/environment';
-import { getBridge, HOST_EVENT, isHostEvent } from './bridge';
+import { getBridge } from './bridge';
+import { HOST_EVENTS, subscribeHostEvents } from './host-events';
 import {
 	parsePermissionRequest,
 	replyParams,
@@ -13,28 +14,32 @@ import {
 let requests = $state<PermissionRequest[]>([]);
 let attached = false;
 
-function onHostEvent(e: Event) {
-	if (!isHostEvent(e)) return;
-	const detail = (e as CustomEvent).detail;
-	if (!detail) return;
-	if (detail.event === 'permission.dismissed') {
-		const id = (detail.data as Record<string, unknown> | null)?.id;
-		if (typeof id === 'string') {
-			requests = requests.filter((request) => request.id !== id);
-		}
-		return;
+type PermissionPush =
+	| { kind: 'dismissed'; id: string }
+	| { kind: 'requested'; request: PermissionRequest };
+
+function parsePermissionPush(event: string, data: Record<string, unknown>): PermissionPush | null {
+	if (event === HOST_EVENTS.PERMISSION_DISMISSED) {
+		const id = data.id;
+		return typeof id === 'string' ? { kind: 'dismissed', id } : null;
 	}
-	if (detail.event !== 'permission.requested') return;
-	const request = parsePermissionRequest(detail.data);
-	if (request && !requests.some((r) => r.id === request.id)) {
-		requests.push(request);
-	}
+	if (event !== HOST_EVENTS.PERMISSION_REQUESTED) return null;
+	const request = parsePermissionRequest(data);
+	return request ? { kind: 'requested', request } : null;
 }
 
 export function attachPermissionListener() {
 	if (!browser || attached) return;
 	attached = true;
-	window.addEventListener(HOST_EVENT, onHostEvent);
+	subscribeHostEvents(parsePermissionPush, (push) => {
+		if (push.kind === 'dismissed') {
+			requests = requests.filter((request) => request.id !== push.id);
+			return;
+		}
+		if (!requests.some((r) => r.id === push.request.id)) {
+			requests.push(push.request);
+		}
+	});
 	// Sync queued requests: push events fired before mount (e.g. boot-time
 	// approvals) would otherwise be missed. Absent bridge = plain browser.
 	void getBridge()

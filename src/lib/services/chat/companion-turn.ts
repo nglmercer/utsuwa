@@ -7,7 +7,12 @@ import {
 	type GestureCue,
 	type CameraCue
 } from '$lib/ai/response-parser';
-import { AVATAR_ACTIONS, resolveLegacyEmote } from '$lib/engine/avatar-actions';
+import { resolveLegacyEmote } from '$lib/engine/avatar-actions';
+import {
+	cueToRoutineStep,
+	routineStepToAvatarRequest
+} from '$lib/engine/avatar-action-runtime';
+import { routineStepGestureKey } from '$lib/engine/avatar-action-key';
 import {
 	createGestureGateState,
 	evaluateGestureGate,
@@ -129,48 +134,29 @@ function fireGestureCue(cue: GestureCue | null, handledKeys: readonly string[] =
 	}
 }
 
-// Execute a gate-approved cue. Semantic animations resolve through the
-// registry (VRMA clips play through the one-shot effect; procedural and
-// world-motion actions go through the action request with their parameters);
-// reactions reuse the tap path; legacy emotes resolve to their shipped clip,
-// nothing else.
+// Execute a gate-approved cue. Cues that map to routine steps go through
+// the shared conversion (VRMA-backed steps play their clip through the
+// one-shot effect; everything else becomes an action request); reactions
+// reuse the tap path; legacy emotes resolve to their shipped clip, nothing
+// else.
 function stageGestureCue(cue: GestureCue) {
-	switch (cue.type) {
-		case 'animation': {
-			const def = AVATAR_ACTIONS[cue.action];
-			if (def.source.kind === 'vrma') {
-				vrmStore.setCurrentAnimation(def.source.url);
-			} else if (def.source.kind === 'procedural') {
-				vrmStore.requestAvatarAction({ kind: 'procedural', action: cue.action, anchorId: cue.anchorId });
-			} else if (cue.action === 'jump') {
-				vrmStore.requestAvatarAction({ kind: 'jump', action: cue.action });
-			} else if (cue.action === 'return_home') {
-				vrmStore.requestAvatarAction({ kind: 'return_home', action: cue.action });
-			} else if (cue.action === 'face_camera') {
-				vrmStore.requestAvatarAction({ kind: 'face_camera', action: cue.action });
-			} else if (cue.action === 'turn') {
-				vrmStore.requestAvatarAction({ kind: 'turn', action: cue.action, direction: cue.direction });
-			} else if (cue.action === 'goto' && cue.anchorId) {
-				vrmStore.requestAvatarAction({ kind: 'goto', action: cue.action, anchorId: cue.anchorId });
-			}
+	const step = cueToRoutineStep(cue);
+	if (step) {
+		if (step.kind === 'emote') {
+			if (step.url) vrmStore.setCurrentAnimation(step.url);
 			return;
 		}
-		case 'locomotion':
-			vrmStore.requestAvatarAction({
-				kind: 'walk',
-				action: cue.action,
-				direction: cue.direction,
-				durationMs: cue.durationMs
-			});
-			return;
-		case 'reaction':
-			vrmStore.requestReaction(cue.zone);
-			return;
-		case 'emote': {
-			const url = resolveLegacyEmote(cue.id);
-			if (url) vrmStore.setCurrentAnimation(url);
-			return;
-		}
+		const request = routineStepToAvatarRequest(step);
+		if (request) vrmStore.requestAvatarAction(request);
+		return;
+	}
+	if (cue.type === 'reaction') {
+		vrmStore.requestReaction(cue.zone);
+		return;
+	}
+	if (cue.type === 'emote') {
+		const url = resolveLegacyEmote(cue.id);
+		if (url) vrmStore.setCurrentAnimation(url);
 	}
 }
 
@@ -199,18 +185,7 @@ function fireCameraCue(cue: CameraCue | null) {
 // model cue for the same requested action is ignored by correlation (not by
 // elapsed-time cooldowns, which cannot span a slow model round-trip).
 export function planStepGestureKeys(plan: AvatarCommandPlan): string[] {
-	return plan.steps.map((step) => {
-		if (step.kind === 'walk') return `locomotion:${step.action}:${step.direction ?? 'forward'}`;
-		if (step.kind === 'jump') return 'animation:jump';
-		if (step.kind === 'return_home') return 'animation:return_home';
-		if (step.kind === 'face_camera') return 'animation:face_camera';
-		if (step.kind === 'turn') return `animation:turn:${step.direction ?? 'back'}`;
-		if (step.kind === 'goto') return `animation:goto:${step.anchorId ?? ''}`;
-		if (step.kind === 'procedural' && step.action === 'sit' && step.anchorId) {
-			return `animation:sit:${step.anchorId}`;
-		}
-		return `animation:${step.action}`;
-	});
+	return plan.steps.map((step) => routineStepGestureKey(step));
 }
 
 export async function processCompanionTurn(input: CompanionTurnInput): Promise<CompanionTurnResult> {

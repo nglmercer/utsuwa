@@ -145,6 +145,132 @@ pub enum IpcMethod {
     TaskEvent,
 }
 
+impl IpcMethod {
+    /// Every method the frontend may call, in enum order. Keep this next
+    /// to the enum: adding a variant means adding it here and to
+    /// `protocol/ipc-contract.json`. The consistency test compares the two
+    /// lists in both directions (plus a count check), so updating only one
+    /// side fails loudly.
+    pub fn all() -> &'static [IpcMethod] {
+        use IpcMethod::*;
+        &[
+            AppVersion,
+            AppReady,
+            AgentSendMessage,
+            AgentCancel,
+            PermissionApprove,
+            PermissionDeny,
+            PermissionList,
+            PermissionGrant,
+            PermissionRevoke,
+            PermissionGrants,
+            SettingsGet,
+            SettingsSet,
+            SettingsGetModelProvider,
+            SettingsSetModelProvider,
+            ProvidersFetchModels,
+            McpStatus,
+            McpConnect,
+            McpSetServerToken,
+            AudioCaptureStart,
+            AudioCaptureStop,
+            AudioCaptureCancel,
+            CameraActivityStatus,
+            MicrophoneActivityStatus,
+            DesktopShareScreenStart,
+            DesktopShareScreenPause,
+            DesktopShareScreenResume,
+            DesktopShareScreenStop,
+            DesktopShareScreenStatus,
+            DesktopControlEnable,
+            DesktopControlDisable,
+            DesktopEmergencyStop,
+            DesktopEmergencyClear,
+            ActivityList,
+            PluginList,
+            PluginEnable,
+            PluginDisable,
+            PluginUpdate,
+            PluginRemove,
+            HostRuntimeState,
+            HostFrontendReady,
+            DiagnosticsReport,
+            TaskCreate,
+            TaskGet,
+            TaskList,
+            TaskCancel,
+            TaskReview,
+            TaskEvent,
+        ]
+    }
+
+    /// The wire name for this method (the serde rename).
+    pub fn name(&self) -> String {
+        serde_json::to_value(self)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+}
+
+/// Host push events (`utsuwa-host-event`): the single source for every
+/// event name the Rust side emits. Production code must use these
+/// constants; tests keep asserting the literal wire strings so an
+/// accidental rename fails loudly. Mirrored by `protocol/ipc-contract.json`
+/// (checked in both directions by `ipc_contract_matches_typed_methods`)
+/// and by `HOST_EVENTS` on the frontend.
+pub mod events {
+    pub const APP_READY: &str = "app.ready";
+
+    pub const AGENT_TEXT_DELTA: &str = "agent.text_delta";
+    pub const AGENT_TOOL_STARTED: &str = "agent.tool_started";
+    pub const AGENT_TOOL_FINISHED: &str = "agent.tool_finished";
+    pub const AGENT_DONE: &str = "agent.turn_done";
+    pub const AGENT_FAILED: &str = "agent.turn_failed";
+    pub const AGENT_CANCELLED: &str = "agent.turn_cancelled";
+    pub const AGENT_SUSPENDED: &str = "agent.turn_suspended";
+
+    pub const TASK_STEP_COMPLETED: &str = "task.step_completed";
+    pub const TASK_TERMINAL: &str = "task.terminal";
+    pub const TASK_AGENT_PROGRESS: &str = "task.agent.progress";
+
+    pub const AVATAR_ROUTINE_REQUESTED: &str = "avatar.routine.requested";
+    pub const AVATAR_ROUTINE_COMPLETED: &str = "avatar.routine.completed";
+
+    pub const PERMISSION_REQUESTED: &str = "permission.requested";
+    pub const PERMISSION_DISMISSED: &str = "permission.dismissed";
+
+    pub const CAMERA_ACTIVITY_CHANGED: &str = "camera.activity.changed";
+    pub const MICROPHONE_ACTIVITY_CHANGED: &str = "microphone.activity.changed";
+    pub const SCREEN_SHARE_CHANGED: &str = "desktop.share_screen.changed";
+    pub const AUDIO_CAPTURE: &str = "audio.capture";
+
+    /// Every host event, mirroring `protocol/ipc-contract.json`.
+    pub fn all() -> &'static [&'static str] {
+        &[
+            APP_READY,
+            AGENT_TEXT_DELTA,
+            AGENT_TOOL_STARTED,
+            AGENT_TOOL_FINISHED,
+            AGENT_DONE,
+            AGENT_FAILED,
+            AGENT_CANCELLED,
+            AGENT_SUSPENDED,
+            TASK_STEP_COMPLETED,
+            TASK_TERMINAL,
+            TASK_AGENT_PROGRESS,
+            AVATAR_ROUTINE_REQUESTED,
+            AVATAR_ROUTINE_COMPLETED,
+            PERMISSION_REQUESTED,
+            PERMISSION_DISMISSED,
+            CAMERA_ACTIVITY_CHANGED,
+            MICROPHONE_ACTIVITY_CHANGED,
+            SCREEN_SHARE_CHANGED,
+            AUDIO_CAPTURE,
+        ]
+    }
+}
+
 /// Request envelope: frontend → host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IpcRequest {
@@ -339,6 +465,77 @@ mod tests {
         };
         let raw = serde_json::to_string(&ev).unwrap();
         assert!(raw.contains("agent.text_delta"));
+    }
+
+    #[test]
+    fn ipc_contract_matches_typed_methods() {
+        // The manifest is the shared IPC source of truth; the typed enum
+        // is the security boundary. Both directions must agree: a method
+        // in the manifest must parse, and every typed method must be
+        // listed. (Events are covered by the frontend's HOST_EVENTS test;
+        // the host emits them as plain strings.)
+        let manifest_path = format!(
+            "{}/../../protocol/ipc-contract.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap_or_else(|err| panic!("read {manifest_path}: {err}"));
+        let contract: serde_json::Value =
+            serde_json::from_str(&manifest).expect("contract is JSON");
+        let listed: Vec<String> = contract["methods"]
+            .as_array()
+            .expect("methods array")
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("method name").to_string())
+            .collect();
+        assert!(!listed.is_empty());
+        for name in &listed {
+            let raw = format!(r#"{{"id":"1","method":"{name}","params":{{}}}}"#);
+            assert!(
+                IpcRequest::parse(&raw).is_ok(),
+                "manifest method does not parse: {name}"
+            );
+        }
+        let typed: Vec<String> = IpcMethod::all().iter().map(IpcMethod::name).collect();
+        assert_eq!(typed.len(), listed.len(), "method count drift");
+        for name in &typed {
+            assert!(
+                listed.contains(name),
+                "typed method missing from manifest: {name}"
+            );
+        }
+        for name in &listed {
+            assert!(
+                typed.contains(name),
+                "manifest method missing from enum: {name}"
+            );
+        }
+        // Same for host push events: every emitted name is a constant in
+        // `events::all()` and every manifest event resolves to one.
+        let listed_events: Vec<String> = contract["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|entry| entry["name"].as_str().expect("event name").to_string())
+            .collect();
+        assert!(!listed_events.is_empty());
+        assert_eq!(
+            events::all().len(),
+            listed_events.len(),
+            "event count drift"
+        );
+        for name in events::all() {
+            assert!(
+                listed_events.iter().any(|listed| listed == name),
+                "emitted event missing from manifest: {name}"
+            );
+        }
+        for name in &listed_events {
+            assert!(
+                events::all().contains(&name.as_str()),
+                "manifest event has no emitter constant: {name}"
+            );
+        }
     }
 
     #[test]

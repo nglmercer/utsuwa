@@ -19,7 +19,7 @@
 
 use host_core::HostEnvironment;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use task_core::{Clock as _, TaskStore as _};
 use task_host::interval::{interval_task, numbered_prompts, IntervalOptions};
@@ -201,6 +201,102 @@ fn tasks_db_path() -> PathBuf {
 const INTERVAL_TOOL_MAX_TIMES: usize = 30;
 const INTERVAL_TOOL_MIN_GAP_MS: i64 = 1_000;
 
+// Small task-tool helpers. Deliberately functions, not a framework: every
+// model-facing task tool funnels its errors, store access, and id checks
+// through these so the five tools cannot drift apart.
+fn task_tool_error(
+    tool: &'static str,
+    code: &'static str,
+    message: impl Into<String>,
+) -> tool_core::ToolError {
+    tool_core::ToolError::structured(tool, code, message.into())
+}
+
+fn open_task_store(
+    path: &Path,
+    tool: &'static str,
+) -> Result<task_core::SqliteTaskStore, tool_core::ToolError> {
+    task_core::SqliteTaskStore::open(path).map_err(|err| {
+        task_tool_error(
+            tool,
+            "store_unavailable",
+            format!("cannot open tasks.db: {err}"),
+        )
+    })
+}
+
+fn require_task_id<'a>(
+    value: &'a str,
+    tool: &'static str,
+) -> Result<&'a str, tool_core::ToolError> {
+    if value.trim().is_empty() {
+        return Err(task_tool_error(
+            tool,
+            "invalid_task_id",
+            "task_id must be a non-empty string",
+        ));
+    }
+    Ok(value)
+}
+
+// The error code stays a parameter (not a fixed string) so each tool keeps
+// its historical code (`invalid_instruction`, `invalid_title`, ...): model
+// callers match on codes, and a shared helper must not rename them.
+fn require_non_empty(
+    value: &str,
+    field: &str,
+    tool: &'static str,
+    code: &'static str,
+) -> Result<(), tool_core::ToolError> {
+    if value.trim().is_empty() {
+        return Err(task_tool_error(
+            tool,
+            code,
+            format!("{field} must be a non-empty string"),
+        ));
+    }
+    Ok(())
+}
+
+fn now_ms() -> i64 {
+    task_core::SystemClock.now_ms()
+}
+
+/// Shared task-store ownership for model-facing task tools. The native
+/// host installs the `TaskHost`'s own store here so tools reuse the one
+/// SQLite authority instead of reopening tasks.db on every call. Cheap to
+/// clone (the store is an `Arc` over one connection); unset tools (tests,
+/// degraded mode) fall back to opening the path per call, as before.
+#[derive(Clone)]
+pub struct TaskToolContext {
+    store: task_core::SqliteTaskStore,
+}
+
+impl TaskToolContext {
+    pub fn new(store: task_core::SqliteTaskStore) -> Self {
+        Self { store }
+    }
+
+    pub fn store(&self) -> &task_core::SqliteTaskStore {
+        &self.store
+    }
+}
+
+#[derive(Clone)]
+enum TaskToolSource {
+    Shared(TaskToolContext),
+    Path(PathBuf),
+}
+
+impl TaskToolSource {
+    fn open(&self, tool: &'static str) -> Result<task_core::SqliteTaskStore, tool_core::ToolError> {
+        match self {
+            TaskToolSource::Shared(ctx) => Ok(ctx.store.clone()),
+            TaskToolSource::Path(path) => open_task_store(path, tool),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct CreateIntervalArgs {
     instruction: String,
@@ -216,7 +312,7 @@ struct CreateIntervalArgs {
 /// like the memory tools, this only writes the host's own state dir,
 /// and every side-effecting step still authorizes at execution time.
 struct CreateIntervalTaskTool {
-    tasks_db: PathBuf,
+    source: TaskToolSource,
 }
 
 #[async_trait::async_trait]
@@ -276,34 +372,30 @@ impl TypedTool for CreateIntervalTaskTool {
         _ctx: tool_core::ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, tool_core::ToolError> {
-        let invalid = |code: &str, message: String| {
-            tool_core::ToolError::structured("tasks.create_interval", code, message)
-        };
+        let tool = "tasks.create_interval";
         let instruction = args.instruction.trim().to_string();
-        if instruction.is_empty() {
-            return Err(invalid(
-                "invalid_instruction",
-                "instruction must be a non-empty string".to_string(),
-            ));
-        }
+        require_non_empty(&instruction, "instruction", tool, "invalid_instruction")?;
         let times = args.times.unwrap_or(3);
         if times == 0 || times > INTERVAL_TOOL_MAX_TIMES {
-            return Err(invalid(
+            return Err(task_tool_error(
+                tool,
                 "invalid_times",
                 format!("times must be 1..={INTERVAL_TOOL_MAX_TIMES}"),
             ));
         }
         let gap_ms = args.gap_ms.unwrap_or(3_000);
         if gap_ms < INTERVAL_TOOL_MIN_GAP_MS {
-            return Err(invalid(
+            return Err(task_tool_error(
+                tool,
                 "invalid_gap",
                 format!("gap_ms must be >= {INTERVAL_TOOL_MIN_GAP_MS}"),
             ));
         }
         if args.scheduled_at.is_some_and(|at| at < 0) {
-            return Err(invalid(
+            return Err(task_tool_error(
+                tool,
                 "invalid_scheduled_at",
-                "scheduled_at must be epoch milliseconds >= 0".to_string(),
+                "scheduled_at must be epoch milliseconds >= 0",
             ));
         }
         let title = args
@@ -320,13 +412,10 @@ impl TypedTool for CreateIntervalTaskTool {
             max_iterations: 4,
             scheduled_at: args.scheduled_at,
         });
-        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
-            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
-        let now = task_core::SystemClock.now_ms();
-        let created = store
-            .create(task, now)
-            .await
-            .map_err(|err| invalid("create_failed", format!("cannot create task: {err}")))?;
+        let store = self.source.open(tool)?;
+        let created = store.create(task, now_ms()).await.map_err(|err| {
+            task_tool_error(tool, "create_failed", format!("cannot create task: {err}"))
+        })?;
         Ok(serde_json::json!({
             "task_id": created.id,
             "title": created.title,
@@ -349,7 +438,7 @@ struct ListTasksArgs {
 /// `tasks.get` has the full detail. Same local-state rationale as
 /// creation: no capability requirement.
 struct ListTasksTool {
-    tasks_db: PathBuf,
+    source: TaskToolSource,
 }
 
 #[async_trait::async_trait]
@@ -395,14 +484,13 @@ impl TypedTool for ListTasksTool {
         _ctx: tool_core::ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, tool_core::ToolError> {
-        let invalid = |code: &str, message: String| {
-            tool_core::ToolError::structured("tasks.list", code, message)
-        };
+        let tool = "tasks.list";
         let status = args
             .status
             .map(|raw| {
                 task_core::TaskStatus::parse(&raw).ok_or_else(|| {
-                    invalid(
+                    task_tool_error(
+                        tool,
                         "invalid_status",
                         format!(
                             "unknown status '{raw}': pending, scheduled, ready, running, waiting, needs_review, completed, failed, cancelled"
@@ -412,12 +500,10 @@ impl TypedTool for ListTasksTool {
             })
             .transpose()?;
         let limit = args.limit.unwrap_or(20).clamp(1, 200);
-        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
-            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
-        let tasks = store
-            .list(status, limit)
-            .await
-            .map_err(|err| invalid("list_failed", format!("cannot list tasks: {err}")))?;
+        let store = self.source.open(tool)?;
+        let tasks = store.list(status, limit).await.map_err(|err| {
+            task_tool_error(tool, "list_failed", format!("cannot list tasks: {err}"))
+        })?;
         let summaries: Vec<serde_json::Value> = tasks
             .iter()
             .map(|task| {
@@ -445,7 +531,7 @@ struct GetTaskArgs {
 /// This is how the agent checks whether a scheduled task ran and what
 /// each repetition produced.
 struct GetTaskTool {
-    tasks_db: PathBuf,
+    source: TaskToolSource,
 }
 
 #[async_trait::async_trait]
@@ -484,24 +570,19 @@ impl TypedTool for GetTaskTool {
         _ctx: tool_core::ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, tool_core::ToolError> {
-        let invalid = |code: &str, message: String| {
-            tool_core::ToolError::structured("tasks.get", code, message)
-        };
-        if args.task_id.trim().is_empty() {
-            return Err(invalid(
-                "invalid_task_id",
-                "task_id must be a non-empty string".to_string(),
-            ));
-        }
-        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
-            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
+        let tool = "tasks.get";
+        let task_id = require_task_id(&args.task_id, tool)?;
+        let store = self.source.open(tool)?;
         let task = store
-            .get(&args.task_id)
+            .get(task_id)
             .await
-            .map_err(|err| invalid("get_failed", format!("cannot read task: {err}")))?
-            .ok_or_else(|| invalid("unknown_task", format!("unknown task '{}'", args.task_id)))?;
-        serde_json::to_value(&task)
-            .map_err(|err| invalid("serialization", format!("cannot encode task: {err}")))
+            .map_err(|err| task_tool_error(tool, "get_failed", format!("cannot read task: {err}")))?
+            .ok_or_else(|| {
+                task_tool_error(tool, "unknown_task", format!("unknown task '{task_id}'"))
+            })?;
+        serde_json::to_value(&task).map_err(|err| {
+            task_tool_error(tool, "serialization", format!("cannot encode task: {err}"))
+        })
     }
 }
 
@@ -515,7 +596,7 @@ struct CancelTaskArgs {
 /// scheduler uses — one implementation, no drift. The cancelled task
 /// stays in history (durable by design); there is no hard delete.
 struct CancelTaskTool {
-    tasks_db: PathBuf,
+    source: TaskToolSource,
 }
 
 #[async_trait::async_trait]
@@ -558,35 +639,28 @@ impl TypedTool for CancelTaskTool {
         _ctx: tool_core::ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, tool_core::ToolError> {
-        let invalid = |code: &str, message: String| {
-            tool_core::ToolError::structured("tasks.cancel", code, message)
-        };
-        if args.task_id.trim().is_empty() {
-            return Err(invalid(
-                "invalid_task_id",
-                "task_id must be a non-empty string".to_string(),
-            ));
-        }
+        let tool = "tasks.cancel";
+        let task_id = require_task_id(&args.task_id, tool)?;
         let reason = args
             .reason
             .filter(|reason| !reason.trim().is_empty())
             .unwrap_or_else(|| "cancelled by agent".to_string());
-        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
-            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
-        let now = task_core::SystemClock.now_ms();
-        match task_core::cancel_task(&store, &args.task_id, reason, now).await {
+        let store = self.source.open(tool)?;
+        match task_core::cancel_task(&store, task_id, reason, now_ms()).await {
             Ok(task) => Ok(serde_json::json!({
                 "task_id": task.id,
                 "status": task.status.as_str(),
             })),
-            Err(task_core::TaskCoreError::NotFound(_)) => Err(invalid(
+            Err(task_core::TaskCoreError::NotFound(_)) => Err(task_tool_error(
+                tool,
                 "unknown_task",
-                format!("unknown task '{}'", args.task_id),
+                format!("unknown task '{task_id}'"),
             )),
             Err(task_core::TaskCoreError::Step(message)) => {
-                Err(invalid("already_terminal", message))
+                Err(task_tool_error(tool, "already_terminal", message))
             }
-            Err(err) => Err(invalid(
+            Err(err) => Err(task_tool_error(
+                tool,
                 "cancel_failed",
                 format!("cannot cancel task: {err}"),
             )),
@@ -608,7 +682,7 @@ struct EditTaskArgs {
 /// rewriting a live task's steps would corrupt the run the manager is
 /// executing.
 struct EditTaskTool {
-    tasks_db: PathBuf,
+    source: TaskToolSource,
 }
 
 #[async_trait::async_trait]
@@ -669,59 +743,50 @@ impl TypedTool for EditTaskTool {
         _ctx: tool_core::ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, tool_core::ToolError> {
-        let invalid = |code: &str, message: String| {
-            tool_core::ToolError::structured("tasks.edit", code, message)
-        };
-        if args.task_id.trim().is_empty() {
-            return Err(invalid(
-                "invalid_task_id",
-                "task_id must be a non-empty string".to_string(),
-            ));
-        }
+        let tool = "tasks.edit";
+        let task_id = require_task_id(&args.task_id, tool)?;
         if let Some(scheduled_at) = args.scheduled_at {
             if scheduled_at < 0 {
-                return Err(invalid(
+                return Err(task_tool_error(
+                    tool,
                     "invalid_scheduled_at",
-                    "scheduled_at must be epoch milliseconds >= 0".to_string(),
+                    "scheduled_at must be epoch milliseconds >= 0",
                 ));
             }
         }
         if let Some(steps) = &args.steps {
             if steps.is_empty() {
-                return Err(invalid(
+                return Err(task_tool_error(
+                    tool,
                     "invalid_steps",
-                    "steps must contain at least one step".to_string(),
+                    "steps must contain at least one step",
                 ));
             }
         }
         if let Some(title) = &args.title {
-            if title.trim().is_empty() {
-                return Err(invalid(
-                    "invalid_title",
-                    "title must not be empty".to_string(),
-                ));
-            }
+            require_non_empty(title, "title", tool, "invalid_title")?;
         }
-        let store = task_core::SqliteTaskStore::open(&self.tasks_db)
-            .map_err(|err| invalid("store_unavailable", format!("cannot open tasks.db: {err}")))?;
+        let store = self.source.open(tool)?;
         let mut task = store
-            .get(&args.task_id)
+            .get(task_id)
             .await
-            .map_err(|err| invalid("get_failed", format!("cannot read task: {err}")))?
-            .ok_or_else(|| invalid("unknown_task", format!("unknown task '{}'", args.task_id)))?;
+            .map_err(|err| task_tool_error(tool, "get_failed", format!("cannot read task: {err}")))?
+            .ok_or_else(|| {
+                task_tool_error(tool, "unknown_task", format!("unknown task '{task_id}'"))
+            })?;
         let editable = matches!(
             task.status,
             task_core::TaskStatus::Pending | task_core::TaskStatus::Scheduled
         ) && task.attempts == 0
             && task.current_step_index == 0;
         if !editable {
-            return Err(invalid(
+            return Err(task_tool_error(
+                tool,
                 "already_started",
-                "only tasks that never started (pending/scheduled, 0 attempts) can be edited; cancel it and create a new one instead"
-                    .to_string(),
+                "only tasks that never started (pending/scheduled, 0 attempts) can be edited; cancel it and create a new one instead",
             ));
         }
-        let now = task_core::SystemClock.now_ms();
+        let now = now_ms();
         if let Some(title) = args.title {
             task.title = title;
         }
@@ -753,10 +818,9 @@ impl TypedTool for EditTaskTool {
         if let Some(scheduled_at) = args.scheduled_at {
             task.scheduled_at = Some(scheduled_at);
         }
-        store
-            .update(&task, now)
-            .await
-            .map_err(|err| invalid("edit_failed", format!("cannot update task: {err}")))?;
+        store.update(&task, now).await.map_err(|err| {
+            task_tool_error(tool, "edit_failed", format!("cannot update task: {err}"))
+        })?;
         Ok(serde_json::json!({
             "task_id": task.id,
             "title": task.title,
@@ -770,18 +834,29 @@ impl TypedTool for EditTaskTool {
 /// turn catalog (runtime.rs), never into task-agent registries
 /// (main.rs, task-cli): tasks must not spawn tasks.
 pub struct TasksToolPack {
-    tasks_db: PathBuf,
+    source: TaskToolSource,
 }
 
 impl TasksToolPack {
     pub fn new() -> Self {
         Self {
-            tasks_db: tasks_db_path(),
+            source: TaskToolSource::Path(tasks_db_path()),
         }
     }
 
     pub fn with_tasks_db(tasks_db: PathBuf) -> Self {
-        Self { tasks_db }
+        Self {
+            source: TaskToolSource::Path(tasks_db),
+        }
+    }
+
+    /// Share one SQLite authority with the `TaskHost` instead of reopening
+    /// tasks.db on every tool call. The native host uses this; unset packs
+    /// keep the lazy per-call open.
+    pub fn with_context(context: TaskToolContext) -> Self {
+        Self {
+            source: TaskToolSource::Shared(context),
+        }
     }
 }
 
@@ -799,19 +874,19 @@ impl ToolPack for TasksToolPack {
     fn tools(&self, _ctx: &ToolLoadContext) -> Vec<Arc<dyn tool_core::Tool>> {
         vec![
             TypedToolAdapter::arc(CreateIntervalTaskTool {
-                tasks_db: self.tasks_db.clone(),
+                source: self.source.clone(),
             }),
             TypedToolAdapter::arc(ListTasksTool {
-                tasks_db: self.tasks_db.clone(),
+                source: self.source.clone(),
             }),
             TypedToolAdapter::arc(GetTaskTool {
-                tasks_db: self.tasks_db.clone(),
+                source: self.source.clone(),
             }),
             TypedToolAdapter::arc(CancelTaskTool {
-                tasks_db: self.tasks_db.clone(),
+                source: self.source.clone(),
             }),
             TypedToolAdapter::arc(EditTaskTool {
-                tasks_db: self.tasks_db.clone(),
+                source: self.source.clone(),
             }),
         ]
     }
@@ -834,7 +909,9 @@ mod tests {
     }
 
     fn tool_at(tasks_db: PathBuf) -> CreateIntervalTaskTool {
-        CreateIntervalTaskTool { tasks_db }
+        CreateIntervalTaskTool {
+            source: TaskToolSource::Path(tasks_db),
+        }
     }
 
     fn args(instruction: &str) -> CreateIntervalArgs {
@@ -1003,7 +1080,7 @@ mod tests {
         let first = create_task(&db, "first").await;
         let _second = create_task(&db, "second").await;
         let tool = ListTasksTool {
-            tasks_db: db.clone(),
+            source: TaskToolSource::Path(db.clone()),
         };
         let out = tool
             .call(
@@ -1055,7 +1132,7 @@ mod tests {
         let db = scratch_db("get");
         let id = create_task(&db, "fetch me").await;
         let tool = GetTaskTool {
-            tasks_db: db.clone(),
+            source: TaskToolSource::Path(db.clone()),
         };
         let out = tool
             .call(
@@ -1093,7 +1170,7 @@ mod tests {
         let db = scratch_db("cancel");
         let id = create_task(&db, "stop me").await;
         let tool = CancelTaskTool {
-            tasks_db: db.clone(),
+            source: TaskToolSource::Path(db.clone()),
         };
         let out = tool
             .call(
@@ -1138,7 +1215,7 @@ mod tests {
         let db = scratch_db("edit");
         let id = create_task(&db, "fix me").await;
         let tool = EditTaskTool {
-            tasks_db: db.clone(),
+            source: TaskToolSource::Path(db.clone()),
         };
         let out = tool
             .call(
@@ -1232,7 +1309,7 @@ mod tests {
             .await
             .expect("mark ready");
         let tool = EditTaskTool {
-            tasks_db: db.clone(),
+            source: TaskToolSource::Path(db.clone()),
         };
         let refused = tool
             .call(
@@ -1250,7 +1327,7 @@ mod tests {
         // Terminal tasks refuse as well.
         let finished = create_task(&db, "done").await;
         CancelTaskTool {
-            tasks_db: db.clone(),
+            source: TaskToolSource::Path(db.clone()),
         }
         .call(
             ctx(),
@@ -1275,5 +1352,152 @@ mod tests {
             .await;
         assert!(refused.is_err());
         let _ = std::fs::remove_file(&db);
+    }
+
+    fn err_code(err: &tool_core::ToolError) -> String {
+        match err {
+            tool_core::ToolError::Structured { code, .. } => code.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn helpers_reject_empty_ids_and_values() {
+        assert_eq!(
+            err_code(&require_task_id("  ", "tasks.get").expect_err("empty id")),
+            "invalid_task_id"
+        );
+        assert!(require_task_id("t-1", "tasks.get").is_ok());
+        assert_eq!(
+            err_code(
+                &require_non_empty(
+                    "",
+                    "instruction",
+                    "tasks.create_interval",
+                    "invalid_instruction"
+                )
+                .expect_err("empty value")
+            ),
+            "invalid_instruction"
+        );
+        assert!(now_ms() > 0);
+    }
+
+    #[tokio::test]
+    async fn get_rejects_empty_task_id_without_touching_the_store() {
+        let tool = GetTaskTool {
+            source: TaskToolSource::Path(PathBuf::from("/nonexistent-tasks.db")),
+        };
+        let err = tool
+            .call(
+                ctx(),
+                GetTaskArgs {
+                    task_id: "   ".to_string(),
+                },
+            )
+            .await
+            .expect_err("empty id");
+        assert_eq!(err_code(&err), "invalid_task_id");
+    }
+
+    #[tokio::test]
+    async fn tools_surface_store_open_errors() {
+        // A path under a missing directory cannot be opened: every tool
+        // must report `store_unavailable`, not panic or hang.
+        let missing = std::env::temp_dir().join(format!(
+            "utsuwa-no-such-dir-{}/tasks.db",
+            std::process::id()
+        ));
+        let tool = ListTasksTool {
+            source: TaskToolSource::Path(missing),
+        };
+        let err = tool
+            .call(
+                ctx(),
+                ListTasksArgs {
+                    status: None,
+                    limit: None,
+                },
+            )
+            .await
+            .expect_err("unopenable store");
+        assert_eq!(err_code(&err), "store_unavailable");
+    }
+
+    #[tokio::test]
+    async fn create_and_edit_reject_negative_schedules() {
+        let db = scratch_db("bad-schedule");
+        let tool = tool_at(db.clone());
+        let err = tool
+            .call(
+                ctx(),
+                CreateIntervalArgs {
+                    scheduled_at: Some(-1),
+                    ..args("use system.time")
+                },
+            )
+            .await
+            .expect_err("negative scheduled_at");
+        assert_eq!(err_code(&err), "invalid_scheduled_at");
+
+        let id = create_task(&db, "editable").await;
+        let edit = EditTaskTool {
+            source: TaskToolSource::Path(db.clone()),
+        };
+        let err = edit
+            .call(
+                ctx(),
+                EditTaskArgs {
+                    task_id: id,
+                    title: None,
+                    instruction: None,
+                    steps: None,
+                    scheduled_at: Some(-5),
+                },
+            )
+            .await
+            .expect_err("negative scheduled_at");
+        assert_eq!(err_code(&err), "invalid_scheduled_at");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    #[tokio::test]
+    async fn shared_context_tools_see_the_same_store_without_a_path() {
+        // An in-memory store has no path at all: only the shared context
+        // makes it reachable, proving tools reuse the installed authority
+        // instead of reopening a path.
+        let store = task_core::SqliteTaskStore::open_in_memory().expect("open");
+        let context = TaskToolContext::new(store.clone());
+        let create = CreateIntervalTaskTool {
+            source: TaskToolSource::Shared(context.clone()),
+        };
+        let out = create
+            .call(ctx(), args("use system.time to get the date"))
+            .await
+            .expect("create through shared store");
+        let id = out
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task_id")
+            .to_string();
+        let get = GetTaskTool {
+            source: TaskToolSource::Shared(context),
+        };
+        let fetched = get
+            .call(
+                ctx(),
+                GetTaskArgs {
+                    task_id: id.clone(),
+                },
+            )
+            .await
+            .expect("get through shared store");
+        assert_eq!(
+            fetched.get("id").and_then(serde_json::Value::as_str),
+            Some(id.as_str())
+        );
+        // And the pack-level constructor wires the same context through.
+        let pack = TasksToolPack::with_context(TaskToolContext::new(store));
+        assert_eq!(pack.tools(&ToolLoadContext::default()).len(), 5);
     }
 }

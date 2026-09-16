@@ -8,7 +8,7 @@ use agent_core::{Agent, AgentEvent, AgentLimits, ToolReplayCache};
 use file_target::{FileRef, FileResolver, TargetPurpose};
 use futures_util::FutureExt as _;
 use host_core::HostEnvironment;
-use ipc_core::HostEvent;
+use ipc_core::{events as host_events, HostEvent};
 use model_core::ModelMessage;
 use std::sync::Arc;
 use tool_sdk::ToolLoadContext;
@@ -64,15 +64,15 @@ impl AgentRuntime {
             }
             let (name, data) = match event {
                 AgentEvent::TextDelta(delta) => (
-                    "agent.text_delta",
+                    host_events::AGENT_TEXT_DELTA,
                     serde_json::json!({ "turn_id": turn_id, "delta": delta }),
                 ),
                 AgentEvent::ToolStarted { id, name } => (
-                    "agent.tool_started",
+                    host_events::AGENT_TOOL_STARTED,
                     serde_json::json!({ "turn_id": turn_id, "id": id, "name": name }),
                 ),
                 AgentEvent::ToolFinished { id, name, ok } => (
-                    "agent.tool_finished",
+                    host_events::AGENT_TOOL_FINISHED,
                     serde_json::json!({ "turn_id": turn_id, "id": id, "name": name, "ok": ok }),
                 ),
             };
@@ -181,7 +181,7 @@ impl AgentRuntime {
             }
             self.emit_if_current(
                 generation,
-                "agent.turn_failed",
+                host_events::AGENT_FAILED,
                 serde_json::json!({
                     "turn_id": turn_id,
                     "error": format!("agent worker panicked: {detail}"),
@@ -245,7 +245,7 @@ impl AgentRuntime {
                 self.emit_terminal(
                     generation,
                     &turn_id,
-                    "agent.turn_failed",
+                    host_events::AGENT_FAILED,
                     serde_json::json!({ "turn_id": turn_id, "error": err.to_string() }),
                 );
                 return;
@@ -273,7 +273,7 @@ impl AgentRuntime {
                 self.emit_terminal(
                     generation,
                     &turn_id,
-                    "agent.turn_failed",
+                    host_events::AGENT_FAILED,
                     serde_json::json!({ "turn_id": turn_id, "error": err.to_string() }),
                 );
                 return;
@@ -312,7 +312,7 @@ impl AgentRuntime {
                 self.emit_terminal(
                     generation,
                     &turn_id,
-                    "agent.turn_failed",
+                    host_events::AGENT_FAILED,
                     serde_json::json!({ "turn_id": turn_id, "error": err.to_string() }),
                 );
             }
@@ -344,7 +344,7 @@ impl AgentRuntime {
                                 self.emit_terminal(
                                     generation,
                                     &turn_id,
-                                    "agent.turn_failed",
+                                    host_events::AGENT_FAILED,
                                     serde_json::json!({ "turn_id": turn_id, "error": "approval queue lock failed" }),
                                 );
                                 return;
@@ -363,15 +363,17 @@ impl AgentRuntime {
                             }
                         }
                         match serde_json::to_value(&request) {
-                            Ok(data) => {
-                                self.emit_if_current(generation, "permission.requested", data)
-                            }
+                            Ok(data) => self.emit_if_current(
+                                generation,
+                                host_events::PERMISSION_REQUESTED,
+                                data,
+                            ),
                             Err(err) => tracing::warn!(%err, "cannot serialize permission request"),
                         }
                         self.emit_terminal(
                             generation,
                             &turn_id,
-                            "agent.turn_suspended",
+                            host_events::AGENT_SUSPENDED,
                             serde_json::json!({
                                 "turn_id": turn_id,
                                 "text": outcome.text,
@@ -403,7 +405,7 @@ impl AgentRuntime {
                         self.emit_terminal(
                             generation,
                             &turn_id,
-                            "agent.turn_done",
+                            host_events::AGENT_DONE,
                             serde_json::json!({
                                 "turn_id": turn_id,
                                 "text": outcome.text,

@@ -46,6 +46,9 @@ export interface AvatarTaskDeps {
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 250;
+// Chat routine budget: bounds both the host-task poll below and the
+// `receipt_timeout_ms` the chat path requests (the renderer then runs
+// under it minus its margin — see `runTimeoutFor` in host-avatar.ts).
 const DEFAULT_ROUTINE_BUDGET_MS = 120_000;
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));

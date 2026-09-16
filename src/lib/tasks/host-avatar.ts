@@ -6,11 +6,13 @@
 // Deps are injected (event target, routine runner, delivery) so node tests
 // cover this without Svelte, DOM, or the bridge; `browser.ts` wires the real
 // implementations.
-import { HOST_EVENT, type HostEventDetail } from '../services/native/bridge.ts';
+import type { HostEventDetail } from '../services/native/bridge.ts';
+import { HOST_EVENTS, subscribeHostEvents } from '../services/native/host-events.ts';
+import { routineStepReceiptKey } from '../engine/avatar-action-key.ts';
 import type { RoutineResult, RoutineStepInput } from '../stores/vrm.svelte.ts';
 
-export const AVATAR_ROUTINE_REQUESTED = 'avatar.routine.requested';
-export const AVATAR_ROUTINE_COMPLETED = 'avatar.routine.completed';
+export const AVATAR_ROUTINE_REQUESTED = HOST_EVENTS.AVATAR_ROUTINE_REQUESTED;
+export const AVATAR_ROUTINE_COMPLETED = HOST_EVENTS.AVATAR_ROUTINE_COMPLETED;
 
 export interface HostRoutineRequest {
 	taskId: string;
@@ -47,16 +49,14 @@ export function routineStepKey(step: {
 	x?: number;
 	z?: number;
 }): string {
-	let key = `${step.kind}:${step.action}`;
-	if (step.direction) key += `:${step.direction}`;
-	if (typeof step.anchorId === 'string' && step.anchorId) {
-		key += `:${step.anchorId}`;
-	} else if (typeof step.x === 'number' && typeof step.z === 'number') {
-		key += `:${step.x.toFixed(2)},${step.z.toFixed(2)}`;
-	}
-	return key;
+	return routineStepReceiptKey(step);
 }
 
+// Local run budget stays strictly under the host's receipt wait
+// (`DEFAULT_ROUTINE_RECEIPT_TIMEOUT_MS`, 60s in
+// `crates/task-host/src/runners.rs`): a slow routine resolves locally
+// instead of racing the host wait. Cross-language constants cannot share
+// an import, so the pairing is pinned here and there by comment.
 const DEFAULT_RUN_TIMEOUT_MS = 55_000;
 const RECEIPT_MARGIN_MS = 2_000;
 const MIN_RUN_TIMEOUT_MS = 5_000;
@@ -163,14 +163,11 @@ export async function handleRoutineRequest(
 
 /** Subscribe to host routine requests; returns an unsubscribe function. */
 export function startHostAvatarListener(deps: HostAvatarListenerDeps): () => void {
-	const onEvent = (event: Event) => {
-		const detail = (event as CustomEvent<HostEventDetail>).detail;
-		const request = parseRoutineRequest(detail);
-		if (!request) return;
-		void handleRoutineRequest(request, deps);
-	};
-	deps.events.addEventListener(HOST_EVENT, onEvent);
-	return () => {
-		deps.events.removeEventListener(HOST_EVENT, onEvent);
-	};
+	return subscribeHostEvents(
+		(event, data) => parseRoutineRequest({ event, data }),
+		(request) => {
+			void handleRoutineRequest(request, deps);
+		},
+		deps.events
+	);
 }

@@ -12,8 +12,13 @@ use std::time::Duration;
 use task_core::{Ms, StepContext, StepOutcome, StepRunner, Task, TaskStep, TaskStore, TaskWait};
 use tool_core::{ToolContext, ToolError};
 
-pub const AVATAR_ROUTINE_REQUESTED_EVENT: &str = "avatar.routine.requested";
-pub const AVATAR_ROUTINE_COMPLETED_EVENT: &str = "avatar.routine.completed";
+pub const AVATAR_ROUTINE_REQUESTED_EVENT: &str = ipc_core::events::AVATAR_ROUTINE_REQUESTED;
+pub const AVATAR_ROUTINE_COMPLETED_EVENT: &str = ipc_core::events::AVATAR_ROUTINE_COMPLETED;
+/// How long the host waits for the renderer's routine receipt. The
+/// WebView side (`DEFAULT_RUN_TIMEOUT_MS` in
+/// `src/lib/tasks/host-avatar.ts`) always runs strictly under this
+/// budget (55s default, or budget minus `RECEIPT_MARGIN_MS`) so a slow
+/// routine resolves locally instead of racing the host wait.
 pub const DEFAULT_ROUTINE_RECEIPT_TIMEOUT_MS: Ms = 60_000;
 /// Single-use approval tickets live at most 5 minutes in the stash.
 pub const TICKET_STASH_TTL: Duration = Duration::from_secs(5 * 60);

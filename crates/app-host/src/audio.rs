@@ -230,7 +230,7 @@ impl AudioCaptureManager {
                 "event": event,
             });
             emit(ipc_core::HostEvent {
-                event: "audio.capture".to_string(),
+                event: ipc_core::events::AUDIO_CAPTURE.to_string(),
                 data,
             });
         };

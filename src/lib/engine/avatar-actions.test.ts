@@ -30,9 +30,9 @@ test('every action has sane metadata', () => {
 		assert.ok(def.description.length > 0);
 		assert.ok(def.cooldownMs >= 1000, `${name} cooldown`);
 		assert.ok(def.mode === 'oneshot' || def.mode === 'loop');
-		if (def.source.kind === 'vrma') {
-			assert.ok(def.source.url.startsWith('/animations/'), `${name} url`);
-			assert.ok(def.source.url.endsWith('.vrma'), `${name} url`);
+		if (def.execution.kind === 'vrma') {
+			assert.ok(def.execution.url.startsWith('/animations/'), `${name} url`);
+			assert.ok(def.execution.url.endsWith('.vrma'), `${name} url`);
 		}
 		if (def.expression) {
 			assert.ok(def.expression.intensity > 0 && def.expression.intensity <= 1);
@@ -142,6 +142,30 @@ test('sit offset drops the hips to seat height, clamped', () => {
 	assert.ok(Math.abs(computeSitOffsetY(0.9, 0.45) + 0.45) < 1e-9);
 	assert.equal(computeSitOffsetY(0.9, 1.5), 0);
 	assert.equal(computeSitOffsetY(1.5, 0.1), -0.8);
+});
+
+test('execution semantics cover every action exactly once', () => {
+	assert.deepEqual(
+		AVATAR_ACTION_NAMES.map((name) => AVATAR_ACTIONS[name].execution.kind),
+		[
+			'vrma',
+			'procedural',
+			'procedural',
+			'procedural',
+			'procedural',
+			'vrma',
+			'vrma',
+			'jump',
+			'walk',
+			'walk',
+			'return_home',
+			'face_camera',
+			'turn',
+			'goto',
+			'procedural',
+			'procedural'
+		]
+	);
 });
 
 test('animation URLs reverse-map to their semantic face', () => {

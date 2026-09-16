@@ -29,7 +29,7 @@ use super::model_gate::{ModelExecutionGate, ModelTurnKind};
 use super::providers::ProviderFactory;
 use super::EmitFn;
 
-pub const TASK_AGENT_PROGRESS_EVENT: &str = "task.agent.progress";
+pub const TASK_AGENT_PROGRESS_EVENT: &str = ipc_core::events::TASK_AGENT_PROGRESS;
 pub const TASK_AGENT_ID: &str = "task-agent";
 pub const DEFAULT_STEP_ITERATIONS: usize = 8;
 pub const MAX_STEP_ITERATIONS: usize = 25;

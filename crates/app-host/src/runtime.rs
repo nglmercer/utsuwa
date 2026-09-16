@@ -55,10 +55,10 @@ pub(crate) use file_target::{ConversationFileContext, FileRef};
 pub(crate) use host_core::HostEnvironment;
 pub(crate) use tool_process::{ProcessLimits, ProcessManager};
 
-use crate::tooling::{ProcessToolPack, SystemToolPack, TasksToolPack};
+use crate::tooling::{ProcessToolPack, SystemToolPack, TaskToolContext, TasksToolPack};
 use audit_core::AuditSink;
 use capability_core::AgentId;
-use ipc_core::HostEvent;
+use ipc_core::{events as host_events, HostEvent};
 use mcp_runtime::McpManager;
 #[cfg(test)]
 use model_core::ModelProvider;
@@ -115,7 +115,7 @@ impl SensorActivityHub {
         self.camera.add_activity_listener(move |state| {
             if let Ok(data) = serde_json::to_value(state) {
                 emit_camera(HostEvent {
-                    event: "camera.activity.changed".to_string(),
+                    event: host_events::CAMERA_ACTIVITY_CHANGED.to_string(),
                     data,
                 });
             }
@@ -124,7 +124,7 @@ impl SensorActivityHub {
         self.microphone.add_activity_listener(move |state| {
             if let Ok(data) = serde_json::to_value(state) {
                 emit_microphone(HostEvent {
-                    event: "microphone.activity.changed".to_string(),
+                    event: host_events::MICROPHONE_ACTIVITY_CHANGED.to_string(),
                     data,
                 });
             }
@@ -205,6 +205,7 @@ pub struct AgentRuntime {
     state: Arc<Mutex<State>>,
     executor: tokio::runtime::Runtime,
     model_gate: Mutex<Option<Arc<model_gate::ModelExecutionGate>>>,
+    task_tools: Mutex<Option<TaskToolContext>>,
 }
 
 impl AgentRuntime {
@@ -342,6 +343,7 @@ impl AgentRuntime {
             })),
             executor,
             model_gate: Mutex::new(None),
+            task_tools: Mutex::new(None),
         });
         // Host-owned privacy publication: synchronous listeners on the hub
         // forward activity changes to the frontend without depending on the
@@ -444,6 +446,25 @@ impl AgentRuntime {
         if let Ok(mut slot) = self.memory.lock() {
             *slot = store;
         }
+    }
+
+    /// Share the `TaskHost`'s SQLite authority with model-facing task
+    /// tools so `tasks.*` calls reuse one connection instead of reopening
+    /// tasks.db per call. The native host installs this at startup; unset
+    /// runtimes (tests, degraded mode) keep the lazy per-call open.
+    pub fn set_task_store(&self, store: task_core::SqliteTaskStore) {
+        if let Ok(mut slot) = self.task_tools.lock() {
+            *slot = Some(TaskToolContext::new(store));
+        }
+    }
+
+    fn task_tool_pack(&self) -> TasksToolPack {
+        if let Ok(slot) = self.task_tools.lock() {
+            if let Some(ctx) = slot.clone() {
+                return TasksToolPack::with_context(ctx);
+            }
+        }
+        TasksToolPack::new()
     }
     /// Install the process-shared model gate so this runtime's interactive
     /// turns serialize against background task-agent turns (which take the
@@ -607,7 +628,7 @@ impl AgentRuntime {
     fn emit_screen_share_changed(&self, status: &ScreenShareStatus) {
         if let Ok(data) = serde_json::to_value(status) {
             (self.emit)(HostEvent {
-                event: "desktop.share_screen.changed".to_string(),
+                event: host_events::SCREEN_SHARE_CHANGED.to_string(),
                 data,
             });
         }
@@ -1031,7 +1052,7 @@ impl AgentRuntime {
             // Durable tasks for the default agent only: the model
             // schedules interval work through the same builder the CLI
             // verification uses. Never in task-agent registries.
-            .with_pack(TasksToolPack::new())
+            .with_pack(self.task_tool_pack())
             // The CDP endpoint is host configuration (loopback-only,
             // sanitized), read fresh every turn; the pack hides control
             // tools while no browser answers there.

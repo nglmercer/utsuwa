@@ -72,6 +72,8 @@ export type AvatarActionName =
 // the speed); routine receipts keep them distinct as walk:walk:* / walk:run:*.
 export type LocomotionActionName = 'walk' | 'run';
 
+export const LOCOMOTION_ACTIONS: readonly LocomotionActionName[] = ['walk', 'run'];
+
 export type LocomotionDirection = 'left' | 'right' | 'forward' | 'back';
 
 export const LOCOMOTION_DIRECTIONS: readonly LocomotionDirection[] = [
@@ -101,21 +103,41 @@ export const TURN_ARRIVE_RAD = 0.03;
 // Hip height for sittable anchors without an explicit seat height.
 export const DEFAULT_SEAT_HEIGHT = 0.45;
 
-export type AvatarActionSource =
-	// A shipped .vrma clip played as a one-shot through the mixer.
+// AI locomotion is bounded: brisk enough to read, short enough to stay
+// framed. Authoritative here so the command parser, response parser, prompt
+// contract, renderer, and tests agree on the same window.
+export const WALK_DURATION_MIN_MS = 300;
+export const WALK_DURATION_MAX_MS = 3000;
+export const WALK_DURATION_DEFAULT_MS = 1200;
+
+// Clamp a walk/run duration to the authoritative window. NaN/Infinity fall
+// back to the default instead of freezing a step (a NaN remainingMs never
+// reaches zero AND the watchdog comparison never fires).
+export function clampWalkDuration(durationMs: number): number {
+	if (!Number.isFinite(durationMs)) return WALK_DURATION_DEFAULT_MS;
+	return Math.min(WALK_DURATION_MAX_MS, Math.max(WALK_DURATION_MIN_MS, Math.round(durationMs)));
+}
+
+// Authoritative execution semantics: exactly how the runtime performs this
+// action. Consumers must branch on this (or use the shared conversion
+// helpers in avatar-action-runtime.ts), never infer behavior from the
+// action name.
+export type AvatarExecution =
 	| { kind: 'vrma'; url: string }
-	// A scripted bone-pulse routine in the renderer (no asset needed).
 	| { kind: 'procedural' }
-	// AvatarRoot world motion (jump arc / walk translation), optionally with
-	// a procedural leg swing underneath. No skeleton asset required.
-	| { kind: 'world-motion' };
+	| { kind: 'jump' }
+	| { kind: 'walk' }
+	| { kind: 'return_home' }
+	| { kind: 'face_camera' }
+	| { kind: 'turn' }
+	| { kind: 'goto' };
 
 export interface AvatarActionDefinition {
 	id: AvatarActionName | LocomotionActionName;
 	label: string;
 	// One line for the prompt catalog: when this action is appropriate.
 	description: string;
-	source: AvatarActionSource;
+	execution: AvatarExecution;
 	mode: 'oneshot' | 'loop';
 	category:
 		| 'greeting'
@@ -140,9 +162,9 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'wave',
 		label: 'Wave',
 		description: 'greeting or goodbye',
+		execution: { kind: 'vrma', url: '/animations/VRMA_04.vrma' },
 		// Medium confidence: right-arm raise arc with finger articulation and
 		// return-to-rest. Alternate candidate VRMA_03 (held right-forearm-up).
-		source: { kind: 'vrma', url: '/animations/VRMA_04.vrma' },
 		mode: 'oneshot',
 		category: 'greeting',
 		cooldownMs: 15000,
@@ -153,7 +175,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'nod',
 		label: 'Nod',
 		description: 'clear agreement or acknowledgement',
-		source: { kind: 'procedural' },
+		execution: { kind: 'procedural' },
 		mode: 'oneshot',
 		category: 'agreement',
 		cooldownMs: 8000,
@@ -163,7 +185,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'shake_head',
 		label: 'Shake head',
 		description: 'clear disagreement',
-		source: { kind: 'procedural' },
+		execution: { kind: 'procedural' },
 		mode: 'oneshot',
 		category: 'disagreement',
 		cooldownMs: 8000,
@@ -173,7 +195,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'bow',
 		label: 'Bow',
 		description: 'greeting, thanks, or apology',
-		source: { kind: 'procedural' },
+		execution: { kind: 'procedural' },
 		mode: 'oneshot',
 		category: 'social',
 		cooldownMs: 12000,
@@ -184,7 +206,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'shrug',
 		label: 'Shrug',
 		description: 'uncertainty',
-		source: { kind: 'procedural' },
+		execution: { kind: 'procedural' },
 		mode: 'oneshot',
 		category: 'expressive',
 		cooldownMs: 10000,
@@ -194,8 +216,8 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'celebrate',
 		label: 'Celebrate',
 		description: 'strong success or excitement',
+		execution: { kind: 'vrma', url: '/animations/VRMA_07.vrma' },
 		// Medium confidence: symmetric arm pumps with knee dips, twice.
-		source: { kind: 'vrma', url: '/animations/VRMA_07.vrma' },
 		mode: 'oneshot',
 		category: 'celebration',
 		cooldownMs: 20000,
@@ -206,9 +228,9 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'dance',
 		label: 'Dance',
 		description: 'only when explicitly requested',
+		execution: { kind: 'vrma', url: '/animations/VRMA_05.vrma' },
 		// Medium-low confidence: full-body symmetric arm arcs with a turn.
 		// Alternate candidate VRMA_01 (sway with a turn).
-		source: { kind: 'vrma', url: '/animations/VRMA_05.vrma' },
 		mode: 'oneshot',
 		category: 'expressive',
 		cooldownMs: 30000,
@@ -220,7 +242,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'jump',
 		label: 'Jump',
 		description: 'only when explicitly requested or clearly appropriate',
-		source: { kind: 'world-motion' },
+		execution: { kind: 'jump' },
 		mode: 'oneshot',
 		category: 'movement',
 		cooldownMs: 15000,
@@ -231,7 +253,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'walk',
 		label: 'Walk',
 		description: 'only when the user asks you to move',
-		source: { kind: 'world-motion' },
+		execution: { kind: 'walk' },
 		mode: 'loop',
 		category: 'movement',
 		cooldownMs: 10000,
@@ -241,8 +263,8 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 	run: {
 		id: 'run',
 		label: 'Run',
-		description: 'only when the user asks you to run or move fast',
-		source: { kind: 'world-motion' },
+		description: 'only when the user asks you to run or hurry',
+		execution: { kind: 'walk' },
 		mode: 'loop',
 		category: 'movement',
 		cooldownMs: 10000,
@@ -253,7 +275,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'return_home',
 		label: 'Return home',
 		description: 'go back to the center of the room',
-		source: { kind: 'world-motion' },
+		execution: { kind: 'return_home' },
 		mode: 'oneshot',
 		category: 'movement',
 		cooldownMs: 8000,
@@ -264,7 +286,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'face_camera',
 		label: 'Face viewer',
 		description: 'turn to face the viewer',
-		source: { kind: 'world-motion' },
+		execution: { kind: 'face_camera' },
 		mode: 'oneshot',
 		category: 'movement',
 		cooldownMs: 8000,
@@ -274,8 +296,8 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 	turn: {
 		id: 'turn',
 		label: 'Turn',
-		description: 'turn in place (direction left, right, or back)',
-		source: { kind: 'world-motion' },
+		description: 'turn in place',
+		execution: { kind: 'turn' },
 		mode: 'oneshot',
 		category: 'movement',
 		cooldownMs: 8000,
@@ -285,8 +307,8 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 	goto: {
 		id: 'goto',
 		label: 'Go to',
-		description: 'go to a named place (center, chair, cushion)',
-		source: { kind: 'world-motion' },
+		description: 'go to a named place',
+		execution: { kind: 'goto' },
 		mode: 'oneshot',
 		category: 'movement',
 		cooldownMs: 10000,
@@ -297,7 +319,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'sit',
 		label: 'Sit down',
 		description: 'sit down in place until you stand',
-		source: { kind: 'procedural' },
+		execution: { kind: 'procedural' },
 		mode: 'loop',
 		category: 'movement',
 		cooldownMs: 8000,
@@ -308,7 +330,7 @@ export const AVATAR_ACTIONS: Record<AvatarActionName | LocomotionActionName, Ava
 		id: 'stand',
 		label: 'Stand up',
 		description: 'stand up from sitting',
-		source: { kind: 'procedural' },
+		execution: { kind: 'procedural' },
 		mode: 'oneshot',
 		category: 'movement',
 		cooldownMs: 5000,
@@ -365,7 +387,7 @@ export function resolveLegacyEmote(id: string): string | null {
 export function actionForAnimationUrl(url: string): AvatarActionDefinition | null {
 	for (const name of AVATAR_ACTION_NAMES) {
 		const def = AVATAR_ACTIONS[name];
-		if (def.source.kind === 'vrma' && def.source.url === url) return def;
+		if (def.execution.kind === 'vrma' && def.execution.url === url) return def;
 	}
 	return null;
 }

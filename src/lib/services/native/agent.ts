@@ -14,6 +14,7 @@
 // invoke('agent.cancel', {}) abandons the in-flight turn.
 // Every event carries the originating turn id; promises ignore events for
 // other turns (a cancelled turn id never resolves a bystander).
+import { HOST_EVENTS } from './host-events.ts';
 
 export interface ExecutedStep {
 	id: string;
@@ -79,17 +80,17 @@ export function parseAgentTurnEvent(event: string, data: unknown): AgentTurnEven
 	const d = data as Record<string, unknown> | null;
 	const turnId = typeof d?.turn_id === 'string' ? d.turn_id : null;
 	switch (event) {
-		case 'agent.text_delta':
+		case HOST_EVENTS.AGENT_TEXT_DELTA:
 			return typeof d?.delta === 'string' ? { kind: 'delta', delta: d.delta, turnId } : null;
-		case 'agent.tool_started':
+		case HOST_EVENTS.AGENT_TOOL_STARTED:
 			return typeof d?.id === 'string' && typeof d?.name === 'string'
 				? { kind: 'tool_started', id: d.id, name: d.name, turnId }
 				: null;
-		case 'agent.tool_finished':
+		case HOST_EVENTS.AGENT_TOOL_FINISHED:
 			return typeof d?.id === 'string' && typeof d?.name === 'string' && typeof d?.ok === 'boolean'
 				? { kind: 'tool_finished', id: d.id, name: d.name, ok: d.ok, turnId }
 				: null;
-		case 'agent.turn_done': {
+		case HOST_EVENTS.AGENT_DONE: {
 			if (typeof d?.text !== 'string') return null;
 			return {
 				kind: 'done',
@@ -102,7 +103,7 @@ export function parseAgentTurnEvent(event: string, data: unknown): AgentTurnEven
 				turnId
 			};
 		}
-		case 'agent.turn_suspended': {
+		case HOST_EVENTS.AGENT_SUSPENDED: {
 			if (typeof d?.text !== 'string' || typeof d?.request_id !== 'string') return null;
 			return {
 				kind: 'suspended',
@@ -114,13 +115,13 @@ export function parseAgentTurnEvent(event: string, data: unknown): AgentTurnEven
 				turnId
 			};
 		}
-		case 'agent.turn_failed':
+		case HOST_EVENTS.AGENT_FAILED:
 			return {
 				kind: 'failed',
 				error: typeof d?.error === 'string' ? d.error : 'unknown error',
 				turnId
 			};
-		case 'agent.turn_cancelled':
+		case HOST_EVENTS.AGENT_CANCELLED:
 			return { kind: 'cancelled', turnId };
 		default:
 			return null;

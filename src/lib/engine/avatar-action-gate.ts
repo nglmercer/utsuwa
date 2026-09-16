@@ -4,6 +4,7 @@
 // cooldowns, duplicate suppression, rate limits, busy/photo guards, and the
 // explicit-request requirement for large gestures (jump, dance, walk).
 import { AVATAR_ACTIONS, type GestureCue } from './avatar-actions.ts';
+import { gestureCueKey } from './avatar-action-key.ts';
 
 export type AvatarMotionState =
 	| 'idle'
@@ -61,20 +62,7 @@ export type GestureGateResult = { allowed: true } | { allowed: false; reason: Ge
 // animation cues (turn direction, goto anchor) include their parameter so
 // "turn left" never suppresses "turn right".
 export function gestureKey(cue: GestureCue): string {
-	switch (cue.type) {
-		case 'animation': {
-			let key = `animation:${cue.action}`;
-			if (cue.direction) key += `:${cue.direction}`;
-			if (cue.anchorId) key += `:${cue.anchorId}`;
-			return key;
-		}
-		case 'locomotion':
-			return `locomotion:${cue.action}:${cue.direction}`;
-		case 'reaction':
-			return `reaction:${cue.zone}`;
-		case 'emote':
-			return `emote:${cue.id}`;
-	}
+	return gestureCueKey(cue);
 }
 
 function duplicateWindowMs(cue: GestureCue): number {

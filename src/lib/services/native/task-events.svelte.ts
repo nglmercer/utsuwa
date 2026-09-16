@@ -1,6 +1,6 @@
 import { browser } from '$app/environment';
 import { chatHintStore } from '$lib/stores/chat-hint.svelte';
-import { HOST_EVENT, isHostEvent } from './bridge';
+import { subscribeHostEvents } from './host-events';
 import { parseTaskProgressEvent, toastMessageFor, truncateToast } from './task-events';
 
 // Background-task results surfacing: the host emits `task.step_completed`
@@ -9,19 +9,15 @@ import { parseTaskProgressEvent, toastMessageFor, truncateToast } from './task-e
 // background output sit in SQLite, visible only to drivers that poll.
 let attached = false;
 
-function onHostEvent(e: Event) {
-	if (!isHostEvent(e)) return;
-	const detail = (e as CustomEvent).detail;
-	if (!detail || typeof detail.event !== 'string') return;
-	const parsed = parseTaskProgressEvent(detail.event, detail.data);
-	if (!parsed) return;
-	const message = toastMessageFor(parsed);
-	if (!message) return;
-	chatHintStore.showHint(truncateToast(message));
-}
-
 export function attachTaskEventsListener() {
 	if (!browser || attached) return;
 	attached = true;
-	window.addEventListener(HOST_EVENT, onHostEvent);
+	subscribeHostEvents(
+		(event, data) => parseTaskProgressEvent(event, data),
+		(parsed) => {
+			const message = toastMessageFor(parsed);
+			if (!message) return;
+			chatHintStore.showHint(truncateToast(message));
+		}
+	);
 }

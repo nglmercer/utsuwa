@@ -1,5 +1,6 @@
 import { browser } from '$app/environment';
-import { getBridge, HOST_EVENT, isHostEvent } from './bridge';
+import { getBridge } from './bridge';
+import { HOST_EVENTS, subscribeHostEvents } from './host-events';
 
 export interface ScreenDisplay {
 	id: string;
@@ -225,15 +226,14 @@ export function clearEmergencyStop() {
 	return update('desktop.emergency_clear');
 }
 
-function onHostEvent(event: Event) {
-	if (!isHostEvent(event)) return;
-	const detail = (event as CustomEvent).detail;
-	if (detail?.event === 'desktop.share_screen.changed') void refreshScreenShareStatus();
-}
-
 export function attachScreenShareListener() {
 	if (!browser || attached) return;
 	attached = true;
-	window.addEventListener(HOST_EVENT, onHostEvent);
+	subscribeHostEvents(
+		(event) => (event === HOST_EVENTS.SCREEN_SHARE_CHANGED ? true : null),
+		() => {
+			void refreshScreenShareStatus();
+		}
+	);
 	void refreshScreenShareStatus();
 }

@@ -7,6 +7,15 @@ import { STAGE_BEHAVIORS, STAGE_INSTRUCTIONS } from '../engine/stages.ts';
 import { isProtectedChannel } from '../engine/facial-expressions.ts';
 import { aiAllowedActions, computeAvatarSpatial, WALK_MAX_RADIUS } from '../engine/avatar-actions.ts';
 import { DEFAULT_SCENE_ANCHORS, type SceneAnchor } from '../engine/scene-anchors.ts';
+import {
+	buildAvatarCatalogExtras,
+	buildAvatarOutputContract,
+	buildCameraOutputContract,
+	buildCameraRules,
+	buildCompletionRules,
+	buildExpressionOutputContract,
+	buildGestureRules
+} from './prompt-contract.ts';
 
 // Prompt context for building
 export interface PromptContext {
@@ -97,22 +106,19 @@ function buildAvatarCatalogLayer(ctx: PromptContext): string {
 		ctx.availableExpressions && ctx.availableExpressions.length > 0
 			? [...new Set(ctx.availableExpressions)].filter((name) => !isProtectedChannel(name))
 			: ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'neutral'];
-	// Locomotion and parameterized moves carry their own usage line below;
-	// everything else renders straight from the action registry.
+	// Locomotion and parameterized moves carry their own generated usage
+	// line below; everything else renders straight from the action registry.
 	const manual = new Set(['walk', 'run', 'turn', 'goto']);
 	const actions = aiAllowedActions()
 		.filter((def) => !manual.has(def.id))
 		.map((def) => `- ${def.id}: ${def.description}`)
 		.join('\n');
+	const extras = buildAvatarCatalogExtras(ctx.anchors ?? [...DEFAULT_SCENE_ANCHORS]).join('\n');
 	return `<avatar>
 Your 3D avatar's face can show: ${faces.join(', ')}.
 Your 3D avatar's body can perform these intentional actions:
 ${actions}
-- walk: only when the user asks you to move (direction left, right, forward, or back)
-- run: only when the user asks you to run or hurry (same directions, faster)
-- turn: turn in place (direction left, right, or back)
-- goto: go to a named place (anchor_id center, chair, or cushion)
-- reaction: flinch toward being touched (zone head, face, shoulder, torso, or hip)
+${extras}
 Walk directions are viewer-relative: forward means toward the viewer. After a walk she faces the viewer again on her own.
 Direct the face with expression_cue and the body with gesture_cue in your JSON block. Blinking, lip-sync, and jaw motion happen on their own — never name those presets.
 Most replies use no body gesture: gesture_cue defaults to null.
@@ -150,6 +156,61 @@ function buildAvatarStateLayer(ctx: PromptContext): string | null {
 	return `<avatar_state>\nShe is ${where}, ${facing}.${posture} Places she can go: ${places}.\n</avatar_state>`;
 }
 
+// Layers shared by every mode: reception, events, native tools, and the
+// avatar catalog/state. Mode builders add only their own system, character,
+// state, memory, and instruction layers around these.
+export function buildCommonPromptLayers(ctx: PromptContext): string[] {
+	return [
+		...(ctx.hasImages ? [buildBeingShownLayer()] : []),
+		buildEventLayer(ctx),
+		...(ctx.nativeRuntime ? [buildNativeAgentLayer()] : []),
+		buildAvatarCatalogLayer(ctx),
+		buildAvatarStateLayer(ctx)
+	].filter((layer): layer is string => layer !== null);
+}
+
+function formatPromptTime(ctx: PromptContext): { timeStr: string; dateStr: string } {
+	return {
+		timeStr: ctx.systemTime.toLocaleTimeString('en-US', {
+			hour: 'numeric',
+			minute: '2-digit',
+			hour12: true
+		}),
+		dateStr: ctx.systemTime.toLocaleDateString('en-US', {
+			weekday: 'long',
+			month: 'short',
+			day: 'numeric'
+		})
+	};
+}
+
+// Recent-turns and known-facts sections, shared by every mode's memory
+// layer. Dating Sim appends triggered memories and session recaps.
+function buildSharedMemorySections(
+	mem: PromptContext['memories'],
+	contextSize?: number
+): string[] {
+	const memoryBudget = getContextMemoryBudget(contextSize);
+	const sections: string[] = [];
+	if (mem.recentTurns.length > 0) {
+		const turnLimit = memoryBudget?.workingMemoryTurns ?? 6;
+		const recentChat = mem.recentTurns
+			.slice(-turnLimit)
+			.map((t) => `${t.role === 'user' ? 'They' : 'You'}: ${t.content}`)
+			.join('\n');
+		sections.push(`Recent conversation:\n${recentChat}`);
+	}
+	if (mem.relevantFacts.length > 0) {
+		const factLimit = memoryBudget?.relevantFacts ?? 5;
+		const factsText = mem.relevantFacts
+			.slice(0, factLimit)
+			.map((f) => `- ${f.content}`)
+			.join('\n');
+		sections.push(`Things you know about them:\n${factsText}`);
+	}
+	return sections;
+}
+
 // Build the complete system prompt
 export function buildSystemPrompt(context: PromptContext): string {
 	// Companion Mode - simplified prompt without relationship mechanics
@@ -161,11 +222,7 @@ export function buildSystemPrompt(context: PromptContext): string {
 		buildCharacterLayer(context),
 		buildStateLayer(context),
 		buildMemoryLayer(context),
-		...(context.hasImages ? [buildBeingShownLayer()] : []),
-		buildEventLayer(context),
-		...(context.nativeRuntime ? [buildNativeAgentLayer()] : []),
-		buildAvatarCatalogLayer(context),
-		buildAvatarStateLayer(context),
+		...buildCommonPromptLayers(context),
 		buildInstructionLayer(context)
 	].filter((layer): layer is string => layer !== null);
 
@@ -174,8 +231,7 @@ export function buildSystemPrompt(context: PromptContext): string {
 
 // Simplified prompt for Companion Mode
 function buildCompanionModePrompt(ctx: PromptContext): string {
-	const timeStr = ctx.systemTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
-	const dateStr = ctx.systemTime.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+	const { timeStr, dateStr } = formatPromptTime(ctx);
 	const mem = ctx.memories;
 
 	const parts: string[] = [];
@@ -209,34 +265,13 @@ Energy: ${energyDesc} (${ctx.state.energy}/100)
 </state>`);
 
 	// Memories
-	const memoryBudget = getContextMemoryBudget(ctx.contextSize);
-	const memorySections: string[] = [];
-	if (mem.recentTurns.length > 0) {
-		const turnLimit = memoryBudget?.workingMemoryTurns ?? 6;
-		const recentChat = mem.recentTurns
-			.slice(-turnLimit)
-			.map((t) => `${t.role === 'user' ? 'They' : 'You'}: ${t.content}`)
-			.join('\n');
-		memorySections.push(`Recent conversation:\n${recentChat}`);
-	}
-	if (mem.relevantFacts.length > 0) {
-		const factLimit = memoryBudget?.relevantFacts ?? 5;
-		const factsText = mem.relevantFacts.slice(0, factLimit).map((f) => `- ${f.content}`).join('\n');
-		memorySections.push(`Things you know about them:\n${factsText}`);
-	}
+	const memorySections = buildSharedMemorySections(mem, ctx.contextSize);
 
 	if (memorySections.length > 0) {
 		parts.push(`<memory>\n${memorySections.join('\n\n')}\n</memory>`);
 	}
 
-	if (ctx.hasImages) parts.push(buildBeingShownLayer());
-
-	const eventLayer = buildEventLayer(ctx);
-	if (eventLayer) parts.push(eventLayer);
-	if (ctx.nativeRuntime) parts.push(buildNativeAgentLayer());
-	parts.push(buildAvatarCatalogLayer(ctx));
-	const avatarState = buildAvatarStateLayer(ctx);
-	if (avatarState) parts.push(avatarState);
+	parts.push(...buildCommonPromptLayers(ctx));
 
 	// Simple instructions (no relationship mechanics)
 	parts.push(`<instructions>
@@ -250,9 +285,9 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "mood_change": { "emotion": "emotion_name", "intensity_delta": number },
   "energy_delta": number,
   "new_memory": null | "something specific worth remembering about them",
-  "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" },
-  "camera_cue": null | { "follow": true|false, "zoom": 0.5 to 2.5, "height": -0.5 to 0.5, "fov": 20 to 60, "reframe": true (re-center on her now) }
+  ${buildExpressionOutputContract()},
+  ${buildAvatarOutputContract(ctx.anchors)},
+  ${buildCameraOutputContract()}
 }
 \`\`\`
 
@@ -260,11 +295,11 @@ expression_cue is optional stage direction for your avatar's face: a brief flash
 
 gesture_cue is optional stage direction for your avatar's body: a named action performance, a short walk, or a physical startle or lean as if touched at that zone.
 
-BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, walk, run, turn, goto, sit, stand, or any position move only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
+${buildGestureRules()}
 
-CAMERA RULES: default to camera_cue null. Touch the camera only when the user explicitly asks about the view, framing, zoom, or following ("zoom in", "follow me", "stop following", "center the camera"). Set only the keys they asked about; never reframe or move the camera unprompted, and never fight framing they set themselves.
+${buildCameraRules()}
 
-COMPLETION HONESTY: never claim an action, task, message send, avatar routine, or external effect completed unless the runtime result confirms it. Your own text is never evidence. Do not say done, finished, moved, sent, or completed unless the corresponding receipt says completed.
+${buildCompletionRules()}
 
 Use new_memory whenever they reveal something about themselves: a preference, a plan, a feeling, someone in their life, or a moment you shared (like a photo they show you). Write it in third person about them (they/them, never assume gender), one short factual sentence stating only what they actually said. Never invent details. Use null only when nothing meaningful came up.
 
@@ -299,8 +334,7 @@ Never claim a tool operation succeeded unless the corresponding tool result conf
 
 // System layer - meta instructions
 function buildSystemLayer(ctx: PromptContext): string {
-	const timeStr = ctx.systemTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
-	const dateStr = ctx.systemTime.toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' });
+	const { timeStr, dateStr } = formatPromptTime(ctx);
 
 	return `<system>
 You are roleplaying as ${ctx.persona.name}, an AI companion in a dating sim style experience.
@@ -376,25 +410,7 @@ ${state.currentStreak > 1 ? `Current Streak: ${state.currentStreak} days` : ''}
 // Memory layer - what she remembers
 function buildMemoryLayer(ctx: PromptContext): string {
 	const mem = ctx.memories;
-	const memoryBudget = getContextMemoryBudget(ctx.contextSize);
-	let sections: string[] = [];
-
-	// Recent conversation
-	if (mem.recentTurns.length > 0) {
-		const turnLimit = memoryBudget?.workingMemoryTurns ?? 6;
-		const recentChat = mem.recentTurns
-			.slice(-turnLimit)
-			.map((t) => `${t.role === 'user' ? 'They' : 'You'}: ${t.content}`)
-			.join('\n');
-		sections.push(`Recent conversation:\n${recentChat}`);
-	}
-
-	// Relevant facts
-	if (mem.relevantFacts.length > 0) {
-		const factLimit = memoryBudget?.relevantFacts ?? 5;
-		const factsText = mem.relevantFacts.slice(0, factLimit).map((f) => `- ${f.content}`).join('\n');
-		sections.push(`Things you know about them:\n${factsText}`);
-	}
+	let sections: string[] = buildSharedMemorySections(mem, ctx.contextSize);
 
 	// Triggered memories
 	if (mem.triggeredMemories.length > 0) {
@@ -453,9 +469,9 @@ Shape:
   "intimacy_delta": -10 to 10,
   "comfort_delta": -10 to 10,
   "new_memory": null | "a fact about the user",
-  "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" },
-  "camera_cue": null | { "follow": true|false, "zoom": 0.5 to 2.5, "height": -0.5 to 0.5, "fov": 20 to 60, "reframe": true (re-center on her now) }
+  ${buildExpressionOutputContract()},
+  ${buildAvatarOutputContract()},
+  ${buildCameraOutputContract()}
 }
 
 The four *_delta values are small numbers for how this exchange moved the relationship: positive when they open up, share, or warm to the companion; near 0 for neutral chat; negative if it went badly. Usually between -3 and 5.
@@ -514,9 +530,9 @@ After your reply, ALWAYS end with a JSON block, even when little changed:
   "comfort_delta": number,
   "new_memory": null | "something specific worth remembering about them",
   "triggered_event": null | "event_id",
-  "expression_cue": null | { "expression": "happy|angry|sad|relaxed|surprised|neutral", "intensity": 0 to 1, "duration_ms": 500 to 6000 },
-  "gesture_cue": null | { "type": "animation", "action": "wave|nod|shake_head|bow|shrug|celebrate|dance|jump|return_home|face_camera|turn|goto|sit|stand", "direction": "left|right|back (turn only)", "anchor_id": "center|chair|cushion (goto/sit only)" } | { "type": "locomotion", "action": "walk|run", "direction": "left|right|forward|back", "duration_ms": 300 to 3000 } | { "type": "reaction", "zone": "head|face|shoulder|torso|hip" },
-  "camera_cue": null | { "follow": true|false, "zoom": 0.5 to 2.5, "height": -0.5 to 0.5, "fov": 20 to 60, "reframe": true (re-center on her now) }
+  ${buildExpressionOutputContract()},
+  ${buildAvatarOutputContract(ctx.anchors)},
+  ${buildCameraOutputContract()}
 }
 \`\`\`
 
@@ -524,11 +540,11 @@ expression_cue is optional stage direction for your avatar's face: a brief flash
 
 gesture_cue is optional stage direction for your avatar's body: a named action performance, a short walk, or a physical startle or lean as if touched at that zone.
 
-BODY GESTURE RULES: default to gesture_cue null. For ordinary conversation, acknowledgements, questions, thinking, waiting, tool use, and neutral replies, gesture_cue MUST be null. Never gesture just because you are speaking, thinking, waiting, or using a tool; never as filler; never repeat the same gesture in adjacent turns; never because mood changed. Nod only for meaningful agreement, wave mainly for greeting or goodbye, and jump, dance, walk, run, turn, goto, sit, stand, or any position move only when the user explicitly asks or the action itself is the interaction. If uncertain whether a gesture adds value, output null.
+${buildGestureRules()}
 
-CAMERA RULES: default to camera_cue null. Touch the camera only when the user explicitly asks about the view, framing, zoom, or following ("zoom in", "follow me", "stop following", "center the camera"). Set only the keys they asked about; never reframe or move the camera unprompted, and never fight framing they set themselves.
+${buildCameraRules()}
 
-COMPLETION HONESTY: never claim an action, task, message send, avatar routine, or external effect completed unless the runtime result confirms it. Your own text is never evidence. Do not say done, finished, moved, sent, or completed unless the corresponding receipt says completed.
+${buildCompletionRules()}
 
 Keep deltas small (-10 to +10 for most interactions). Use new_memory whenever they reveal something about themselves: a preference, a plan, a feeling, someone in their life, or a moment you shared (like a photo they show you). Write it in third person about them (they/them, never assume gender), one short factual sentence stating only what they actually said. Never invent details. Use null only when nothing meaningful came up.
 

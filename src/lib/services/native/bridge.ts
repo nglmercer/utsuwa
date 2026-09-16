@@ -58,5 +58,12 @@ export interface HostEventDetail {
 }
 
 export function isHostEvent(e: Event): e is CustomEvent<HostEventDetail> {
-	return e instanceof CustomEvent && typeof (e as CustomEvent).type === 'string';
+	if (!(e instanceof CustomEvent)) return false;
+	const detail = (e as CustomEvent).detail as HostEventDetail | null | undefined;
+	if (!detail || typeof detail !== 'object') return false;
+	if (typeof detail.event !== 'string') return false;
+	// The bridge always dispatches `data` as an object (`data || {}`); a
+	// foreign CustomEvent on the same channel carries anything, so reject it.
+	if (!detail.data || typeof detail.data !== 'object') return false;
+	return true;
 }

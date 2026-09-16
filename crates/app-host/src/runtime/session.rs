@@ -2,7 +2,7 @@
 use super::providers::read_autonomous_full_access;
 use super::{AgentRuntime, RuntimeError};
 use agent_core::ToolReplayCache;
-use ipc_core::HostEvent;
+use ipc_core::{events as host_events, HostEvent};
 use model_core::ModelMessage;
 use std::sync::{atomic::Ordering, Arc};
 
@@ -82,7 +82,7 @@ impl AgentRuntime {
         }
 
         (self.emit)(HostEvent {
-            event: "permission.dismissed".to_string(),
+            event: host_events::PERMISSION_DISMISSED.to_string(),
             data: serde_json::json!({
                 "id": request_id,
                 "reason": "autonomous_full_access",
@@ -270,7 +270,7 @@ impl AgentRuntime {
             None => serde_json::json!({}),
         };
         (self.emit)(HostEvent {
-            event: "agent.turn_cancelled".to_string(),
+            event: host_events::AGENT_CANCELLED.to_string(),
             data,
         });
     }

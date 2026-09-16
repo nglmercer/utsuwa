@@ -6,6 +6,7 @@
 // Events over the bridge:
 //   `task.step_completed` { task_id, step_id, title, text }
 //   `task.terminal` { task_id, title, status, text }
+import { HOST_EVENTS } from './host-events.ts';
 
 export interface TaskStepEvent {
 	kind: 'step';
@@ -31,7 +32,7 @@ export function parseTaskProgressEvent(
 	data: unknown
 ): TaskProgressEvent | null {
 	const d = data as Record<string, unknown> | null;
-	if (event === 'task.step_completed') {
+	if (event === HOST_EVENTS.TASK_STEP_COMPLETED) {
 		if (
 			typeof d?.task_id !== 'string' ||
 			typeof d?.step_id !== 'string' ||
@@ -42,7 +43,7 @@ export function parseTaskProgressEvent(
 		}
 		return { kind: 'step', taskId: d.task_id, stepId: d.step_id, title: d.title, text: d.text };
 	}
-	if (event === 'task.terminal') {
+	if (event === HOST_EVENTS.TASK_TERMINAL) {
 		if (
 			typeof d?.task_id !== 'string' ||
 			typeof d?.title !== 'string' ||

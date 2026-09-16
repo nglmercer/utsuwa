@@ -1,5 +1,6 @@
 import { browser } from '$app/environment';
-import { getBridge, HOST_EVENT, isHostEvent } from './bridge';
+import { getBridge } from './bridge';
+import { HOST_EVENTS, subscribeHostEvents } from './host-events';
 import {
 	parseActivityList,
 	type ActivityRecord
@@ -11,19 +12,17 @@ import {
 let records = $state<ActivityRecord[]>([]);
 let attached = false;
 
-function onHostEvent(e: Event) {
-	if (!isHostEvent(e)) return;
-	const detail = (e as CustomEvent).detail;
-	if (!detail || detail.event !== 'agent.turn_done') return;
-	// A finished turn executed tools: refresh the trail. Best-effort;
-	// the panel also refreshes on mount and on demand.
-	void refreshActivity();
-}
-
 export function attachActivityListener() {
 	if (!browser || attached) return;
 	attached = true;
-	window.addEventListener(HOST_EVENT, onHostEvent);
+	subscribeHostEvents(
+		(event) => (event === HOST_EVENTS.AGENT_DONE ? true : null),
+		() => {
+			// A finished turn executed tools: refresh the trail. Best-effort;
+			// the panel also refreshes on mount and on demand.
+			void refreshActivity();
+		}
+	);
 	void refreshActivity();
 }
 

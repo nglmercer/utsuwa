@@ -14,6 +14,8 @@
 //! `--debug`/`--trace` runs too (e.g. `RUST_LOG='app_host::ipc=warn'`
 //! silences per-request IPC spam while keeping everything else verbose).
 
+mod bootstrap;
+
 use app_host::{
     ipc::{emit_script, Dispatcher},
     protocol::{self, AssetServer},
@@ -21,13 +23,11 @@ use app_host::{
     AppHostConfig, FrontendSource,
 };
 use ipc_core::HostEvent;
-use policy_core::ApprovalQueue;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(target_os = "linux"))]
 use std::sync::mpsc::Receiver;
-use std::sync::{mpsc::Sender, Arc, Mutex};
-use tool_sdk::ToolPack as _;
+use std::sync::{mpsc::Sender, Arc};
 use wry::{PermissionKind, PermissionResponse, WebViewBuilder};
 
 #[cfg(not(target_os = "linux"))]
@@ -918,198 +918,40 @@ fn run_winit(
     }
 }
 
-/// Shared host startup: storage, audit, approvals, dispatcher, and the
-/// agent runtime. The UI runner (GTK or winit) takes over afterwards.
+/// Shared host startup: services, dispatcher, the agent runtime, and the
+/// durable task authority. Details live in `bootstrap/`; the UI runner
+/// (GTK or winit) takes over afterwards.
 fn start_host(emit: EmitFn, dev_grant_workspace: bool) -> Dispatcher {
     tracing::debug!("host.boot.begin");
     let boot_started = std::time::Instant::now();
-    // SQLite state: settings KV + persistent grants. A host without
-    // storage still runs — approvals go in-memory and every launch
-    // re-prompts (fail-closed for authority, open for availability).
-    let storage = match storage_core::Storage::open(&storage_core::default_db_path("utsuwa")) {
-        Ok(store) => Some(Arc::new(Mutex::new(store))),
-        Err(err) => {
-            tracing::error!(%err, "failed to open state.db; running without storage");
-            None
-        }
-    };
-    // Shared audit sink (plan Phase 35): the permission queue and the
-    // agent runtime both record here; the Activity panel reads it back
-    // over `activity.list`. Bounded in memory; durable storage is later.
-    let audit = Arc::new(audit_core::InMemorySink::new());
-    // The live permission kernel state: agent turns submit here, the
-    // dialog resolves here, resumed turns read grants from here.
-    let approvals = Arc::new(Mutex::new(match &storage {
-        Some(store) => {
-            let seed = match store.lock().expect("storage lock").load_grants() {
-                Ok(rows) => rows.into_iter().map(|row| row.grant).collect(),
-                Err(err) => {
-                    tracing::error!(%err, "failed to load persistent grants; starting empty");
-                    Vec::new()
-                }
-            };
-            ApprovalQueue::new()
-                .with_grants(seed)
-                .on_persistent_grant(storage_core::persistent_grant_hook(Arc::clone(store)))
-                .with_sink(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>)
-        }
-        None => {
-            ApprovalQueue::new().with_sink(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>)
-        }
-    }));
-    if dev_grant_workspace {
-        match std::env::current_dir().and_then(|path| path.canonicalize()) {
-            Ok(workspace) => {
-                let is_secret_root = policy_core::is_secret_path(&capability_core::Resource::Path(
-                    workspace.clone(),
-                ));
-                let is_home = std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .and_then(|home| std::path::PathBuf::from(home).canonicalize().ok())
-                    .is_some_and(|home| home == workspace);
-                if !is_secret_root && !is_home {
-                    if let Ok(queue) = approvals.lock() {
-                        if let Err(err) = queue.grant_direct(
-                            capability_core::PrincipalKind::Agent,
-                            capability_core::Capability::FilesystemRead,
-                            capability_core::ResourceScope::new(vec![
-                                capability_core::Resource::Path(workspace.clone()),
-                            ]),
-                            policy_core::GrantLifetime::Session,
-                            format!("developer workspace grant for {}", workspace.display()),
-                        ) {
-                            tracing::error!(%err, "could not install developer workspace grant");
-                        }
-                    }
-                } else {
-                    tracing::warn!(path = %workspace.display(), "refusing developer grant for home or secret root");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(%err, "cannot resolve current directory for developer grant")
-            }
-        }
-    }
+    let services = bootstrap::services::open_host_services(dev_grant_workspace);
     let version = env!("CARGO_PKG_VERSION").to_string();
-    let secrets = secret_core::system("utsuwa");
-    // Host-owned sensor hub: privacy indicators stay authoritative even if
-    // the agent runtime below fails to initialize (degraded mode). The
-    // runtime constructor attaches event publication on success; attach here
-    // only for the degraded path so events are never duplicated.
-    let sensors = Arc::new(app_host::runtime::SensorActivityHub::new());
     let mut dispatcher = Dispatcher::new(version)
-        .with_approvals(Arc::clone(&approvals))
-        .with_audit(Arc::clone(&audit))
-        .with_sensors(Arc::clone(&sensors))
-        .with_secret_store(Arc::clone(&secrets));
-    // Cloned (not moved) so the task agent backend below can snapshot the
-    // same standing grants for its step-scoped authorizer.
-    let task_approvals = Arc::clone(&approvals);
-    // One model gate for the process: interactive chat turns and background
-    // task-agent turns serialize here (interactive first) instead of
-    // contending for provider rate limits.
-    let model_gate = Arc::new(app_host::runtime::model_gate::ModelExecutionGate::new());
-    let runtime = match app_host::runtime::AgentRuntime::start_with_secrets_and_sensors(
-        approvals,
-        storage.clone(),
-        Some(Arc::clone(&audit) as Arc<dyn audit_core::AuditSink>),
-        Arc::clone(&emit),
-        Arc::clone(&secrets),
-        Arc::clone(&sensors),
-    ) {
-        Ok(runtime) => Some(runtime),
-        Err(err) => {
-            tracing::error!(%err, "agent runtime unavailable; agent.* methods will fail");
-            sensors.attach_event_publisher(&emit);
-            None
-        }
-    };
-    let audio_activity = sensors.microphone();
+        .with_approvals(Arc::clone(&services.approvals))
+        .with_audit(Arc::clone(&services.audit))
+        .with_sensors(Arc::clone(&services.sensors))
+        .with_secret_store(Arc::clone(&services.secrets));
+    let runtime = bootstrap::agent::start_agent_runtime(&services, &emit);
+    let audio_activity = services.sensors.microphone();
     let audio_manager = Arc::new(app_host::audio::AudioCaptureManager::new(
         dispatcher.media_registry(),
         Arc::clone(&emit),
         audio_activity,
     ));
     dispatcher = dispatcher.with_audio_capture(audio_manager);
-    if let Some(store) = &storage {
+    if let Some(store) = &services.storage {
         dispatcher = dispatcher.with_storage(Arc::clone(store));
     }
     // Durable task authority (tasks.db beside state.db): Rust owns
     // WHAT/WHEN/whether-it-succeeded; the renderer only produces receipts.
-    // Focused registry: read-only system facts + notifications. Privileged
-    // tools arrive through the task-review approval-ticket flow. Agent steps
-    // run bounded turns on the configured provider via TaskAgentBackend.
-    let task_host = {
-        let tasks_path = storage_core::default_state_dir("utsuwa").join("tasks.db");
-        let mut registry = tool_core::ToolRegistry::new();
-        let load_ctx = tool_sdk::ToolLoadContext::default();
-        let system_pack =
-            app_host::tooling::SystemToolPack::new(host_core::HostEnvironment::snapshot());
-        for tool in system_pack
-            .tools(&load_ctx)
-            .into_iter()
-            .chain(tool_notification::NotificationToolPack.tools(&load_ctx))
-        {
-            if let Err(err) = registry.register(tool) {
-                tracing::warn!(%err, "task registry: skipping duplicate tool");
-            }
-        }
-        let registry = Arc::new(registry);
-        let services = Arc::new(task_host::HostServices::new(Arc::clone(&registry)));
-        let providers = app_host::runtime::providers::provider_factory_with_secrets(
-            storage.clone(),
-            Arc::clone(&secrets),
-        );
-        let agent_backend = Arc::new(app_host::runtime::task_agent::TaskAgentBackend::new(
-            providers,
-            registry,
-            task_approvals,
-            Arc::clone(&emit),
-            Arc::clone(&services),
-        ));
-        agent_backend.set_model_gate(Arc::clone(&model_gate));
-        match task_host::TaskHost::open_with_services(
-            &tasks_path,
-            services,
-            Arc::clone(&emit),
-            Some(agent_backend),
-        ) {
-            Ok(host) => Some(Arc::new(host)),
-            Err(err) => {
-                tracing::error!(%err, "failed to open tasks.db; task.* methods will fail");
-                None
-            }
-        }
-    };
+    let task_host = bootstrap::tasks::build_task_host(&services, &emit);
     if let Some(tasks) = &task_host {
         dispatcher = dispatcher.with_tasks(Arc::clone(tasks));
     }
     if let Some(runtime) = runtime {
-        // MCP Bearer [REDACTED] resolve from the same keychain-backed store.
-        runtime.set_secret_store(Arc::clone(&secrets));
-        runtime.set_model_gate(Arc::clone(&model_gate));
-        // Durable memory beside state.db; an unopenable file falls
-        // back to the runtime's isolated in-memory store (logged).
-        let memory_path = storage_core::default_state_dir("utsuwa").join("memory.db");
-        match memory::MemoryStore::open(&memory_path) {
-            Ok(store) => runtime.set_memory_store(Arc::new(store)),
-            Err(err) => {
-                tracing::error!(%err, "failed to open memory.db; using in-memory memory")
-            }
-        }
-        // Background task tick (the single scheduling authority) plus the
-        // worker pool that executes dispatched tasks off the tick path.
-        // Without the agent executor (degraded mode) neither runs and
-        // mutating task.* IPC calls fall back to one inline tick each.
+        bootstrap::agent::configure_runtime(&runtime, &services, &task_host);
         if let Some(tasks) = task_host {
-            runtime.executor_handle().spawn(task_host::run_tick_loop(
-                Arc::clone(&tasks),
-                std::time::Duration::from_secs(2),
-            ));
-            runtime.executor_handle().spawn(task_host::run_worker_pool(
-                tasks,
-                task_host::WorkerConfig::default(),
-            ));
+            bootstrap::tasks::install_task_workers(&runtime, tasks);
         }
         dispatcher = dispatcher.with_agent(runtime);
     }

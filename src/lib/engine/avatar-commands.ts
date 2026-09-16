@@ -3,13 +3,14 @@
 // segment becomes a step, never just the first match. Pure and node-safe.
 // English plus compact Japanese; word-boundaried to avoid "jumper"/"dancer".
 import {
-	AVATAR_ACTIONS,
+	clampWalkDuration,
 	type AvatarActionName,
 	type AvatarRoutineStep,
 	type LocomotionActionName,
 	type LocomotionDirection,
 	type TurnDirection
 } from './avatar-actions.ts';
+import { actionToRoutineStep } from './avatar-action-runtime.ts';
 import { resolveSceneAnchor } from './scene-anchors.ts';
 
 export interface AvatarCommandPlan {
@@ -20,9 +21,14 @@ export interface AvatarCommandPlan {
 	remainingText?: string;
 }
 
-export const WALK_DURATION_MIN_MS = 300;
-export const WALK_DURATION_MAX_MS = 3000;
-export const WALK_DURATION_DEFAULT_MS = 1200;
+// Walk-duration bounds live in avatar-actions.ts; re-exported here so
+// existing importers keep working.
+export {
+	WALK_DURATION_MIN_MS,
+	WALK_DURATION_MAX_MS,
+	WALK_DURATION_DEFAULT_MS,
+	clampWalkDuration
+} from './avatar-actions.ts';
 const MAX_PLAN_STEPS = 8;
 
 // Split sequential commands: "walk left then right", "jump, wave", "nod. bow".
@@ -36,32 +42,16 @@ const DURATION_RE = /(\d+)\s*(seconds?|secs?|s|秒)\b/i;
 const LOCOMOTION_VERB_RE = /\bwalk\b|\brun\b|\bmove\b|\bgo\b|歩|走/;
 
 function actionStep(action: AvatarActionName): AvatarRoutineStep {
-	const def = AVATAR_ACTIONS[action];
-	if (def.source.kind === 'vrma') {
-		return { kind: 'emote', action, url: def.source.url };
-	}
-	if (action === 'jump') return { kind: 'jump', action };
-	if (action === 'return_home') return { kind: 'return_home', action };
-	if (action === 'face_camera') return { kind: 'face_camera', action };
-	if (action === 'sit' || action === 'stand') return { kind: 'procedural', action };
-	return { kind: 'procedural', action };
+	// Verb-table actions are never parameterized gotos, so this is total.
+	return actionToRoutineStep(action) as AvatarRoutineStep;
 }
 
 function locomotionStep(
 	direction: LocomotionDirection,
 	action: LocomotionActionName = 'walk'
 ): (durationMs?: number) => AvatarRoutineStep {
-	return (durationMs?: number) => ({
-		kind: 'walk',
-		action,
-		direction,
-		durationMs: clampWalkDuration(durationMs ?? WALK_DURATION_DEFAULT_MS)
-	});
-}
-
-export function clampWalkDuration(durationMs: number): number {
-	if (!Number.isFinite(durationMs)) return WALK_DURATION_DEFAULT_MS;
-	return Math.min(WALK_DURATION_MAX_MS, Math.max(WALK_DURATION_MIN_MS, Math.round(durationMs)));
+	return (durationMs?: number) =>
+		actionToRoutineStep(action, { direction, durationMs }) as AvatarRoutineStep;
 }
 
 const WALK_DIRS: Array<{ re: RegExp; direction: LocomotionDirection; notIf?: RegExp }> = [
@@ -154,7 +144,7 @@ function parseSegment(
 	if (gotoMarker && gotoMarker.index !== undefined) {
 		const label = text.slice(gotoMarker.index + gotoMarker[0].length).trim();
 		const anchor = label ? resolveSceneAnchor(label) : null;
-		if (anchor) return { kind: 'goto', action: 'goto', anchorId: anchor.id };
+		if (anchor) return actionToRoutineStep('goto', { anchorId: anchor.id }) as AvatarRoutineStep;
 		// "Go to the left" walks left; "go to mars" is not a walk at all.
 		const bare = label.replace(/^(the|a)\s+/, '').trim();
 		if (
@@ -179,7 +169,7 @@ function parseSegment(
 				return locomotionStep('forward')(parseDurationMs(text));
 			}
 			const anchor = label ? resolveSceneAnchor(label) : null;
-			if (anchor) return { kind: 'goto', action: 'goto', anchorId: anchor.id };
+			if (anchor) return actionToRoutineStep('goto', { anchorId: anchor.id }) as AvatarRoutineStep;
 			return null;
 		}
 	}
@@ -192,19 +182,21 @@ function parseSegment(
 			const anchor = resolveSceneAnchor(label);
 			if (anchor) {
 				return [
-					{ kind: 'goto', action: 'goto', anchorId: anchor.id },
-					{ kind: 'procedural', action: 'sit', anchorId: anchor.id }
+					actionToRoutineStep('goto', { anchorId: anchor.id }) as AvatarRoutineStep,
+					actionToRoutineStep('sit', { anchorId: anchor.id }) as AvatarRoutineStep
 				];
 			}
 		}
-		return { kind: 'procedural', action: 'sit' };
+		return actionToRoutineStep('sit') as AvatarRoutineStep;
 	}
-	if (/\bstand\b|立/.test(text)) return { kind: 'procedural', action: 'stand' };
+	if (/\bstand\b|立/.test(text)) return actionToRoutineStep('stand') as AvatarRoutineStep;
 
-	if (RETURN_HOME_RE.test(text)) return { kind: 'return_home', action: 'return_home' };
-	if (FACE_CAMERA_RE.test(text)) return { kind: 'face_camera', action: 'face_camera' };
+	if (RETURN_HOME_RE.test(text)) return actionToRoutineStep('return_home') as AvatarRoutineStep;
+	if (FACE_CAMERA_RE.test(text)) return actionToRoutineStep('face_camera') as AvatarRoutineStep;
 	if (/\bturn\b|\bspin\b|回って/.test(text)) {
-		return { kind: 'turn', action: 'turn', direction: findTurnDirection(text) ?? 'back' };
+		return actionToRoutineStep('turn', {
+			direction: findTurnDirection(text) ?? 'back'
+		}) as AvatarRoutineStep;
 	}
 
 	// Walk/run accept a bare verb ("walk" steps forward); move/go are too

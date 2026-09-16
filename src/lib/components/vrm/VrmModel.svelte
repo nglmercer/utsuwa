@@ -2,46 +2,36 @@
 	import { T, useThrelte, useTask } from '@threlte/core';
 	import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 	import { VRMLoaderPlugin, VRMUtils, type VRM } from '@pixiv/three-vrm';
-	import { createVRMAnimationClip } from '@pixiv/three-vrm-animation';
-	import { loadVrmAnimation } from '$lib/services/vrm-animations';
 	import { vrmStore } from '$lib/stores/vrm.svelte';
 	import { ttsStore } from '$lib/stores/tts.svelte';
 	import { displayStore } from '$lib/stores/display.svelte';
 	import { photomodeStore } from '$lib/stores/photomode.svelte';
-	import { loadPoseAnimation, loadPoseManifest } from '$lib/services/poses';
-	import { pickReaction, stageTier, type TouchZone } from '$lib/engine/photo-reactions';
 	import { characterStore } from '$lib/stores/character.svelte';
 	import {
-		approachWeight,
-		blendTemporaryFace,
-		directTemporaryTarget,
-		emptyWeights,
-		moodToExpressionWeights,
-		reactionEnvelope,
-		resolveTargets
-	} from '$lib/engine/facial-expressions';
-	import {
-		actionForAnimationUrl,
-		clampWalkOffset,
-		computeSitOffsetY,
-		DEFAULT_SEAT_HEIGHT,
-		expressionForAnimationUrl,
-		GOTO_ARRIVE_DIST,
+		clampWalkDuration,
 		GOTO_SPEED_MPS,
-		jumpArcHeight,
-		RUN_SPEED_MPS,
-		RUN_STEP_HZ,
 		shortAngleDelta,
 		TURN_ARRIVE_RAD,
-		TURN_SPEED_RPS,
-		turnTargetYaw,
-		WALK_MAX_RADIUS,
-		WALK_SPEED_MPS,
-		WALK_STEP_HZ,
+		WALK_DURATION_DEFAULT_MS,
 		yawToFacePoint
 	} from '$lib/engine/avatar-actions';
-	import { resolveSceneAnchor } from '$lib/engine/scene-anchors';
-	import { WALK_DURATION_DEFAULT_MS, clampWalkDuration } from '$lib/engine/avatar-commands';
+	import {
+		JUMP_DURATION,
+		MotionController,
+		resolveGotoTarget,
+		type MotionRoot
+	} from '$lib/avatar/motion-controller';
+	import {
+		createRoutineController,
+		type RoutineStepInput
+	} from '$lib/avatar/routine-controller';
+	import { PROCEDURAL_DURATIONS } from '$lib/avatar/procedural-pose-controller';
+	import type { PoseHumanoid } from '$lib/avatar/procedural-pose-controller';
+	import { AnimationController } from '$lib/avatar/animation-controller';
+	import {
+		ExpressionController,
+		type ExpressionHumanoid
+	} from '$lib/avatar/expression-controller';
 	import {
 		computeSpringJointParams,
 		clampFrameDelta,
@@ -55,7 +45,6 @@
 		type CameraAngles
 	} from '$lib/engine/camera-impulse';
 	import { lipSyncAnalyzer } from '$lib/services/lipsync/analyzer';
-	import { routineStepKey } from '$lib/tasks/host-avatar';
 	import { untrack } from 'svelte';
 	import * as THREE from 'three';
 
@@ -80,24 +69,6 @@
 		}
 	} as const;
 
-	// Smoothing speed for mood-face weights (exponential approach; ~6 reaches
-	// ~99% of a new target in under a second, frame-rate independent).
-	const MOOD_FACE_SPEED = 6;
-
-	// Best-effort expression write: presets were resolved against the model's
-	// snapshot, so a throw only happens on a mid-frame model swap.
-	function safeSetFace(
-		manager: { setValue: (name: string, value: number) => void } | null | undefined,
-		name: string,
-		value: number
-	) {
-		if (!manager) return;
-		try {
-			manager.setValue(name, value);
-		} catch {
-			// Unknown preset on this model; resolution already skipped it.
-		}
-	}
 
 	interface Props {
 		url: string;
@@ -149,23 +120,9 @@
 		}
 	});
 
-	// === Animation State ===
-	let mixer = $state<THREE.AnimationMixer | null>(null);
-	let idleAction = $state<THREE.AnimationAction | null>(null); // Current idle animation
-	let talkingAction = $state<THREE.AnimationAction | null>(null); // Looping talking animation
-	let talkingClip = $state<THREE.AnimationClip | null>(null); // Cached talking clip
-	let emoteAction = $state<THREE.AnimationAction | null>(null); // One-shot emote animations
-	let isEmotePlaying = $state(false); // True when an emote is playing (disables blinking)
-	let lastIdleIndex = $state(-1); // Track last played idle to avoid repeats
 	const currentAnimation = $derived(vrmStore.currentAnimation);
 	// Talking animation plays when TTS is speaking OR when text-based talking is triggered
 	const shouldTalk = $derived(ttsStore.isSpeaking || vrmStore.isTalking);
-
-	// === Blinking State ===
-	let blinkTimer = $state(0);
-	let nextBlinkTime = $state(Math.random() * 4 + 2); // 2-6 seconds
-	let isBlinking = $state(false);
-	let blinkProgress = $state(0);
 
 	// === Breathing State ===
 	let breathTime = $state(0);
@@ -257,456 +214,85 @@
 		}
 	}
 
-	// Pick a random idle animation index, excluding the last played one
-	function pickRandomIdleIndex(): number {
-		const urls = vrmStore.idleAnimationUrls;
-		if (urls.length <= 1) return 0;
 
-		let newIndex: number;
-		do {
-			newIndex = Math.floor(Math.random() * urls.length);
-		} while (newIndex === lastIdleIndex);
 
-		return newIndex;
-	}
-
-	// Idle animation cycling timer
-	let idleCycleTimeout: ReturnType<typeof setTimeout> | null = null;
-
-	// Load and start the looping idle animation
-	function startIdleAnimation(targetVrm: VRM, targetMixer: THREE.AnimationMixer) {
-		const urls = vrmStore.idleAnimationUrls;
-		if (!urls || urls.length === 0) return;
-
-		const index = pickRandomIdleIndex();
-		lastIdleIndex = index;
-		const idleUrl = urls[index];
-
-		loadVrmAnimation(idleUrl)
-			.then((vrmAnimation) => {
-				// Model was swapped or unmounted while this animation loaded
-				if (mixer !== targetMixer) return;
-
-				const clip = createVRMAnimationClip(vrmAnimation, targetVrm);
-				const action = targetMixer.clipAction(clip);
-				action.setLoop(THREE.LoopRepeat, Infinity);
-				action.play();
-				// A model that finishes loading while photo mode is already open
-				// holds its stance instead of idling through the shot
-				if (photomodeStore.active) action.paused = true;
-				idleAction = action;
-
-				// Schedule next animation change
-				scheduleIdleCycle(targetVrm, targetMixer, clip.duration);
-			})
-			.catch((error) => {
-				console.error('Error loading idle animation:', error);
-			});
-	}
-
-	// Schedule the next idle animation switch
-	function scheduleIdleCycle(targetVrm: VRM, targetMixer: THREE.AnimationMixer, duration: number) {
-		if (idleCycleTimeout) {
-			clearTimeout(idleCycleTimeout);
-		}
-		// Switch after 1-2 full loops of the current animation
-		const loops = 1 + Math.random();
-		const delay = duration * loops * 1000;
-		idleCycleTimeout = setTimeout(() => {
-			if (!shouldTalk && !isEmotePlaying && !photomodeStore.active) {
-				playNextIdleAnimation(targetVrm, targetMixer);
-			} else {
-				// Retry later if we're busy (talking, emoting, or posing for a photo)
-				scheduleIdleCycle(targetVrm, targetMixer, duration);
-			}
-		}, delay);
-	}
-
-	// Play the next random idle animation with smooth crossfade
-	function playNextIdleAnimation(targetVrm: VRM, targetMixer: THREE.AnimationMixer) {
-		const urls = vrmStore.idleAnimationUrls;
-		if (!urls || urls.length === 0) return;
-
-		const index = pickRandomIdleIndex();
-		lastIdleIndex = index;
-		const idleUrl = urls[index];
-
-		loadVrmAnimation(idleUrl)
-			.then((vrmAnimation) => {
-				// Model was swapped or unmounted while this animation loaded
-				if (mixer !== targetMixer) return;
-
-				// Fade out current idle
-				if (idleAction) {
-					idleAction.fadeOut(1.2);
-				}
-
-				const clip = createVRMAnimationClip(vrmAnimation, targetVrm);
-				const action = targetMixer.clipAction(clip);
-				action.setLoop(THREE.LoopRepeat, Infinity);
-				action.reset().fadeIn(1.2).play();
-				idleAction = action;
-
-				// Schedule next change
-				scheduleIdleCycle(targetVrm, targetMixer, clip.duration);
-			})
-			.catch((error) => {
-				console.error('Error loading idle animation:', error);
-			});
-	}
-
-	// Load the talking animation clip (called once after model loads)
-	function loadTalkingAnimation(targetVrm: VRM, targetMixer: THREE.AnimationMixer) {
-		const talkingUrl = vrmStore.talkingAnimationUrl;
-		if (!talkingUrl) return;
-
-		loadVrmAnimation(talkingUrl)
-			.then((vrmAnimation) => {
-				// Model was swapped or unmounted while this animation loaded
-				if (mixer !== targetMixer) return;
-
-				talkingClip = createVRMAnimationClip(vrmAnimation, targetVrm);
-			})
-			.catch((error) => {
-				console.error('Error loading talking animation:', error);
-			});
-	}
-
-	// === Photo mode ===
-	// A held pose is a single-frame clip: play, pause at t=0, and let the weight
-	// crossfade do the transition. vrm.update() keeps running in the render task,
-	// so spring bones and blinking stay alive while posed.
-	let poseAction: THREE.AnimationAction | null = null;
-	// Rapid pose taps race their async loads; only the latest application wins.
-	let poseToken = 0;
-	// Clips are per-model; caching them means repeat selections reuse the same
-	// mixer action instead of accumulating new clips. Cleared on model switch.
-	const poseClipCache = new Map<string, THREE.AnimationClip>();
-
-	async function applyPhotoPose(poseId: string | null) {
-		const targetVrm = vrm;
-		const targetMixer = mixer;
-		if (!targetVrm || !targetMixer) return;
-		const token = ++poseToken;
-
-		// A slower fade reads as easing into the pose rather than a hard cut
-		const POSE_FADE = 0.6;
-
-		if (poseId === null) {
-			// Natural: fade any pose out and hold the idle stance
-			if (poseAction) {
-				poseAction.fadeOut(POSE_FADE);
-				poseAction = null;
-			}
-			if (idleAction) {
-				idleAction.reset().fadeIn(POSE_FADE).play();
-				idleAction.paused = true;
-			}
-			return;
-		}
-
-		const manifest = await loadPoseManifest();
-		const entry = manifest.find((p) => p.id === poseId);
-		if (!entry) return;
-
-		try {
-			const animation = await loadPoseAnimation(entry.file);
-			// Model swapped or a newer pose was requested while this one loaded
-			if (mixer !== targetMixer || token !== poseToken) return;
-			if (!photomodeStore.active) return;
-
-			let clip = poseClipCache.get(poseId);
-			if (!clip) {
-				clip = createVRMAnimationClip(animation, targetVrm);
-				poseClipCache.set(poseId, clip);
-			}
-			const previous = poseAction ?? idleAction;
-			if (previous) previous.fadeOut(POSE_FADE);
-
-			const action = targetMixer.clipAction(clip);
-			action.reset();
-			action.setLoop(THREE.LoopOnce, 1);
-			action.clampWhenFinished = true;
-			action.fadeIn(POSE_FADE).play();
-			// Freeze at the clip's expressive moment (manifest hold, fraction of
-			// duration). Frame zero is a neutral stance on most motion clips, which
-			// made every placeholder pose look identical.
-			action.paused = true;
-			action.time = clip.duration * Math.min(Math.max(entry.hold ?? 0, 0), 0.99);
-			poseAction = action;
-		} catch (e) {
-			console.error('[PhotoMode] Failed to apply pose:', e);
-		}
-	}
-
-	// Enter/exit lifecycle: freeze the current stance on the way in, and re-run
-	// the normal idle start path on the way out so cycling resumes cleanly.
-	let wasPhotoActive = false;
+	// Photo enter/exit: the animation controller freezes the stance on the
+	// way in and hands back to the idle cycler on the way out. Entering
+	// also cancels any routine — a posed avatar must not keep dancing.
 	$effect(() => {
 		const active = photomodeStore.active;
 		untrack(() => {
-			const targetVrm = vrm;
-			const targetMixer = mixer;
-			if (!targetVrm || !targetMixer) {
-				wasPhotoActive = active;
-				return;
-			}
-			if (active && !wasPhotoActive) {
-				cancelRoutine('photo-mode');
-				if (talkingAction) talkingAction.fadeOut(0.2);
-				if (idleAction) {
-					// Ensure the idle actually holds weight (entering mid-talk left it
-					// faded out), then freeze it as the held stance.
-					idleAction.play();
-					idleAction.fadeIn(0.2);
-					idleAction.paused = true;
-				}
-			} else if (!active && wasPhotoActive) {
-				if (poseAction) {
-					poseAction.fadeOut(0.6);
-					poseAction = null;
-				}
-				// Resume the frozen idle so the crossfade has live motion to blend
-				// from, then hand back to the cycler, which fades it out against a
-				// fresh idle clip and reschedules cycling. Starting a second idle at
-				// full weight here (the old path) blended two idles at once and made
-				// the resumed animation drift strangely. When TTS is still speaking,
-				// the talking-switch effect fades the talking action back in instead;
-				// starting an idle at the same time would blend both at half weight.
-				if (idleAction) idleAction.paused = false;
-				if (!shouldTalk) {
-					playNextIdleAnimation(targetVrm, targetMixer);
-				}
-			}
-			wasPhotoActive = active;
+			const transition = animation.setPhotoActive(active);
+			if (transition === 'entered') cancelRoutine('photo-mode');
 		});
 	});
 
-	// Apply pose selections while photo mode is active
+	// Apply pose selections while photo mode is active.
 	$effect(() => {
 		const active = photomodeStore.active;
 		const poseId = photomodeStore.selectedPoseId;
 		if (!active) return;
 		untrack(() => {
-			// Entering starts on Natural, which the enter lifecycle already froze,
-			// but the token still bumps so an in-flight pose load can't land stale
-			if (poseId === null && !poseAction) {
-				poseToken++;
-				return;
-			}
-			applyPhotoPose(poseId);
+			void animation.applyPose(poseId);
 		});
 	});
 
-	// Held photo expression: applied exclusively, cleared on change and exit.
-	// Tap reactions layer a transient expression on top and restore this one.
-	let heldExpression: string | null = null;
+	// Held photo expression: applied exclusively, cleared on change and
+	// exit. Tap reactions layer a transient expression on top and restore it.
 	$effect(() => {
 		const active = photomodeStore.active;
 		const name = photomodeStore.selectedExpression;
 		untrack(() => {
-			const em = vrm?.expressionManager;
-			if (!em) return;
-			if (heldExpression && heldExpression !== name) {
-				em.setValue(heldExpression, 0);
-				heldExpression = null;
-			}
-			if (active && name) {
-				em.setValue(name, 1);
-				heldExpression = name;
-			}
+			expression.setPhotoExpression(active, name);
 		});
 	});
 
-	// Tap reactions: an expression flash plus a decaying rotation nudge whose
-	// motion the spring bones inherit. Repeat taps inside the window escalate.
-	// Pulses overlap instead of replacing each other (replacement snapped the
-	// active nudge to zero, which read as a jump on rapid taps), and every
-	// nudge applied to a bone is explicitly undone at the start of the next
-	// frame, so nothing can accumulate no matter what the mixer weights are.
-	interface ReactionPulse {
-		bone: THREE.Object3D;
-		t: number;
-		duration: number;
-		magnitude: number;
-		direction: number;
-	}
-	let activePulses: ReactionPulse[] = [];
+	// Every nudge applied to a bone is explicitly undone at the start of the
+	// next frame, so nothing can accumulate no matter what the mixer weights are.
 	let appliedNudges: Array<{ bone: THREE.Object3D; z: number; x: number; y?: number }> = [];
-	// In-flight transient face (tap flash, emote grin, AI cue): staged from
-	// vrmStore.expressionRequest and arbitrated against the mood face below.
-	let transientFace: { name: string; weight: number; t: number; duration: number; seq: number } | null =
-		null;
-	// Smoothed weights the mood system owns (emotional presets + custom
-	// transient names like 'shy'). Never includes blink/viseme/jaw channels.
-	const moodWeights = new Map<string, number>();
-	const recentTaps = { zone: null as TouchZone | null, at: 0, count: 0 };
-	const REACTION_REPEAT_WINDOW_MS = 4000;
 
+	// Transient faces (tap flash, emote grin, AI cue) stage into the
+	// expression controller, which arbitrates them against the mood face.
 	$effect(() => {
 		const request = vrmStore.expressionRequest;
 		untrack(() => {
-			if (!request) {
-				// Cleared mid-flight: jump into the release so the face fades
-				// back to mood instead of snapping.
-				if (transientFace) {
-					transientFace.t = Math.max(transientFace.t, transientFace.duration * 0.7);
-				}
-				return;
-			}
-			if (transientFace && transientFace.seq === request.seq) return;
-			transientFace = {
-				name: request.expression,
-				weight: request.intensity,
-				t: 0,
-				duration: Math.max(0.1, request.durationMs / 1000),
-				seq: request.seq
-			};
+			expression.stageExpression(
+				request
+					? {
+							expression: request.expression,
+							intensity: request.intensity,
+							durationMs: request.durationMs,
+							seq: request.seq
+						}
+					: null
+			);
 		});
 	});
 
+	// Tap reactions: an expression flash plus a decaying rotation nudge
+	// whose motion the spring bones inherit.
 	$effect(() => {
 		const request = vrmStore.reactionRequest;
 		if (!request) return;
 		untrack(() => {
-			const targetVrm = vrm;
-			if (!targetVrm) return;
-
-			const now = performance.now();
-			if (recentTaps.zone === request.zone && now - recentTaps.at < REACTION_REPEAT_WINDOW_MS) {
-				recentTaps.count += 1;
-			} else {
-				recentTaps.count = 0;
-			}
-			recentTaps.zone = request.zone;
-			recentTaps.at = now;
-
-			const tier = stageTier(characterStore.state.relationshipStage);
-			const spec = pickReaction(request.zone, tier, recentTaps.count);
-
-			// The face flash goes through the shared arbitration (no direct
-			// expression writes here): it overlays the mood face, then melts back.
-			const em = targetVrm.expressionManager;
-			if (em) {
-				const available = em.expressions.map((e) => e.expressionName);
-				const name = spec.expressions.find((candidate) => available.includes(candidate));
-				if (name) {
-					vrmStore.requestExpression({ expression: name, intensity: spec.weight, durationMs: 1800 });
-				}
-			}
-
-			const bone =
-				request.zone === 'head' || request.zone === 'face'
-					? targetVrm.humanoid.getNormalizedBoneNode('head')
-					: request.zone === 'shoulder'
-						? (targetVrm.humanoid.getNormalizedBoneNode('upperChest') ??
-							targetVrm.humanoid.getNormalizedBoneNode('chest'))
-						: request.zone === 'torso'
-							? targetVrm.humanoid.getNormalizedBoneNode('spine')
-							: targetVrm.humanoid.getNormalizedBoneNode('hips');
-			const fallback = targetVrm.humanoid.getNormalizedBoneNode('spine');
-			const target = bone ?? fallback;
-			if (target && activePulses.length < 4) {
-				// Half strength while she is talking: the head is already moving,
-				// and a full kick layered on that read as a jump
-				const talkScale = shouldTalk ? 0.5 : 1;
-				activePulses.push({
-					bone: target,
-					t: 0,
-					duration: 0.9,
-					magnitude: spec.impulse * talkScale,
-					direction: Math.random() > 0.5 ? 1 : -1
-				});
-			}
+			expression.stageReaction(request.zone);
 		});
 	});
 
 	// === Intentional avatar actions (procedural / jump / walk) ===
 	// At most one runs at a time; staging a new one cancels the current.
-	// Bone offsets reuse appliedNudges (auto-undone next frame); root motion
-	// is set absolutely every frame, so interrupts can never strand a pose.
-	const PROCEDURAL_DURATIONS: Record<string, number> = {
-		nod: 0.9,
-		shake_head: 0.9,
-		bow: 1.3,
-		shrug: 0.8,
-		sit: 1.1,
-		stand: 0.9
-	};
-	const JUMP_DURATION = 0.65; // s
-	const JUMP_HEIGHT = 0.28; // m at the apex
-	interface LocomotionState {
-		dirX: number;
-		dirZ: number;
-		remainingMs: number;
-		phase: number;
-		speed: number;
-		stepHz: number;
-	}
-	let locomotion: LocomotionState | null = null;
-	// Goto/return-home: steered translation toward a clamped plane target with
-	// a walk swing underneath. Shares the arrival/completion path for both.
-	interface GotoState {
-		targetX: number;
-		targetZ: number;
-		phase: number;
-	}
-	let gotoState: GotoState | null = null;
-	// In-place yaw. Routine steps report completion; ambient re-facing (the
-	// automatic face-camera after a walk) clears silently and never holds busy.
-	interface TurnState {
-		targetYaw: number;
-		routineStep: boolean;
-	}
-	let turnState: TurnState | null = null;
-	let jumpState: { t: number } | null = null;
-	let procedural: { name: string; t: number; duration: number } | null = null;
-	// Held sitting posture: the sit step blends in over its duration, then
-	// these persist until stand (or any locomotion auto-stands). The root-Y
-	// drop plus the bent-knee pose reads as sitting on the seat height.
-	let sitting = false;
-	let sitOffsetY = 0;
-	let sitTargetY = 0;
-	let actionSeqSeen = 0;
-
-	function syncActionBusy() {
-		vrmStore.setActionBusy(
-			isEmotePlaying ||
-				locomotion !== null ||
-				gotoState !== null ||
-				(turnState !== null && turnState.routineStep) ||
-				jumpState !== null ||
-				procedural !== null
-		);
-	}
-
-	function cancelAvatarActions() {
-		locomotion = null;
-		gotoState = null;
-		turnState = null;
-		procedural = null;
-		if (jumpState) {
-			jumpState = null;
-			avatarRoot.position.y = sitting ? sitOffsetY : 0;
+	// Motion state and per-frame integration live in MotionController (see
+	// src/lib/avatar/); this component owns the THREE scene, the stores,
+	// and the wiring between them.
+	const motionRoot: MotionRoot = {
+		position: avatarRoot.position,
+		get yaw() {
+			return avatarRoot.rotation.y;
+		},
+		set yaw(value: number) {
+			avatarRoot.rotation.y = value;
 		}
-		syncActionBusy();
-	}
-
-	// Standing up is implicit in every translation and jump: she stands, then
-	// moves. Only an explicit sit step (or a reset/model swap) changes the
-	// seated baseline otherwise.
-	function autoStand(): void {
-		if (!sitting) return;
-		sitting = false;
-		sitOffsetY = 0;
-		sitTargetY = 0;
-		avatarRoot.position.y = 0;
-	}
-
-	function smoothstep(edge0: number, edge1: number, x: number): number {
-		const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
-		return t * t * (3 - 2 * t);
-	}
+	};
 
 	function nudge(bone: THREE.Object3D | null, x: number, z: number, y = 0) {
 		if (!bone) return;
@@ -716,107 +302,7 @@
 		appliedNudges.push({ bone, z, x, y });
 	}
 
-	// One procedural frame at progress p (0..1). Small additive programs that
-	// read correctly without mocap; all offsets unwind via appliedNudges.
-	function applyProceduralAction(name: string, p: number) {
-		const targetVrm = vrm;
-		if (!targetVrm) return;
-		const humanoid = targetVrm.humanoid;
-		if (name === 'nod') {
-			const a = Math.sin(p * Math.PI * 2);
-			nudge(humanoid.getNormalizedBoneNode('head'), -0.3 * a, 0);
-			nudge(humanoid.getNormalizedBoneNode('neck'), -0.12 * a, 0);
-		} else if (name === 'shake_head') {
-			nudge(humanoid.getNormalizedBoneNode('head'), 0, 0, 0.45 * Math.sin(p * Math.PI * 2));
-		} else if (name === 'bow') {
-			const k = smoothstep(0, 0.35, p) * (1 - smoothstep(0.65, 1, p));
-			nudge(humanoid.getNormalizedBoneNode('spine'), 0.38 * k, 0);
-			nudge(humanoid.getNormalizedBoneNode('chest'), 0.12 * k, 0);
-			nudge(humanoid.getNormalizedBoneNode('head'), 0.24 * k, 0);
-		} else if (name === 'shrug') {
-			const k = Math.sin(p * Math.PI);
-			for (const side of ['leftUpperArm', 'rightUpperArm'] as const) {
-				const bone = humanoid.getNormalizedBoneNode(side);
-				// Outward follows the rig's own rest sign, so v0 and v1 agree.
-				if (bone) nudge(bone, 0, (Math.sign(bone.rotation.z) || 1) * 0.28 * k);
-			}
-			nudge(humanoid.getNormalizedBoneNode('head'), -0.06 * k, 0.1 * k);
-		} else if (name === 'sit') {
-			applySittingPose(smoothstep(0, 0.8, p));
-		} else if (name === 'stand') {
-			applySittingPose(1 - smoothstep(0, 0.8, p));
-		}
-	}
-
-	// Seated lower body at blend k (0 standing, 1 fully seated): thighs swing
-	// forward, shins hang down, spine stays upright. The root-Y drop (handled
-	// in the frame loop) puts the hips at seat height so the feet stay near
-	// the floor instead of dangling.
-	function applySittingPose(k: number) {
-		const targetVrm = vrm;
-		if (!targetVrm || k <= 0) return;
-		const humanoid = targetVrm.humanoid;
-		nudge(humanoid.getNormalizedBoneNode('leftUpperLeg'), -1.25 * k, 0);
-		nudge(humanoid.getNormalizedBoneNode('rightUpperLeg'), -1.25 * k, 0);
-		nudge(humanoid.getNormalizedBoneNode('leftLowerLeg'), 1.35 * k, 0);
-		nudge(humanoid.getNormalizedBoneNode('rightLowerLeg'), 1.35 * k, 0);
-		nudge(humanoid.getNormalizedBoneNode('spine'), -0.06 * k, 0);
-	}
-
-	// Shared step swing for walk, run, and steered goto arrivals: opposing
-	// leg/arm swing at the caller's phase. Rides appliedNudges like the rest.
-	function applyWalkSwing(swing: number) {
-		const targetVrm = vrm;
-		if (!targetVrm) return;
-		const humanoid = targetVrm.humanoid;
-		nudge(humanoid.getNormalizedBoneNode('leftUpperLeg'), -0.38 * swing, 0);
-		nudge(humanoid.getNormalizedBoneNode('rightUpperLeg'), 0.38 * swing, 0);
-		nudge(humanoid.getNormalizedBoneNode('leftLowerLeg'), 0.45 * Math.max(0, -swing), 0);
-		nudge(humanoid.getNormalizedBoneNode('rightLowerLeg'), 0.45 * Math.max(0, swing), 0);
-		nudge(humanoid.getNormalizedBoneNode('leftUpperArm'), 0.2 * swing, 0);
-		nudge(humanoid.getNormalizedBoneNode('rightUpperArm'), -0.2 * swing, 0);
-	}
-
 	const scratchWalkDir = new THREE.Vector3();
-	const scratchWalkToAvatar = new THREE.Vector3();
-
-	// Walk directions are viewer-relative: "left" means screen-left from the
-	// current camera, "forward" means toward the viewer.
-	function walkDirectionVector(direction: string): { x: number; z: number } {
-		if (camera.current) {
-			camera.current.getWorldPosition(scratchWalkDir);
-			scratchWalkToAvatar.subVectors(avatarRoot.position, scratchWalkDir);
-			scratchWalkToAvatar.y = 0;
-			if (scratchWalkToAvatar.lengthSq() > 1e-6) {
-				scratchWalkToAvatar.normalize();
-				// Screen-right = view direction × up = (-vz, 0, vx).
-				const rx = -scratchWalkToAvatar.z;
-				const rz = scratchWalkToAvatar.x;
-				if (direction === 'left') return { x: -rx, z: -rz };
-				if (direction === 'right') return { x: rx, z: rz };
-				if (direction === 'back') return { x: scratchWalkToAvatar.x, z: scratchWalkToAvatar.z };
-				return { x: -scratchWalkToAvatar.x, z: -scratchWalkToAvatar.z };
-			}
-		}
-		if (direction === 'left') return { x: -1, z: 0 };
-		if (direction === 'right') return { x: 1, z: 0 };
-		if (direction === 'back') return { x: 0, z: -1 };
-		return { x: 0, z: 1 };
-	}
-
-	function startProceduralAction(name: string, anchorId?: string): boolean {
-		const duration = PROCEDURAL_DURATIONS[name];
-		if (!duration) return false;
-		if (name === 'sit') {
-			// Seat height comes from the anchor when the plan traveled to one
-			// ("sit on the chair"); otherwise the default chair height.
-			const seatHeight = (anchorId && resolveSceneAnchor(anchorId)?.seatHeight) || DEFAULT_SEAT_HEIGHT;
-			sitTargetY = computeSitOffsetY(measureHipsWorldY(), seatHeight);
-		}
-		procedural = { name, t: 0, duration };
-		console.debug('[AvatarCue] action started', `procedural:${name}`);
-		return true;
-	}
 
 	function measureHipsWorldY(): number {
 		const hips = vrm?.humanoid.getNormalizedBoneNode('hips');
@@ -826,64 +312,25 @@
 		return p.y;
 	}
 
-	function startJumpAction(): void {
-		autoStand();
-		jumpState = { t: 0 };
-		console.debug('[AvatarCue] action started', 'jump');
-	}
+	const motion = new MotionController({
+		root: motionRoot,
+		humanoid: () => (vrm?.humanoid ?? null) as unknown as PoseHumanoid | null,
+		nudge: (bone, x, z, y) => nudge(bone as THREE.Object3D | null, x, z, y ?? 0),
+		cameraPosition: (out) => {
+			if (!camera.current) return false;
+			camera.current.getWorldPosition(scratchWalkDir);
+			out.x = scratchWalkDir.x;
+			out.y = scratchWalkDir.y;
+			out.z = scratchWalkDir.z;
+			return true;
+		},
+		measureHipsY: () => measureHipsWorldY()
+	});
 
-	function startWalkAction(direction: string, durationMs?: number, action = 'walk'): void {
-		autoStand();
-		const dir = walkDirectionVector(direction);
-		const running = action === 'run';
-		// clampWalkDuration (not inline min/max): NaN/Infinity must fall back
-		// to the default instead of freezing the step — NaN remainingMs never
-		// reaches zero AND the watchdog comparison never fires.
-		locomotion = {
-			dirX: dir.x,
-			dirZ: dir.z,
-			remainingMs: clampWalkDuration(durationMs ?? WALK_DURATION_DEFAULT_MS),
-			phase: 0,
-			speed: running ? RUN_SPEED_MPS : WALK_SPEED_MPS,
-			stepHz: running ? RUN_STEP_HZ : WALK_STEP_HZ
-		};
-		console.debug('[AvatarCue] action started', `${running ? 'run' : 'walk'}:${direction}`);
-	}
+	let actionSeqSeen = 0;
 
-	function startGotoAction(targetX: number, targetZ: number, label: string): void {
-		autoStand();
-		const clamped = clampWalkOffset(targetX, targetZ, WALK_MAX_RADIUS);
-		gotoState = { targetX: clamped.x, targetZ: clamped.z, phase: 0 };
-		console.debug('[AvatarCue] action started', label);
-	}
-
-	function startReturnHomeAction(): void {
-		startGotoAction(0, 0, 'return_home');
-	}
-
-	function startTurnAction(direction: string, routineStep: boolean): boolean {
-		if (direction !== 'left' && direction !== 'right' && direction !== 'back') return false;
-		turnState = { targetYaw: turnTargetYaw(avatarRoot.rotation.y, direction), routineStep };
-		console.debug('[AvatarCue] action started', `turn:${direction}`);
-		return true;
-	}
-
-	// Yaw toward the live scene camera. Routine steps report completion; the
-	// ambient post-walk re-face clears silently.
-	function startFaceCameraAction(routineStep: boolean): boolean {
-		if (!camera.current) return false;
-		camera.current.getWorldPosition(scratchWalkDir);
-		turnState = {
-			targetYaw: yawToFacePoint(
-				avatarRoot.position.x,
-				avatarRoot.position.z,
-				scratchWalkDir.x,
-				scratchWalkDir.z
-			),
-			routineStep
-		};
-		console.debug('[AvatarCue] action started', 'face_camera');
-		return true;
+	function syncActionBusy() {
+		vrmStore.setActionBusy(motion.isBusy(animation.isEmotePlaying));
 	}
 
 	function startAmbientFaceCamera(): void {
@@ -897,7 +344,7 @@
 		);
 		// Already facing: skip the turn entirely instead of micro-rotating.
 		if (Math.abs(shortAngleDelta(target - avatarRoot.rotation.y)) < TURN_ARRIVE_RAD * 2) return;
-		turnState = { targetYaw: target, routineStep: false };
+		motion.startFaceCamera(false);
 	}
 
 	function handleAvatarActionRequest(req: {
@@ -916,195 +363,41 @@
 		}
 		if (req.kind === 'reset') {
 			cancelRoutine('reset');
-			sitting = false;
-			sitOffsetY = 0;
-			sitTargetY = 0;
-			avatarRoot.position.set(0, 0, 0);
-			avatarRoot.rotation.set(0, 0, 0);
+			motion.resetPose();
 			return;
 		}
 		// A new action interrupts the current one (and any routine); every
 		// program below is absolute per-frame, so interruption strands nothing.
 		cancelRoutine('superseded');
 		if (req.kind === 'procedural') {
-			if (!startProceduralAction(req.action, req.anchorId)) return;
+			if (!motion.startProcedural(req.action, req.anchorId)) return;
 		} else if (req.kind === 'jump') {
-			startJumpAction();
+			motion.startJump();
 		} else if (req.kind === 'walk') {
-			startWalkAction(req.direction ?? 'forward', req.durationMs, req.action);
+			if (req.action === 'run') motion.startRun(req.direction ?? 'forward', req.durationMs);
+			else motion.startWalk(req.direction ?? 'forward', req.durationMs);
 		} else if (req.kind === 'return_home') {
-			startReturnHomeAction();
+			motion.startReturnHome();
 		} else if (req.kind === 'turn') {
-			if (!startTurnAction(req.direction ?? 'back', false)) return;
+			if (!motion.startTurn(req.direction ?? 'back', false)) return;
 		} else if (req.kind === 'face_camera') {
-			if (!startFaceCameraAction(false)) return;
+			if (!motion.startFaceCamera(false)) return;
 		} else if (req.kind === 'goto') {
 			const target = resolveGotoTarget(req);
 			if (!target) return;
-			startGotoAction(target.x, target.z, `goto:${target.label}`);
+			motion.startGoto(target.x, target.z, `goto:${target.label}`);
 		} else {
 			return;
 		}
 		syncActionBusy();
 	}
 
-	// Goto target resolution, shared by single actions and routine steps:
-	// named anchor first, explicit x/z second, nothing for anything else.
-	function resolveGotoTarget(req: {
-		anchorId?: string;
-		x?: number;
-		z?: number;
-	}): { x: number; z: number; label: string } | null {
-		if (req.anchorId) {
-			const anchor = resolveSceneAnchor(req.anchorId);
-			if (!anchor) return null;
-			return { x: anchor.x, z: anchor.z, label: anchor.id };
-		}
-		if (typeof req.x === 'number' && typeof req.z === 'number') {
-			return { x: req.x, z: req.z, label: `${req.x.toFixed(2)},${req.z.toFixed(2)}` };
-		}
-		return null;
-	}
-
 	// === Avatar routines: ordered step sequences with completion ===
-	// Every step transitions pending -> running -> completed|failed|cancelled
-	// in the ledger, and the routine resolves to completed ONLY when every
-	// expected step completed with zero failures. A per-step watchdog (driven
-	// by render time, so a hidden tab pauses deadlines together with motion)
-	// fails stuck steps instead of hanging the routine forever.
-	interface ActiveRoutine {
-		id: string;
-		steps: Array<{
-			kind: string;
-			action: string;
-			direction?: string;
-			durationMs?: number;
-			url?: string;
-			anchorId?: string;
-			x?: number;
-			z?: number;
-		}>;
-		index: number;
-		completed: string[];
-		failures: Array<{ stepIndex: number; key: string; reason: string }>;
-		continueOnFailure: boolean;
-		startedAt: number;
-		stepStartedAt: number;
-		stepElapsed: number;
-		stepDeadlineMs: number;
-	}
-	let routine: ActiveRoutine | null = null;
-	let routineSeqSeen = 0;
+	// The step ledger, watchdog, and finish truth table live in the routine
+	// controller; this wiring starts/halts physical motion per step and
+	// records the authoritative receipt into the VRM store.
 	let routineAwaitingEmote: string | null = null;
-
-	// Canonical step key (receipts + verification) lives in tasks/host-avatar.ts.
-
-	function finishRoutine(status: 'completed' | 'partial' | 'failed' | 'cancelled' | 'timed_out') {
-		if (!routine) return;
-		vrmStore.recordRoutineResult({
-			routineId: routine.id,
-			status,
-			expected: routine.steps.map(routineStepKey),
-			completed: routine.completed,
-			failures: routine.failures,
-			startedAt: routine.startedAt,
-			finishedAt: Date.now(),
-			endPosition: { x: avatarRoot.position.x, y: avatarRoot.position.y, z: avatarRoot.position.z }
-		});
-		console.debug('[AvatarCue] routine finished', `${routine.id} (${status})`);
-		routine = null;
-		routineAwaitingEmote = null;
-		syncActionBusy();
-	}
-
-	function cancelRoutine(reason: string) {
-		if (routine) {
-			const step = routine.steps[routine.index];
-			if (step) {
-				vrmStore.recordRoutineStep({
-					routineId: routine.id,
-					stepIndex: routine.index,
-					key: routineStepKey(step),
-					status: 'cancelled',
-					reason,
-					startedAt: routine.stepStartedAt,
-					finishedAt: Date.now()
-				});
-			}
-			// Drop a routine-owned emote selection so a pending load cannot
-			// play after the cancel; a manual selection is left untouched.
-			if (routineAwaitingEmote && vrmStore.currentAnimation === routineAwaitingEmote) {
-				vrmStore.setCurrentAnimation(null);
-			}
-			console.debug('[AvatarCue] routine cancelled', `${routine.id} (${reason})`);
-		}
-		cancelAvatarActions();
-		if (!routine) return;
-		finishRoutine('cancelled');
-	}
-
-	function advanceRoutine() {
-		if (!routine) return;
-		if (routine.index >= routine.steps.length) {
-			if (routine.failures.length === 0) finishRoutine('completed');
-			else if (routine.completed.length > 0) finishRoutine('partial');
-			else finishRoutine('failed');
-			return;
-		}
-		const step = routine.steps[routine.index];
-		const key = routineStepKey(step);
-		routine.stepStartedAt = Date.now();
-		routine.stepElapsed = 0;
-		let started = false;
-		let deadline = 5000;
-		if (step.kind === 'procedural') {
-			started = startProceduralAction(step.action, step.anchorId);
-			deadline = (PROCEDURAL_DURATIONS[step.action] ?? 1) * 1000 + 1500;
-		} else if (step.kind === 'jump') {
-			startJumpAction();
-			started = true;
-			deadline = JUMP_DURATION * 1000 + 1500;
-		} else if (step.kind === 'walk') {
-			startWalkAction(step.direction ?? 'forward', step.durationMs, step.action);
-			started = true;
-			deadline = clampWalkDuration(step.durationMs ?? WALK_DURATION_DEFAULT_MS) + 1500;
-		} else if (step.kind === 'return_home') {
-			startReturnHomeAction();
-			started = true;
-			deadline = gotoDeadlineMs(0, 0);
-		} else if (step.kind === 'turn') {
-			started = startTurnAction(step.direction ?? 'back', true);
-			deadline = 4000;
-		} else if (step.kind === 'face_camera') {
-			started = startFaceCameraAction(true);
-			deadline = 4000;
-		} else if (step.kind === 'goto') {
-			const target = resolveGotoTarget(step);
-			if (target) {
-				startGotoAction(target.x, target.z, `goto:${target.label}`);
-				started = true;
-				deadline = gotoDeadlineMs(target.x, target.z);
-			}
-		} else if (step.kind === 'emote' && step.url) {
-			routineAwaitingEmote = step.url;
-			vrmStore.setCurrentAnimation(step.url);
-			started = true;
-			deadline = 15000;
-		}
-		routine.stepDeadlineMs = deadline;
-		if (!started) {
-			failCurrentStep('unknown step');
-			return;
-		}
-		vrmStore.recordRoutineStep({
-			routineId: routine.id,
-			stepIndex: routine.index,
-			key,
-			status: 'running',
-			startedAt: routine.stepStartedAt
-		});
-		syncActionBusy();
-	}
+	let routineSeqSeen = 0;
 
 	// Watchdog budget for a steered arrival: travel time at goto speed plus
 	// a fixed margin, floored so adjacent anchors never starve the step.
@@ -1113,90 +406,151 @@
 		return Math.min(15000, Math.max(3500, (dist / GOTO_SPEED_MPS) * 1000 + 2500));
 	}
 
-	function failCurrentStep(reason: string, timedOut = false) {
-		if (!routine) return;
-		const step = routine.steps[routine.index];
-		if (!step) return;
-		const key = routineStepKey(step);
-		routine.failures.push({ stepIndex: routine.index, key, reason });
-		vrmStore.recordRoutineStep({
-			routineId: routine.id,
-			stepIndex: routine.index,
-			key,
-			status: 'failed',
-			reason,
-			startedAt: routine.stepStartedAt,
-			finishedAt: Date.now()
-		});
-		// Stop the half-played motion.
-		if (step.kind === 'walk') locomotion = null;
-		if (step.kind === 'return_home' || step.kind === 'goto') gotoState = null;
-		if (step.kind === 'turn' || step.kind === 'face_camera') turnState = null;
-		if (step.kind === 'jump') {
-			jumpState = null;
-			avatarRoot.position.y = sitting ? sitOffsetY : 0;
+	const routineController = createRoutineController({
+		executor: {
+			startStep(step) {
+				let started = false;
+				let deadline = 5000;
+				if (step.kind === 'procedural') {
+					started = motion.startProcedural(step.action, step.anchorId);
+					deadline = (PROCEDURAL_DURATIONS[step.action] ?? 1) * 1000 + 1500;
+				} else if (step.kind === 'jump') {
+					motion.startJump();
+					started = true;
+					deadline = JUMP_DURATION * 1000 + 1500;
+				} else if (step.kind === 'walk') {
+					if (step.action === 'run') motion.startRun(step.direction ?? 'forward', step.durationMs);
+					else motion.startWalk(step.direction ?? 'forward', step.durationMs);
+					started = true;
+					deadline = clampWalkDuration(step.durationMs ?? WALK_DURATION_DEFAULT_MS) + 1500;
+				} else if (step.kind === 'return_home') {
+					motion.startReturnHome();
+					started = true;
+					deadline = gotoDeadlineMs(0, 0);
+				} else if (step.kind === 'turn') {
+					started = motion.startTurn(step.direction ?? 'back', true);
+					deadline = 4000;
+				} else if (step.kind === 'face_camera') {
+					started = motion.startFaceCamera(true);
+					deadline = 4000;
+				} else if (step.kind === 'goto') {
+					const target = resolveGotoTarget(step);
+					if (target) {
+						motion.startGoto(target.x, target.z, `goto:${target.label}`);
+						started = true;
+						deadline = gotoDeadlineMs(target.x, target.z);
+					}
+				} else if (step.kind === 'emote' && step.url) {
+					routineAwaitingEmote = step.url;
+					vrmStore.setCurrentAnimation(step.url);
+					started = true;
+					deadline = 15000;
+				}
+				return { started, deadlineMs: deadline };
+			},
+			stopStep(step) {
+				motion.stopKind(step.kind);
+				if (step.kind === 'emote') {
+					routineAwaitingEmote = null;
+					if (step.url && vrmStore.currentAnimation === step.url) vrmStore.setCurrentAnimation(null);
+				}
+			}
+		},
+		reporter: {
+			recordStep: (result) => vrmStore.recordRoutineStep(result),
+			recordResult: (result) => vrmStore.recordRoutineResult(result),
+			now: () => Date.now()
+		},
+		getEndPosition: () => ({
+			x: avatarRoot.position.x,
+			y: avatarRoot.position.y,
+			z: avatarRoot.position.z
+		}),
+		onChange: () => {
+			if (!routineController.active) routineAwaitingEmote = null;
+			syncActionBusy();
 		}
-		if (step.kind === 'procedural') procedural = null;
-		if (step.kind === 'emote') {
-			routineAwaitingEmote = null;
-			if (step.url && vrmStore.currentAnimation === step.url) vrmStore.setCurrentAnimation(null);
-		}
-		routine.index++;
-		if (!routine.continueOnFailure) {
-			if (timedOut) finishRoutine('timed_out');
-			else if (routine.completed.length > 0) finishRoutine('partial');
-			else finishRoutine('failed');
-			return;
-		}
-		advanceRoutine();
-	}
+	});
 
-	function completeRoutineStep() {
-		if (!routine) return;
-		const step = routine.steps[routine.index];
-		if (!step) return;
-		const key = routineStepKey(step);
-		routine.completed.push(key);
-		vrmStore.recordRoutineStep({
-			routineId: routine.id,
-			stepIndex: routine.index,
-			key,
-			status: 'completed',
-			startedAt: routine.stepStartedAt,
-			finishedAt: Date.now()
-		});
-		routine.index++;
-		advanceRoutine();
+	function cancelRoutine(reason: string) {
+		// Drop a routine-owned emote selection so a pending load cannot
+		// play after the cancel; a manual selection is left untouched.
+		if (
+			routineController.active &&
+			routineAwaitingEmote &&
+			vrmStore.currentAnimation === routineAwaitingEmote
+		) {
+			vrmStore.setCurrentAnimation(null);
+		}
+		routineController.cancel(reason);
+		motion.cancel();
+		syncActionBusy();
 	}
 
 	function startRoutine(request: {
 		id: string;
-		steps: ActiveRoutine['steps'];
+		steps: RoutineStepInput[];
 		policy?: { continueOnFailure?: boolean };
 	}) {
-		// Replacement policy: at most one routine; a new one cancels the old.
-		cancelRoutine('superseded');
-		routine = {
-			id: request.id,
-			steps: request.steps,
-			index: 0,
-			completed: [],
-			failures: [],
-			continueOnFailure: request.policy?.continueOnFailure ?? false,
-			startedAt: Date.now(),
-			stepStartedAt: 0,
-			stepElapsed: 0,
-			stepDeadlineMs: 0
-		};
-		console.debug('[AvatarCue] routine started', `${request.id} (${request.steps.length} steps)`);
-		advanceRoutine();
+		routineController.start(request.id, request.steps, request.policy);
 	}
+
+	// Clip animation (idle cycle, talking loop, emotes, photo poses) and
+	// the face (reactions, mood, blink, visemes) live in their controllers
+	// (see src/lib/avatar/); this wiring connects them to the stores, the
+	// routine ledger, and the live humanoid.
+	const animation = new AnimationController({
+		idleUrls: () => vrmStore.idleAnimationUrls,
+		talkingUrl: () => vrmStore.talkingAnimationUrl,
+		findAnimation: (id) => vrmStore.availableAnimations.find((a) => a.url === id || a.id === id),
+		readEmoteSelection: () => vrmStore.currentAnimation,
+		clearEmoteSelection: () => vrmStore.setCurrentAnimation(null),
+		requestFace: (expression, intensity, durationMs) =>
+			vrmStore.requestExpression({ expression, intensity, durationMs }),
+		photoActive: () => photomodeStore.active,
+		shouldTalk: () => shouldTalk,
+		hasActiveRoutine: () => routineController.active !== null,
+		isRoutineAwaitingEmote: (url) => routineController.active !== null && routineAwaitingEmote === url,
+		isAnyEmoteAwaited: () => routineController.active !== null && routineAwaitingEmote !== null,
+		onEmoteClipStarted: (url, deadlineMs) => {
+			if (routineController.active && routineAwaitingEmote === url) {
+				routineController.setStepDeadline(deadlineMs);
+				routineController.resetStepElapsed();
+			}
+		},
+		onEmoteFinished: (url) => {
+			if (routineController.active && routineAwaitingEmote === url) {
+				routineAwaitingEmote = null;
+				routineController.completeCurrentStep();
+			}
+		},
+		onEmoteLoadFailed: () => {
+			if (routineController.active && routineAwaitingEmote) {
+				routineAwaitingEmote = null;
+				routineController.failCurrentStep('emote load failed');
+			}
+		},
+		onManualEmoteWhileRoutine: () => cancelRoutine('superseded'),
+		onBusyChanged: () => syncActionBusy()
+	});
+
+	const expression = new ExpressionController({
+		getHumanoid: () => (vrm?.humanoid ?? null) as unknown as ExpressionHumanoid | null,
+		nudge: (bone, x, z, y) => nudge(bone as THREE.Object3D | null, x, z, y ?? 0),
+		getRelationshipStage: () => characterStore.state.relationshipStage,
+		shouldTalk: () => shouldTalk,
+		requestFace: (expressionName, intensity, durationMs) =>
+			vrmStore.requestExpression({ expression: expressionName, intensity, durationMs }),
+		getExpressionManager: () => vrm?.expressionManager ?? null,
+		getAvailableExpressionNames: () =>
+			vrm?.expressionManager?.expressions.map((e) => e.expressionName) ?? []
+	});
 
 	$effect(() => {
 		const request = vrmStore.actionRequest;
 		if (!request) return;
 		untrack(() => {
-			if (!vrm || !mixer) return;
+			if (!animation.isAttached) return;
 			if (request.seq === actionSeqSeen) return;
 			actionSeqSeen = request.seq;
 			handleAvatarActionRequest(request);
@@ -1207,7 +561,7 @@
 		const request = vrmStore.routineRequest;
 		if (!request) return;
 		untrack(() => {
-			if (!vrm || !mixer) return;
+			if (!animation.isAttached) return;
 			if (request.seq === routineSeqSeen) return;
 			routineSeqSeen = request.seq;
 			startRoutine(request);
@@ -1219,170 +573,25 @@
 		lipSyncAnalyzer.setAnalyser(ttsStore.currentAnalyser);
 	});
 
-	// Switch between idle and talking animations based on speaking/talking state
+	// Switch between idle and talking animations based on speaking state.
+	// A held photo pose must not be stomped by TTS either; exit restores.
+	// Photo activity is a tracked read: exiting photo mode while TTS is
+	// still speaking must re-run the switch so the talking loop fades back
+	// in (the exit path only resumes the idle cycler when silent).
 	$effect(() => {
 		const speaking = shouldTalk;
-		const currentMixer = untrack(() => mixer);
-		const currentIdleAction = untrack(() => idleAction);
-		const currentTalkingClip = untrack(() => talkingClip);
-		const currentEmotePlaying = untrack(() => isEmotePlaying);
-
-		// Don't switch if emote is playing or no mixer/clips available. A held
-		// photo pose must not be stomped by TTS either; exit restores the loop.
-		if (!currentMixer || currentEmotePlaying || photomodeStore.active) return;
-
-		if (speaking && currentTalkingClip) {
-			// Start talking animation, fade out idle
-			if (currentIdleAction) {
-				currentIdleAction.fadeOut(0.3);
-			}
-
-			// Create and play talking action
-			let currentTalkingAction = untrack(() => talkingAction);
-			if (!currentTalkingAction) {
-				currentTalkingAction = currentMixer.clipAction(currentTalkingClip);
-				currentTalkingAction.setLoop(THREE.LoopRepeat, Infinity);
-				talkingAction = currentTalkingAction;
-			}
-			currentTalkingAction.reset().fadeIn(0.3).play();
-
-		} else if (!speaking) {
-			// Stop talking, resume idle animation
-			const currentTalkingAction = untrack(() => talkingAction);
-			if (currentTalkingAction) {
-				currentTalkingAction.fadeOut(0.3);
-			}
-
-			// Resume the current idle action
-			if (currentIdleAction) {
-				currentIdleAction.reset().fadeIn(0.3).play();
-			}
-
-		}
+		const photoOpen = photomodeStore.active;
+		untrack(() => {
+			animation.setTalking(speaking, photoOpen);
+		});
 	});
 
-	// Play emote animations when currentAnimation changes
+	// Play emote animations when the selection changes.
 	$effect(() => {
 		const animId = currentAnimation;
-		const currentVrm = untrack(() => vrm);
-		const currentMixer = untrack(() => mixer);
-		const currentIdleAction = untrack(() => idleAction);
-
-		if (!currentVrm || !currentMixer) return;
-
-		// Stop any current emote
-		const prevEmote = untrack(() => emoteAction);
-		if (prevEmote) {
-			prevEmote.fadeOut(0.3);
-		}
-
-		// If no emote selected, just ensure idle is playing
-		if (!animId) {
-			isEmotePlaying = false;
-			emoteAction = null;
-			syncActionBusy();
-			if (currentIdleAction && !currentIdleAction.isRunning()) {
-				currentIdleAction.reset().fadeIn(0.3).play();
-			}
-			return;
-		}
-
-		// Find the emote animation
-		const animationData = vrmStore.availableAnimations.find((a) => a.url === animId || a.id === animId);
-		if (!animationData?.url) return;
-
-		// Load emote VRMA file
-		loadVrmAnimation(animationData.url)
-			.then((vrmAnimation) => {
-				untrack(() => {
-					if (!vrm || !mixer) return;
-					// Stale load (selection moved on while fetching): discard
-					// instead of playing a clip nobody asked for anymore.
-					if (vrmStore.currentAnimation !== animId) return;
-
-					// Fade out idle animation
-					const currentIdle = idleAction;
-					if (currentIdle) {
-						currentIdle.fadeOut(0.2);
-					}
-
-					// Create and play emote; loop mode comes from the action
-					// registry (all VRMA entries are one-shots today).
-					const clip = createVRMAnimationClip(vrmAnimation, vrm);
-					const action = mixer.clipAction(clip);
-					const loopForever = actionForAnimationUrl(animationData.url)?.mode === 'loop';
-					if (loopForever) action.setLoop(THREE.LoopRepeat, Infinity);
-					else action.setLoop(THREE.LoopOnce, 1);
-					action.clampWhenFinished = true;
-					action.timeScale = 1.5;
-					action.reset().fadeIn(0.2).play();
-					emoteAction = action;
-					isEmotePlaying = true;
-					// Routine emote steps get a clip-derived watchdog budget
-					// from the moment the clip actually starts playing.
-					if (routine && routineAwaitingEmote === animationData.url) {
-						routine.stepDeadlineMs =
-							(action.getClip().duration / action.timeScale) * 1000 + 3000;
-						routine.stepElapsed = 0;
-					}
-					syncActionBusy();
-					console.debug('[AvatarCue] action started', `emote:${animationData.id}`);
-					// A manually triggered emote supersedes any routine; the
-					// routine's own emote step arrives with its URL awaited.
-					if (routine && routineAwaitingEmote !== animationData.url) {
-						cancelRoutine('superseded');
-					}
-
-					// Face comes from the action's metadata, not a generic
-					// grin: unmapped clips leave the mood face alone.
-					const face = expressionForAnimationUrl(animationData.url);
-					if (face) {
-						const clipMs = Math.round((action.getClip().duration / action.timeScale) * 1000);
-						vrmStore.requestExpression({
-							expression: face.expression,
-							intensity: face.intensity,
-							durationMs: clipMs
-						});
-					}
-
-					// When emote finishes, return to idle
-					const capturedMixer = mixer;
-					const capturedIdleAction = currentIdle;
-					const onFinished = (e: { action: THREE.AnimationAction }) => {
-						if (e.action === action) {
-							capturedMixer.removeEventListener('finished', onFinished);
-							isEmotePlaying = false;
-							emoteAction = null;
-							if (routine && routineAwaitingEmote === animationData.url) {
-								routineAwaitingEmote = null;
-								completeRoutineStep();
-							}
-							syncActionBusy();
-							console.debug('[AvatarCue] action finished', `emote:${animationData.id}`);
-
-							// The action face fades out with its own envelope; nothing to clear.
-
-							// Resume idle animation
-							if (capturedIdleAction) {
-								capturedIdleAction.reset().fadeIn(0.3).play();
-							}
-
-							vrmStore.setCurrentAnimation(null);
-						}
-					};
-					capturedMixer.addEventListener('finished', onFinished);
-				});
-			})
-			.catch((error) => {
-				console.error('Error loading emote animation:', error);
-				// Clear the stale selection so the gesture gate's busy flag
-				// (currentAnimation !== null) can't stick forever.
-				vrmStore.setCurrentAnimation(null);
-				if (routine && routineAwaitingEmote) {
-					routineAwaitingEmote = null;
-					failCurrentStep('emote load failed');
-				}
-			});
+		untrack(() => {
+			animation.playEmoteSelection(animId);
+		});
 	});
 
 	// Load VRM when URL changes
@@ -1441,24 +650,11 @@
 				snapshotSpringBase(loadedVrm);
 
 				vrm = loadedVrm;
-				avatarRoot.position.set(0, 0, 0);
-				avatarRoot.rotation.set(0, 0, 0);
-				sitting = false;
-				sitOffsetY = 0;
-				sitTargetY = 0;
-				gotoState = null;
-				turnState = null;
+				motion.resetPose();
 				avatarRoot.add(loadedVrm.scene);
-				const newMixer = new THREE.AnimationMixer(loadedVrm.scene);
-				mixer = newMixer;
+				animation.attach(loadedVrm, new THREE.AnimationMixer(loadedVrm.scene));
 				vrmStore.setVrm(loadedVrm);
 				vrmStore.setLoading(false);
-
-				// Start the looping idle animation
-				startIdleAnimation(loadedVrm, newMixer);
-
-				// Pre-load the talking animation
-				loadTalkingAnimation(loadedVrm, newMixer);
 
 				// Debug: Log available expressions
 				// if (loadedVrm.expressionManager) {
@@ -1517,48 +713,23 @@
 		);
 
 		return () => {
-			// Cleanup on unmount or URL change
+			// Cleanup on unmount or URL change. Detaching the animation
+			// controller stops timers and actions and clears a mid-play
+			// emote selection whose 'finished' handler (bound to the old
+			// mixer) would otherwise never run.
 			cancelled = true;
-			if (idleCycleTimeout) {
-				clearTimeout(idleCycleTimeout);
-				idleCycleTimeout = null;
-			}
-			if (mixer) {
-				mixer.stopAllAction();
-				mixer = null;
-				idleAction = null;
-				talkingAction = null;
-				talkingClip = null;
-				emoteAction = null;
-			}
-			// If an emote was mid-play, its 'finished' handler (bound to the old
-			// mixer) never runs, so reset the flags it would have cleared —
-			// otherwise currentAnimation stays stale and the next model can
-			// immediately replay the leftover emote.
-			if (isEmotePlaying) {
-				isEmotePlaying = false;
-				vrmStore.setCurrentAnimation(null);
-			}
+			animation.detach();
 			if (vrm) {
 				avatarRoot.remove(vrm.scene);
-				avatarRoot.position.set(0, 0, 0);
-				avatarRoot.rotation.set(0, 0, 0);
-				sitting = false;
-				sitOffsetY = 0;
-				sitTargetY = 0;
+				motion.resetPose();
 				cancelRoutine('model-unloaded');
 				// Frees geometries, materials, and textures (manual traverse missed textures)
 				VRMUtils.deepDispose(vrm.scene);
 				vrmStore.setVrm(null);
 				vrm = null;
 				springBase = [];
-				poseAction = null;
-				poseClipCache.clear();
-				activePulses = [];
+				expression.reset();
 				appliedNudges = [];
-				transientFace = null;
-				moodWeights.clear();
-				heldExpression = null;
 			}
 		};
 	});
@@ -1600,154 +771,29 @@
 		}
 		appliedNudges.length = 0;
 
-		// Update animation mixer
-		mixer?.update(delta);
+		// Advance clip animation (idle cycle, talking loop, emotes, poses).
+		animation.update(delta);
 
-		// Tap reactions: decaying additive nudges layered over whatever the
-		// mixer wrote, rendered this frame (so the body sways with the physics
-		// instead of the solver and the render disagreeing, which read as
-		// jitter during talking). Overlapping pulses sum; each bone's total is
-		// recorded for the undo above.
-		if (activePulses.length > 0) {
-			const remaining: ReactionPulse[] = [];
-			for (const pulse of activePulses) {
-				pulse.t += delta;
-				const progress = pulse.t / pulse.duration;
-				if (progress >= 1) continue;
-				// sin^2 has zero slope at both ends: eases in and out
-				const wave = Math.sin(progress * Math.PI);
-				const envelope = wave * wave * Math.exp(-1.6 * progress);
-				const angle = pulse.magnitude * 0.07 * envelope;
-				const z = angle * pulse.direction;
-				const x = -angle * 0.4;
-				pulse.bone.rotation.z += z;
-				pulse.bone.rotation.x += x;
-				appliedNudges.push({ bone: pulse.bone, z, x });
-				remaining.push(pulse);
-			}
-			activePulses = remaining;
-		}
+		// Tap reactions: decaying additive nudges layered over whatever
+		// the mixer wrote, rendered this frame so the body sways with the
+		// physics. Overlapping pulses sum; totals ride the undo buffer.
+		expression.updatePulses(delta);
 
 		// Intentional world-motion actions: walk/run translation, steered
 		// goto/return-home arrivals, and in-place turns with a procedural step
 		// swing, plus the jump parabola. Root motion is absolute per-frame;
 		// bone offsets ride appliedNudges and unwind automatically.
-		if (locomotion) {
-			const step = Math.min(delta, 0.1);
-			const dist = locomotion.speed * step;
-			const clamped = clampWalkOffset(
-				avatarRoot.position.x + locomotion.dirX * dist,
-				avatarRoot.position.z + locomotion.dirZ * dist,
-				WALK_MAX_RADIUS
-			);
-			avatarRoot.position.x = clamped.x;
-			avatarRoot.position.z = clamped.z;
-			const targetYaw = Math.atan2(locomotion.dirX, locomotion.dirZ);
-			avatarRoot.rotation.y +=
-				shortAngleDelta(targetYaw - avatarRoot.rotation.y) * Math.min(1, delta * 6);
-			locomotion.phase += delta * Math.PI * 2 * locomotion.stepHz;
-			applyWalkSwing(Math.sin(locomotion.phase));
-			locomotion.remainingMs -= delta * 1000;
-			if (locomotion.remainingMs <= 0) {
-				locomotion = null;
-				completeRoutineStep();
-				syncActionBusy();
-				// Walks end in profile; ease back to the viewer unless a queued
-				// routine step (or photo mode) owns the body next.
-				if (!routine) startAmbientFaceCamera();
-				console.debug('[AvatarCue] action finished', 'locomotion');
+		for (const completion of motion.update(delta)) {
+			if (completion.routine) routineController.completeCurrentStep();
+			syncActionBusy();
+			// Walks end in profile; ease back to the viewer unless a queued
+			// routine step (or photo mode) owns the body next.
+			if (
+				(completion.type === 'locomotion' || completion.type === 'goto') &&
+				!routineController.active
+			) {
+				startAmbientFaceCamera();
 			}
-		}
-		if (gotoState) {
-			const dx = gotoState.targetX - avatarRoot.position.x;
-			const dz = gotoState.targetZ - avatarRoot.position.z;
-			const dist = Math.hypot(dx, dz);
-			if (dist <= GOTO_ARRIVE_DIST) {
-				gotoState = null;
-				completeRoutineStep();
-				syncActionBusy();
-				if (!routine) startAmbientFaceCamera();
-				console.debug('[AvatarCue] action finished', 'goto');
-			} else {
-				const step = Math.min(delta, 0.1);
-				const move = Math.min(dist, GOTO_SPEED_MPS * step);
-				const clamped = clampWalkOffset(
-					avatarRoot.position.x + (dx / dist) * move,
-					avatarRoot.position.z + (dz / dist) * move,
-					WALK_MAX_RADIUS
-				);
-				avatarRoot.position.x = clamped.x;
-				avatarRoot.position.z = clamped.z;
-				const targetYaw = Math.atan2(dx, dz);
-				avatarRoot.rotation.y +=
-					shortAngleDelta(targetYaw - avatarRoot.rotation.y) * Math.min(1, delta * 6);
-				gotoState.phase += delta * Math.PI * 2 * WALK_STEP_HZ;
-				applyWalkSwing(Math.sin(gotoState.phase));
-			}
-		}
-		if (turnState) {
-			const diff = shortAngleDelta(turnState.targetYaw - avatarRoot.rotation.y);
-			const maxStep = TURN_SPEED_RPS * Math.min(delta, 0.1);
-			if (Math.abs(diff) <= Math.max(TURN_ARRIVE_RAD, maxStep)) {
-				const wasRoutine = turnState.routineStep;
-				const arrived = turnState.targetYaw;
-				turnState = null;
-				// Snap to the target, normalized so long sessions never stack spins.
-				avatarRoot.rotation.y = shortAngleDelta(arrived);
-				if (wasRoutine) completeRoutineStep();
-				syncActionBusy();
-				console.debug('[AvatarCue] action finished', 'turn');
-			} else {
-				avatarRoot.rotation.y += Math.sign(diff) * maxStep;
-			}
-		}
-		if (jumpState) {
-			jumpState.t += delta;
-			const progress = jumpState.t / JUMP_DURATION;
-			if (progress >= 1) {
-				avatarRoot.position.y = 0;
-				jumpState = null;
-				completeRoutineStep();
-				syncActionBusy();
-				console.debug('[AvatarCue] action finished', 'jump');
-			} else {
-				avatarRoot.position.y = jumpArcHeight(progress, JUMP_HEIGHT);
-			}
-		}
-		if (procedural) {
-			procedural.t += delta;
-			const progress = procedural.t / procedural.duration;
-			if (progress >= 1) {
-				// Sit/stand hand a persistent posture to the frame loop; every
-				// other procedural fully unwinds via appliedNudges.
-				if (procedural.name === 'sit') {
-					sitting = true;
-					sitOffsetY = sitTargetY;
-					avatarRoot.position.y = sitOffsetY;
-				} else if (procedural.name === 'stand') {
-					sitting = false;
-					sitOffsetY = 0;
-					sitTargetY = 0;
-					avatarRoot.position.y = 0;
-				}
-				console.debug('[AvatarCue] action finished', `procedural:${procedural.name}`);
-				procedural = null;
-				completeRoutineStep();
-				syncActionBusy();
-			} else {
-				if (procedural.name === 'sit') {
-					avatarRoot.position.y = sitTargetY * smoothstep(0, 0.8, progress);
-				} else if (procedural.name === 'stand') {
-					avatarRoot.position.y = sitOffsetY * (1 - smoothstep(0, 0.8, progress));
-				}
-				applyProceduralAction(procedural.name, progress);
-			}
-		}
-		// Held sitting posture: re-applied every frame once the sit transition
-		// hands off, until stand or any locomotion (which auto-stands first).
-		if (sitting && !procedural && !locomotion && !gotoState && !jumpState) {
-			avatarRoot.position.y = sitOffsetY;
-			applySittingPose(1);
 		}
 		// Live root pose for the prompt and camera follow. The store skips
 		// the write unless something moved, so this stays cheap per frame.
@@ -1756,17 +802,12 @@
 			y: avatarRoot.position.y,
 			z: avatarRoot.position.z,
 			yaw: avatarRoot.rotation.y,
-			sitting
+			sitting: motion.sitting
 		});
 		// Routine watchdog: a step that never reports completion fails instead
-		// of hanging the routine (and its promise) forever.
-		if (routine) {
-			routine.stepElapsed += delta;
-			if (routine.stepElapsed * 1000 > routine.stepDeadlineMs) {
-				console.debug('[AvatarCue] step watchdog fired', routine.id);
-				failCurrentStep('step exceeded its deadline', true);
-			}
-		}
+		// of hanging the routine (and its promise) forever. Driven by render
+		// time, so a hidden tab pauses deadlines together with motion.
+		routineController.tick(delta);
 
 		// Camera-driven jiggle: measure orbit velocity and advance the damped
 		// spring. The offsets are applied around vrm.update() further down, so
@@ -1782,68 +823,19 @@
 			prevCamAngles = angles;
 		}
 
-		// === Mood face + transient arbitration ===
-		// Priority: held photo pose (exclusive) > transient reaction (tap flash,
-		// emote grin, AI cue) > persistent mood > resting face. Only emotional
-		// presets are written here; blink, visemes, and jawOpen are owned by
-		// their own systems and the engine's protected set.
+		// Mood face + transient arbitration. Priority: held photo pose
+		// (exclusive) > transient reaction (tap flash, emote grin, AI cue) >
+		// persistent mood > resting face. Only emotional presets are written
+		// here; blink, visemes, and jawOpen are owned by their own systems.
 		{
 			const em = vrm.expressionManager;
 			if (em) {
-				if (transientFace) {
-					transientFace.t += delta;
-					if (transientFace.t >= transientFace.duration) {
-						const done = transientFace;
-						transientFace = null;
-						if (done.name === heldExpression) {
-							// The reaction borrowed the held expression; hand it back whole.
-							moodWeights.delete(done.name);
-							safeSetFace(em, done.name, 1);
-						}
-						// Other names melt back into the mood through moodWeights below.
-					}
-				}
-
-				const available = vrmStore.availableExpressions;
-				const temp =
-					transientFace && transientFace.weight > 0
-						? {
-								name: transientFace.name,
-								weight: transientFace.weight * reactionEnvelope(transientFace.t, transientFace.duration)
-							}
-						: null;
-				const held = photomodeStore.active ? heldExpression : null;
-				const base = held ? emptyWeights() : moodToExpressionWeights(characterStore.state.mood);
-				const blended = blendTemporaryFace(base, temp);
-				const targets = new Map<string, number>();
-				for (const target of resolveTargets(blended, available)) {
-					targets.set(target.name, target.weight);
-				}
-				if (temp) {
-					const direct = directTemporaryTarget(temp, available);
-					if (direct) targets.set(direct.name, Math.max(targets.get(direct.name) ?? 0, direct.weight));
-				}
-
-				// Drive owned weights toward their targets.
-				for (const [name, weight] of targets) {
-					const next = approachWeight(moodWeights.get(name) ?? 0, weight, delta, MOOD_FACE_SPEED);
-					moodWeights.set(name, next);
-					safeSetFace(em, name, next);
-				}
-				// Decay anything without a target back to rest. A stale entry for
-				// the held preset decays silently (the pose owns the actual value)
-				// so exiting the pose ramps back up instead of snapping.
-				for (const [name, current] of [...moodWeights]) {
-					if (targets.has(name)) continue;
-					const next = approachWeight(current, 0, delta, MOOD_FACE_SPEED);
-					if (next <= 0.001) {
-						moodWeights.delete(name);
-						if (name !== held) safeSetFace(em, name, 0);
-					} else {
-						moodWeights.set(name, next);
-						if (name !== held) safeSetFace(em, name, next);
-					}
-				}
+				expression.updateFace(delta, {
+					expressionManager: em,
+					availableExpressions: vrmStore.availableExpressions,
+					mood: characterStore.state.mood,
+					photoActive: photomodeStore.active
+				});
 			}
 		}
 
@@ -1945,81 +937,13 @@
 		const expressionManager = vrm.expressionManager;
 		if (!expressionManager) return;
 
-		// Helper to set expression (silently ignores if not found)
-		const setExpression = (name: string, value: number) => {
-			try {
-				expressionManager.setValue(name, value);
-			} catch {
-				// Expression doesn't exist on this model
-			}
-		};
-
-		// === Blinking Animation (runs during idle, disabled during emotes) ===
-		if (!isEmotePlaying) {
-			blinkTimer += delta;
-
-			if (!isBlinking && blinkTimer >= nextBlinkTime) {
-				// Start blink
-				isBlinking = true;
-				blinkProgress = 0;
-			}
-
-			if (isBlinking) {
-				blinkProgress += delta * 8; // Blink duration ~0.125s
-
-				// Asymmetric blink curve: quick close (30%), slow open (70%)
-				let blinkValue: number;
-				if (blinkProgress < 0.3) {
-					// Quick close
-					blinkValue = blinkProgress / 0.3;
-				} else {
-					// Slow open
-					blinkValue = 1 - (blinkProgress - 0.3) / 0.7;
-				}
-
-				const finalBlinkValue = Math.max(0, blinkValue);
-
-				if (blinkProgress >= 1) {
-					// End blink
-					isBlinking = false;
-					blinkTimer = 0;
-					nextBlinkTime = Math.random() * 4 + 2; // Random 2-6 seconds
-					// Try all blink expression variants
-					setExpression('blink', 0);
-					setExpression('Blink', 0);
-					setExpression('eyeBlinkLeft', 0);
-					setExpression('eyeBlinkRight', 0);
-				} else {
-					// Try all blink expression variants
-					setExpression('blink', finalBlinkValue);
-					setExpression('Blink', finalBlinkValue);
-					setExpression('eyeBlinkLeft', finalBlinkValue);
-					setExpression('eyeBlinkRight', finalBlinkValue);
-				}
-			}
-		}
-
-		// Apply expression changes
-		expressionManager.update();
-
-		// === Lip-sync Animation ===
-		const visemes = lipSyncAnalyzer.update(delta);
-
-		// Apply viseme weights - try multiple naming conventions
-		// VRM 1.0 style
-		setExpression('aa', visemes.aa);
-		setExpression('ee', visemes.ee);
-		setExpression('ih', visemes.ih);
-		setExpression('oh', visemes.oh);
-		setExpression('ou', visemes.ou);
-		// VRM 0.x style
-		setExpression('a', visemes.aa);
-		setExpression('i', visemes.ih);
-		setExpression('u', visemes.ou);
-		setExpression('e', visemes.ee);
-		setExpression('o', visemes.oh);
-		// ARKit style (jawOpen for mouth)
-		setExpression('jawOpen', visemes.aa * 0.7);
+		// Blinking (suppressed while an emote plays), the expression manager
+		// update, then lip-sync visemes across VRM 1.0, 0.x, and ARKit names.
+		expression.updateBlinkAndVoice(delta, {
+			expressionManager,
+			emotePlaying: animation.isEmotePlaying,
+			visemes: lipSyncAnalyzer.update(delta)
+		});
 	});
 </script>
 

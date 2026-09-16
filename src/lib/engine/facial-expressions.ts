@@ -18,6 +18,13 @@ export const EMOTIONAL_EXPRESSIONS: EmotionalExpression[] = [
 	'neutral'
 ];
 
+// One-shot expression-cue stage window: a brief flash while the reply lands,
+// never a stuck face. Authoritative here so the response parser and the
+// prompt contract agree.
+export const EXPRESSION_CUE_DURATION_MIN_MS = 500;
+export const EXPRESSION_CUE_DURATION_MAX_MS = 6000;
+export const EXPRESSION_CUE_DEFAULT_DURATION_MS = 2000;
+
 export function isEmotionalExpression(value: unknown): value is EmotionalExpression {
 	return (
 		typeof value === 'string' &&

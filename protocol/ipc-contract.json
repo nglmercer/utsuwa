@@ -1,0 +1,206 @@
+{
+  "_comment": "Native IPC contract: every method the WebView may invoke (typed by IpcMethod in crates/ipc-core) and every host push event (utsuwa-host-event). Consistency tests on both sides compare against this file; add the name here when adding a method or event on either side.",
+  "version": 1,
+  "methods": [
+    {
+      "name": "app.version"
+    },
+    {
+      "name": "app.ready"
+    },
+    {
+      "name": "agent.send_message"
+    },
+    {
+      "name": "agent.cancel"
+    },
+    {
+      "name": "permission.approve"
+    },
+    {
+      "name": "permission.deny"
+    },
+    {
+      "name": "permission.list"
+    },
+    {
+      "name": "permission.grant"
+    },
+    {
+      "name": "permission.revoke"
+    },
+    {
+      "name": "permission.grants"
+    },
+    {
+      "name": "settings.get"
+    },
+    {
+      "name": "settings.set"
+    },
+    {
+      "name": "settings.get_model_provider"
+    },
+    {
+      "name": "settings.set_model_provider"
+    },
+    {
+      "name": "providers.fetch_models"
+    },
+    {
+      "name": "mcp.status"
+    },
+    {
+      "name": "mcp.connect"
+    },
+    {
+      "name": "mcp.set_server_token"
+    },
+    {
+      "name": "audio_capture.start"
+    },
+    {
+      "name": "audio_capture.stop"
+    },
+    {
+      "name": "audio_capture.cancel"
+    },
+    {
+      "name": "camera.activity.status"
+    },
+    {
+      "name": "microphone.activity.status"
+    },
+    {
+      "name": "desktop.share_screen.start"
+    },
+    {
+      "name": "desktop.share_screen.pause"
+    },
+    {
+      "name": "desktop.share_screen.resume"
+    },
+    {
+      "name": "desktop.share_screen.stop"
+    },
+    {
+      "name": "desktop.share_screen.status"
+    },
+    {
+      "name": "desktop.control.enable"
+    },
+    {
+      "name": "desktop.control.disable"
+    },
+    {
+      "name": "desktop.emergency_stop"
+    },
+    {
+      "name": "desktop.emergency_clear"
+    },
+    {
+      "name": "activity.list"
+    },
+    {
+      "name": "plugin.list"
+    },
+    {
+      "name": "plugin.enable"
+    },
+    {
+      "name": "plugin.disable"
+    },
+    {
+      "name": "plugin.update"
+    },
+    {
+      "name": "plugin.remove"
+    },
+    {
+      "name": "host.runtime_state"
+    },
+    {
+      "name": "host.frontend_ready"
+    },
+    {
+      "name": "diagnostics.report"
+    },
+    {
+      "name": "task.create"
+    },
+    {
+      "name": "task.get"
+    },
+    {
+      "name": "task.list"
+    },
+    {
+      "name": "task.cancel"
+    },
+    {
+      "name": "task.review"
+    },
+    {
+      "name": "task.event"
+    }
+  ],
+  "events": [
+    {
+      "name": "app.ready"
+    },
+    {
+      "name": "agent.text_delta"
+    },
+    {
+      "name": "agent.tool_started"
+    },
+    {
+      "name": "agent.tool_finished"
+    },
+    {
+      "name": "agent.turn_done"
+    },
+    {
+      "name": "agent.turn_failed"
+    },
+    {
+      "name": "agent.turn_cancelled"
+    },
+    {
+      "name": "agent.turn_suspended"
+    },
+    {
+      "name": "task.step_completed"
+    },
+    {
+      "name": "task.terminal"
+    },
+    {
+      "name": "task.agent.progress"
+    },
+    {
+      "name": "avatar.routine.requested"
+    },
+    {
+      "name": "avatar.routine.completed"
+    },
+    {
+      "name": "permission.requested"
+    },
+    {
+      "name": "permission.dismissed"
+    },
+    {
+      "name": "camera.activity.changed"
+    },
+    {
+      "name": "microphone.activity.changed"
+    },
+    {
+      "name": "desktop.share_screen.changed"
+    },
+    {
+      "name": "audio.capture"
+    }
+  ]
+}
