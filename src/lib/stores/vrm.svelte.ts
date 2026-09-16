@@ -38,6 +38,37 @@ export interface AvatarActionRequest {
 	seq: number;
 }
 
+export interface RoutineStepInput {
+	kind: 'procedural' | 'jump' | 'walk' | 'emote';
+	action: string;
+	direction?: 'left' | 'right' | 'forward' | 'back';
+	durationMs?: number;
+	url?: string;
+}
+
+export interface AvatarRoutineRequest {
+	id: string;
+	steps: RoutineStepInput[];
+	seq: number;
+}
+
+export interface RoutineStepResult {
+	routineId: string;
+	key: string;
+	status: 'done' | 'dropped' | 'cancelled';
+	reason?: string;
+	at: number;
+}
+
+export interface RoutineResult {
+	routineId: string;
+	status: 'done' | 'cancelled';
+	completed: string[];
+	endPosition?: { x: number; z: number };
+	at: number;
+	seq: number;
+}
+
 // Default models bundled with the app (first one is loaded by default).
 // See static/models/README.md for each model's license.
 const DEFAULT_MODELS: VrmModel[] = [
@@ -171,6 +202,49 @@ function createVrmStore() {
 	let actionBusy = $state(false);
 	function setActionBusy(busy: boolean) {
 		actionBusy = busy;
+	}
+
+	// Avatar routines: ordered multi-step body sequences (walk L/R/F/B, jump
+	// combos). The model component plays steps in order and reports back, so
+	// requesters get completion instead of fire-and-forget silence. Routines
+	// are volatile (avatar plane is ms/s lifetime): they do not survive a
+	// reload, but every step lands in the ledger before it is forgotten.
+	let routineRequest = $state<AvatarRoutineRequest | null>(null);
+	let routineSeq = 0;
+	function requestAvatarRoutine(steps: RoutineStepInput[]): string {
+		const id = crypto.randomUUID();
+		routineRequest = { id, steps, seq: ++routineSeq };
+		return id;
+	}
+	let routineLedger = $state<RoutineStepResult[]>([]);
+	let lastRoutineResult = $state<RoutineResult | null>(null);
+	let routineResultSeq = 0;
+	type RoutineResultListener = (result: RoutineResult) => void;
+	const routineResultListeners = new Set<RoutineResultListener>();
+	function onRoutineResult(listener: RoutineResultListener): () => void {
+		routineResultListeners.add(listener);
+		return () => {
+			routineResultListeners.delete(listener);
+		};
+	}
+	function recordRoutineStep(entry: Omit<RoutineStepResult, 'at'>) {
+		routineLedger = [...routineLedger.slice(-19), { ...entry, at: Date.now() }];
+	}
+	function recordRoutineResult(input: {
+		routineId: string;
+		status: 'done' | 'cancelled';
+		completed: string[];
+		endPosition?: { x: number; z: number };
+	}) {
+		const result: RoutineResult = { ...input, at: Date.now(), seq: ++routineResultSeq };
+		lastRoutineResult = result;
+		for (const listener of [...routineResultListeners]) {
+			try {
+				listener(result);
+			} catch {
+				// A failing listener must not break staging or siblings.
+			}
+		}
 	}
 
 	// Temporary facial expression (AI cue, tap flash, emote grin): overlays the
@@ -585,6 +659,19 @@ function createVrmStore() {
 			return actionBusy;
 		},
 		setActionBusy,
+		get routineRequest() {
+			return routineRequest;
+		},
+		requestAvatarRoutine,
+		get routineLedger() {
+			return routineLedger;
+		},
+		get lastRoutineResult() {
+			return lastRoutineResult;
+		},
+		onRoutineResult,
+		recordRoutineStep,
+		recordRoutineResult,
 		get expressionRequest() {
 			return expressionRequest;
 		},

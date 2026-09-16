@@ -435,7 +435,7 @@
 				return;
 			}
 			if (active && !wasPhotoActive) {
-				cancelAvatarActions();
+				cancelRoutine('photo-mode');
 				if (talkingAction) talkingAction.fadeOut(0.2);
 				if (idleAction) {
 					// Ensure the idle actually holds weight (entering mid-talk left it
@@ -720,6 +720,30 @@
 		return { x: 0, z: 1 };
 	}
 
+	function startProceduralAction(name: string): boolean {
+		const duration = PROCEDURAL_DURATIONS[name];
+		if (!duration) return false;
+		procedural = { name, t: 0, duration };
+		console.debug('[AvatarCue] action started', `procedural:${name}`);
+		return true;
+	}
+
+	function startJumpAction(): void {
+		jumpState = { t: 0 };
+		console.debug('[AvatarCue] action started', 'jump');
+	}
+
+	function startWalkAction(direction: string, durationMs?: number): void {
+		const dir = walkDirectionVector(direction);
+		locomotion = {
+			dirX: dir.x,
+			dirZ: dir.z,
+			remainingMs: Math.min(3000, Math.max(300, Math.round(durationMs ?? 1200))),
+			phase: 0
+		};
+		console.debug('[AvatarCue] action started', `walk:${direction}`);
+	}
+
 	function handleAvatarActionRequest(req: {
 		kind: string;
 		action: string;
@@ -727,40 +751,132 @@
 		durationMs?: number;
 	}) {
 		if (req.kind === 'stop') {
-			cancelAvatarActions();
+			cancelRoutine('stopped');
 			vrmStore.setCurrentAnimation(null);
 			return;
 		}
 		if (req.kind === 'reset') {
-			cancelAvatarActions();
+			cancelRoutine('reset');
 			avatarRoot.position.set(0, 0, 0);
 			avatarRoot.rotation.set(0, 0, 0);
 			return;
 		}
-		// A new action interrupts the current one; every program below is
-		// absolute per-frame, so interruption strands nothing.
-		cancelAvatarActions();
+		// A new action interrupts the current one (and any routine); every
+		// program below is absolute per-frame, so interruption strands nothing.
+		cancelRoutine('superseded');
 		if (req.kind === 'procedural') {
-			const duration = PROCEDURAL_DURATIONS[req.action];
-			if (!duration) return;
-			procedural = { name: req.action, t: 0, duration };
-			console.debug('[AvatarCue] action started', `procedural:${req.action}`);
+			if (!startProceduralAction(req.action)) return;
 		} else if (req.kind === 'jump') {
-			jumpState = { t: 0 };
-			console.debug('[AvatarCue] action started', 'jump');
+			startJumpAction();
 		} else if (req.kind === 'walk') {
-			const dir = walkDirectionVector(req.direction ?? 'forward');
-			locomotion = {
-				dirX: dir.x,
-				dirZ: dir.z,
-				remainingMs: Math.min(3000, Math.max(300, Math.round(req.durationMs ?? 1200))),
-				phase: 0
-			};
-			console.debug('[AvatarCue] action started', `walk:${req.direction ?? 'forward'}`);
+			startWalkAction(req.direction ?? 'forward', req.durationMs);
 		} else {
 			return;
 		}
 		syncActionBusy();
+	}
+
+	// === Avatar routines: ordered step sequences with completion ===
+	interface ActiveRoutine {
+		id: string;
+		steps: Array<{ kind: string; action: string; direction?: string; durationMs?: number; url?: string }>;
+		index: number;
+		completed: string[];
+	}
+	let routine: ActiveRoutine | null = null;
+	let routineSeqSeen = 0;
+	let routineAwaitingEmote: string | null = null;
+
+	function routineStepKey(step: { kind: string; action: string; direction?: string }): string {
+		return `${step.kind}:${step.action}${step.direction ? `:${step.direction}` : ''}`;
+	}
+
+	function cancelRoutine(reason: string) {
+		cancelAvatarActions();
+		if (!routine) return;
+		vrmStore.recordRoutineResult({
+			routineId: routine.id,
+			status: 'cancelled',
+			completed: routine.completed,
+			endPosition: { x: avatarRoot.position.x, z: avatarRoot.position.z }
+		});
+		console.debug('[AvatarCue] routine cancelled', `${routine.id} (${reason})`);
+		routine = null;
+		routineAwaitingEmote = null;
+		syncActionBusy();
+	}
+
+	function advanceRoutine() {
+		if (!routine) return;
+		if (routine.index >= routine.steps.length) {
+			vrmStore.recordRoutineResult({
+				routineId: routine.id,
+				status: 'done',
+				completed: routine.completed,
+				endPosition: { x: avatarRoot.position.x, z: avatarRoot.position.z }
+			});
+			console.debug('[AvatarCue] routine finished', routine.id);
+			routine = null;
+			routineAwaitingEmote = null;
+			syncActionBusy();
+			return;
+		}
+		const step = routine.steps[routine.index];
+		const key = routineStepKey(step);
+		let started = false;
+		if (step.kind === 'procedural') {
+			started = startProceduralAction(step.action);
+		} else if (step.kind === 'jump') {
+			startJumpAction();
+			started = true;
+		} else if (step.kind === 'walk') {
+			startWalkAction(step.direction ?? 'forward', step.durationMs);
+			started = true;
+		} else if (step.kind === 'emote' && step.url) {
+			routineAwaitingEmote = step.url;
+			vrmStore.setCurrentAnimation(step.url);
+			started = true;
+		}
+		if (!started) {
+			vrmStore.recordRoutineStep({ routineId: routine.id, key, status: 'dropped', reason: 'unknown step' });
+			routine.index++;
+			advanceRoutine();
+			return;
+		}
+		syncActionBusy();
+	}
+
+	function dropRoutineStep(reason: string) {
+		if (!routine) return;
+		const step = routine.steps[routine.index];
+		if (!step) return;
+		vrmStore.recordRoutineStep({
+			routineId: routine.id,
+			key: routineStepKey(step),
+			status: 'dropped',
+			reason
+		});
+		routine.index++;
+		advanceRoutine();
+	}
+
+	function completeRoutineStep() {
+		if (!routine) return;
+		const step = routine.steps[routine.index];
+		if (!step) return;
+		const key = routineStepKey(step);
+		routine.completed.push(key);
+		vrmStore.recordRoutineStep({ routineId: routine.id, key, status: 'done' });
+		routine.index++;
+		advanceRoutine();
+	}
+
+	function startRoutine(request: { id: string; steps: ActiveRoutine['steps'] }) {
+		// Replacement policy: at most one routine; a new one cancels the old.
+		cancelRoutine('superseded');
+		routine = { id: request.id, steps: request.steps, index: 0, completed: [] };
+		console.debug('[AvatarCue] routine started', `${request.id} (${request.steps.length} steps)`);
+		advanceRoutine();
 	}
 
 	$effect(() => {
@@ -771,6 +887,17 @@
 			if (request.seq === actionSeqSeen) return;
 			actionSeqSeen = request.seq;
 			handleAvatarActionRequest(request);
+		});
+	});
+
+	$effect(() => {
+		const request = vrmStore.routineRequest;
+		if (!request) return;
+		untrack(() => {
+			if (!vrm || !mixer) return;
+			if (request.seq === routineSeqSeen) return;
+			routineSeqSeen = request.seq;
+			startRoutine(request);
 		});
 	});
 
@@ -877,6 +1004,11 @@
 					isEmotePlaying = true;
 					syncActionBusy();
 					console.debug('[AvatarCue] action started', `emote:${animationData.id}`);
+					// A manually triggered emote supersedes any routine; the
+					// routine's own emote step arrives with its URL awaited.
+					if (routine && routineAwaitingEmote !== animationData.url) {
+						cancelRoutine('superseded');
+					}
 
 					// Face comes from the action's metadata, not a generic
 					// grin: unmapped clips leave the mood face alone.
@@ -898,6 +1030,10 @@
 							capturedMixer.removeEventListener('finished', onFinished);
 							isEmotePlaying = false;
 							emoteAction = null;
+							if (routine && routineAwaitingEmote === animationData.url) {
+								routineAwaitingEmote = null;
+								completeRoutineStep();
+							}
 							syncActionBusy();
 							console.debug('[AvatarCue] action finished', `emote:${animationData.id}`);
 
@@ -919,6 +1055,10 @@
 				// Clear the stale selection so the gesture gate's busy flag
 				// (currentAnimation !== null) can't stick forever.
 				vrmStore.setCurrentAnimation(null);
+				if (routine && routineAwaitingEmote) {
+					routineAwaitingEmote = null;
+					dropRoutineStep('emote load failed');
+				}
 			});
 	});
 
@@ -1075,7 +1215,7 @@
 				avatarRoot.remove(vrm.scene);
 				avatarRoot.position.set(0, 0, 0);
 				avatarRoot.rotation.set(0, 0, 0);
-				cancelAvatarActions();
+				cancelRoutine('model-unloaded');
 				// Frees geometries, materials, and textures (manual traverse missed textures)
 				VRMUtils.deepDispose(vrm.scene);
 				vrmStore.setVrm(null);
@@ -1184,6 +1324,7 @@
 			locomotion.remainingMs -= delta * 1000;
 			if (locomotion.remainingMs <= 0) {
 				locomotion = null;
+				completeRoutineStep();
 				syncActionBusy();
 				console.debug('[AvatarCue] action finished', 'locomotion:walk');
 			}
@@ -1194,6 +1335,7 @@
 			if (progress >= 1) {
 				avatarRoot.position.y = 0;
 				jumpState = null;
+				completeRoutineStep();
 				syncActionBusy();
 				console.debug('[AvatarCue] action finished', 'jump');
 			} else {
@@ -1206,6 +1348,7 @@
 			if (progress >= 1) {
 				console.debug('[AvatarCue] action finished', `procedural:${procedural.name}`);
 				procedural = null;
+				completeRoutineStep();
 				syncActionBusy();
 			} else {
 				applyProceduralAction(procedural.name, progress);
